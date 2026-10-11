@@ -70,6 +70,7 @@ import type {
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
+import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms } from '../raw-forms.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
@@ -807,14 +808,27 @@ function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?
  * which — thrown inside the speculative-compression drain — halts ALL
  * compression. Non-text blocks (tool_use/tool_result/image) pass through
  * unchanged, so tool pairing is preserved; callers drop any message left with
- * an empty content array.
+ * an empty content array. membrane's zero-width carriers of opaque Responses
+ * items (a compaction item, a hosted tool's call) are empty text too, so they
+ * are dropped from compression requests as well, as they always were.
+ *
+ * Released narrowly (releaseVanishedRawForms, not releaseEditedRawForms): an
+ * empty part dropped from a Responses message item while a sibling part
+ * survives still rides inside the sibling's raw item, and only whitespace can
+ * ship that way, so releasing would re-render the whole item (and its reasoning
+ * pairing) from fields for no content change. An item none of whose parts
+ * survive is gone from the wire, a dropped carrier's item included, so the
+ * reasoning paired with it gives up its id rather than be replayed without its
+ * follower.
+ *
+ * Exported for its tests; not part of the package's API.
  */
-function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
-  return content.filter((b) => {
+export function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
+  return releaseVanishedRawForms(content, content.filter((b) => {
     if (b.type !== 'text') return true;
     const text = (b as { text?: unknown }).text;
     return typeof text === 'string' && text.trim().length > 0;
-  });
+  }));
 }
 
 /**
@@ -838,9 +852,16 @@ function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
  * ("thinking blocks ... cannot be modified", observed 2026-07-16 on the
  * `full` replay arm). Passing raw thinking through requires keeping those
  * turns byte-identical — a follow-up experiment, not a blanket strip removal.
+ *
+ * A stripped Responses reasoning item releases the raw item it was paired
+ * with, so the follower isn't replayed with an id whose reasoning is gone
+ * (see raw-forms.ts).
  */
 function stripThinkingBlocks(content: ContentBlock[]): ContentBlock[] {
-  return content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
+  return releaseEditedRawForms(
+    content,
+    content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking'),
+  );
 }
 
 /**
@@ -11089,8 +11110,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // browser carries most of its image bytes NESTED in tool results, not as
     // top-level blocks. Capping only the top level left those untouched and
     // membrane's transport shed kept firing at 27MB (2026-07-12).
-    const capBlocks = (blocks: ContentBlock[]): ContentBlock[] =>
-      blocks.map((b) => {
+    // A block is copied only when an image in it is replaced, so an untouched
+    // block keeps its identity and its raw replay form (see raw-forms.ts).
+    const capBlocks = (blocks: ContentBlock[]): ContentBlock[] => {
+      let changed = false;
+      const capped = blocks.map((b) => {
         if (b.type === 'image') {
           const bytes = AutobiographicalStrategy.imageBlockBytes(b);
           if (kept + bytes <= capBytes) {
@@ -11098,14 +11122,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             return b;
           }
           dropped++;
+          changed = true;
           return { type: 'text', text: AutobiographicalStrategy.IMAGE_PLACEHOLDER } as ContentBlock;
         }
         const nested = (b as { type: string; content?: unknown }).content;
         if (b.type === 'tool_result' && Array.isArray(nested)) {
-          return { ...b, content: capBlocks(nested as ContentBlock[]) } as ContentBlock;
+          const inner = capBlocks(nested as ContentBlock[]);
+          if (inner === nested) return b;
+          changed = true;
+          return { ...b, content: inner } as ContentBlock;
         }
         return b;
       });
+      return changed ? releaseEditedRawForms(blocks, capped) : blocks;
+    };
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       if (!Array.isArray(m.content)) continue;
@@ -11448,7 +11478,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
         if (filtered.length !== entry.content.length) {
           entry.content = filtered.length > 0
-            ? filtered
+            ? releaseEditedRawForms(entry.content, filtered)
             : [{ type: 'text', text: '[tool call omitted]' }];
         }
       }
@@ -11546,22 +11576,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           b => b.type === 'tool_result' && b.toolUseId === id,
         );
         if (bi === -1) continue;
-        const real = src.content[bi];
-        const rest = src.content.filter((_, k) => k !== bi);
+        const source = src.content;
+        const real = source[bi];
+        const rest = source.filter((_, k) => k !== bi);
+        // A raw replay form shared with the results left behind (one
+        // <function_results> holding several) is true of neither side once
+        // they're apart; each gives it up (see raw-forms.ts).
         src.content = rest.length > 0
-          ? rest
+          ? releaseEditedRawForms(source, rest)
           : [{ type: 'text', text: '[tool result moved during context repair]' }];
         // The result still reaches the request, next to its tool_use:
         // provenance credits the source body with it there.
         (src.relocatedResults ??= []).push(id);
-        return real;
+        return releaseSharedRawFormsOnMove(real, source);
       }
       return this.createToolResultStub(id);
     });
   }
 
   /**
-   * Prune tool_use / tool_result blocks in-place:
+   * Prune tool_use / tool_result blocks in place on the entries (an edited
+   * entry gets its own copy of its content array, never the store's):
    *  1. Truncate `tool_use.input` blocks whose serialized JSON exceeds
    *     `toolUseInputMaxTokens`.
    *  2. For each tool name, keep only the last N `tool_result` blocks
@@ -11574,6 +11609,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * affect chunk formation or the recall/pin layout.
    */
   protected pruneToolEntries(entries: ContextEntry[]): void {
+    // Each edited entry's content as it was, so the edit's raw replay forms can
+    // be released once both passes are done (see raw-forms.ts).
+    //
+    // An entry's content array can be its message's own, from the store's
+    // cached getAll() view (immutable to callers), whenever no message cap cut
+    // it. So the first edit gives the entry a copy and leaves that array as it
+    // was. An edit written into it would reach every getAll() caller until the
+    // next store write, and the next compile would start from the marker
+    // instead of the original (the compile-twice test in raw-forms.test.ts).
+    const originals = new Map<ContextEntry, ContentBlock[]>();
+    const replaceBlock = (entry: ContextEntry, index: number, block: ContentBlock): void => {
+      if (!originals.has(entry)) {
+        originals.set(entry, entry.content);
+        entry.content = entry.content.slice();
+      }
+      entry.content[index] = block;
+    };
+
     // Pass 1: build toolUseId → toolName map and apply input truncation
     const toolUseInputCap = this.config.toolUseInputMaxTokens ?? 0;
     const toolUseIdToName = new Map<string, string>();
@@ -11589,14 +11642,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const inputTokens = Math.ceil(inputJson.length / 4);
           if (inputTokens > toolUseInputCap) {
             const keys = Object.keys(block.input).slice(0, 5);
-            entry.content[i] = {
+            replaceBlock(entry, i, {
               ...block,
               input: {
                 _truncated: true,
                 _originalTokens: inputTokens,
                 _keys: keys,
               },
-            };
+            });
           }
         }
       }
@@ -11624,27 +11677,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Pass 3: apply per-tool max-last-N
     const cfg = this.config.toolResultMaxLastN;
-    if (cfg === undefined) return;
+    if (cfg !== undefined) {
+      for (const [toolName, occs] of occurrencesByTool) {
+        let limit: number | undefined;
+        if (typeof cfg === 'number') limit = cfg;
+        else if (typeof cfg === 'object') limit = cfg[toolName];
+        if (limit === undefined || limit < 0) continue;
 
-    for (const [toolName, occs] of occurrencesByTool) {
-      let limit: number | undefined;
-      if (typeof cfg === 'number') limit = cfg;
-      else if (typeof cfg === 'object') limit = cfg[toolName];
-      if (limit === undefined || limit < 0) continue;
+        const excessCount = occs.length - limit;
+        if (excessCount <= 0) continue;
 
-      const excessCount = occs.length - limit;
-      if (excessCount <= 0) continue;
-
-      for (let i = 0; i < excessCount; i++) {
-        const { entry, blockIndex } = occs[i];
-        const orig = entry.content[blockIndex];
-        if (orig.type !== 'tool_result') continue;
-        const fresherCount = occs.length - i - 1;
-        entry.content[blockIndex] = {
-          ...orig,
-          content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
-        };
+        for (let i = 0; i < excessCount; i++) {
+          const { entry, blockIndex } = occs[i];
+          const orig = entry.content[blockIndex];
+          if (orig.type !== 'tool_result') continue;
+          const fresherCount = occs.length - i - 1;
+          replaceBlock(entry, blockIndex, {
+            ...orig,
+            content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
+          });
+        }
       }
+    }
+
+    for (const [entry, before] of originals) {
+      entry.content = releaseEditedRawForms(before, entry.content);
     }
   }
 
@@ -11823,11 +11880,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Under `'full'` (default) this IS `summaryAnswerProse`, block for block.
    * Under `'live-strip'` the captured reasoning carriers are omitted from the
-   * live render alone: whole blocks dropped, every surviving block passed
-   * through untouched, so the same entry's mint-side recall still replays its
-   * signed blocks byte-verbatim. Mutating a carrier here would break the
-   * signature that the mint surface depends on — hence omission, never
-   * rewriting.
+   * live render alone: whole blocks dropped, so the same entry's mint-side
+   * recall still replays its signed blocks byte-verbatim. Mutating a carrier
+   * here would break the signature that the mint surface depends on — hence
+   * omission, never rewriting. Every surviving block is passed through by
+   * reference, except a Responses item a stripped reasoning item led to: every
+   * block that shares it is copied without its raw item, and so without its id
+   * (see raw-forms.ts).
    *
    * A carrier-only entry (reasoning captured, no prose block — degenerate, and
    * guarded against at mint time) would strip to an empty assistant turn,
@@ -11926,14 +11985,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     summaries: SummaryEntry[],
     maxTokens: number,
   ): { content: ContentBlock[]; refs: Array<{ id: string; level: number; partial?: true }> } {
+    // A separator follows the answer before it on the wire, so the reasoning at
+    // that answer's end gives up its id first (see raw-forms.ts).
+    const separated = (content: ContentBlock[]): ContentBlock[] => [
+      ...releaseTrailingReasoning(content),
+      { type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT },
+    ];
     if (this.config.recallEnvelope !== 'xml') {
-      const content: ContentBlock[] = [];
+      let content: ContentBlock[] = [];
       // Which summary each text block of the full answer belongs to (-1 for
       // separators), so a flat truncation can be read back per summary.
+      // releaseTrailingReasoning keeps every block's position, so the two
+      // stay aligned.
       const owners: number[] = [];
       summaries.forEach((s, idx) => {
         if (idx > 0) {
-          content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
+          content = separated(content);
           owners.push(-1);
         }
         for (const block of this.liveWindowAnswerContent(s)) {
@@ -11979,7 +12046,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return { content: out, refs };
     }
 
-    const content: ContentBlock[] = [];
+    let content: ContentBlock[] = [];
     const refs: Array<{ id: string; level: number; partial?: true }> = [];
     const separatorCost = this.estimateTextOnlyTokens(
       { content: [{ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT }] } as StoredMessage,
@@ -11991,7 +12058,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (maxTokens > 0 && proseBudget <= 0) break;
       const prose = this.liveWindowAnswerProse(s);
       const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
-      if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
+      if (idx > 0) content = separated(content);
       content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
       refs.push(capped === prose ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
       if (maxTokens > 0) {
@@ -12052,6 +12119,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return cause;
   }
 
+  /**
+   * Cut a message's text and string tool-result content to `maxTokens`. A cut
+   * or dropped block gives up its raw replay form, along with every block
+   * sharing it, so the cut reaches the wire (see raw-forms.ts).
+   */
   protected truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
     if (maxTokens <= 0) return content;
     const est = this.estimateTextOnlyTokens({ content } as StoredMessage);
@@ -12105,6 +12177,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    return result;
+    return releaseEditedRawForms(content, result);
   }
 }
