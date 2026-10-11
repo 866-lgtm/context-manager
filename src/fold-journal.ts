@@ -816,14 +816,17 @@ export class FoldJournal {
       // Another format's links aren't read, so the walk has nowhere to start.
       notes.push(`The branch's newest record, ${state.newest.id}, is of another format, so receipts before it aren't listed.`);
     } else if (state?.shadowedBy) {
-      notes.push(`Record ${state.shadowedBy}, newer than this branch's newest readable record, can't be read: it may have been this branch's newest, and a receipt it held isn't listed.`);
+      notes.push(`Record ${state.shadowedBy}, newer than this branch's newest readable record, can't be read: it may have been this branch's newest, and any receipt it held isn't listed.`);
     }
     const cut = state?.receiptsCut;
     if (cut) {
-      const before = `Receipts before ${list[0]?.id ?? 'the newest'} aren't listed`;
-      notes.push(cut.linksTo === undefined
-        ? `${before}: record ${cut.at}, which links to them, can't be read as a receipt.`
-        : `${before}: record ${cut.at} links to ${cut.linksTo}, which isn't before it.`);
+      // A forward link is found on a receipt already listed, so only an
+      // unreadable one can leave the list empty.
+      notes.push(list.length === 0
+        ? `No receipts are listed: record ${cut.at}, where the branch's receipts start, can't be read as a receipt.`
+        : cut.linksTo === undefined
+          ? `Receipts before ${list[0]!.id} aren't listed: record ${cut.at}, which links to them, can't be read as a receipt.`
+          : `Receipts before ${list[0]!.id} aren't listed: record ${cut.at} links to ${cut.linksTo}, which isn't before it.`);
     }
     if (unloadable.length > 0) notes.push(`Receipt${unloadable.length === 1 ? '' : 's'} ${unloadable.join(', ')} can't be read and ${unloadable.length === 1 ? 'is' : 'are'} left out.`);
     return { branch, receipts, latestId, more, ...(notes.length > 0 ? { note: notes.join(' ') } : {}) };

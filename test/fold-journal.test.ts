@@ -1644,6 +1644,15 @@ describe('fold journal durability and index', () => {
         what,
       );
     }
+    // A newest record with no receipt whose link names no record: nothing is
+    // listed, and the note doesn't read as if the newest were.
+    const { receipt: _receipt, ...noReceipt } = record;
+    cm.getStore().appendJson('context-manager/accepted-layout', { ...noReceipt, compileId: 'cut-empty', pr: '0' });
+    cm.close();
+    ({ cm } = await open(strategy));
+    const empty = cm.listFoldReceipts({ limit: 10 });
+    assert.deepEqual(empty.receipts, []);
+    assert.match(empty.note ?? '', /^No receipts are listed: record 0, where the branch's receipts start, can't be read as a receipt\./);
     cm.close();
   });
 
