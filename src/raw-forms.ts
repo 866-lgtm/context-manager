@@ -46,9 +46,11 @@
  * no field can render it. So an opaque carrier is never released. In a
  * pairing it is an item like any other, so a hosted tool's call is the
  * follower of the reasoning that led to it. A pairing released through one
- * leaves it whole, with its id: when its reasoning is stripped, as compression
- * input strips all reasoning, it ships with its id and no reasoning, as main
- * sends it. Only dropping it could change that.
+ * leaves it whole, with its id. So where its reasoning is stripped and it
+ * stays, it ships with its id and no reasoning, as main sends it: that is the
+ * live-strip recall answer (see liveWindowAnswerProse). Compression input
+ * strips the reasoning too, but drops every carrier with the other empty text
+ * (stripEmptyTextBlocks), so there it doesn't ship at all.
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
