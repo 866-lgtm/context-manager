@@ -41,7 +41,14 @@ interface ApiMessage { participant: string; content: ContentBlock[] }
 // API-shape validator: mirrors what the Anthropic API enforces.
 // ---------------------------------------------------------------------------
 
-function validateApiShape(messages: readonly ApiMessage[]): void {
+/** How a tool_result names its call, which depends on where it is read. */
+type ResultIdReader = (block: ContentBlock) => string | undefined;
+/** Context-manager's own messages are Membrane-shaped: `toolUseId`. */
+const membraneResultId: ResultIdReader = (block) => (block as { toolUseId?: string }).toolUseId;
+/** On the wire the API reads `tool_use_id`, and only that. */
+const wireResultId: ResultIdReader = (block) => (block as { tool_use_id?: string }).tool_use_id;
+
+function validateApiShape(messages: readonly ApiMessage[], resultId: ResultIdReader): void {
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     const isUser = msg.participant.toLowerCase() === 'user';
@@ -57,9 +64,7 @@ function validateApiShape(messages: readonly ApiMessage[]): void {
         const id = (block as { id: string }).id;
         const next = messages[i + 1];
         const matched = next?.content.some(
-          (b) =>
-            b.type === 'tool_result' &&
-            ((b as { tool_use_id?: string }).tool_use_id ?? (b as { toolUseId?: string }).toolUseId) === id,
+          (b) => b.type === 'tool_result' && resultId(b) === id,
         );
         if (!matched) {
           throw new Error(
@@ -69,7 +74,7 @@ function validateApiShape(messages: readonly ApiMessage[]): void {
       }
 
       if (block.type === 'tool_result') {
-        const tid = (block as { tool_use_id?: string }).tool_use_id ?? (block as { toolUseId?: string }).toolUseId;
+        const tid = resultId(block);
         const prev = messages[i - 1];
         const matched = prev?.content.some(
           (b) => b.type === 'tool_use' && (b as { id: string }).id === tid,
@@ -88,14 +93,14 @@ function validateApiShape(messages: readonly ApiMessage[]): void {
 // Mock membrane: validates shape, returns deterministic compressed text.
 // ---------------------------------------------------------------------------
 
-function createValidatingMembrane(compressionRatio = 5) {
+function createValidatingMembrane(compressionRatio = 5, resultId: ResultIdReader = membraneResultId) {
   const calls: Array<{ messages: ApiMessage[]; outputChars: number }> = [];
   const membrane = {
     complete: async (request: {
       messages: ApiMessage[];
       config?: { maxTokens?: number };
     }) => {
-      validateApiShape(request.messages);
+      validateApiShape(request.messages, resultId);
       const inputChars = request.messages
         .flatMap((m) => m.content)
         .map((b) => (b as { text?: string }).text ?? '')
@@ -119,16 +124,44 @@ function createValidatingMembrane(compressionRatio = 5) {
 }
 
 /**
+ * Membrane's formatters convert a block to its wire form before the tool-pair
+ * normalizer runs: a tool_result names its call as `tool_use_id`.
+ */
+function toWireBlock(block: ContentBlock): ContentBlock {
+  if (block.type !== 'tool_result') return block;
+  const { toolUseId, ...rest } = block as ContentBlock & { toolUseId?: string };
+  return { ...rest, tool_use_id: toolUseId } as unknown as ContentBlock;
+}
+
+/**
+ * Normalizer repairs that stand in for half a tool cycle: a result invented
+ * for a tool_use that had none, or a result turned to text because its call
+ * was gone (`stray_` from membrane#54 on, `orphan_` before). The API accepts
+ * the repaired request, but it no longer says what happened, so here each
+ * means context-manager lost half of a cycle it was given whole. The list
+ * mirrors membrane's own set of repairs that rewrite content rather than
+ * placement (PREFIX_REWRITING_NORMALIZE_EVENT_KINDS, which its package
+ * doesn't export): a new kind belongs here when membrane adds it there.
+ */
+const LOST_HALF_CYCLE_REPAIRS = new Set([
+  'synthetic_pending_result',
+  'orphan_tool_result_textified',
+  'stray_tool_result_textified',
+]);
+
+/**
  * Wire-boundary variant: validates the shape a request would have AFTER
  * Membrane's tool-pair normalizer — i.e. what actually goes to the API.
  * `createValidatingMembrane` above holds CM to producing raw-valid shapes
  * on its own; this one holds the CM+Membrane stack to shipping a valid
  * payload. Use it for scenarios where the split responsibility is the
  * point (either CM's splitMixedToolMessages or Membrane's normalizer must
- * handle the shape — the API only sees their composition).
+ * handle the shape — the API only sees their composition). The
+ * normalizer may move blocks to the right turns; it may not have to stand
+ * in for a result or a call that context-manager dropped.
  */
 function createWireValidatingMembrane(compressionRatio = 5) {
-  const { membrane: inner, calls } = createValidatingMembrane(compressionRatio);
+  const { membrane: inner, calls } = createValidatingMembrane(compressionRatio, wireResultId);
   const membrane = {
     complete: async (request: {
       messages: ApiMessage[];
@@ -136,14 +169,22 @@ function createWireValidatingMembrane(compressionRatio = 5) {
     }) => {
       // Mirror Membrane's wire boundary: every message starts user-roled
       // (the default assistantParticipant is 'Claude', which matches none
-      // of the participants used here), then the normalizer re-roles
-      // tool_use / thinking blocks onto assistant turns and enforces
-      // pairing. Validate the post-normalization shape.
+      // of the participants used here) and in wire form, then the
+      // normalizer re-roles tool_use / thinking blocks onto assistant turns
+      // and enforces pairing. Validate the post-normalization shape.
       const provider = request.messages.map((m) => ({
         role: 'user' as const,
-        content: m.content as any,
+        content: m.content.map(toWireBlock) as any,
       }));
-      const normalized = normalizeToolPairs(provider);
+      const repairs: string[] = [];
+      const normalized = normalizeToolPairs(provider, {
+        onEvent: (event: { kind: string }) => {
+          if (LOST_HALF_CYCLE_REPAIRS.has(event.kind)) repairs.push(event.kind);
+        },
+      });
+      if (repairs.length > 0) {
+        throw new Error(`the normalizer stood in for lost halves of tool cycles: ${repairs.join(', ')}`);
+      }
       const asApiShape = normalized.messages.map((m) => ({
         participant: m.role,
         content: m.content as ContentBlock[],
@@ -444,7 +485,8 @@ describe('Compression pipeline: API shape invariants', () => {
     assert.ok(calls.length > 0, 'expected at least one compression call to land');
     // validateApiShape throwing inside the mock membrane is the failure
     // mode — no throw means every request shipped was API-valid, i.e. the
-    // bundled cycles were split before reaching the membrane.
+    // bundled cycles were split before reaching the membrane, and that the
+    // normalizer didn't have to stand in for half of any of them.
     await manager.close();
   });
 
@@ -516,5 +558,37 @@ describe('Compression pipeline: API shape invariants', () => {
 
     assert.ok(calls.length > 0, 'adaptive path produced no compression calls');
     await manager.close();
+  });
+});
+
+describe('the wire-validating mock', () => {
+  // The postmortem case relies on this mock to tell a whole composition from
+  // one the normalizer had to patch; pin both directions here.
+  const send = (messages: ApiMessage[]) =>
+    createWireValidatingMembrane().membrane.complete({ messages });
+
+  it('accepts whole tool cycles bundled into one user-roled message (the normalizer re-roles them)', async () => {
+    await send([
+      { participant: 'user', content: [t('look'), u('W1'), r('W1'), t('done')] },
+      { participant: 'agent', content: [t('ok')] },
+    ]);
+  });
+
+  it('refuses a tool_use whose result was lost, though the normalizer can invent one', async () => {
+    await assert.rejects(
+      send([{ participant: 'user', content: [t('look'), u('W2')] }]),
+      /synthetic_pending_result/,
+    );
+  });
+
+  it('refuses a tool_result whose call was lost, though the normalizer can turn it to text', async () => {
+    await assert.rejects(
+      send([
+        { participant: 'user', content: [t('look')] },
+        { participant: 'agent', content: [t('ok')] },
+        { participant: 'user', content: [r('W3'), t('more')] },
+      ]),
+      /tool_result_textified/,
+    );
   });
 });
