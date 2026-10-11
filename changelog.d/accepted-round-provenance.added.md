@@ -43,10 +43,11 @@
     1.3 bytes each) and its units (forms with counts), so a message missing
     from either view is never counted inside a range. An acceptance writes a
     delta on the branch's previous record, whose size follows what changed,
-    or a snapshot once the deltas since the last one would outweigh it,
-    after 256 deltas, or when no delta can express the change. The history
-    behind the window costs only its members, in snapshots, and rebuilding a
-    layout reads at most two snapshots' worth of layout.
+    or a snapshot of the whole layout once the records since the last
+    snapshot would outweigh it, each counted whole, receipt included. So
+    snapshots cost about as much again as the deltas between them, the bytes
+    stored per acceptance don't grow with the history, and rebuilding a
+    layout reads at most about two snapshots' worth.
   - Every manager on one store object shares an index of these records: the
     first acceptance or receipt query after the store opens lists and reads
     them once, and each manager adds its own records as it writes them. The

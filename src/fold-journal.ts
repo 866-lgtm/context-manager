@@ -29,8 +29,11 @@
  *   reverse, so a crash or a failed append between the two cannot duplicate
  *   or lose a receipt. Diffs read only the persisted layout, never the live
  *   message view. A layout persists as its members (gap-coded sequences) and
- *   its units (forms with counts): a delta's size follows what changed, and
- *   the history behind the window costs only its members, in snapshots.
+ *   its units (forms with counts). A delta's size follows what changed. A
+ *   snapshot holds the whole layout, the history behind the window as its
+ *   members; it is written only once the records since the last one would
+ *   outweigh it, so snapshots cost about as much again as the deltas between
+ *   them, and the bytes stored per acceptance don't grow with the session.
  *
  * Typed records are enumerable from any branch, but each one takes the next
  * sequence of the branch selected when it is written, as any record does:
@@ -60,8 +63,6 @@ export const ACCEPTED_LAYOUT_RECORD = 'context-manager/accepted-layout';
 /** The accepted-layout record format. Records of another format are not
  *  read: format 1 was never released. */
 const RECORD_VERSION = 2;
-/** At most this many deltas follow a snapshot, however small they are. */
-const MAX_CHAIN = 256;
 /** history--folds' limit bounds. */
 export const FOLD_QUERY_DEFAULT_LIMIT = 10;
 export const FOLD_QUERY_MAX_LIMIT = 100;
@@ -230,7 +231,8 @@ interface AcceptedLayoutRecord {
   totalTokens: number;
   /** Deltas since the snapshot, this one included (0 for a snapshot). */
   chain: number;
-  /** Layout bytes of the snapshot, and of the deltas since it (this one included). */
+  /** The snapshot record's size, and the delta records' since it (this one
+   *  included; 0 for a snapshot), each as its JSON, receipt and all. */
   sb: number;
   db: number;
   /** The receipt this acceptance produced; its id is the record's id. */
@@ -289,6 +291,11 @@ function readRecord<T>(store: JsStore, id: string): T | null {
   } catch {
     return null;
   }
+}
+
+/** A record's size as stored: its JSON, in UTF-8 bytes. */
+function recordBytes(record: AcceptedLayoutRecord): number {
+  return Buffer.byteLength(JSON.stringify(record), 'utf8');
 }
 
 function isLayoutRecord(record: AcceptedLayoutRecord | null): record is AcceptedLayoutRecord {
@@ -612,15 +619,19 @@ export class FoldJournal {
    *
    * Every acceptance writes its record, an unchanged layout included (an
    * empty delta), so every accepted compile is in the index. The layout is a
-   * delta on the branch's previous record, or a snapshot once the deltas
-   * written since the last snapshot would outweigh it, after MAX_CHAIN of
-   * them, or when no delta can express the change (layoutDelta returns
-   * null). The deltas after a snapshot never outweigh it, so rebuilding a
-   * layout reads at most two snapshots' worth of layout. A failed append may
-   * or may not have landed, so the branch's cached latest layout is dropped
-   * and the index is listed again at its next use: the next acceptance finds
-   * this compile already accepted if its record did land, instead of writing
-   * a second receipt.
+   * delta on the branch's previous record, or a snapshot once the delta
+   * records written since the last snapshot, this one included, would
+   * outweigh that snapshot's record. Sizes are whole records as JSON,
+   * receipts included, so the bound holds on what is stored. The records
+   * after a snapshot never outweigh it, and every snapshot but the newest is
+   * outweighed by the records after it plus the one that tipped the next:
+   * snapshots in all cost about as much again as the deltas between them,
+   * and rebuilding a layout reads at most two snapshots' worth. No count of
+   * deltas forces a snapshot, so a chain of small deltas behind a large
+   * snapshot stays a chain. A failed append may or may not have landed, so
+   * the branch's cached latest layout is dropped and the index is listed
+   * again at its next use: the next acceptance finds this compile already
+   * accepted if its record did land, instead of writing a second receipt.
    */
   private commit(
     provenance: CompileProvenance,
@@ -637,19 +648,23 @@ export class FoldJournal {
       compileId: provenance.compileId,
       totalTokens: layout.totalTokens,
     };
-    const delta = prev && prev.chain < MAX_CHAIN ? layoutDelta(prev, next) : null;
-    const deltaBytes = delta ? JSON.stringify(delta).length : 0;
-    let record: AcceptedLayoutRecord;
-    if (prev && delta && prev.deltaBytes + deltaBytes <= prev.snapshotBytes) {
-      record = {
-        ...base, kind: 'delta', prev: prev.recordId, ...delta,
-        chain: prev.chain + 1, sb: prev.snapshotBytes, db: prev.deltaBytes + deltaBytes,
+    const receipt = draft ? { receipt: draft } : {};
+    let record: AcceptedLayoutRecord | null = null;
+    if (prev) {
+      const delta: AcceptedLayoutRecord = {
+        ...base, kind: 'delta', prev: prev.recordId, ...layoutDelta(prev, next),
+        chain: prev.chain + 1, sb: prev.snapshotBytes, db: 0, ...receipt,
       };
-    } else {
-      const snapshot = { m: encodeSequences(next.members), units: next.units };
-      record = { ...base, kind: 'snapshot', ...snapshot, chain: 0, sb: JSON.stringify(snapshot).length, db: 0 };
+      const db = prev.deltaBytes + recordBytes(delta);
+      if (db <= prev.snapshotBytes) record = { ...delta, db };
     }
-    if (draft) record.receipt = draft;
+    if (!record) {
+      const snapshot: AcceptedLayoutRecord = {
+        ...base, kind: 'snapshot', m: encodeSequences(next.members), units: next.units,
+        chain: 0, sb: 0, db: 0, ...receipt,
+      };
+      record = { ...snapshot, sb: recordBytes(snapshot) };
+    }
 
     const index = storeIndex(this.store);
     let written: { id: string };
@@ -722,8 +737,7 @@ export class FoldJournal {
     }
     try {
       if (!current || current.m === undefined || !current.units) throw new Error('no snapshot');
-      let layout: StoredLayout = { members: decodeSequences(current.m), units: current.units };
-      for (let i = chain.length - 1; i >= 0; i--) layout = applyLayoutDelta(layout, chain[i]!);
+      const layout = applyLayoutChain({ members: decodeSequences(current.m), units: current.units }, chain.reverse());
       if (!wellFormed(layout)) throw new Error('members and units disagree');
       return layout;
     } catch (err) {
@@ -848,19 +862,17 @@ function membershipDelta(before: readonly number[], after: readonly number[]): {
   return { removed, added };
 }
 
-function applyMembership(members: readonly number[], removed: readonly number[], added: readonly number[]): number[] {
-  const kept: number[] = [];
-  let r = 0;
-  for (const s of members) {
-    while (r < removed.length && removed[r]! < s) r++;
-    if (r < removed.length && removed[r] === s) continue;
-    kept.push(s);
-  }
+/** `members` with each sequence's final change applied: false removes it, true adds it. */
+function applyMembershipChanges(members: readonly number[], changed: ReadonlyMap<number, boolean>): number[] {
+  if (changed.size === 0) return [...members];
+  const kept = members.filter((s) => changed.get(s) !== false);
+  const added = [...changed].filter(([, present]) => present).map(([s]) => s).sort((a, b) => a - b);
   const out: number[] = [];
   let i = 0;
   let j = 0;
   while (i < kept.length || j < added.length) {
     if (j >= added.length || (i < kept.length && kept[i]! < added[j]!)) out.push(kept[i++]!);
+    else if (i < kept.length && kept[i] === added[j]) { out.push(kept[i++]!); j++; }
     else out.push(added[j++]!);
   }
   return out;
@@ -1074,12 +1086,11 @@ export interface LayoutDelta {
  * and added, its units as a common prefix of `p` kept, `drop` dropped, `ins`
  * inserted, the rest of `prev` kept, then `app` appended. Arrivals become
  * added members and appended units; a fold in the middle becomes a small
- * drop/ins. Null when `prev`'s last unit is not in `next` (a snapshot is
- * simpler then). Empty parts are left out.
+ * drop/ins; a change to `prev`'s last unit replaces everything after the
+ * common prefix. Every pair of layouts has one. Empty parts are left out.
  */
-export function layoutDelta(prev: StoredLayout, next: StoredLayout): LayoutDelta | null {
+export function layoutDelta(prev: StoredLayout, next: StoredLayout): LayoutDelta {
   const units = unitsDelta(prev.units, next.units);
-  if (!units) return null;
   const { removed, added } = membershipDelta(prev.members, next.members);
   return {
     ...(removed.length > 0 ? { mr: encodeSequences(removed) } : {}),
@@ -1091,7 +1102,7 @@ export function layoutDelta(prev: StoredLayout, next: StoredLayout): LayoutDelta
   };
 }
 
-function unitsDelta(prev: readonly LayoutUnit[], next: readonly LayoutUnit[]): { p: number; drop: number; ins: LayoutUnit[]; app: LayoutUnit[] } | null {
+function unitsDelta(prev: readonly LayoutUnit[], next: readonly LayoutUnit[]): { p: number; drop: number; ins: LayoutUnit[]; app: LayoutUnit[] } {
   let p = 0;
   while (p < prev.length && p < next.length && unitEqual(prev[p]!, next[p]!)) p++;
   if (p === prev.length) return { p, drop: 0, ins: [], app: next.slice(p) };
@@ -1103,7 +1114,9 @@ function unitsDelta(prev: readonly LayoutUnit[], next: readonly LayoutUnit[]): {
   for (let k = next.length - 1; k >= p; k--) {
     if (unitEqual(next[k]!, lastPrev)) { j = k; break; }
   }
-  if (j < 0) return null;
+  // prev's last unit changed (grew, re-leveled, became partial): replace
+  // everything after the common prefix.
+  if (j < 0) return { p, drop: prev.length - p, ins: next.slice(p), app: [] };
   let r = 0;
   while (
     prev.length - 1 - r >= p &&
@@ -1119,14 +1132,27 @@ function unitsDelta(prev: readonly LayoutUnit[], next: readonly LayoutUnit[]): {
 }
 
 export function applyLayoutDelta(prev: StoredLayout, record: LayoutDelta): StoredLayout {
-  const p = record.p ?? 0;
-  const drop = record.drop ?? 0;
-  return {
-    members: applyMembership(
-      prev.members,
-      record.mr !== undefined ? decodeSequences(record.mr) : [],
-      record.ma !== undefined ? decodeSequences(record.ma) : [],
-    ),
-    units: [...prev.units.slice(0, p), ...(record.ins ?? []), ...prev.units.slice(p + drop), ...(record.app ?? [])],
-  };
+  return applyLayoutChain(prev, [record]);
+}
+
+/**
+ * Apply a chain of deltas, oldest first, in one pass: each sequence's last
+ * change wins, merged into the members once, and each unit edit applies in
+ * place. So rebuilding a long chain costs the members once plus the edits,
+ * not a pass over the members per delta.
+ */
+export function applyLayoutChain(base: StoredLayout, deltas: readonly LayoutDelta[]): StoredLayout {
+  const changed = new Map<number, boolean>();
+  let units = [...base.units];
+  for (const d of deltas) {
+    if (d.mr !== undefined) for (const s of decodeSequences(d.mr)) changed.set(s, false);
+    if (d.ma !== undefined) for (const s of decodeSequences(d.ma)) changed.set(s, true);
+    const p = d.p ?? 0;
+    const drop = d.drop ?? 0;
+    const ins = d.ins ?? [];
+    if (ins.length <= 1024) units.splice(p, drop, ...ins);
+    else units = units.slice(0, p).concat(ins, units.slice(p + drop));
+    for (const u of d.app ?? []) units.push(u);
+  }
+  return { members: applyMembershipChanges(base.members, changed), units };
 }

@@ -10,10 +10,11 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy } from '../src/index.js';
-import { FoldJournal, applyLayoutDelta, decodeSequences, encodeSequences, layoutDelta } from '../src/fold-journal.js';
+import { FoldJournal, applyLayoutChain, applyLayoutDelta, decodeSequences, encodeSequences, layoutDelta } from '../src/fold-journal.js';
 import type { StoredLayout } from '../src/fold-journal.js';
 import type {
   ContextEntry,
@@ -27,6 +28,7 @@ import type {
   CompileProvenance,
   FoldReceipt,
   LayoutUnit,
+  RenderedLayout,
 } from '../src/index.js';
 
 const STORE = './test-fold-journal';
@@ -422,7 +424,7 @@ describe('fold journal', () => {
     cm.close();
   });
 
-  it('reconstructs a long delta chain exactly across a restart', async () => {
+  it('reconstructs its records exactly across a restart', async () => {
     let { cm, strategy } = await open();
     add(cm, 2);
     await acceptCompile(cm);
@@ -430,12 +432,20 @@ describe('fold journal', () => {
       add(cm, 1, `t${i}-`);
       await acceptCompile(cm);
     }
+    const kinds = layoutRecords(cm.getStore()).map((r) => r.kind);
+    assert.ok(kinds.filter((k) => k === 'snapshot').length >= 2 && kinds.at(-1) === 'delta', `snapshots and deltas both: ${kinds.join(',')}`);
     cm.close();
     ({ cm, strategy } = await open());
     const all = cm.getAllMessages();
     strategy.plan.set(all[40]!.id, 'omit');
     const r = await acceptCompile(cm);
     assert.deepEqual(r?.changes?.map((c) => [c.first.messageId, c.before.form, c.after.form]), [[all[40]!.id, 'raw', 'omitted']]);
+    // Every message omitted: one run from the first to the newest, which only
+    // a rebuild holding every arrival, in its form, reports whole.
+    for (const m of all) strategy.plan.set(m.id, 'omit');
+    const whole = await acceptCompile(cm);
+    assert.deepEqual(whole?.changes?.map((c) => [c.first.messageId, c.last.messageId, c.messages, c.before.form, c.after.form]),
+      [[all[0]!.id, all[39]!.id, 40, 'raw', 'omitted'], [all[41]!.id, all.at(-1)!.id, all.length - 41, 'raw', 'omitted']]);
     cm.close();
   });
 
@@ -726,12 +736,46 @@ describe('compile provenance', () => {
 });
 
 /** Each accepted-layout record: its kind, and the bytes of its layout part. */
-function layoutRecords(store: JsStore): Array<{ kind: string; bytes: number; chain: number; members: number }> {
+/**
+ * Each accepted-layout record: `bytes` is its layout part (without the
+ * receipt, namespace, branch and compile id), `stored` its whole payload,
+ * and `json` the whole record as JSON, the size the byte rule counts.
+ */
+function layoutRecords(store: JsStore): Array<{ kind: string; bytes: number; stored: number; json: number; chain: number; sb: number; db: number; members: number }> {
   return store.getRecordIdsByType('context-manager/accepted-layout').map((id) => {
-    const record = JSON.parse(store.getRecord(id)!.payload.toString('utf8'));
+    const payload = store.getRecord(id)!.payload;
+    const record = JSON.parse(payload.toString('utf8'));
     const { receipt: _receipt, ns: _ns, branch: _branch, compileId: _compileId, ...layout } = record;
-    return { kind: record.kind, bytes: JSON.stringify(layout).length, chain: record.chain, members: record.m ? decodeSequences(record.m).length : 0 };
+    return {
+      kind: record.kind, bytes: JSON.stringify(layout).length, stored: payload.length, json: Buffer.byteLength(JSON.stringify(record)),
+      chain: record.chain, sb: record.sb, db: record.db, members: record.m ? decodeSequences(record.m).length : 0,
+    };
   });
+}
+
+/**
+ * The byte rule, chain by chain: the delta records after a snapshot never
+ * outweigh it, and the next snapshot comes only once one more record would
+ * have (so no snapshot is written early, by a count or otherwise). Sizes are
+ * the records' JSON as context-manager measures it (the stored payload may
+ * be serialized a few bytes differently).
+ */
+function assertSnapshotsAmortized(records: ReturnType<typeof layoutRecords>): void {
+  const largest = Math.max(...records.filter((r) => r.kind === 'delta').map((r) => r.json));
+  let snapshot = records[0]!;
+  let since = 0;
+  for (const r of records.slice(1)) {
+    if (r.kind === 'delta') {
+      since += r.json;
+      assert.ok(r.db <= r.sb, `the records since a snapshot never outweigh it: ${r.db} > ${r.sb}`);
+      continue;
+    }
+    // The record that tipped it went into the new snapshot, not a delta, so
+    // allow it as up to twice the largest delta written.
+    assert.ok(since + 2 * largest + 16 >= snapshot.json, `a snapshot comes only once the records since the last would outweigh it: ${since} + 2 x ${largest} < ${snapshot.json}`);
+    snapshot = r;
+    since = 0;
+  }
 }
 
 const mean = (xs: number[]): number => xs.reduce((a, b) => a + b, 0) / Math.max(1, xs.length);
@@ -765,13 +809,18 @@ describe('fold journal size', () => {
     assert.ok(Math.max(...late) <= 200, `a delta stays small: ${Math.max(...late)} bytes`);
     assert.ok(mean(late) <= mean(early) * 1.2 + 4, `deltas do not grow with the history: ${mean(early).toFixed(1)} then ${mean(late).toFixed(1)}`);
     const snapshots = records.filter((r) => r.kind === 'snapshot');
+    assert.ok(snapshots.length >= 3, `several snapshot rollovers: ${snapshots.length}`);
     for (const snap of snapshots) {
       // Members at about a byte and a third each, plus the rendered units.
       assert.ok(snap.bytes <= snap.members * 2 + 2000, `snapshot of ${snap.members} members: ${snap.bytes} bytes`);
     }
-    const total = records.reduce((sum, r) => sum + r.bytes, 0);
-    const deltaTotal = deltas.reduce((sum, r) => sum + r.bytes, 0);
-    assert.ok(total <= 3 * deltaTotal + 4 * 2000, `snapshots cost about what the deltas since them do: ${total} bytes in all, ${deltaTotal} in deltas`);
+    assertSnapshotsAmortized(records);
+    // What each acceptance costs in all, snapshots included, stays flat as the
+    // history grows: a late stretch costs no more per round than an early one.
+    const perRound = (from: number, to: number) => records.slice(from, to).reduce((sum, r) => sum + r.stored, 0) / (to - from);
+    const earlyPerRound = perRound(filled + 20, filled + 220);
+    const latePerRound = perRound(400, 600);
+    assert.ok(latePerRound <= earlyPerRound * 1.25, `stored bytes per acceptance don't grow with the history: ${earlyPerRound.toFixed(0)} then ${latePerRound.toFixed(0)}`);
     cm.close();
   });
 
@@ -795,38 +844,78 @@ describe('fold journal size', () => {
     };
   }
 
-  it('writes a snapshot once the deltas since the last one would outweigh it', async () => {
-    // A small window: each unchanged round writes a small delta, so the deltas
-    // soon outweigh the snapshot, and a rebuild never reads more than about
-    // two snapshots' worth.
+  it('writes a snapshot once the records since the last one would outweigh it', async () => {
+    // A small window: each unchanged round writes a small delta record, so the
+    // records soon outweigh the snapshot, and a rebuild never reads more than
+    // about two snapshots' worth.
     const cm = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy(), namespace: 'agents/tester' });
     for (let i = 0; i < 10; i++) cm.addMessage('user', [{ type: 'text', text: `message ${i}` }]);
-    const { journal, records } = fastJournal(cm);
+    const { journal } = fastJournal(cm);
     for (let round = 0; round < 60; round++) {
       journal.accept((await cm.compile({ maxTokens: 100_000, reserveForResponse: 0 })).provenance!, Date.now(), undefined);
     }
-    const all = records();
+    const all = layoutRecords(cm.getStore());
     assert.ok(all.filter((r) => r.kind === 'snapshot').length >= 2, 'a later snapshot follows the first');
-    for (const r of all.filter((x) => x.kind === 'delta')) {
-      assert.ok(r.db <= r.sb, `the deltas since a snapshot never outweigh it: ${r.db} > ${r.sb}`);
+    assert.ok(all.filter((r) => r.kind === 'delta').length >= 20, 'and deltas between them');
+    // Each delta counts its whole record, receipt and envelope included (the
+    // counters' own digits aside: a record is measured before they're set).
+    let since = 0;
+    for (const r of all) {
+      since = r.kind === 'snapshot' ? 0 : since + r.json;
+      if (r.kind === 'delta') assert.ok(Math.abs(r.db - since) <= 8 * r.chain, `db counts the records since the snapshot: ${r.db} against ${since}`);
     }
+    assertSnapshotsAmortized(all);
     cm.close();
   });
 
-  it('writes a snapshot after 256 deltas, however small they are', async () => {
-    // A window large enough that unchanged rounds would take hundreds more
-    // deltas to outweigh its snapshot: the chain cap bounds a rebuild instead.
-    const cm = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy(), namespace: 'agents/tester' });
-    for (let i = 0; i < 200; i++) cm.addMessage('user', [{ type: 'text', text: `message ${i}` }]);
-    const { journal, records } = fastJournal(cm);
-    for (let round = 0; round < 258; round++) {
-      journal.accept((await cm.compile({ maxTokens: 1_000_000, reserveForResponse: 0 })).provenance!, Date.now(), undefined);
+  it('a long chain of small deltas behind a large snapshot stays a chain, and rebuilds exactly after a reopen', async () => {
+    // A history of 100,000 messages behind a raw window, sequences two apart,
+    // and arrivals only (no fold, so no receipt). Its snapshot outweighs 300
+    // small deltas, so no snapshot follows, however many deltas there are.
+    let cm = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy(), namespace: 'agents/tester' });
+    const branch = cm.currentBranchRef();
+    const omitted = 99_950;
+    let members = Array.from({ length: 100_000 }, (_, i) => 2 * (i + 1));
+    let ids = members.map((m) => `m${m}`);
+    const layoutOf = (tail?: LayoutUnit): RenderedLayout => ({
+      v: 2, members, memberIds: ids, totalTokens: (members.length - omitted) * 10, calibration: 1,
+      units: [
+        { k: 'o', n: omitted },
+        ...Array.from({ length: members.length - omitted - (tail ? 1 : 0) }, (): LayoutUnit => ({ k: 'r', t: 10 })),
+        ...(tail ? [tail] : []),
+      ],
+    });
+    const provenance = (layout: RenderedLayout): CompileProvenance => ({
+      compileId: randomUUID(), namespace: 'agents/tester', branch, messages: [], layout, strategy: 'synthetic',
+    });
+    const { journal } = fastJournal(cm);
+    journal.accept(provenance(layoutOf()), Date.now(), undefined);
+    for (let round = 0; round < 300; round++) {
+      const next = members.at(-1)! + 2;
+      members = [...members, next];
+      ids = [...ids, `m${next}`];
+      journal.accept(provenance(layoutOf()), Date.now(), undefined);
     }
-    const all = records();
-    assert.equal(all[256]!.chain, 256, 'the 256th delta');
-    assert.ok(all[256]!.db * 1.25 < all[256]!.sb, `far from outweighing the snapshot: ${all[256]!.db} of ${all[256]!.sb}`);
-    assert.equal(all[257]!.kind, 'snapshot', 'then a snapshot all the same');
-    assert.equal(all.filter((r) => r.kind === 'snapshot').length, 2);
+    const all = layoutRecords(cm.getStore());
+    assert.deepEqual(all.map((r) => r.kind), ['snapshot', ...Array<string>(300).fill('delta')], 'no count of deltas forces a snapshot');
+    assert.equal(all.at(-1)!.chain, 300);
+    assert.ok(all.at(-1)!.db <= all.at(-1)!.sb, `${all.at(-1)!.db} of ${all.at(-1)!.sb}`);
+
+    // The records rebuild the last layout exactly, members and units.
+    const store = cm.getStore();
+    const payloads = store.getRecordIdsByType('context-manager/accepted-layout').map((id) => JSON.parse(store.getRecord(id)!.payload.toString('utf8')));
+    const rebuilt = applyLayoutChain({ members: decodeSequences(payloads[0].m), units: payloads[0].units }, payloads.slice(1));
+    const written = layoutOf();
+    assert.deepEqual(rebuilt, { members: written.members, units: written.units });
+
+    // And a fresh store object's journal rebuilds it the same way: the newest
+    // message turning omitted is one change, which it reports only when the
+    // rebuild holds every arrival, and every unit in place.
+    cm.close();
+    cm = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy(), namespace: 'agents/tester' });
+    const receipt = fastJournal(cm).journal.accept(provenance(layoutOf({ k: 'o', n: 1 })), Date.now(), undefined);
+    assert.deepEqual(receipt?.changes?.map((c) => [c.first.sequence, c.last.sequence, c.before.form, c.after.form]),
+      [[members.at(-1), members.at(-1), 'raw', 'omitted']]);
     cm.close();
   });
 
@@ -894,6 +983,7 @@ describe('fold journal size', () => {
       while (members.length < count) members.push((members.at(-1) ?? 0) + 1 + rand(3));
       return { members, units };
     };
+    let asserted = 0;
     for (let round = 0; round < 2000; round++) {
       const prevUnits = Array.from({ length: rand(8) + 1 }, unit);
       const nextUnits = rand(2) === 0 ? [...prevUnits.slice(0, rand(prevUnits.length + 1)), ...Array.from({ length: rand(4) }, unit), ...prevUnits.slice(rand(prevUnits.length))] : Array.from({ length: rand(8) + 1 }, unit);
@@ -901,9 +991,21 @@ describe('fold journal size', () => {
       const unique = [...new Set(pool)];
       const prev = layout(prevUnits, unique.filter(() => rand(4) > 0));
       const next = layout(nextUnits, unique.filter(() => rand(4) > 0));
-      const delta = layoutDelta(prev, next);
-      if (!delta) continue;
-      assert.deepEqual(applyLayoutDelta(prev, delta), next, `round ${round}`);
+      assert.deepEqual(applyLayoutDelta(prev, layoutDelta(prev, next)), next, `round ${round}`);
+      asserted++;
+    }
+    assert.equal(asserted, 2000, 'every pair of layouts has a delta');
+
+    // A chain rebuilt in one pass equals the same deltas applied one at a time,
+    // across chains that remove and re-add the same sequences.
+    for (let chain = 0; chain < 200; chain++) {
+      const pool = [...new Set(Array.from({ length: 40 }, () => rand(120)))];
+      const layouts = Array.from({ length: 2 + rand(12) }, () => layout(Array.from({ length: rand(8) + 1 }, unit), pool.filter(() => rand(3) > 0)));
+      const deltas = layouts.slice(1).map((l, i) => layoutDelta(layouts[i]!, l));
+      let stepwise = layouts[0]!;
+      for (const d of deltas) stepwise = applyLayoutDelta(stepwise, d);
+      assert.deepEqual(stepwise, layouts.at(-1), `chain ${chain}, one at a time`);
+      assert.deepEqual(applyLayoutChain(layouts[0]!, deltas), layouts.at(-1), `chain ${chain}, in one pass`);
     }
   });
 });
