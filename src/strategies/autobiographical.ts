@@ -1,6 +1,7 @@
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import { NativeFormatter } from '@animalabs/membrane';
+import { registerStateIfAbsent } from '../state-registration.js';
 import { phaseChannel } from '../phase-channel.js';
 import type {
   ContextStrategy,
@@ -1864,91 +1865,75 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Register the three Chronicle state slots this strategy uses.
-   * Idempotent — chronicle throws if a state is already registered, which we
-   * swallow (the existing slot is what we want).
+   * Register the Chronicle state slots this strategy uses. A slot that
+   * already exists is kept as it is (see isStateExistsFor). Any other
+   * registration failure propagates and stops initialization. Registrations
+   * are separate and durable, so the slots registered before the failing one
+   * stay registered, and the next start registers the rest.
    */
   protected registerStates(): void {
     if (!this.store) return;
-    try {
-      this.store.registerState({
-        id: this.summariesStateId,
+    const store = this.store;
+    const registerState = (registration: Parameters<JsStore['registerState']>[0]): void => {
+      registerStateIfAbsent(store, registration);
+    };
+    registerState({
+      id: this.summariesStateId,
+      strategy: 'append_log',
+      deltaSnapshotEvery: 50,
+      fullSnapshotEvery: 10,
+    });
+    if (this.chunkPersistenceEnabled) {
+      registerState({
+        id: this.chunksStateId,
         strategy: 'append_log',
         deltaSnapshotEvery: 50,
         fullSnapshotEvery: 10,
       });
-    } catch { /* already registered */ }
-    if (this.chunkPersistenceEnabled) {
-      try {
-        this.store.registerState({
-          id: this.chunksStateId,
-          strategy: 'append_log',
-          deltaSnapshotEvery: 50,
-          fullSnapshotEvery: 10,
-        });
-      } catch { /* already registered */ }
     }
     if (this.config.foldingStrategy === 'kv-unified') {
-      try {
-        this.store.registerState({
-          id: this.kvUnifiedReceiptStateId,
-          strategy: 'snapshot',
-        });
-      } catch { /* already registered */ }
+      registerState({
+        id: this.kvUnifiedReceiptStateId,
+        strategy: 'snapshot',
+      });
     }
-    try {
-      this.store.registerState({
-        id: this.counterStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.mergeQueueStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.mergeQuarantineStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.pinsStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.calibrationStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.compressionRefusalQuarantineLedgerStateId,
-        strategy: 'append_log',
-        deltaSnapshotEvery: 50,
-        fullSnapshotEvery: 10,
-      });
-    } catch { /* already registered */ }
+    registerState({
+      id: this.counterStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.mergeQueueStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.mergeQuarantineStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.pinsStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.calibrationStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.compressionRefusalQuarantineLedgerStateId,
+      strategy: 'append_log',
+      deltaSnapshotEvery: 50,
+      fullSnapshotEvery: 10,
+    });
     // Adaptive-resolution state slots — only registered when the flag is on
     // so chronicles without the flag don't accumulate unused slots.
     if (this.config.adaptiveResolution) {
-      try {
-        this.store.registerState({
-          id: this.resolutionsStateId,
-          strategy: 'snapshot',
-        });
-      } catch { /* already registered */ }
-      try {
-        this.store.registerState({
-          id: this.locksStateId,
-          strategy: 'snapshot',
-        });
-      } catch { /* already registered */ }
+      registerState({
+        id: this.resolutionsStateId,
+        strategy: 'snapshot',
+      });
+      registerState({
+        id: this.locksStateId,
+        strategy: 'snapshot',
+      });
     }
   }
 
