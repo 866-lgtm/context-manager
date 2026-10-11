@@ -36,9 +36,12 @@
     branch selected when it is written. The store syncs before the record is
     appended, so the state it names is durable first, and again after, so an
     acceptance is durable before `acceptRound` returns or announces it. A
-    compile is accepted once: a retry writes nothing, whether its first
+    compile is accepted once: a retry writes nothing and returns what its
+    first acceptance returned (its receipt, or null), whether that
     acceptance reported success or an uncertain failure, ran in another
-    manager on the store, or ran before a reopen.
+    manager on the store, or ran before a reopen. A compile is accepted on
+    the manager that compiled it: one of another namespace is refused with
+    an error.
   - A layout persists as its members (message sequences, gap-coded, about
     1.3 bytes each) and its units (forms with counts), so a message missing
     from either view is never counted inside a range. An acceptance writes a
@@ -48,11 +51,16 @@
     snapshots cost about as much again as the deltas between them, the bytes
     stored per acceptance don't grow with the history, and rebuilding a
     layout reads at most about two snapshots' worth.
-  - Every manager on one store object shares an index of these records: the
-    first acceptance or receipt query after the store opens lists and reads
-    them once, and each manager adds its own records as it writes them. The
-    index keeps record ids and acceptance times; a receipt is read from the
-    store when a query returns it.
+  - A use reads the records it needs rather than every record. An
+    acceptance reads its branch's newest record, read back from the
+    store's newest, and the chain that rebuilds its layout. A compile
+    carries where the journal stood (`provenance.journalMark`, a record
+    known durable), so finding an earlier acceptance of the same compile
+    reads only the records after it. Each record names its branch's
+    previous receipt, so a query reads receipts and nothing else. Every
+    manager on one store object shares what has been read; the first use
+    after the store opens lists the records' ids and syncs once, making
+    every record present durable.
   - Layouts persist base token estimates, taken before the store's
     calibration, so identical content costs the same in every compile. A
     receipt's estimated token counts apply the calibration its compile
@@ -66,7 +74,9 @@
     after it, so a reader pages forward from the last receipt it got, with
     `more` saying whether there is more, and `afterId: '0'` pages a branch's
     whole record from its start; `since` is an ISO 8601 time (a bare number
-    is refused rather than guessed at). Label receipts with
+    is refused rather than guessed at). `branch` is a name, or a branch as
+    receipts name it (`{ id, created }`), which reaches a deleted branch
+    even when a live one has taken its name. Label receipts with
     `setReceiptSource`.
   - Subscribe with `onFoldReceipt`. A listener hears each receipt its
     manager's `acceptRound` returns, and, at that manager's next acceptance

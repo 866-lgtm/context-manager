@@ -73,6 +73,7 @@ export type {
   RawBodySource,
   CompiledMessageSources,
   CompileProvenance,
+  JournalMark,
   RenderedLayout,
   LayoutUnit,
   // Strategy types

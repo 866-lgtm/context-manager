@@ -1135,13 +1135,16 @@ export class ContextManager {
 
     const finish = (result: CompileResult, injected: ContentBlock[][]): CompileResult => {
       result.rawBodies = rawBodiesOf(attribution);
+      const layout = this.renderedLayoutFor(viewMessages, entries, attribution.rawComplete, injected, selectionCause);
       result.provenance = {
         compileId: randomUUID(),
         namespace: this.strategyNamespace,
         branch,
         messages: messageSources,
-        layout: this.renderedLayoutFor(viewMessages, entries, attribution.rawComplete, injected, selectionCause),
+        layout,
         strategy: this.strategy.name,
+        // Only a layout is ever accepted, so only then ask where the journal stands.
+        ...(layout ? { journalMark: this.foldJournal.mark() } : {}),
       };
       if (this.debugLogContext) this.logCompiledContext(result);
       return result;
@@ -1281,8 +1284,12 @@ export class ContextManager {
    * `altered`, or `unknown`, the default); receipts record it beside the
    * layout, which is the compile's.
    *
-   * Returns the receipt written, or null (no change, already accepted, or a
-   * strategy that does not report its layout).
+   * Returns the receipt, or null: no change, or a strategy that does not
+   * report its layout. A compile accepted before returns what that
+   * acceptance returned, its receipt or null, so a retry after an uncertain
+   * failure learns the outcome, and a receipt can come back again (key on
+   * its id). A provenance from another manager's namespace is refused with
+   * an error: accept a compile on the manager that compiled it.
    */
   acceptRound(args: {
     provenance: CompileProvenance;

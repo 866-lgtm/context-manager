@@ -231,6 +231,26 @@ export interface CompileProvenance {
   layout: RenderedLayout | null;
   /** The active strategy's name. */
   strategy: string;
+  /**
+   * Where the store's fold journal stood when this compile ran, so that
+   * accepting it again finds its first acceptance without reading the whole
+   * journal (see JournalMark). Absent or null, every record is read. Pass
+   * the provenance back as you got it.
+   */
+  journalMark?: JournalMark | null;
+}
+
+/**
+ * The newest accepted-layout record known durable when a compile ran, and
+ * the compile that record accepted. Any acceptance of the compile was
+ * written after it. A durable record outlives a crash and keeps its id, so
+ * only the records after it need reading; one that is gone, or whose id now
+ * names another compile (a record at the end of the log can rot, and its id
+ * then goes to a later one), proves nothing, and every record is read.
+ */
+export interface JournalMark {
+  recordId: string;
+  compileId: string;
 }
 
 /**
