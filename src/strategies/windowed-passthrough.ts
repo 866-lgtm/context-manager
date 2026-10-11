@@ -10,6 +10,7 @@ import type {
   SelectOptions,
   Sequence,
 } from '../types/index.js';
+import { registerStateIfAbsent } from '../state-registration.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { JsStore } from '@animalabs/chronicle';
@@ -146,11 +147,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   async initialize(ctx: StrategyContext): Promise<void> {
     this.store = ctx.store;
     this.stateId = this.anchorStateIdOverride ?? `${ctx.namespace}/windowed:anchor`;
-    try {
-      this.store.registerState({ id: this.stateId, strategy: 'snapshot' });
-    } catch {
-      /* already registered */
-    }
+    registerStateIfAbsent(this.store, { id: this.stateId, strategy: 'snapshot' });
     this.loadBranchState();
     this.loadedBranch = observeStoreBranch(this.store);
   }
