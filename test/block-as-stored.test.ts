@@ -13,7 +13,8 @@ import { describe, it, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, blockAsStored } from '../src/index.js';
+import { JsStore } from '@animalabs/chronicle';
+import { BlobManager, ContextManager, PassthroughStrategy, blockAsStored } from '../src/index.js';
 
 const STORE = './test-block-as-stored';
 function cleanup(): void {
@@ -76,6 +77,107 @@ describe('blockAsStored', () => {
 
     manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
     check(manager.getMessage(id)?.content, 'after reopening');
+    check(manager.getAllMessages().at(-1)?.content, 'after reopening, from the full listing');
+    check(manager.getMessageWindow(0, 1).messages[0]?.content, 'after reopening, from a window');
+    manager.close();
+  });
+
+  it('pins the stored form of each kind of media to literal output, not only to the store', () => {
+    // The equality above runs the store and the export through the same helpers, so a change to a
+    // helper moves both together. These pin the round trip itself.
+    const named = (name: string): ContentBlock => FIXTURES.find(([n]) => n === name)![1];
+    assert.deepStrictEqual(blockAsStored(named('png labeled jpeg')), {
+      type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' },
+    });
+    assert.deepStrictEqual(blockAsStored(named('a document')), {
+      type: 'document', source: { type: 'base64', data: b64(PDF), mediaType: 'application/pdf' },
+    });
+    assert.deepStrictEqual(blockAsStored(named('audio')), {
+      type: 'audio', source: { type: 'base64', data: b64('52494646'), mediaType: 'audio/wav' },
+    });
+    assert.deepStrictEqual(blockAsStored(named('video')), {
+      type: 'video', source: { type: 'base64', data: b64('0000001866747970'), mediaType: 'video/mp4' },
+    });
+  });
+
+  it('writes the sniffed type into the stored reference, not the declared one', async () => {
+    const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+    manager.addMessage('user', [image(PNG, 'image/jpeg')]);
+    const raw = manager.getMessageWindow(0, 1, { resolveBlobs: false }).messages[0]!.content[0] as unknown as {
+      type: string; ref: { mediaType: string; originalType: string };
+    };
+    manager.close();
+    assert.equal(raw.type, 'blob_ref');
+    assert.equal(raw.ref.mediaType, 'image/png', 'the reference holds the type its bytes carry');
+    assert.equal(raw.ref.originalType, 'image');
+  });
+
+  it('relabels on read a reference an older release wrote under the wrong type', async () => {
+    // Older releases wrote the declared label into the reference. Build one by hand: the store keeps a
+    // blob_ref as given, and the read side relabels it from the bytes.
+    const store = JsStore.openOrCreate({ path: STORE });
+    const hash = store.storeBlob(Buffer.from(PNG, 'hex'), 'image/jpeg');
+    store.close();
+    const legacy = { type: 'blob_ref', ref: { hash, mediaType: 'image/jpeg', originalType: 'image' } } as unknown as ContentBlock;
+    const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+    const id = manager.addMessage('user', [legacy]);
+    const back = manager.getMessage(id)!.content[0];
+    manager.close();
+    assert.deepStrictEqual(back, { type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' } });
+  });
+
+  it('a reference of an unknown original type fails its read, naming the type', async () => {
+    const store = JsStore.openOrCreate({ path: STORE });
+    const hash = store.storeBlob(Buffer.from(PNG, 'hex'), 'image/png');
+    store.close();
+    const odd = { type: 'blob_ref', ref: { hash, mediaType: 'image/png', originalType: 'hologram' } } as unknown as ContentBlock;
+    const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+    try {
+      const id = manager.addMessage('user', [odd]);
+      assert.throws(() => manager.getMessage(id), /Blob reference of unknown original type: "hologram"/);
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('throws for a block the store refuses, and for a blob_ref, rather than return a form the store would not give back', async () => {
+    const untypedDocument = { type: 'document', source: { type: 'base64', data: b64(PDF) } } as unknown as ContentBlock;
+    const untypedUnsniffable = { type: 'image', source: { type: 'base64', data: b64(AVIF) } } as unknown as ContentBlock;
+    const noData = { type: 'audio', source: { type: 'base64', mediaType: 'audio/wav' } } as unknown as ContentBlock;
+    const ref = { type: 'blob_ref', ref: { hash: 'h', mediaType: 'image/png', originalType: 'image' } } as unknown as ContentBlock;
+    assert.throws(() => blockAsStored(untypedDocument), /document block without a media type has no stored form/);
+    assert.throws(() => blockAsStored(untypedUnsniffable), /image block without a media type its bytes supply has no stored form/);
+    assert.throws(() => blockAsStored(noData), /audio block without base64 data has no stored form/);
+    assert.throws(() => blockAsStored(ref), /blob_ref reads back as the media it references/);
+    // The store refuses the same blocks on write.
+    const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+    try {
+      for (const block of [untypedDocument, untypedUnsniffable, noData]) {
+        assert.throws(() => manager.addMessage('user', [block]));
+      }
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('BlobManager\'s media helpers follow the store\'s rule for what becomes a blob', () => {
+    const named = (name: string): ContentBlock => FIXTURES.find(([n]) => n === name)![1];
+    const file = named('an image whose source is a file');
+    assert.equal(BlobManager.hasStorableMedia(file), true, 'a non-URL image is stored as a blob, base64 or not');
+    assert.equal(BlobManager.estimateMediaSize(file), Math.ceil(b64(PNG).length * 0.75));
+    assert.equal(BlobManager.hasStorableMedia(named('a URL image')), false);
+    assert.equal(BlobManager.estimateMediaSize(named('a URL image')), 0);
+    assert.equal(BlobManager.hasStorableMedia(named('audio')), true);
+    assert.equal(BlobManager.hasStorableMedia(named('text')), false);
+  });
+
+  it('stores an untyped image whose bytes carry a signature under the sniffed type', async () => {
+    const untyped = { type: 'image', source: { type: 'base64', data: b64(PNG) } } as unknown as ContentBlock;
+    const expected = blockAsStored(untyped);
+    assert.equal((expected as { source: { mediaType: string } }).source.mediaType, 'image/png');
+    const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+    const id = manager.addMessage('user', [untyped]);
+    assert.deepStrictEqual(manager.getMessage(id)!.content[0], expected);
     manager.close();
   });
 
@@ -109,7 +211,8 @@ describe('blockAsStored', () => {
   });
 
   it('gives back every other block as it was, and changes nothing it is given', () => {
-    for (const [name, block] of FIXTURES.filter(([n]) => ['a URL image', 'text', 'a tool call', 'a tool result'].includes(n))) {
+    for (const name of ['a URL image', 'text', 'a tool call', 'a tool result']) {
+      const block = FIXTURES.find(([n]) => n === name)![1];
       assert.equal(blockAsStored(block), block, name);
     }
     for (const [name, block] of FIXTURES) {

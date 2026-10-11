@@ -34,8 +34,9 @@ function sniffRasterImageMediaType(bytes: Uint8Array): string | null {
 }
 
 function canonicalImageMediaTypeFromBase64(data: string, declared: string): string {
-  // The first 16 decoded bytes cover every signature above. Decode only a
-  // short prefix so legacy multi-megabyte blobs do not get copied in full.
+  // 32 base64 characters decode to 24 bytes, which cover every signature
+  // above (the longest needs 12). Decode only a short prefix so legacy
+  // multi-megabyte blobs do not get copied in full.
   const prefix = Buffer.from(data.slice(0, 32), 'base64');
   return sniffRasterImageMediaType(prefix) ?? declared;
 }
@@ -88,42 +89,73 @@ function blockFromBlob(kind: BlobReference['originalType'], data: string, mediaT
       return { type: 'audio', source } as AudioContent;
     case 'video':
       return { type: 'video', source } as VideoContent;
+    default:
+      // A reference no release of this package writes: say so, rather than put
+      // undefined into a message's content.
+      throw new Error(`Blob reference of unknown original type: ${JSON.stringify(kind)}`);
   }
 }
 
 /**
  * A content block as the store hands it back once it is stored: what
  * `getMessage`, `getAllMessages` and `getMessageWindow` return for it with
- * blobs resolved (their default), live and after reopening.
+ * blobs resolved (their default), live and after reopening. `append` and
+ * `edit` return content as it was given, not this.
  *
  * Inline media is kept as a blob: an image whose source isn't a URL, and
  * every document, audio or video block. It comes back as
  * `{ type, source: { type: 'base64', data, mediaType } }` and nothing else:
  * its data is re-encoded from the decoded bytes, and an image's media type
  * is taken from its bytes' signature where they have one (png, jpeg, gif,
- * webp), any other type staying as declared. Every other block comes back as
- * it was given. This is built from the same helpers as the store's own write
- * and read, and no option shapes that round trip: `resolveBlobs: false` only
- * skips the read side, and a blob reference never equals this.
+ * webp), any other type staying as declared. A URL image is kept as given,
+ * like every other block, which comes back as it was given. This is built
+ * from the same helpers as the store's own write and read, and no option
+ * shapes that round trip: `resolveBlobs: false` only skips the read side, and
+ * a blob reference never equals this.
  *
- * The store's serialization applies to every block as well, and this
- * doesn't model it: undefined fields are dropped, keys come back in another
- * order, and strings are written as UTF-8, so a lone surrogate comes back as
- * U+FFFD. Compare or hash JSON-shaped values with those normalized.
+ * An image's stored form depends on this release's signature set: images are
+ * relabelled on write and re-sniffed on read, so a release that recognized
+ * another signature would read some stored images back under another type. A
+ * digest of a stored form is a digest under the release that read it, and a
+ * change to the signature set is a change to stored forms that its release
+ * notes should say.
  *
- * A block the store refuses on write, such as a media block without base64
- * data or without a media type, has no stored form: what this returns for it
- * is unspecified, and it may throw.
+ * The store's serialization applies to every block as well, and this doesn't
+ * model it: what `JSON.stringify` changes changes here too. Undefined fields
+ * are dropped, keys can come back in another order, NaN and Infinity become
+ * null, -0 becomes 0, undefined array entries become null, and strings are
+ * written as UTF-8, so a lone surrogate comes back as U+FFFD. Compare or hash
+ * through a canonical serializer that normalizes these.
+ *
+ * This is the round trip of one block. A strategy's ingress chunking
+ * (`chunkIngressMessage`) can store one delivered message as several, each
+ * holding part of its content, which this doesn't predict.
+ *
+ * It throws for a block the store refuses on write, which has no stored form:
+ * an inline media block without base64 data, or one with no media type that,
+ * for an image, its bytes don't supply either. It also throws for a
+ * `blob_ref`, which reads back as the media it references, and that takes the
+ * store to know.
  *
  * Pure and synchronous: no store and no I/O, so a body can be hashed as the
  * store will keep it before anything is written.
  */
 export function blockAsStored(block: ContentBlock): ContentBlock {
+  if ((block as { type: string }).type === 'blob_ref') {
+    throw new Error('blockAsStored: a blob_ref reads back as the media it references, which takes the store to know');
+  }
   const kind = blobKindOf(block);
   if (!kind) return block;
   const { data, mediaType } = (block as { source: Base64Source }).source;
+  if (typeof data !== 'string') {
+    throw new Error(`blockAsStored: a ${kind} block without base64 data has no stored form: the store refuses it`);
+  }
   const bytes = Buffer.from(data, 'base64');
-  return blockFromBlob(kind, bytes.toString('base64'), blobMediaType(bytes, mediaType, kind));
+  const storedType = blobMediaType(bytes, mediaType, kind);
+  if (typeof storedType !== 'string') {
+    throw new Error(`blockAsStored: a ${kind} block without a media type${kind === 'image' ? ' its bytes supply' : ''} has no stored form: the store refuses it`);
+  }
+  return blockFromBlob(kind, bytes.toString('base64'), storedType);
 }
 
 /**
@@ -247,34 +279,15 @@ export class BlobManager {
    * Check if a content block contains media that would be stored as a blob.
    */
   static hasStorableMedia(block: ContentBlock): boolean {
-    switch (block.type) {
-      case 'image':
-        return block.source.type === 'base64';
-      case 'document':
-      case 'audio':
-      case 'video':
-        return true;
-      default:
-        return false;
-    }
+    return blobKindOf(block) !== null;
   }
 
   /**
    * Estimate the storage size of media content.
    */
   static estimateMediaSize(block: ContentBlock): number {
-    switch (block.type) {
-      case 'image':
-        if (block.source.type === 'base64') {
-          return Math.ceil(block.source.data.length * 0.75); // base64 -> bytes
-        }
-        return 0;
-      case 'document':
-      case 'audio':
-      case 'video':
-        return Math.ceil(block.source.data.length * 0.75);
-      default:
-        return 0;
-    }
+    if (!blobKindOf(block)) return 0;
+    const data = (block as { source: { data?: unknown } }).source.data;
+    return typeof data === 'string' ? Math.ceil(data.length * 0.75) : 0; // base64 -> bytes
   }
 }
