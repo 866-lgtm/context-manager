@@ -1426,10 +1426,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
   /**
    * The lane's durable evidence that compression works: a sequence advanced
-   * once per landed success (an L1 pushed, a merge dequeued), never before the
-   * success's own result is written; when the last one landed; and when the
-   * failures since it began, for the stall alert. Branch-scoped like the rest
-   * of the strategy's state.
+   * once per landed success (an L1 pushed, a merged summary written), never
+   * before the success's own result is written; when the last one landed; and
+   * when the failures since it began, for the stall alert. Branch-scoped like
+   * the rest of the strategy's state.
    */
   protected get compressionLaneEvidenceStateId(): string {
     return `${this.ns}/autobio:compression-lane-evidence`;
@@ -4332,18 +4332,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Write the lane's evidence and sync it, as the progress writer does: a
+   * landing must outlive a crash that follows it (or the next failure of
+   * another request is not counted), and so must the stall clock's start (or
+   * a crash loop restarts it on every boot and the stall never alerts).
+   */
+  private writeLaneEvidence(evidence: { landed: number; lastLandedAt: number | null; failingSince?: number | null }): void {
+    if (!this.store) return;
+    this.store.setStateJson(this.compressionLaneEvidenceStateId, evidence);
+    this.store.sync();
+  }
+
+  /**
    * A compression landed: its result is written (an L1 pushed and its chunk
-   * record marked, or a merge dequeued). Advance the lane's evidence, which
-   * makes the next failure of any OTHER request count (nextFailureStreak),
-   * and end a stall. Called only after the result is written, never at the
-   * answer: a crash in between loses a success, which only makes the next
-   * failure not count, and never invents one.
+   * record marked, or a merged summary written and its entry dequeued; a
+   * skipped entry is neither). Advance the lane's evidence, which makes the
+   * next failure of any OTHER request count (nextFailureStreak), and end a
+   * stall. Called only after the result is written, never at the answer: a
+   * crash in between loses a success, which only makes the next failure not
+   * count, and never invents one.
    */
   private noteCompressionLanded(): void {
     if (this.store) {
       const { landed } = this.readLaneEvidence();
       // A landed success ends the failures since the last one (failingSince).
-      this.store.setStateJson(this.compressionLaneEvidenceStateId, { landed: landed + 1, lastLandedAt: Date.now() });
+      this.writeLaneEvidence({ landed: landed + 1, lastLandedAt: Date.now() });
     }
     if (this.compressionStall) {
       console.warn(`[autobiographical] compression stall over: ${this.compressionStall.subject} was stalled since ${new Date(this.compressionStall.since).toISOString()}`);
@@ -4365,7 +4378,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let since = evidence.failingSince;
     if (since === null) {
       since = now;
-      this.store?.setStateJson(this.compressionLaneEvidenceStateId, { ...evidence, failingSince: since });
+      this.writeLaneEvidence({ ...evidence, failingSince: since });
     }
     if (this.compressionStall) return;
     if (now - since < AutobiographicalStrategy.COMPRESSION_STALL_ALERT_MS) return;
@@ -5472,22 +5485,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this.mergeBlockedByHold(merge.sourceIds, ctx.messageStore)) return;
       this._drainProgress++; // executing a merge is real work, even if a
       // follow-on merge gets enqueued and the queue length nets out unchanged
-      const merging = this.executeMerge(merge.level, merge.sourceIds, ctx);
+      // Whether the merge wrote its parent (see executeMerge): a skipped
+      // entry made no call and wrote nothing.
+      let merged = false;
+      const merging = this.executeMerge(merge.level, merge.sourceIds, ctx).then((wrote) => {
+        merged = wrote;
+      });
       this.pendingCompression = merging;
 
       try {
         await merging;
         if (!this.isCompressionBranchCurrent(sourceBranch)) return;
-        // Success: drop from head and persist the shorter queue. We
-        // re-check that head is still our merge in case some future code
-        // path mutates the queue mid-await (today no other site does,
-        // but the assertion makes that invariant explicit).
+        // Success, or a skipped entry: drop from head and persist the
+        // shorter queue. We re-check that head is still our merge in case
+        // some future code path mutates the queue mid-await (today no other
+        // site does, but the assertion makes that invariant explicit).
         if (this.mergeQueue[0] === merge) {
           this.dequeueMerge();
         }
-        this.resumeCompressionLane();
-        // The merge's summary is written and its entry dequeued: it has landed.
-        this.noteCompressionLanded();
+        // Only a written merge is an answer, and a landing. A skip (a stale
+        // entry, a missing source, a crossed merge refused) says nothing about
+        // the provider: counting it would let an outage advance the lane's
+        // evidence, and resuming would reset its backoff.
+        if (merged) {
+          this.resumeCompressionLane();
+          // The merge's summary is written and its entry dequeued: it has landed.
+          this.noteCompressionLanded();
+        }
       } catch (error) {
         // Terminal-disposition rejection: the LLM answered, but with a
         // refusal / truncation / tool call / empty — bounded-retry policy,
@@ -5545,12 +5569,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // bounded rejection policy, whose retries shrink the recall budget,
         // giving the provider a genuinely different request. In an outage
         // nothing lands, so nothing is counted. A deferral by the caller's
-        // provider admission made no call and changes nothing.
+        // provider admission made no call and changes nothing. As in L1's
+        // interrupt, the run is decided before any pause: the failure that
+        // decides it is the merge's own, not the lane's, so it pauses nothing
+        // and feeds no stall clock.
         if (failureKind === 'transient') {
-          this.pauseCompressionLane(
-            sourceBranch, ctx, error, 'merge',
-            `the L${merge.level} merge of ${merge.sourceIds.length} summaries from ${merge.sourceIds[0] ?? '?'}`,
-          );
           if (!isAdmissionDeferral(error) && this.isCompressionBranchCurrent(sourceBranch)) {
             const failureClass = compressionFailureClass(error);
             const streak = nextFailureStreak(
@@ -5581,6 +5604,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             }
             this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
           }
+          this.pauseCompressionLane(
+            sourceBranch, ctx, error, 'merge',
+            `the L${merge.level} merge of ${merge.sourceIds.length} summaries from ${merge.sourceIds[0] ?? '?'}`,
+          );
         }
         throw error;
       } finally {
@@ -8602,12 +8629,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Merge N summaries at one level into a single summary at the next level.
    * Uses self-voice consolidation prompt.
+   *
+   * Resolves true when it wrote the merged parent. It resolves false, having
+   * written nothing, when it skips the entry with no call (a source missing
+   * or already parented, or a crossed merge refused) or its branch went stale
+   * during the call. tick drops a skipped entry from the queue, but only a
+   * written merge is an answer that resumes the lane and a landing that
+   * advances its evidence (noteCompressionLanded).
    */
   protected async executeMerge(
     targetLevel: SummaryLevel,
     sourceIds: string[],
     ctx: StrategyContext
-  ): Promise<void> {
+  ): Promise<boolean> {
     const sourceBranch = this.requireLoadedBranch('executeMerge');
     if (!ctx.membrane) {
       throw new Error('No membrane instance for merge');
@@ -8619,7 +8653,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     if (sources.length !== sourceIds.length) {
       console.warn('executeMerge: some source summaries not found, skipping');
-      return;
+      return false;
     }
 
     // A queued merge may become stale after another worker/earlier queue item
@@ -8634,7 +8668,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         `executeMerge: ${alreadyParented.length}/${sources.length} source(s) already parented ` +
           `(${alreadyParented.map((source) => source.id).join(', ')}); skipping stale queue entry`,
       );
-      return;
+      return false;
     }
 
     // Last line of defence: a crossed node is never minted. Whatever enqueued
@@ -8645,7 +8679,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const topology = this.mergeTopologyProblem(targetLevel, sources, this.mergePositionIndex());
     if (topology) {
       this.refuseCrossedMerge(targetLevel, sourceIds, topology);
-      return;
+      return false;
     }
 
     const targetTokens = this.config.summaryTargetTokens ?? 2000;
@@ -9189,7 +9223,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // src/mint-preimage.ts). Computed AFTER dispatch because only then is
       // the accepted request known.
       const requestHash = sha256Json(acceptedRequest);
-      if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+      if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
 
       // Terminal-disposition gate (2026-08-01): a consolidation may become
       // canonical only after a COMPLETE accepted disposition — `end_turn` +
@@ -9305,6 +9339,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // Check if this merge triggers a further merge
       this.checkMergeThreshold();
+      return true;
     } catch (error) {
       // Disposition rejections already warned + receipted above — don't
       // double-log them as crashes; tick() consumes them for retry policy.

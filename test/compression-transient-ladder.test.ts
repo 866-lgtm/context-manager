@@ -906,13 +906,27 @@ describe('compression lane: failures are evidence only by the company they keep'
     }
   });
 
+  /** The evidence slot's value at each store sync: what a crash right after it would keep. */
+  function watchSyncedEvidence(manager: ContextManager): unknown[] {
+    const store = manager.getStore();
+    const sync = store.sync.bind(store);
+    const synced: unknown[] = [];
+    store.sync = () => {
+      synced.push(store.getStateJson(evidenceSlot));
+      sync();
+    };
+    return synced;
+  }
+
   it('a landed L1 advances the lane\'s durable evidence, after its result is written', async () => {
     const mock = scripted([OK('a memory')]);
     const fx = await queued(mock.membrane);
+    const synced = watchSyncedEvidence(fx.manager);
     const landed = () => (fx.manager.getStore().getStateJson(evidenceSlot) as { landed?: number } | null)?.landed ?? 0;
     assert.equal(landed(), 0);
     await fx.strategy.tick(managerContext(fx.manager));
     assert.equal(landed(), 1);
+    assert.deepEqual(synced.at(-1), fx.manager.getStore().getStateJson(evidenceSlot), 'and synced: a crash right after keeps it');
     assert.ok(fx.strategy.summariesView().some((s) => s.content === 'a memory'), 'the L1 it counts is pushed');
     fx.manager.close();
   });
@@ -920,6 +934,7 @@ describe('compression lane: failures are evidence only by the company they keep'
   it('failures for an hour with nothing landing alert once, through checkReadiness, until something lands', async () => {
     const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
     const fx = await queued(mock.membrane);
+    const synced = watchSyncedEvidence(fx.manager);
     const warnings: string[] = [];
     const warn = console.warn;
     console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
@@ -929,7 +944,8 @@ describe('compression lane: failures are evidence only by the company they keep'
       // Stand for an hour of failures: the clock is the durable start of the failures since the last landed success.
       const store = fx.manager.getStore();
       const evidence = store.getStateJson(evidenceSlot) as Record<string, unknown>;
-      assert.equal(typeof evidence.failingSince, 'number', 'the failures\' start is kept durably');
+      assert.equal(typeof evidence.failingSince, 'number', 'the failures\' start is kept');
+      assert.deepEqual(synced.at(-1), evidence, 'durably: synced, so a crash loop does not restart the clock');
       store.setStateJson(evidenceSlot, { ...evidence, failingSince: Date.now() - 61 * 60_000 });
       for (let i = 0; i < 2; i++) {
         fx.strategy.expirePause();
