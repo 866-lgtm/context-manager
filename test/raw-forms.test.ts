@@ -75,6 +75,9 @@ const reasoning = (): ContentBlock =>
 // membrane's zero-width carrier for an opaque Responses item: its raw item is its whole content.
 const opaqueCarrier = (): ContentBlock =>
   ({ type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_1', encrypted_content: 'z' } } as ContentBlock);
+// A hosted tool's call is opaque too, and follows the reasoning that led to it.
+const searchCall = (): ContentBlock =>
+  ({ type: 'text', text: '', rawItem: { type: 'web_search_call', id: 'ws_1', status: 'completed' } } as ContentBlock);
 const signedThinking = (): ContentBlock => ({ type: 'thinking', thinking: 'mm', signature: 'sig' } as ContentBlock);
 
 describe('raw forms: keys and release', () => {
@@ -157,19 +160,38 @@ describe('raw forms: keys and release', () => {
 });
 
 describe('raw forms: opaque carriers, drops and appends', () => {
-  it('an opaque carrier keeps its raw item, and is neither half of a reasoning pairing', () => {
+  it('an opaque carrier keeps its raw item, and is the follower of the reasoning before it', () => {
     const think = reasoning();
-    const opaque = opaqueCarrier();
+    const search = searchCall();
     const parts = [itemText('first part'), itemText('second part')];
-    const content = [think, opaque, ...parts];
-    const edited = releaseEditedRawForms(content, [think, opaque, { ...parts[0], text: 'cut' } as ContentBlock, parts[1]]);
-    assert.equal(rawOf(edited[0]).rawItem, undefined, 'the reasoning paired with the edited item is released');
-    assert.equal(edited[1], opaque, 'the opaque carrier between them is untouched, by identity');
+    const content = [think, search, ...parts];
+    assert.equal(withoutRawForms(search), search, 'even asked to release everything, a carrier keeps its raw item');
+    // Editing the message after the search releases that message alone: the reasoning and the call it led to stay paired.
+    const edited = releaseEditedRawForms(content, [think, search, { ...parts[0], text: 'cut' } as ContentBlock, parts[1]]);
+    assert.equal(edited[0], think, 'the reasoning keeps its id, with its follower');
+    assert.equal(edited[1], search, 'and so does the call it led to');
     assert.equal(rawOf(edited[3]).rawItem, undefined, 'the edited item gives up its raw form in every part');
-    assert.equal(withoutRawForms(opaque), opaque, 'even asked to release everything, a carrier keeps its raw item');
-    const dropped = releaseEditedRawForms(content, [opaque, ...parts]);
-    assert.equal(dropped[0], opaque, 'dropping the reasoning leaves the carrier as it was');
-    assert.equal(rawOf(dropped[1]).rawItem, undefined, 'and releases the item the reasoning led to');
+    // Stripping the reasoning releases its pairing, and the call can only ship whole, as main sends it.
+    const stripped = releaseEditedRawForms(content, [search, ...parts]);
+    assert.equal(stripped[0], search, 'the call stays whole');
+    assert.equal(stripped[1], parts[0], 'and the message after it keeps its id');
+    // Dropping the call (an empty carrier) releases the reasoning that led to it.
+    const dropped = releaseVanishedRawForms(content, [think, ...parts]);
+    assert.equal(rawOf(dropped[0]).rawItem, undefined);
+  });
+
+  it('a compaction carrier is never a follower: the reasoning before it pairs past it', () => {
+    const think = reasoning();
+    const compaction = opaqueCarrier();
+    const parts = [itemText('first part'), itemText('second part')];
+    const content = [think, compaction, ...parts];
+    const edited = releaseEditedRawForms(content, [think, compaction, { ...parts[0], text: 'cut' } as ContentBlock, parts[1]]);
+    assert.equal(rawOf(edited[0]).rawItem, undefined, 'the reasoning paired with the edited message is released');
+    assert.equal(edited[1], compaction, 'the compaction item between them is untouched, by identity');
+    assert.equal(rawOf(edited[3]).rawItem, undefined);
+    const dropped = releaseEditedRawForms(content, [compaction, ...parts]);
+    assert.equal(dropped[0], compaction, 'dropping the reasoning leaves the compaction item as it was');
+    assert.equal(rawOf(dropped[1]).rawItem, undefined, 'and releases the message the reasoning led to');
   });
 
   it('a drop releases the reasoning of an item none of whose parts survive, and nothing for a part whose sibling survives', () => {
@@ -193,6 +215,15 @@ describe('raw forms: opaque carriers, drops and appends', () => {
     assert.equal(rawOf(out[2]).rawItem, undefined, 'the reasoning at the end gives up its id');
     const signed = signedThinking();
     assert.equal(releaseTrailingReasoning([signed])[0], signed, 'a block without a raw item is untouched');
+    const think = reasoning();
+    const search = searchCall();
+    const ledToSearch = releaseTrailingReasoning([think, search]);
+    assert.equal(ledToSearch[0], think, 'reasoning followed by an opaque call is not at the end: it keeps its id');
+    assert.equal(ledToSearch[1], search);
+    const compaction = opaqueCarrier();
+    const beforeCompaction = releaseTrailingReasoning([think, compaction]);
+    assert.equal(rawOf(beforeCompaction[0]).rawItem, undefined, 'a compaction item after it is no follower, so the reasoning is at the end');
+    assert.equal(beforeCompaction[1], compaction);
   });
 });
 

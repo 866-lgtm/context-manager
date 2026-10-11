@@ -40,10 +40,14 @@
  * That is the only shape it could take: without its id and without encrypted
  * content, the provider has nothing to resolve it from.
  *
- * An opaque item (a Responses item membrane has no block for, such as an
- * encrypted compaction item) rides on a zero-width text block whose raw item is
- * its whole content: no field can render it. So an opaque carrier is never
- * released, and it is neither half of a reasoning pairing.
+ * An opaque item (a Responses item membrane has no block for: an encrypted
+ * compaction item, a hosted tool's call such as a web search, a custom tool
+ * call) rides on a zero-width text block whose raw item is its whole content:
+ * no field can render it. So an opaque carrier is never released; a pairing
+ * released through it leaves it whole, with its id, which is how main sends
+ * it. In a pairing it is an item like any other, since a tool call follows the
+ * reasoning that led to it, except a compaction item: that is compacted
+ * context, not something a reasoning item leads to, so it is never a follower.
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
@@ -70,6 +74,11 @@ export function isOpaqueCarrier(block: ContentBlock): boolean {
   if (block.type !== 'text') return false;
   const raw = (block as RawFormCarrier).rawItem;
   return !!raw && typeof raw === 'object' && (raw as { type?: unknown }).type !== 'message';
+}
+
+/** An opaque carrier of a compaction item: compacted context, never a reasoning item's follower. */
+function isCompactionCarrier(block: ContentBlock): boolean {
+  return isOpaqueCarrier(block) && ((block as RawFormCarrier).rawItem as { type?: unknown }).type === 'compaction';
 }
 
 function itemKey(block: ContentBlock): string | undefined {
@@ -145,16 +154,16 @@ export function releaseEditedRawForms(
 
 /**
  * The keys of a message's reasoning pairings, read from its content as it was:
- * each run of reasoning items pairs with the next item that is neither
- * reasoning nor opaque. Reasoning with no such item after it in the message
- * pairs with nothing here.
+ * each run of reasoning items pairs with the next item that isn't reasoning,
+ * an opaque tool call included, and a compaction item excluded. Reasoning with
+ * no such item after it in the message pairs with nothing here.
  */
 function pairingsOf(before: readonly ContentBlock[]): string[][] {
   const pairings: string[][] = [];
   let pending: string[] = [];
   for (const block of before) {
     const key = itemKey(block);
-    if (!key || isOpaqueCarrier(block)) continue;
+    if (!key || isCompactionCarrier(block)) continue;
     if (isReasoningItem(block)) {
       if (!pending.includes(key)) pending.push(key);
       continue;
@@ -229,7 +238,7 @@ export function releaseTrailingReasoning(content: ContentBlock[]): ContentBlock[
   for (let i = content.length - 1; i >= 0; i--) {
     const block = content[i];
     const key = itemKey(block);
-    if (!key || isOpaqueCarrier(block)) continue;
+    if (!key || isCompactionCarrier(block)) continue;
     if (!isReasoningItem(block)) break;
     trailing.add(key);
   }
