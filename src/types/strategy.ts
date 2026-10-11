@@ -124,9 +124,11 @@ export interface ReadinessState {
    * hour with nothing landing (AutobiographicalStrategy). `since` is when the
    * failures began (ISO time), `subject` the work that kept failing, and
    * `failureClass` its failure (membrane's error type and HTTP status). A
-   * request that fails while nothing else lands is never counted against
-   * itself, so it backs off indefinitely: if it is the request's own fault,
-   * exhausting it takes an operator. Cleared when a compression lands.
+   * failure counts against its request only once other compression has
+   * landed, so while nothing lands the request backs off indefinitely and is
+   * never decided. In an outage that is the intent; if the provider is
+   * answering, the request may be failing on its own and needs inspecting.
+   * Cleared when a compression lands.
    */
   compressionStall?: { since: string; subject: string; failureClass: string };
 }

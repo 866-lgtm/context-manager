@@ -4237,7 +4237,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
       return;
     }
-    this.noteCompressionFailureForStall(subject, error);
+    this.noteCompressionFailureForStall(lane, subject, error);
     // A stated wait still standing from an earlier failure (or deferral) on
     // this model is not shortened by this one (see the construction below).
     const reason = describeCompressionFailure(error);
@@ -4353,7 +4353,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * an operator hears of it. The clock starts at the first failure after the
    * last landed success, kept durably, so a restart does not reset it.
    */
-  private noteCompressionFailureForStall(subject: string, error: unknown): void {
+  private noteCompressionFailureForStall(lane: 'l1' | 'merge', subject: string, error: unknown): void {
     const now = Date.now();
     const evidence = this.readLaneEvidence();
     let since = evidence.failingSince;
@@ -4367,13 +4367,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.compressionStall = { since, subject, failureClass, alertedAt: now };
     console.warn(
       `[autobiographical] compression stalled: nothing has landed since ${new Date(since).toISOString()}, ` +
-        `and ${subject} keeps failing (${failureClass}). A request failing while no other work lands is never ` +
-        `counted against itself, so it backs off indefinitely; if it is the request's own fault, exhausting it takes ` +
-        `an operator.`,
+        `and ${subject} keeps failing (${failureClass}). A failure counts against its request only once other ` +
+        `compression has landed, so until something lands it backs off indefinitely and is never decided. If the ` +
+        `provider is answering, the request may be failing on its own: inspect it.`,
     );
     logCompressionCall({
       event: 'compression:lane-stalled',
-      operation: 'compress_l1',
+      operation: lane === 'l1' ? 'compress_l1' : 'merge',
       metadata: { since: new Date(since).toISOString(), subject, failure_class: failureClass },
     });
   }
