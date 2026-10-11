@@ -8819,10 +8819,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const newest = messages[messages.length - 1];
     if (newest) {
       const newestBody = bodyBoundsIn(messages, messages.length - 1);
-      const newestGroupIds = new Set(messages.slice(newestBody.from, newestBody.to + 1).map(m => m.id));
+      const newestBodyIds = new Set(messages.slice(newestBody.from, newestBody.to + 1).map(m => m.id));
       const newestRetained = merged.some(
-        entry => (entry.sourceMessageId !== undefined && newestGroupIds.has(entry.sourceMessageId)) ||
-          (entry.sourceMessageIds ?? []).some(id => newestGroupIds.has(id)),
+        entry => (entry.sourceMessageId !== undefined && newestBodyIds.has(entry.sourceMessageId)) ||
+          (entry.sourceMessageIds ?? []).some(id => newestBodyIds.has(id)),
       );
       if (!newestRetained) {
         throw this.overBudgetError(budget, {
