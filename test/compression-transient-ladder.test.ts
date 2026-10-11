@@ -1118,6 +1118,26 @@ describe('ladder progress goes when its debt is paid, and is swept on its own ca
     fx.manager.close();
   });
 
+  it('nor does a fresh ladder, once it has written the family and the family is dropped (I4)', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const mock = scripted([REFUSAL, { gate, then: { throw: failure('network') } }]);
+    const fx = await build(mock.membrane, { hoist: true });
+    assert.equal(progressSlot(fx.manager).length, 0, 'no progress when the ladder begins');
+    const run = fx.strategy.run(fx.target(), managerContext(fx.manager));
+    const deadline = Date.now() + 10_000;
+    while (mock.calls.length < 2) {
+      if (Date.now() > deadline) assert.fail('the second rung was never called');
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(progressSlot(fx.manager).length, 1, 'the ladder wrote its canonical refusal');
+    fx.manager.getStore().setStateJson(PROGRESS_SLOT, []);
+    release();
+    await assert.rejects(run, /zz network failure/);
+    assert.equal(progressSlot(fx.manager).length, 0, 'what it wrote, once dropped, is not written back');
+    fx.manager.close();
+  });
+
   it('the dedup guard pays off the span\'s progress (I25)', async () => {
     const mock = scripted([OK('never called')]);
     const fx = await build(mock.membrane);

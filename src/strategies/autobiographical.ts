@@ -7253,17 +7253,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let progressCanonicalInputTokens = progress?.canonicalProviderInputTokens;
       let failureStreak = progress?.failureStreak;
       const answeredRequests = new Set<string>();
+      // Whether this family's progress has been in the slot during this
+      // ladder: found there when it began, or written by it since.
+      let progressSeen = progress !== undefined;
       const persistProgress = (): void => {
-        // A family that had progress when this ladder began, and has none in
-        // the slot now, was dropped meanwhile (minted, exhausted, cleared or
-        // swept, here or by another strategy on this store): this ladder's
-        // snapshot must not bring it back. The check and the write are
-        // synchronous, with no await between them.
-        if (progress && !this.readCompressionFamilyProgress().has(quarantineRecord.familyKey)) return;
+        // A family whose progress was in the slot during this ladder, and is
+        // gone from it now, was dropped meanwhile (minted, exhausted, cleared
+        // or swept, here or by another strategy on this store): this ladder's
+        // snapshot must not bring it back, whether it began with progress or
+        // wrote the first. The check and the write are synchronous, with no
+        // await between them.
+        if (progressSeen && !this.readCompressionFamilyProgress().has(quarantineRecord.familyKey)) return;
         this.recordCompressionFamilyProgress(
           sourceBranch, quarantineRecord, progressOutcomes, progressCanonicalInputTokens, failureStreak, answeredRequests,
           chunk.messages.map((message) => message.id),
         );
+        progressSeen = true;
       };
       /** Keep one deterministic answer; durable before the next rung's call. */
       const noteOutcome = (outcome: CompressionRefusalOutcomeRecord): void => {
