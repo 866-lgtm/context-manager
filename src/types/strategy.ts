@@ -206,10 +206,12 @@ export interface ContextStrategy {
 /**
  * Per-call options for `select()` / `compile()`.
  *
- * `dryRun` exists because the adaptive path is NOT side-effect-free: it
- * commits fold resolutions to Chronicle and enqueues real compression work.
- * An operator UI that previews a hypothetical budget must not do either, or
- * every slider drag would rewrite the fold plan and spend LLM tokens.
+ * `dryRun` exists because a select is NOT side-effect-free: it commits fold
+ * resolutions and chunk records to Chronicle, enqueues real compression work,
+ * and leaves state the next compile and observers read. An operator UI that
+ * previews a hypothetical budget must change none of it, or every slider drag
+ * would rewrite the fold plan, spend LLM tokens and change what the next real
+ * compile sends. The field's doc gives the whole contract.
  */
 export interface SelectOptions {
   /**
@@ -218,12 +220,21 @@ export interface SelectOptions {
    * rebuild closes, no produce/merge enqueue, no shadow production pick, no
    * transition bookkeeping, and nothing a select leaves for the next one or for
    * observers (the cache-marker baseline, the transition status, the render
-   * stats, calibration's estimate and arming), all on every path out, throws
-   * included. An over-budget plan doesn't throw at the plan check; a later
-   * stage that can't fit still throws, as for a real compile, leaving nothing
-   * behind, and only `previewContext` turns every such throw into a report. A
-   * compression hold that has expired still expires at a dry compile, as at
-   * every hold query: its clock is its own.
+   * stats, calibration's estimate, arming and store view, the store order, the
+   * head-window memo, and whether chunk records are trusted), all on every
+   * path out, throws included.
+   *
+   * What a dry select refuses is what a real compile refuses, with one
+   * exception: an over-budget plan is not thrown at the plan check. A plain
+   * dry compile then returns that plan's entries with no verdict, and
+   * `previewContext` is where infeasibility is reported. The head-and-tail
+   * check before the plan check, and any later stage that can't fit, still
+   * throw as for a real compile, leaving nothing behind; `previewContext`
+   * reports an over-budget throw and passes any other throw through.
+   *
+   * A compression hold ends at its deadline, whoever looks: the manager
+   * releases an expired hold at any compile or hold query, a dry compile
+   * included, and that release is the one thing a dry compile can leave.
    */
   dryRun?: boolean;
   /** Exact normalized tools/system/context-prefix identity supplied by the

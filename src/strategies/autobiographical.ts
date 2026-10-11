@@ -4711,12 +4711,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   select(
     store: MessageStoreView,
     log: ContextLogView,
-      budget: TokenBudget,
-      opts?: SelectOptions
-    ): ContextEntry[] {
-      this.requireLoadedBranch('select');
-      const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
-      const _t0 = _diag ? Date.now() : 0;
+    budget: TokenBudget,
+    opts?: SelectOptions
+  ): ContextEntry[] {
+    this.requireLoadedBranch('select');
+    const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
+    const _t0 = _diag ? Date.now() : 0;
     if (opts?.dryRun !== true) {
       this.rebuildChunks(store);
       if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
@@ -4726,24 +4726,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the next one and for observers: the cache-marker baseline the next
     // compile measures its stable prefix against, the transition status
     // (getHotContextSettings), the render stats (getRenderStats, with its
-    // plan-vs-actual) and calibration's estimate and arming stay as the last
-    // committing select left them. They are put back here, on every path out,
-    // throws included; each select path gates its own persistence and
-    // enqueueing. The dry run's own render stats are its output, as its plan
-    // is (_lastPreview), and previewContext reads them from _lastPreviewStats.
+    // plan-vs-actual), calibration's estimate, arming and store view, the
+    // store order and the head-window memo stay as the last committing select
+    // left them. They are put back here, on every path out, throws included;
+    // each select path gates its own persistence and enqueueing. The dry run's
+    // own render stats are its output, as its plan is (_lastPreview), and
+    // previewContext reads them from _lastPreviewStats.
     // Chunking runs dry too: a chunk the dry run closes gets no record, and
-    // the chunks and compression queue go back to the last committing
-    // rebuild's, so no tick compresses what only a dry run (or a preview's
-    // overridden chunk size) cut.
+    // the chunks, the compression queue and whether chunk records are trusted
+    // (a dry rebuild at a preview's chunk size can read them as orphaned) go
+    // back to the last committing rebuild's, so no tick compresses what only
+    // a dry run (or a preview's overridden chunk size) cut.
     const saved = {
       chunks: this.chunks,
       compressionQueue: this.compressionQueue,
+      chunkRecordsOrphaned: this.chunkRecordsOrphaned,
+      orphanWarned: this._orphanWarned,
       prevCacheKeys: this._prevCacheKeys,
       lastFrontierTokens: this.lastFrontierTokens,
       transitionBlocked: this.transitionBlocked,
       lastRenderStats: this._lastRenderStats,
       lastCompileEstimate: this._lastCompileEstimate,
       calibrationArmed: this._calibrationArmed,
+      storeView: this._storeView,
+      storeOrder: this._storeOrder,
+      headStartMemo: this._cachedHeadStartIndex,
     };
     this._lastPreviewStats = undefined;
     this._dryRunSelect = true;
@@ -4753,17 +4760,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return this.selectPath(store, budget, opts);
     } finally {
       this._dryRunSelect = false;
+      // Only stats this dry run produced are its preview's: on a throw before
+      // they're written, the previous select's must not pose as the preview's.
       if (this._lastRenderStats !== saved.lastRenderStats) {
         this._lastPreviewStats = this._lastRenderStats ?? undefined;
       }
       this.chunks = saved.chunks;
       this.compressionQueue = saved.compressionQueue;
+      this.chunkRecordsOrphaned = saved.chunkRecordsOrphaned;
+      this._orphanWarned = saved.orphanWarned;
       this._prevCacheKeys = saved.prevCacheKeys;
       this.lastFrontierTokens = saved.lastFrontierTokens;
       this.transitionBlocked = saved.transitionBlocked;
       this._lastRenderStats = saved.lastRenderStats;
       this._lastCompileEstimate = saved.lastCompileEstimate;
       this._calibrationArmed = saved.calibrationArmed;
+      this._storeView = saved.storeView;
+      this._storeOrder = saved.storeOrder;
+      this._cachedHeadStartIndex = saved.headStartMemo;
     }
   }
 
@@ -8388,7 +8402,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // also restore it here, or the two owners will disagree.
     if (_diag) { console.error(`[cm-cache] selectAdaptive: inputs-built ${Date.now() - _t}ms`); _t = Date.now(); }
     const result = picker.run(pickerInputs, foldingBudget);
-    if (this.config.foldingStrategy === 'kv-unified' && !dryRun) {
+    if (this.config.foldingStrategy === 'kv-unified') {
+      // The plan's check runs dry or not, so a dry select refuses what a real
+      // compile would; only the draft it builds is a real compile's alone.
       const tree = new SummaryTree(pickerInputs);
       const nextSequence = (this.kvUnifiedReceipts.head?.sequence ?? 0) + 1;
       const leaves = new Map<ChunkId, PresentedLeaf>();
@@ -8398,6 +8414,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (level > 0 && !summaryId) {
           throw new Error(`kv-unified selected unavailable L${level} for ${chunk.id}`);
         }
+        if (dryRun) continue;
         const repHash = level === 0 ? `raw:${chunk.id}` : `summary:${summaryId}`;
         const previous = this.kvUnifiedReceipts.leaves.get(chunk.id);
         leaves.set(chunk.id, {
@@ -8409,12 +8426,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               : nextSequence,
         });
       }
-      this.kvUnifiedDraft = {
-        leaves,
-        layout: renderLayout(pickerInputs, tree, result.finalResolutions),
-        immutablePrefixHash: opts?.kvUnifiedImmutablePrefixHash,
-        markerUnitIndices: [],
-      };
+      if (!dryRun) {
+        this.kvUnifiedDraft = {
+          leaves,
+          layout: renderLayout(pickerInputs, tree, result.finalResolutions),
+          immutablePrefixHash: opts?.kvUnifiedImmutablePrefixHash,
+          markerUnitIndices: [],
+        };
+      }
     }
     if (_diag) { console.error(`[cm-cache] selectAdaptive: picker.run ${Date.now() - _t}ms`); _t = Date.now(); }
     this.lastFrontierTokens = result.finalTokens;

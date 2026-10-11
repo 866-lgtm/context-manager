@@ -436,9 +436,15 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
     await side.compile({ maxTokens: 100_000, reserveForResponse: 200 });
     const recordsBefore = chunkRecords(strategy);
     addConversation(main, 40);
+    const chunksBefore = (strategy as unknown as { chunks: unknown }).chunks;
     side.previewContext({ maxTokens: 100_000, reserveForResponse: 200 }, { targetChunkTokens: 50 });
     assert.strictEqual(chunkRecords(strategy), recordsBefore, 'a boundary cut at the preview\u2019s size would be kept for good');
     assert.strictEqual(persistedChunkRecords(strategy), recordsBefore);
+    assert.strictEqual((strategy as unknown as { chunks: unknown }).chunks, chunksBefore, 'the chunks are the last real rebuild\u2019s');
+    // A real compile at the preview's chunk size closes chunks here, or this test proves nothing.
+    (strategy as unknown as { config: { targetChunkTokens: number } }).config.targetChunkTokens = 50;
+    await side.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    assert.ok(chunkRecords(strategy) > recordsBefore, 'the 50-token size closes chunks');
     side.close();
     main.close();
   });
@@ -452,6 +458,8 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
     addConversation(manager, 10);
     await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true });
     assert.strictEqual(JSON.stringify(manager.getRenderStats()), live);
+    await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+    assert.notStrictEqual(JSON.stringify(manager.getRenderStats()), live, 'a real compile changes them, or this test proves nothing');
   });
 
   it('puts back whatever a dry select wrote, on a throw too', async () => {
@@ -464,11 +472,19 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
         const out = super.selectAdaptive(...args);
         if (args[2]?.dryRun) {
           const self = this as unknown as Record<string, unknown>;
+          self.chunks = [];
+          self.compressionQueue = [99];
+          self.chunkRecordsOrphaned = true;
+          self._orphanWarned = true;
+          self._prevCacheKeys = ['zz'];
           self.lastFrontierTokens = 1;
           self.transitionBlocked = 'transition-pace-floor';
           self._lastRenderStats = null;
           self._lastCompileEstimate = 1;
           self._calibrationArmed = true;
+          self._storeView = {};
+          self._storeOrder = new Map();
+          self._cachedHeadStartIndex = { id: 'zz', msgCount: 1, result: 0 };
           if (this.throwAfter) throw new Error('zz-after-writing');
         }
         return out;
@@ -484,13 +500,25 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
     strategy.reportRealInputTokens(calibration(strategy).estimate);
     const before = () => JSON.stringify([manager.getHotContextSettings(), manager.getRenderStats(), calibration(strategy)]);
     const expected = before();
+    // Every field select() saves and restores, read by identity.
+    const fields = [
+      'chunks', 'compressionQueue', 'chunkRecordsOrphaned', '_orphanWarned', '_prevCacheKeys', 'lastFrontierTokens',
+      'transitionBlocked', '_lastRenderStats', '_lastCompileEstimate', '_calibrationArmed', '_storeView', '_storeOrder',
+      '_cachedHeadStartIndex',
+    ];
+    const raw = () => fields.map((f) => (strategy as unknown as Record<string, unknown>)[f]);
+    const rawBefore = raw();
+    const assertRestored = (when: string) => raw().forEach((value, i) =>
+      assert.strictEqual(value, rawBefore[i], `${fields[i]} is put back ${when}`));
     await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true });
     assert.strictEqual(before(), expected);
+    assertRestored('after a dry compile');
     strategy.throwAfter = true;
     await assert.rejects(
       manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true }),
       /zz-after-writing/,
     );
     assert.strictEqual(before(), expected);
+    assertRestored('after a dry compile that throws');
   });
 });
