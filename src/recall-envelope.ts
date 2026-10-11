@@ -1,5 +1,5 @@
 import type { ContentBlock } from '@animalabs/membrane';
-import { releaseEditedRawForms } from './raw-forms.js';
+import { isOpaqueCarrier, releaseEditedRawForms, releaseTrailingReasoning } from './raw-forms.js';
 import type { RecallEnvelopeMode, SummaryEntry } from './types/strategy.js';
 
 /**
@@ -60,15 +60,22 @@ export function recallEnvelopeAddedText(
 /**
  * Wrap a recall answer's content blocks.
  *
- * The tags land on the FIRST and LAST text blocks, never on reasoning
+ * The tags land on the FIRST and LAST prose blocks, never on reasoning
  * carriers: `responseContent` replays signed thinking whose signatures only
  * verify on byte-identical blocks, and a text block prepended before them
- * would also break the provider's thinking-first turn shape. Blocks that are
- * not rewritten are passed through by reference; rewritten ones are copies, so
- * the stored entry is never mutated. A rewritten block gives up its raw replay
+ * would also break the provider's thinking-first turn shape. A zero-width
+ * carrier of an opaque Responses item is not prose either: its raw item is its
+ * whole content, so it is never rewritten. Blocks that are neither rewritten
+ * nor released are passed through by reference; the others are copies, so the
+ * stored entry is never mutated. A rewritten block gives up its raw replay
  * form, along with every block that shares it and a Responses reasoning item
  * paired with it, so the tags reach the wire (see raw-forms.ts). A released
  * carrier keeps its content fields byte for byte; only its raw item goes.
+ *
+ * An answer with no prose gets the envelope as a block of its own, after the
+ * carriers. A Responses reasoning item at its end then gives up its id, since
+ * the envelope would follow it on the wire as an item the provider never
+ * produced.
  */
 export function wrapRecallAnswerContent(
   content: ContentBlock[],
@@ -79,11 +86,11 @@ export function wrapRecallAnswerContent(
   const { open, close } = buildRecallEnvelopeTags(summary);
   const textPositions: number[] = [];
   content.forEach((block, position) => {
-    if (block.type === 'text') textPositions.push(position);
+    if (block.type === 'text' && !isOpaqueCarrier(block)) textPositions.push(position);
   });
   if (textPositions.length === 0) {
-    // Carriers but no prose: still delimit the memory, still touch nothing.
-    return [...content, { type: 'text', text: `${open}\n${close}` }];
+    // Carriers but no prose: still delimit the memory, and rewrite no carrier.
+    return [...releaseTrailingReasoning(content), { type: 'text', text: `${open}\n${close}` }];
   }
   const firstText = textPositions[0];
   const lastText = textPositions[textPositions.length - 1];

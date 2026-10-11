@@ -67,7 +67,7 @@ import type {
 } from '../adaptive/folding-strategy.js';
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
-import { releaseEditedRawForms, releaseSharedRawFormsOnMove } from '../raw-forms.js';
+import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseVanishedRawForms } from '../raw-forms.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
@@ -807,17 +807,20 @@ function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?
  * unchanged, so tool pairing is preserved; callers drop any message left with
  * an empty content array.
  *
- * Deliberately not followed by releaseEditedRawForms: an empty part dropped
- * from a Responses message item still rides inside its siblings' raw item, but
- * only whitespace can ship that way, and releasing would re-render the whole
- * item (and its reasoning pairing) from fields for no content change.
+ * Released narrowly (releaseVanishedRawForms, not releaseEditedRawForms): an
+ * empty part dropped from a Responses message item while a sibling part
+ * survives still rides inside the sibling's raw item, and only whitespace can
+ * ship that way, so releasing would re-render the whole item (and its reasoning
+ * pairing) from fields for no content change. An item none of whose parts
+ * survive is gone from the wire, so the reasoning paired with it gives up its
+ * id rather than be replayed without its follower.
  */
 function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
-  return content.filter((b) => {
+  return releaseVanishedRawForms(content, content.filter((b) => {
     if (b.type !== 'text') return true;
     const text = (b as { text?: unknown }).text;
     return typeof text === 'string' && text.trim().length > 0;
-  });
+  }));
 }
 
 /**
@@ -11819,11 +11822,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Under `'full'` (default) this IS `summaryAnswerProse`, block for block.
    * Under `'live-strip'` the captured reasoning carriers are omitted from the
-   * live render alone: whole blocks dropped, every surviving block passed
-   * through untouched, so the same entry's mint-side recall still replays its
-   * signed blocks byte-verbatim. Mutating a carrier here would break the
-   * signature that the mint surface depends on — hence omission, never
-   * rewriting.
+   * live render alone: whole blocks dropped, so the same entry's mint-side
+   * recall still replays its signed blocks byte-verbatim. Mutating a carrier
+   * here would break the signature that the mint surface depends on — hence
+   * omission, never rewriting. Every surviving block is passed through by
+   * reference, except a Responses item a stripped reasoning item led to, which
+   * is copied without its id (see raw-forms.ts).
    *
    * A carrier-only entry (reasoning captured, no prose block — degenerate, and
    * guarded against at mint time) would strip to an empty assistant turn,

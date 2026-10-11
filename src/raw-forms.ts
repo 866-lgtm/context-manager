@@ -31,9 +31,19 @@
  * by id, and a reasoning item replayed with its id but without that follower,
  * or a follower replayed with its id but without its reasoning, is a pairing
  * the provider didn't produce. So releasing either releases both. Released,
- * both are rendered from their fields without ids (membrane's converter sends
- * a `redacted_thinking` block as an id-less reasoning item), which is the shape
- * membrane already sends for any history without raw items.
+ * both are rendered from their fields without ids, which is the shape membrane
+ * already sends for any history without raw items. For the reasoning, that
+ * depends on what it carried: with encrypted content it is a
+ * `redacted_thinking` block, which membrane's converter sends as an id-less
+ * reasoning item with that content; without, it is a plain `thinking` block,
+ * which the converter has no form for, so a released one is not sent at all.
+ * That is the only shape it could take: without its id and without encrypted
+ * content, the provider has nothing to resolve it from.
+ *
+ * An opaque item (a Responses item membrane has no block for, such as an
+ * encrypted compaction item) rides on a zero-width text block whose raw item is
+ * its whole content: no field can render it. So an opaque carrier is never
+ * released, and it is neither half of a reasoning pairing.
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
@@ -49,6 +59,17 @@ function xmlKey(block: ContentBlock): string | undefined {
 function isReasoningItem(block: ContentBlock): boolean {
   const raw = (block as RawFormCarrier).rawItem;
   return !!raw && typeof raw === 'object' && (raw as { type?: unknown }).type === 'reasoning';
+}
+
+/**
+ * A text block carrying an opaque Responses item: membrane's zero-width carrier
+ * for an item it has no block for (see membrane's parseProviderContent). A text
+ * block from a message item's part carries that message item instead.
+ */
+export function isOpaqueCarrier(block: ContentBlock): boolean {
+  if (block.type !== 'text') return false;
+  const raw = (block as RawFormCarrier).rawItem;
+  return !!raw && typeof raw === 'object' && (raw as { type?: unknown }).type !== 'message';
 }
 
 function itemKey(block: ContentBlock): string | undefined {
@@ -75,11 +96,12 @@ export function rawFormKeys(block: ContentBlock): string[] {
 /**
  * The block without the raw forms whose keys are in `keys`, or without any
  * raw form when `keys` is omitted. Returns the block itself when it carries
- * none of them, so an untouched block keeps its identity.
+ * none of them, so an untouched block keeps its identity. An opaque carrier
+ * keeps its raw item, which is its whole content.
  */
 export function withoutRawForms(block: ContentBlock, keys?: ReadonlySet<string>): ContentBlock {
   const xml = xmlKey(block);
-  const item = itemKey(block);
+  const item = isOpaqueCarrier(block) ? undefined : itemKey(block);
   const dropXml = xml !== undefined && (!keys || keys.has(xml));
   const dropItem = item !== undefined && (!keys || keys.has(item));
   if (!dropXml && !dropItem) return block;
@@ -122,30 +144,33 @@ export function releaseEditedRawForms(
 }
 
 /**
- * Widen `released` to whole reasoning pairings, read from the message's
- * content as it was: each run of reasoning items pairs with the next
- * non-reasoning item, and a pairing with any member released is released
- * whole.
+ * The keys of a message's reasoning pairings, read from its content as it was:
+ * each run of reasoning items pairs with the next item that is neither
+ * reasoning nor opaque. Reasoning with no such item after it in the message
+ * pairs with nothing here.
  */
-function releasePairings(before: readonly ContentBlock[], released: Set<string>): void {
+function pairingsOf(before: readonly ContentBlock[]): string[][] {
   const pairings: string[][] = [];
   let pending: string[] = [];
-  let lastFollower: string | undefined;
   for (const block of before) {
     const key = itemKey(block);
-    if (!key) continue;
+    if (!key || isOpaqueCarrier(block)) continue;
     if (isReasoningItem(block)) {
       if (!pending.includes(key)) pending.push(key);
-      lastFollower = undefined;
       continue;
     }
-    // A later part of the same item continues the pairing it already joined.
-    if (key === lastFollower) continue;
     if (pending.length > 0) pairings.push([...pending, key]);
     pending = [];
-    lastFollower = key;
   }
-  // Reasoning with no follower in this message pairs with nothing here.
+  return pairings;
+}
+
+/**
+ * Widen `released` to whole reasoning pairings, read from the message's
+ * content as it was: a pairing with any member released is released whole.
+ */
+function releasePairings(before: readonly ContentBlock[], released: Set<string>): void {
+  const pairings = pairingsOf(before);
   let widened = true;
   while (widened) {
     widened = false;
@@ -159,6 +184,63 @@ function releasePairings(before: readonly ContentBlock[], released: Set<string>)
       }
     }
   }
+}
+
+/**
+ * Reconcile a message's content after blocks were dropped from it, releasing
+ * only what a drop made untrue: the reasoning pairing of an item that no block
+ * still carries. A dropped part of an item that a surviving sibling still
+ * carries leaves everything as it was, since the item still ships whole through
+ * the sibling (with the dropped part inside it).
+ *
+ * `after` must keep each surviving block by identity, as a filter does.
+ * Returns `after` itself when nothing has to change.
+ */
+export function releaseVanishedRawForms(
+  before: readonly ContentBlock[],
+  after: ContentBlock[],
+): ContentBlock[] {
+  const kept = new Set<ContentBlock>(after);
+  const surviving = new Set<string>(after.flatMap(rawFormKeys));
+  const released = new Set<string>();
+  for (const block of before) {
+    if (kept.has(block)) continue;
+    for (const key of rawFormKeys(block)) if (!surviving.has(key)) released.add(key);
+  }
+  if (released.size === 0) return after;
+  releasePairings(before, released);
+  let changed = false;
+  const result = after.map((block) => {
+    const next = withoutRawForms(block, released);
+    if (next !== block) changed = true;
+    return next;
+  });
+  return changed ? result : after;
+}
+
+/**
+ * The content, for a block about to be appended after it: the reasoning items
+ * at its end, which no item follows in this message, are released, since the
+ * appended block would follow them on the wire as an item the provider never
+ * produced. Everything else keeps its identity.
+ */
+export function releaseTrailingReasoning(content: ContentBlock[]): ContentBlock[] {
+  const trailing = new Set<string>();
+  for (let i = content.length - 1; i >= 0; i--) {
+    const block = content[i];
+    const key = itemKey(block);
+    if (!key || isOpaqueCarrier(block)) continue;
+    if (!isReasoningItem(block)) break;
+    trailing.add(key);
+  }
+  if (trailing.size === 0) return content;
+  let changed = false;
+  const result = content.map((block) => {
+    const next = withoutRawForms(block, trailing);
+    if (next !== block) changed = true;
+    return next;
+  });
+  return changed ? result : content;
 }
 
 /**
