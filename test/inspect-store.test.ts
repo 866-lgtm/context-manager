@@ -187,6 +187,7 @@ describe('inspect-store', () => {
     const path = join(dir, 'store');
     const store = JsStore.openOrCreate({ path });
     store.registerState({ id: 'agents/Ada/autobio:summaries', strategy: 'append_log', deltaSnapshotEvery: 50, fullSnapshotEvery: 10 });
+    store.registerState({ id: 'agents/Ada/autobio:resolutions', strategy: 'snapshot' });
     store.close();
     const before = snapshot(path);
     const refused = run([path, '--namespace', 'agents/Ada', '--output', join(dir, 'out-sample'), '--sample-compile', '20000']);
@@ -194,9 +195,13 @@ describe('inspect-store', () => {
     assert.match(refused.stderr, /--sample-compile: "agents\/Ada" has no message slot .* so there is no history to compile; nothing was inspected/);
     assert.equal(existsSync(join(dir, 'out-sample')), false, 'nothing written');
     assert.equal(snapshot(path), before, 'no message slot was registered');
-    const { code, stdout } = run([path, '--namespace', 'agents/Ada', '--output', join(dir, 'out')]);
+    const { code, stdout, stderr } = run([path, '--namespace', 'agents/Ada', '--output', join(dir, 'out')]);
     assert.equal(code, 0);
     assert.match(stdout, /Messages: 0 \(no message slot\)/);
+    // Registered and never written: chronicle reads such a state as null, which is "nothing stored yet", not damage.
+    assert.match(stdout, /Summaries: 0 \(\{\}\), as stored/);
+    assert.match(stdout, /Resolutions recorded: 0\n/);
+    assert.doesNotMatch(stderr, /unreadable|holds /);
   });
 
   it('a malformed invocation is refused before anything is opened or written (#48901)', async () => {
@@ -312,18 +317,22 @@ describe('inspect-store', () => {
     assert.match(readFileSync(join(out, 'messages.md'), 'utf8'), /\[000\] User .* res=L2: zz message 0/, 'the resolved message is labelled');
   });
 
-  it('reports a summaries state that is not a list, rather than reading it as empty', () => {
+  it('reports a summaries state that is not a list, and a resolutions state that is not a map, rather than reading either as empty', () => {
     const dir = mkdtempSync(join(tmpdir(), 'inspect-store-'));
     dirs.push(dir);
     const path = join(dir, 'store');
     const store = JsStore.openOrCreate({ path });
     store.registerState({ id: 'agents/Bad/autobio:summaries', strategy: 'snapshot' });
     store.setStateJson('agents/Bad/autobio:summaries', { not: 'a list' });
+    store.registerState({ id: 'agents/Bad/autobio:resolutions', strategy: 'snapshot' });
+    store.setStateJson('agents/Bad/autobio:resolutions', ['not', 'a map']);
     store.close();
     const { code, stdout, stderr } = run([path, '--namespace', 'agents/Bad', '--output', join(dir, 'out')]);
     assert.equal(code, 0, stderr);
     assert.match(stderr, /agents\/Bad\/autobio:summaries holds a map, not a list of summaries/);
     assert.match(stdout, /Summaries: unreadable \(agents\/Bad\/autobio:summaries holds a map\)/);
+    assert.match(stderr, /agents\/Bad\/autobio:resolutions holds a list, not a map of message ids to levels/);
+    assert.match(stdout, /Resolutions recorded: unreadable \(agents\/Bad\/autobio:resolutions holds a list\)/);
   });
 
   it('refuses a store another process holds open, saying so, and writes nothing', async () => {
