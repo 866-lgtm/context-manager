@@ -1199,6 +1199,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private runtimeTransitionPaceTokens: number | undefined;
   /** Diagnostics from the most recent dry-run select. Not persisted. */
   private _lastPreview: PreviewResult | undefined;
+  /** The last dry select's own render stats, which select() keeps apart from
+   *  the live ones for previewContext. */
+  private _lastPreviewStats: RenderStats | undefined;
+  /** Set while a dry select runs: its chunking persists no chunk record. */
+  private _dryRunSelect = false;
   /** Serializes previews against each other (see previewContext). */
   private _previewInFlight = false;
 
@@ -1376,32 +1381,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       throw new Error('previewContext is already running; previews must not overlap');
     }
     this._previewInFlight = true;
+    // The config swap below is this method's own to undo. What the dry select
+    // leaves for observers (transition status, render stats, calibration),
+    // select() puts back for every dry run, whichever of selectAdaptive's
+    // OverBudgetError sites throws; any throw is turned into a report below.
     const savedConfig = this.config;
     const savedPicker = this._adaptivePicker;
     const savedHeadCache = this._cachedHeadStartIndex;
-    // selectAdaptive has FOUR OverBudgetError sites — an early head+tail check
-    // that fires before the picker even runs, the post-pick check, and two
-    // late render-stage checks. Rather than gate each (fragile, and a new site
-    // would silently break previews), restore bookkeeping here in `finally`
-    // and convert any throw into a report below.
-    const savedFrontier = this.lastFrontierTokens;
-    const savedBlocked = this.transitionBlocked;
-    const savedKvStable = this._lastKvStable;
-    // select() calls rsBegin(), which RESETS the render-stats family. Those feed
-    // getRenderStats() -> /debug/context/makeup and the Context panel, so a dry
-    // run would leave the operator's live segment breakdown showing numbers from
-    // a hypothetical compile until the next real one. Save and restore them:
-    // "commits nothing" has to include in-memory observability, not just
-    // Chronicle.
-    // `_lastRenderStats` is the one that matters: select() ends with
-    // `_lastRenderStats = r; _rs = null`, and getRenderStats() reads
-    // _lastRenderStats. Guarding only _rs (null by then) protected nothing.
-    const savedRs = this._rs;
-    const savedLastRs = this._lastRenderStats;
-    const savedDrops = this._uncoveredDrops;
-    const savedEmitted = this._emittedSummaryIds;
-    const savedPlannedTokens = this._plannedTokens;
-    const savedPlannedMeta = this._plannedMeta;
     this._lastPreview = undefined;
     try {
       // Drop explicit undefined/null overrides BEFORE spreading: a spread
@@ -1462,31 +1448,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview',
         );
       }
-      // Segment breakdown for the hypothetical compile, captured BEFORE the
-      // finally block restores the live one. Lets a caller show the previewed
+      // Segment breakdown for the hypothetical compile, which select() kept
+      // apart from the live one. Lets a caller show the previewed
       // head/middle/tail split without re-deriving it.
       return {
         ...preview,
-        // Read _lastRenderStats, not _rs: select() has already committed and
-        // nulled _rs by this point.
         ...(opts?.render
-          ? { entries: rendered, stats: this._lastRenderStats ?? undefined }
+          ? { entries: rendered, stats: this._lastPreviewStats }
           : {}),
       };
     } finally {
       this.config = savedConfig;
       this._adaptivePicker = savedPicker;
       this._cachedHeadStartIndex = savedHeadCache;
-      this.lastFrontierTokens = savedFrontier;
-      this.transitionBlocked = savedBlocked;
-      this._lastKvStable = savedKvStable;
-      this._rs = savedRs;
-      this._lastRenderStats = savedLastRs;
-      this._uncoveredDrops = savedDrops;
-      this._emittedSummaryIds = savedEmitted;
-      this._plannedTokens = savedPlannedTokens;
-      this._plannedMeta = savedPlannedMeta;
       this._lastPreview = undefined;
+      this._lastPreviewStats = undefined;
       this._previewInFlight = false;
     }
   }
@@ -4741,17 +4717,65 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.requireLoadedBranch('select');
       const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
       const _t0 = _diag ? Date.now() : 0;
+    if (opts?.dryRun !== true) {
       this.rebuildChunks(store);
       if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
+      return this.selectPath(store, budget, opts);
+    }
+    // A dry run commits nothing, and that includes what a select leaves for
+    // the next one and for observers: the cache-marker baseline the next
+    // compile measures its stable prefix against, the transition status
+    // (getHotContextSettings), the render stats (getRenderStats, with its
+    // plan-vs-actual) and calibration's estimate and arming stay as the last
+    // committing select left them. They are put back here, on every path out,
+    // throws included; each select path gates its own persistence and
+    // enqueueing. The dry run's own render stats are its output, as its plan
+    // is (_lastPreview), and previewContext reads them from _lastPreviewStats.
+    // Chunking runs dry too: a chunk the dry run closes gets no record, and
+    // the chunks and compression queue go back to the last committing
+    // rebuild's, so no tick compresses what only a dry run (or a preview's
+    // overridden chunk size) cut.
+    const saved = {
+      chunks: this.chunks,
+      compressionQueue: this.compressionQueue,
+      prevCacheKeys: this._prevCacheKeys,
+      lastFrontierTokens: this.lastFrontierTokens,
+      transitionBlocked: this.transitionBlocked,
+      lastRenderStats: this._lastRenderStats,
+      lastCompileEstimate: this._lastCompileEstimate,
+      calibrationArmed: this._calibrationArmed,
+    };
+    this._lastPreviewStats = undefined;
+    this._dryRunSelect = true;
+    try {
+      this.rebuildChunks(store);
+      if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
+      return this.selectPath(store, budget, opts);
+    } finally {
+      this._dryRunSelect = false;
+      if (this._lastRenderStats !== saved.lastRenderStats) {
+        this._lastPreviewStats = this._lastRenderStats ?? undefined;
+      }
+      this.chunks = saved.chunks;
+      this.compressionQueue = saved.compressionQueue;
+      this._prevCacheKeys = saved.prevCacheKeys;
+      this.lastFrontierTokens = saved.lastFrontierTokens;
+      this.transitionBlocked = saved.transitionBlocked;
+      this._lastRenderStats = saved.lastRenderStats;
+      this._lastCompileEstimate = saved.lastCompileEstimate;
+      this._calibrationArmed = saved.calibrationArmed;
+    }
+  }
 
+  private selectPath(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
     // Image stripping runs inside each select path (before stats commit / cache
     // markers), so the returned entries are already bounded — see
     // applyImageStripping.
     if (this.config.adaptiveResolution) {
       return this.selectAdaptive(store, budget, opts);
     }
-    // selectHierarchical commits nothing (no state-slot writes, no enqueue),
-    // so it is already dry-run-safe and needs no gating.
+    // selectHierarchical persists and enqueues nothing; what it leaves for
+    // observers (render stats) select() restores for a dry run.
     return this.selectHierarchical(store, budget);
   }
 
@@ -8357,11 +8381,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       opts?.kvUnifiedImmutablePrefixHash,
       opts?.kvUnifiedContinuityRelaxation,
     );
-    // NOTE: a dry run also disturbs transition bookkeeping below
+    // NOTE: a dry run also writes transition bookkeeping below
     // (`lastFrontierTokens` feeds `prepared` in getHotContextSettings(), so a
-    // low-budget preview could make a converging transition look prepared and
-    // get it settled by the next real compile). That is restored by
-    // previewContext's `finally`, which owns it for ALL throw paths — do not
+    // low-budget dry run could make a converging transition look prepared).
+    // select() puts it back for every dry run, on ALL throw paths — do not
     // also restore it here, or the two owners will disagree.
     if (_diag) { console.error(`[cm-cache] selectAdaptive: inputs-built ${Date.now() - _t}ms`); _t = Date.now(); }
     const result = picker.run(pickerInputs, foldingBudget);
@@ -8499,9 +8522,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // Record what a dry run needs, then restore the transition bookkeeping the
-    // pick just clobbered. Done before the over-budget check so an infeasible
-    // preview still reports instead of leaving state disturbed.
+    // Record what a dry run needs (select() puts back the transition
+    // bookkeeping the pick just wrote). Done before the over-budget check so
+    // an infeasible preview still reports.
     if (dryRun) {
       this._lastPreview = {
         finalTokens: result.finalTokens,
@@ -8860,7 +8883,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // real strategy to ~50% (docs/kv-stable-context-control.md — marker
     // placement is the dominant KV lever).
     this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
-    if (this.config.foldingStrategy === 'kv-unified' && this.kvUnifiedDraft) {
+    // A dry run made no draft of its own (see the draft's creation), so the
+    // draft here is the last real compile's, which a dry layout must not
+    // re-mark.
+    if (this.config.foldingStrategy === 'kv-unified' && this.kvUnifiedDraft && !dryRun) {
       this.kvUnifiedDraft.markerUnitIndices = this.reconcileKvUnifiedMarkerIndices(
         merged, this.kvUnifiedDraft.layout, headMessageIds, tailMessageIds,
       );
@@ -10674,8 +10700,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         compressed: false,
       };
       // Persist the boundary the moment it closes — from here on this
-      // span is owned and never re-keyed by config drift or restarts.
-      if (this.chunkPersistenceEnabled) {
+      // span is owned and never re-keyed by config drift or restarts. A dry
+      // select's chunks stay unrecorded: select() puts the last committing
+      // rebuild's chunks back after it.
+      if (this.chunkPersistenceEnabled && !this._dryRunSelect) {
         const record: ChunkRecord = {
           id: `c-${this.chunkIdCounter++}`,
           sourceIds: chunk.messages.map(m => m.id),

@@ -170,10 +170,13 @@ export interface ContextStrategy {
    *
    * `opts.dryRun` requests a NON-COMMITTING select: the returned entries are
    * what a real compile at this budget would produce, but no fold resolutions
-   * are persisted, no compression/merge work is enqueued, and no transition
-   * bookkeeping is advanced. Implementations that cannot honour it must
-   * ignore it only if they are already side-effect-free (see
-   * `selectHierarchical`); any path that commits state MUST gate on it.
+   * or chunk records are persisted, no compression/merge work is enqueued, no transition
+   * bookkeeping is advanced, and what a select leaves for the next one or for
+   * observers (its cache-marker baseline, transition status, render stats,
+   * and calibration's estimate and arming) stays as the last committing
+   * select left it. Implementations that cannot
+   * honour it must ignore it only if they are already side-effect-free; any
+   * path that commits state MUST gate on it.
    */
   select(
     store: MessageStoreView,
@@ -211,8 +214,16 @@ export interface ContextStrategy {
 export interface SelectOptions {
   /**
    * Compute the layout without committing anything: no resolution persistence,
-   * no produce/merge enqueue, no shadow production pick, and no transition
-   * bookkeeping. Over-budget becomes a reported condition rather than a throw.
+   * no chunk record and no compression queued for a chunk the select's
+   * rebuild closes, no produce/merge enqueue, no shadow production pick, no
+   * transition bookkeeping, and nothing a select leaves for the next one or for
+   * observers (the cache-marker baseline, the transition status, the render
+   * stats, calibration's estimate and arming), all on every path out, throws
+   * included. An over-budget plan doesn't throw at the plan check; a later
+   * stage that can't fit still throws, as for a real compile, leaving nothing
+   * behind, and only `previewContext` turns every such throw into a report. A
+   * compression hold that has expired still expires at a dry compile, as at
+   * every hold query: its clock is its own.
    */
   dryRun?: boolean;
   /** Exact normalized tools/system/context-prefix identity supplied by the

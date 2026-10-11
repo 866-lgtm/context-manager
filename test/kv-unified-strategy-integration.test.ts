@@ -105,6 +105,24 @@ test('kv-unified failed submission clears single flight without committing', asy
   manager.close();
 });
 
+test('a dry compile leaves the last real compile\u2019s kv-unified draft markers alone', async () => {
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  for (let i = 0; i < 12; i++) {
+    manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text: `turn ${i} ` + 'word '.repeat(30) }]);
+  }
+  const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+  await manager.compile(budget, undefined, { kvUnifiedImmutablePrefixHash: 'immutable-v1' });
+  const draft = () => (selected as unknown as { kvUnifiedDraft: { markerUnitIndices: number[] } | null }).kvUnifiedDraft;
+  const before = [...draft()!.markerUnitIndices];
+  for (let i = 0; i < 6; i++) {
+    manager.addMessage('user', [{ type: 'text', text: `later ${i} ` + 'word '.repeat(30) }]);
+  }
+  await manager.compile(budget, undefined, { dryRun: true, kvUnifiedImmutablePrefixHash: 'immutable-v1' });
+  assert.deepEqual(draft()!.markerUnitIndices, before, 'the submission would carry markers from a layout never sent');
+  manager.close();
+});
+
 test('kv-unified places token-weighted 33/66/100 history markers plus tail', () => {
   const selected = strategy();
   const entries = Array.from({ length: 12 }, (_, index) => ({
