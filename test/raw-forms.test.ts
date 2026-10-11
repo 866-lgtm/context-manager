@@ -80,6 +80,8 @@ const opaqueCarrier = (): ContentBlock =>
 const searchCall = (): ContentBlock =>
   ({ type: 'text', text: '', rawItem: { type: 'web_search_call', id: 'ws_1', status: 'completed' } } as ContentBlock);
 const signedThinking = (): ContentBlock => ({ type: 'thinking', thinking: 'mm', signature: 'sig' } as ContentBlock);
+// membrane#101's carrier for a <function_calls> block that dispatched nothing: its rawXml is its whole text.
+const attempt = (rawXml = CALLS_XML): ContentBlock => ({ type: 'tool_attempt', rawXml } as unknown as ContentBlock);
 
 describe('raw forms: keys and release', () => {
   it('keys a raw form as the formatters tell them apart', () => {
@@ -91,6 +93,22 @@ describe('raw forms: keys and release', () => {
     assert.deepEqual(rawFormKeys({ type: 'tool_use', id: 'a', name: 'n', input: {}, rawXml: '' } as ContentBlock), []);
     assert.deepEqual(rawFormKeys(itemText('t', 'not-an-object')), []);
     assert.deepEqual(rawFormKeys({ type: 'text', text: 'plain' }), []);
+    // The XML formatter replays rawXml only on tool_use and tool_result runs; elsewhere it is content.
+    assert.deepEqual(rawFormKeys(attempt()), []);
+  });
+
+  it('a block whose rawXml is its content keeps it when a dispatched block with the same text goes', () => {
+    // Two byte-identical <function_calls> blocks in one message: the first dispatched, so its tool_use carries
+    // the text as rawXml; the second refused whole (say, a per-turn cap), so a tool_attempt carries it.
+    const use = xmlUse('a', '/big');
+    const refused = attempt();
+    for (const release of [releaseEditedRawForms, releaseVanishedRawForms]) {
+      const after = release([use, refused], [refused]);
+      assert.equal(after[0], refused, `${release.name}: the attempt is untouched, by identity`);
+      assert.equal(rawOf(after[0]).rawXml, CALLS_XML);
+    }
+    assert.equal(withoutRawForms(refused), refused, 'nothing strips it');
+    assert.equal(releaseSharedRawFormsOnMove(use, [use, refused]), use, 'nor does a move share it');
   });
 
   it('an edited block and every block sharing its raw form give it up; an unrelated one keeps its own', () => {

@@ -58,6 +58,13 @@ import type { ContentBlock } from '@animalabs/membrane';
 type RawFormCarrier = { rawXml?: unknown; rawItem?: unknown };
 
 function xmlKey(block: ContentBlock): string | undefined {
+  // The XML formatter replays `rawXml` only for runs of tool_use and
+  // tool_result blocks. On any other block it is not a replay form, and
+  // releasing it would leave the block with nothing to render: the
+  // `tool_attempt` block proposed in membrane#101 (a `<function_calls>` block
+  // that dispatched nothing) carries its whole text there, which can be
+  // byte-identical to a dispatched block's `rawXml` in the same message.
+  if (block.type !== 'tool_use' && block.type !== 'tool_result') return undefined;
   const raw = (block as RawFormCarrier).rawXml;
   // The XML formatter replays only a non-empty string.
   return typeof raw === 'string' && raw.length > 0 ? `xml:${raw}` : undefined;
