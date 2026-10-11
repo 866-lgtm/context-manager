@@ -553,6 +553,48 @@ describe('sharded writes declare their group size', () => {
     }
   });
 
+  it('a listener that throws fails neither its write nor a sharded body', async () => {
+    const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    class Sharding extends PassthroughStrategy {
+      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+        return { bodyGroupId: 'three', shards: content.map((block, i) => ({ content: [block], shardIndex: i })) };
+      }
+    }
+    const path = './test-listener-throws';
+    rmSync(path, { recursive: true, force: true });
+    const error = console.error;
+    const logged: string[] = [];
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      const cm = await ContextManager.open({ path, strategy: new Sharding() });
+      const heard: string[] = [];
+      let throwOn = -1;
+      cm.onMessage((event) => {
+        heard.push(event.type);
+        if (heard.length === throwOn) throw new Error('listener failed');
+      });
+      throwOn = 1;
+      const plain = cm.addMessage('bob', [text('plain')]);
+      // The last shard's listener throws, and then a middle one's.
+      throwOn = 4;
+      const last = cm.addMessage('alice', [text('one '), text('two '), text('three')]);
+      throwOn = 6;
+      const middle = cm.addMessage('carol', [text('four '), text('five '), text('six')]);
+      assert.deepEqual(heard, ['add', 'add', 'add', 'add', 'add', 'add', 'add'], 'every shard heard, nothing removed');
+      assert.equal(logged.filter((l) => l.includes('a listener threw')).length, 3);
+      const result = await cm.compile();
+      const bodies = result.provenance!.messages.flatMap((m) => (m.kind === 'raw' ? m.bodies : []));
+      for (const id of [plain, last, middle]) {
+        assert.equal(bodies.find((b) => b.messageId === id)?.complete, true, `${id}: stored whole`);
+      }
+      cm.close();
+    } finally {
+      console.error = error;
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
   it('a sharded write that fails partway leaves nothing behind, and a retry writes one complete body', async () => {
     const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
     const { JsStore } = await import('@animalabs/chronicle');

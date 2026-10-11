@@ -386,6 +386,8 @@ interface StoreIndex {
 }
 
 const storeIndexes = new WeakMap<JsStore, StoreIndex>();
+/** Store objects whose index couldn't be read for a compile's mark, already reported. */
+const markFailures = new WeakSet<JsStore>();
 
 function stateKey(namespace: string, branch: Pick<BranchRef, 'id' | 'created'>): string {
   return `${namespace}\u0000${branch.id}@${branch.created}`;
@@ -395,20 +397,23 @@ function stateKey(namespace: string, branch: Pick<BranchRef, 'id' | 'created'>):
 function storeIndex(store: JsStore): StoreIndex {
   let index = storeIndexes.get(store);
   if (!index) {
-    index = { ids: store.getRecordIdsByType(ACCEPTED_LAYOUT_RECORD), stale: false, durable: 0, mark: null, newest: null, branches: new Map(), warned: new Set() };
-    storeIndexes.set(store, index);
-    if (index.ids.length > 0) {
+    const built: StoreIndex = { ids: store.getRecordIdsByType(ACCEPTED_LAYOUT_RECORD), stale: false, durable: 0, mark: null, newest: null, branches: new Map(), warned: new Set() };
+    if (built.ids.length > 0) {
       // One sync makes everything present at open durable, so a compile can
       // carry any of it as its mark: a record a crash could still take might
       // have its id reissued.
       store.sync();
-      index.durable = index.ids.length;
-      index.newest = readHead(store, index, index.ids[index.ids.length - 1]!);
-      for (let i = index.ids.length - 1; i >= 0 && !index.mark; i--) {
-        const head = i === index.ids.length - 1 ? index.newest : readHead(store, index, index.ids[i]!);
-        if (head) index.mark = { recordId: head.id, compileId: head.compileId };
+      built.durable = built.ids.length;
+      built.newest = readHead(store, built, built.ids[built.ids.length - 1]!);
+      for (let i = built.ids.length - 1; i >= 0 && !built.mark; i--) {
+        const head = i === built.ids.length - 1 ? built.newest : readHead(store, built, built.ids[i]!);
+        if (head) built.mark = { recordId: head.id, compileId: head.compileId };
       }
     }
+    // Kept only once every step above has succeeded, so a failed one is
+    // tried again at the next use.
+    storeIndexes.set(store, built);
+    index = built;
   } else if (index.stale) {
     // Only an append of this object's can have added to the list: one at a
     // time, so a read that throws partway counts nothing twice.
@@ -487,9 +492,22 @@ export class FoldJournal {
     private readonly namespace: string,
   ) {}
 
-  /** Where the journal stands, for a compile to carry (see JournalMark). */
+  /**
+   * Where the journal stands, for a compile to carry (see JournalMark).
+   * Called inside every compile, so it never throws: when the store can't
+   * be read or synced, the compile carries no mark (an acceptance of it then
+   * reads every record), and the failure is reported once per store object.
+   */
   mark(): JournalMark | null {
-    return storeIndex(this.store).mark;
+    try {
+      return storeIndex(this.store).mark;
+    } catch (err) {
+      if (!markFailures.has(this.store)) {
+        markFailures.add(this.store);
+        console.error(`[fold-journal] can't tell where the journal stands (${(err as Error).message}); compiles carry no mark until it can`);
+      }
+      return null;
+    }
   }
 
   setSource(source: ReceiptSource): void {

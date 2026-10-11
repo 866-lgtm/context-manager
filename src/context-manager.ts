@@ -832,7 +832,9 @@ export class ContextManager {
    * so it can run while a sharded addMessage is still storing that body's
    * remaining shards. It must not add a message synchronously: one added there
    * would land between a body's shards and split the body (body-runs.ts).
-   * Add it after the call returns (a microtask or later) instead.
+   * Add it after the call returns (a microtask or later) instead. A listener
+   * that throws is logged, and the write it heard stands: the throw doesn't
+   * reach the caller.
    */
   onMessage(listener: MessageStoreListener): () => void {
     return this.messageStore.addListener(listener);

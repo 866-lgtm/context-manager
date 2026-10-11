@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
-import type { JsStore } from '@animalabs/chronicle';
+import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy } from '../src/index.js';
 import { FoldJournal, applyLayoutChain, applyLayoutDelta, decodeSequences, encodeSequences, layoutDelta } from '../src/fold-journal.js';
 import type { StoredLayout } from '../src/fold-journal.js';
@@ -1329,6 +1329,34 @@ describe('fold journal durability and index', () => {
       console.error = error;
     }
     cm.close();
+  });
+
+  it('a compile never fails because the journal cannot be read: it carries no mark, and a later compile tries again', async () => {
+    let { cm } = await open();
+    add(cm, 3);
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    cm.close();
+
+    const real = JsStore.openOrCreate({ path: STORE });
+    let failSync = false;
+    const flaky = wrapStore(real, { sync: () => { if (failSync) throw new Error('EIO (injected)'); real.sync(); } });
+    cm = await ContextManager.open({ store: flaky, strategy: new ScriptedStrategy(), namespace: 'agents/tester' });
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      failSync = true;
+      const first = await cm.compile(BUDGET);
+      assert.equal(first.provenance?.journalMark, null, 'the compile stands, without a mark');
+      await cm.compile(BUDGET);
+      assert.equal(errors.filter((e) => e.includes("can't tell where the journal stands")).length, 1, 'reported once');
+      failSync = false;
+      const later = await cm.compile(BUDGET);
+      assert.equal(later.provenance?.journalMark?.recordId, real.getRecordIdsByType('context-manager/accepted-layout').at(-1), 'the index was not kept half-built: the next compile has its mark');
+    } finally {
+      console.error = error;
+      cm.close();
+    }
   });
 
   it('a store id found rather than minted is made durable before it is handed out', async () => {
