@@ -582,7 +582,7 @@ describe('sharded writes declare their group size', () => {
       throwOn = 6;
       const middle = cm.addMessage('carol', [text('four '), text('five '), text('six')]);
       assert.deepEqual(heard, ['add', 'add', 'add', 'add', 'add', 'add', 'add'], 'every shard heard, nothing removed');
-      assert.equal(logged.filter((l) => l.includes('a listener threw')).length, 3);
+      assert.equal(logged.filter((l) => l.includes('onMessage listener threw')).length, 3);
       const result = await cm.compile();
       const bodies = result.provenance!.messages.flatMap((m) => (m.kind === 'raw' ? m.bodies : []));
       for (const id of [plain, last, middle]) {
@@ -593,6 +593,17 @@ describe('sharded writes declare their group size', () => {
       console.error = error;
       rmSync(path, { recursive: true, force: true });
     }
+  });
+
+  it("the manager's own listener stays outside that: a failed propagation still fails the write", async () => {
+    await withManager('./test-own-listener', async (open) => {
+      const cm = await open();
+      const id = cm.addMessage('alice', [text('before')]);
+      const log = (cm as unknown as { contextLog: { findBySource: (id: string) => unknown } }).contextLog;
+      log.findBySource = () => { throw new Error('context log unwritable'); };
+      assert.throws(() => cm.editMessage(id, [text('after')]), /context log unwritable/);
+      cm.close();
+    });
   });
 
   it('a sharded write that fails partway leaves nothing behind, and a retry writes one complete body', async () => {

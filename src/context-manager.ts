@@ -837,7 +837,16 @@ export class ContextManager {
    * reach the caller.
    */
   onMessage(listener: MessageStoreListener): () => void {
-    return this.messageStore.addListener(listener);
+    // A host's listener observes; its throw isn't the write's failure. The
+    // manager's own listener (the context log's propagation) stays outside
+    // this, so a failure there still fails the write as before.
+    return this.messageStore.addListener((event) => {
+      try {
+        listener(event);
+      } catch (err) {
+        console.error(`[context-manager] an onMessage listener threw on a '${event.type}' event; the write stands:`, err);
+      }
+    });
   }
 
   /**

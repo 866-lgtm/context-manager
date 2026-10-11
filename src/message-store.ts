@@ -305,18 +305,9 @@ export class MessageStore {
     return () => this.listeners.delete(listener);
   }
 
-  /**
-   * Tell every listener. A listener that throws is reported and the rest are
-   * still told: the write that emitted the event has landed, so it stands,
-   * and a caller isn't told it failed (a retry would write it again).
-   */
   private emit(event: MessageStoreEvent): void {
     for (const listener of this.listeners) {
-      try {
-        listener(event);
-      } catch (err) {
-        console.error(`[message-store] a listener threw on a '${event.type}' event; the write stands:`, err);
-      }
+      listener(event);
     }
   }
 

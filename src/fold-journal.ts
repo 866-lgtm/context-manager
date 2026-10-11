@@ -504,7 +504,7 @@ export class FoldJournal {
     } catch (err) {
       if (!markFailures.has(this.store)) {
         markFailures.add(this.store);
-        console.error(`[fold-journal] can't tell where the journal stands (${(err as Error).message}); compiles carry no mark until it can`);
+        console.error(`[fold-journal] can't tell where the journal stands (${err instanceof Error ? err.message : String(err)}); compiles carry no mark until it can`);
       }
       return null;
     }
