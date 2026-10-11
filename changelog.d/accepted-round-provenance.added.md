@@ -98,7 +98,8 @@
     on a branch, the branch's newest receipt if the manager hasn't announced
     it: one whose write reported a failure, one another manager wrote, or one
     from before a reopen. So it can hear a receipt again, and needn't hear
-    every receipt: key on the receipt's id, and read `listFoldReceipts` for
-    the whole record.
+    every receipt: key on the receipt's id and `compileId` (a receipt lost to
+    Chronicle's rot exception can have its id go to a later receipt), and
+    read `listFoldReceipts` for the whole record.
   - `getStoreId`, `currentBranchRef` and `describeRenderedForms` support hosts
     that export or explain them.

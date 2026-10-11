@@ -453,10 +453,13 @@ describe('sharded writes declare their group size', () => {
       } finally {
         console.error = error;
       }
-      assert.ok(logged.some((l) => l.includes('could not be removed')), 'the failed removal is reported');
       store.append = append;
       store.removeBodyGroup = removeBodyGroup;
       const [head] = cm.getAllMessages();
+      assert.ok(
+        logged.some((l) => l.includes('removing what it wrote threw') && l.includes(`body group ${head!.bodyGroupId} (first shard ${head!.id})`)),
+        `the failed removal is reported, naming the short body: ${logged.join('\n')}`,
+      );
       assert.equal(head!.shardCount, 2, 'the stored shard declares the whole group');
       const first = await cm.compile();
       const raw = first.provenance!.messages.find((m) => m.kind === 'raw' && m.bodies[0]!.messageId === head!.id);
@@ -471,6 +474,37 @@ describe('sharded writes declare their group size', () => {
       assert.equal(rawAgain.bodies[0]!.complete, false);
       assert.deepEqual(rawAgain.bodies[0]!.missing, ['shards']);
       reopened.close();
+    });
+  });
+
+  it('a rollback whose own reads fail still raises the write\'s error, and reports it', async () => {
+    await withManager('./test-shard-count-recovery-read', async (open) => {
+      const cm = await open();
+      const store = (cm as unknown as { messageStore: { append: (...args: unknown[]) => unknown; getTail: (n: number) => unknown[] } }).messageStore;
+      const append = store.append.bind(store);
+      const getTail = store.getTail.bind(store);
+      // The first shard lands, then its append throws, so the rollback has
+      // to read the store's tail to find it, and that read fails too.
+      store.append = (...args: unknown[]) => {
+        append(...args);
+        throw new Error('injected failure after the first shard landed');
+      };
+      store.getTail = () => { throw new Error('injected failure of the tail read'); };
+      const error = console.error;
+      const logged: string[] = [];
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        assert.throws(() => cm.addMessage('alice', [text('[header]'), text('the body')]), /injected failure after the first shard landed/);
+      } finally {
+        console.error = error;
+        store.append = append;
+        store.getTail = getTail;
+      }
+      assert.ok(
+        logged.some((l) => l.includes('removing what it wrote threw') && l.includes('injected failure of the tail read')),
+        `the failed recovery is reported: ${logged.join('\n')}`,
+      );
+      cm.close();
     });
   });
 
@@ -591,6 +625,8 @@ describe('sharded writes declare their group size', () => {
       const middle = cm.addMessage('carol', [text('four '), text('five '), text('six')]);
       assert.deepEqual(heard, ['add', 'add', 'add', 'add', 'add', 'add', 'add'], 'every shard heard, nothing removed');
       assert.equal(logged.filter((l) => l.includes('onMessage listener threw')).length, 3);
+      assert.ok(logged.some((l) => l.includes(`'add' event for message ${plain};`)), 'each names the message it missed');
+      assert.ok(logged.some((l) => l.includes('onMessage listener threw') && l.includes('(body group three);')), "and a shard's body group");
       const result = await cm.compile();
       const bodies = result.provenance!.messages.flatMap((m) => (m.kind === 'raw' ? m.bodies : []));
       for (const id of [plain, last, middle]) {

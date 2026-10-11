@@ -46,6 +46,8 @@ class ScriptedStrategy implements ContextStrategy {
   /** Message ids rendered raw although their plan names a summary that
    *  still covers them (a pin keeps a covered message raw). */
   pinned = new Set<string>();
+  /** Summary ids describeRenderedSummaries leaves out (it can't describe them). */
+  undescribed = new Set<string>();
   cause: string | undefined;
 
   checkReadiness(): ReadinessState {
@@ -77,6 +79,7 @@ class ScriptedStrategy implements ContextStrategy {
   describeRenderedSummaries(ids: readonly string[]): ReadonlyMap<string, RenderedSummaryInfo> {
     const out = new Map<string, RenderedSummaryInfo>();
     for (const id of ids) {
+      if (this.undescribed.has(id)) continue;
       const leaves: string[] = [];
       let level = 0;
       for (const [mid, form] of this.plan) {
@@ -529,6 +532,12 @@ describe('fold journal', () => {
     assert.deepEqual(announced, [landedReceipt!.id], 'and announced once, so a projection converges');
     assert.equal(journal.accept(second, Date.now(), undefined)?.id, landedReceipt!.id);
     assert.equal(announced.length, 1, 'never twice');
+    // Only each branch's newest announced receipt is kept, so an older one a
+    // retry finds is heard again (listeners key on ids), and the newest stays once.
+    assert.equal(journal.accept(first, Date.now(), undefined)?.id, baseline!.id);
+    assert.deepEqual(announced, [landedReceipt!.id, baseline!.id], 'an older receipt a retry finds is heard again');
+    assert.equal(journal.accept(second, Date.now(), undefined)?.id, landedReceipt!.id);
+    assert.deepEqual(announced, [landedReceipt!.id, baseline!.id], 'and the newest still once');
     assert.equal(retry.accept(second, Date.now(), undefined)?.id, landedReceipt!.id, 'a fresh journal finds it too');
 
     // The ordinary next-activation path: the uncertain write was on the
@@ -1471,6 +1480,114 @@ describe('fold journal durability and index', () => {
     cm.close();
   });
 
+  it('reports a record the store no longer has as missing, not as damaged', async () => {
+    const { cm } = await open();
+    add(cm, 2);
+    await acceptCompile(cm);
+    add(cm, 1, 'n');
+    await acceptCompile(cm);
+    const real = cm.getStore();
+    const gone = real.getRecordIdsByType('context-manager/accepted-layout').at(-1)!;
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      // As after a rot: the id is listed, but the store has no record for it.
+      const journal = new FoldJournal(wrapStore(real, { getRecord: (id: string) => (id === gone ? null : real.getRecord(id)) }), 'agents/tester');
+      journal.query({ limit: 10 });
+      assert.ok(errors.some((e) => e.includes(`accepted-layout record ${gone} is missing`)), errors.join('\n'));
+      assert.ok(!errors.some((e) => e.includes(`record ${gone} is unreadable`)), 'not reported as damaged');
+    } finally {
+      console.error = error;
+    }
+    cm.close();
+  });
+
+  it('a store whose identity record cannot be read mints a new id, says so, and keeps it', async () => {
+    let { cm } = await open();
+    cm.getStore().appendJson('context-manager/store-identity', { v: 1 });
+    const errors: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    let minted: string;
+    try {
+      minted = cm.getStoreId();
+      assert.ok(errors.some((e) => e.includes("identity record") && e.includes("can't be read") && e.includes(minted)), errors.join('\n'));
+    } finally {
+      console.error = error;
+    }
+    cm.close();
+    ({ cm } = await open());
+    assert.equal(cm.getStoreId(), minted!, 'the new id is the store\'s from then on');
+    cm.close();
+  });
+
+  it('listing says when the newest record, unreadable or of another format, may hide receipts', async () => {
+    let { cm, strategy } = await open();
+    add(cm, 3);
+    const baseline = await acceptCompile(cm);
+    assert.equal(baseline?.kind, 'baseline');
+    const layoutIds = () => cm.getStore().getRecordIdsByType('context-manager/accepted-layout');
+    const error = console.error;
+    console.error = () => {};
+    try {
+      // An unreadable record above the branch's newest readable one: the
+      // readable history is listed, and the note says what may be missing.
+      const newest = JSON.parse(cm.getStore().getRecord(layoutIds().at(-1)!)!.payload.toString('utf8'));
+      cm.getStore().appendJson('context-manager/accepted-layout', { hello: 'world' });
+      const unreadable = layoutIds().at(-1)!;
+      cm.close();
+      ({ cm } = await open(strategy));
+      let listed = cm.listFoldReceipts({ limit: 10 });
+      assert.deepEqual(listed.receipts.map((r) => r.id), [baseline!.id], 'the readable receipts are listed');
+      assert.match(listed.note ?? '', new RegExp(`Record ${unreadable}, newer than this branch's newest readable record, can't be read`));
+      // A newest record of another format: its links aren't read, so nothing
+      // is listed, and the note says why.
+      cm.getStore().appendJson('context-manager/accepted-layout', { ...newest, v: 2, compileId: 'older-format' });
+      const other = layoutIds().at(-1)!;
+      cm.close();
+      ({ cm } = await open(strategy));
+      listed = cm.listFoldReceipts({ limit: 10 });
+      assert.deepEqual(listed.receipts, []);
+      assert.match(listed.note ?? '', new RegExp(`newest record, ${other}, is of another format`));
+    } finally {
+      console.error = error;
+    }
+    cm.close();
+  });
+
+  it('a compile that renders a summary its strategy cannot describe has no layout, records nothing, and is reported once per summary', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    strategy.plan.set(ids[0]!, { summary: 's1', level: 1 });
+    strategy.undescribed.add('s1');
+    const layoutCount = () => cm.getStore().getRecordIdsByType('context-manager/accepted-layout').length;
+    const before = layoutCount();
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+    try {
+      for (let i = 0; i < 2; i++) {
+        const { provenance } = await cm.compile(BUDGET);
+        assert.equal(provenance?.layout, null, 'no layout is reported');
+        assert.equal(provenance?.journalMark, undefined, 'so no mark is asked for');
+        assert.equal(cm.acceptRound({ provenance: provenance! }), null, 'and nothing is recorded');
+      }
+      assert.equal(layoutCount(), before, 'nothing written');
+      assert.equal(warnings.filter((w) => w.includes('cannot describe') && w.includes('s1')).length, 1, 'reported once for that summary');
+      // Described again, the next compile records its layout, and its receipt
+      // carries the change since the last layout recorded.
+      strategy.undescribed.delete('s1');
+      const receipt = await acceptCompile(cm);
+      assert.equal(receipt?.kind, 'change');
+      assert.ok(receipt?.changes?.some((c) => c.after.form === 'summary'), 'the summary the dropped compiles rendered');
+    } finally {
+      console.warn = warn;
+    }
+    cm.close();
+  });
+
   it('a chain that leaves its branch gives a baseline', async () => {
     let { cm, strategy } = await open();
     add(cm, 3);
@@ -1514,11 +1631,18 @@ describe('fold journal durability and index', () => {
     // points forward, past itself.
     for (const [what, pr] of [['a link to no record', '0'], ['a link forward', '999999999']] as const) {
       cm.getStore().appendJson('context-manager/accepted-layout', { ...record, compileId: `cut-${pr}`, pr });
+      const cutAt = cm.getStore().getRecordIdsByType('context-manager/accepted-layout').at(-1)!;
       cm.close();
       ({ cm } = await open(strategy));
       const result = cm.listFoldReceipts({ limit: 10 });
       assert.equal(result.receipts.length, 1, what);
-      assert.match(result.note ?? '', new RegExp(`aren't listed: record ${pr}`), what);
+      assert.match(
+        result.note ?? '',
+        pr === '0'
+          ? /aren't listed: record 0, which links to them, can't be read as a receipt/
+          : new RegExp(`aren't listed: record ${cutAt} links to ${pr}, which isn't before it`),
+        what,
+      );
     }
     cm.close();
   });

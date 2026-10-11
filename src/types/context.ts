@@ -248,10 +248,11 @@ export interface CompileProvenance {
 /**
  * The newest accepted-layout record known durable when a compile ran, and
  * the compile that record accepted. Any acceptance of the compile was
- * written after it. A durable record outlives a crash and keeps its id, so
- * only the records after it need reading; one that is gone, or whose id now
- * names another compile (a record at the end of the log can rot, and its id
- * then goes to a later one), proves nothing, and every record is read.
+ * written after it. A durable record outlives a crash with its id, unless it
+ * is the log's last record and rots: open drops it, and its id can go to a
+ * later record. So only the records after the mark need reading, and a mark
+ * that is gone, or whose id now names another compile, proves nothing, and
+ * every record is read.
  */
 export interface JournalMark {
   recordId: string;

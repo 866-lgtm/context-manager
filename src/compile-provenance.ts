@@ -375,8 +375,10 @@ function compositeCovers(content: ContentBlock[], members: StoredMessage[]): boo
  * order. Additions are allowed (a strategy may prefix a provenance header or
  * merge it into the first text block); losses are not: a truncated text, a
  * stripped image, or a block a structural repair removed makes the copy
- * partial. Each stored block must be covered by a later rendered block of
- * the same kind — a text block by one that contains its whole text.
+ * partial. Each stored block must be covered, in order, by a rendered block
+ * of the same kind: a text block by one that contains its whole text, where
+ * consecutive stored texts may share one rendered text block that joins
+ * them, each found after the one before.
  */
 export function coversStoredContent(rendered: readonly ContentBlock[], stored: readonly ContentBlock[]): boolean {
   if (rendered === stored) return true;

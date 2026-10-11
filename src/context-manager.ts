@@ -574,22 +574,25 @@ export class ContextManager {
             if (firstId === null) firstId = message.id;
           }
         } catch (err) {
-          // A write that fails partway leaves no part of the body behind:
-          // remove what it wrote (the failing shard too, if it landed), so a
-          // retry writes one body. If that fails as well, the shards stay,
-          // and shardCount marks the body short. The first shard's own
-          // append can throw after it landed: then it's the store's last.
+          // A write that fails partway leaves no part of the body in the
+          // store: remove what it wrote (the failing shard too, if it
+          // landed), so a retry writes one body. If that fails as well, the
+          // shards may stay, and shardCount marks the body short. The first
+          // shard's own append can throw after it landed: then it's the
+          // store's last. Nothing here replaces the write's own error.
           let landed = firstId;
-          if (landed === null && this.messageStore.length() > lengthBefore) {
-            const last = this.messageStore.getTail(1)[0];
-            if (last?.bodyGroupId === decision.bodyGroupId) landed = last.id;
-          }
-          if (landed !== null) {
-            try {
-              this.messageStore.removeBodyGroup(landed);
-            } catch (removal) {
-              console.error(`[context-manager] a sharded addMessage failed partway, and its shards could not be removed: ${(removal as Error).message}`);
+          try {
+            if (landed === null && this.messageStore.length() > lengthBefore) {
+              const last = this.messageStore.getTail(1)[0];
+              if (last?.bodyGroupId === decision.bodyGroupId) landed = last.id;
             }
+            if (landed !== null) this.messageStore.removeBodyGroup(landed);
+          } catch (removal) {
+            console.error(
+              `[context-manager] a sharded addMessage failed partway, and removing what it wrote threw, so body group ` +
+                `${decision.bodyGroupId}${landed !== null ? ` (first shard ${landed})` : ''} may be left short: ` +
+                (removal instanceof Error ? removal.message : String(removal)),
+            );
           }
           throw err;
         }
@@ -842,8 +845,10 @@ export class ContextManager {
    * remaining shards. It must not add a message synchronously: one added there
    * would land between a body's shards and split the body (body-runs.ts).
    * Add it after the call returns (a microtask or later) instead. A listener
-   * that throws is logged, and the write it heard stands: the throw doesn't
-   * reach the caller.
+   * that throws is logged, naming the message it missed, and the write it
+   * heard stands: the throw doesn't reach the caller. Each call registers
+   * its own listener and returns its own unsubscribe, so a function
+   * registered twice hears each event twice.
    */
   onMessage(listener: MessageStoreListener): () => void {
     // A host's listener observes; its throw isn't the write's failure. The
@@ -853,7 +858,7 @@ export class ContextManager {
       try {
         listener(event);
       } catch (err) {
-        console.error(`[context-manager] an onMessage listener threw on a '${event.type}' event; the write stands:`, err);
+        console.error(`[context-manager] an onMessage listener threw on a '${event.type}' event for ${describeStoreEvent(event)}; the write stands:`, err);
       }
     });
   }
@@ -1311,12 +1316,12 @@ export class ContextManager {
    * Accept a compile whose provider round succeeded. Call once a round that
    * carried `provenance`'s messages has stood. A compile is accepted once:
    * repeat calls (later rounds of the same compile, or a retry after an
-   * uncertain failure, from this manager or another on the store, before or
-   * after a reopen) are no-ops. Compares the compile's rendered layout with
-   * the last layout accepted on the compile's own branch in its namespace,
-   * by any manager of it on the store — even when another branch is selected
-   * by now — and appends a fold receipt when any message changed form, or a
-   * baseline when that branch has no record it can read.
+   * uncertain failure, from this manager or another of its namespace on the
+   * store, before or after a reopen) are no-ops. Compares the compile's
+   * rendered layout with the last layout accepted on the compile's own branch
+   * in its namespace, by any manager of it on the store — even when another
+   * branch is selected by now — and appends a fold receipt when any message
+   * changed form, or a baseline when that branch has no record it can read.
    * `usage` is the confirming round's own usage as the provider reported it;
    * leave a field undefined when it was not reported. `presentation` is how
    * that round carried the compile, as its producer reported (`verbatim`,
@@ -1331,9 +1336,10 @@ export class ContextManager {
    * receipt carries the changes of both rounds. A compile accepted before
    * returns what that acceptance returned, its receipt or null, so a retry
    * after an uncertain failure learns the outcome, and a receipt can come
-   * back again (key on its id). A provenance from another manager's
-   * namespace is refused with an error: accept a compile on the manager that
-   * compiled it.
+   * back again (key on its id and compileId: a receipt lost to Chronicle's
+   * rot exception can have its id go to a later receipt). A provenance of
+   * another namespace is refused with an error: accept a compile on the
+   * manager that compiled it.
    */
   acceptRound(args: {
     provenance: CompileProvenance;
@@ -1931,5 +1937,18 @@ export class ContextManager {
       contextEntryCount: this.contextLog.length(),
       branches: this.listBranches().length,
     };
+  }
+}
+
+/** What a store event was about, for a log line: its message (and body group), or its span. */
+function describeStoreEvent(event: MessageStoreEvent): string {
+  switch (event.type) {
+    case 'add':
+      return `message ${event.message.id}${event.message.bodyGroupId ? ` (body group ${event.message.bodyGroupId})` : ''}`;
+    case 'edit':
+    case 'remove':
+      return `message ${event.messageId}`;
+    case 'removeRange':
+      return `messages ${event.fromId} to ${event.toId}`;
   }
 }
