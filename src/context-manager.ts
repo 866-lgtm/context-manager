@@ -555,19 +555,34 @@ export class ContextManager {
         // anywhere but here and below, so nothing of its own can. A host's
         // onMessage listener runs inside each append, and its contract rules out
         // adding a message from there synchronously.
-        for (const shard of ordered) {
-          const message = this.messageStore.append(
-            participant,
-            shard.content,
-            metadata,
-            causedBy,
-            {
-              bodyGroupId: decision.bodyGroupId,
-              shardIndex: shard.shardIndex,
-              shardCount,
+        try {
+          for (const shard of ordered) {
+            const message = this.messageStore.append(
+              participant,
+              shard.content,
+              metadata,
+              causedBy,
+              {
+                bodyGroupId: decision.bodyGroupId,
+                shardIndex: shard.shardIndex,
+                shardCount,
+              }
+            );
+            if (firstId === null) firstId = message.id;
+          }
+        } catch (err) {
+          // A write that fails partway leaves no part of the body behind:
+          // remove what it wrote (the failing shard too, if it landed), so a
+          // retry writes one body. If that fails as well, the shards stay,
+          // and shardCount marks the body short.
+          if (firstId !== null) {
+            try {
+              this.messageStore.removeBodyGroup(firstId);
+            } catch (removal) {
+              console.error(`[context-manager] a sharded addMessage failed partway, and its shards could not be removed: ${(removal as Error).message}`);
             }
-          );
-          if (firstId === null) firstId = message.id;
+          }
+          throw err;
         }
         return firstId!;
       }

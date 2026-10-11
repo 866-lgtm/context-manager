@@ -423,6 +423,20 @@ describe('fold journal', () => {
     cm.close();
   });
 
+  it('records how the confirming round carried the compile, as its producer reported', async () => {
+    const { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    const verbatim = cm.acceptRound({ provenance: (await cm.compile(BUDGET)).provenance!, presentation: 'verbatim' });
+    assert.equal(verbatim?.presentation, 'verbatim');
+    strategy.plan.set(ids[0]!, 'omit');
+    const altered = cm.acceptRound({ provenance: (await cm.compile(BUDGET)).provenance!, presentation: 'altered' });
+    assert.equal(altered?.presentation, 'altered');
+    strategy.plan.set(ids[1]!, 'omit');
+    assert.equal((await acceptCompile(cm))?.presentation, 'unknown', 'unknown when not reported');
+    assert.deepEqual(cm.listFoldReceipts({ limit: 10 }).receipts.map((r) => r.presentation), ['unknown', 'altered', 'verbatim'], 'and as listed');
+    cm.close();
+  });
+
   it('records the source the host supplies, and names its store', async () => {
     const { cm } = await open();
     cm.setReceiptSource({ runtime: 'connectome-host', dataDirectory: '/data/linn', agent: 'Linn' });

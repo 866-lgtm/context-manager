@@ -66,7 +66,7 @@ export const ACCEPTED_LAYOUT_RECORD = 'context-manager/accepted-layout';
 /** The accepted-layout record format. Records of another format are not
  *  read: formats 1 and 2 were never released. */
 const RECORD_VERSION = 3;
-/** history--folds' limit bounds. */
+/** How many receipts listFoldReceipts returns when no limit is given, and the most it returns for any limit. */
 export const FOLD_QUERY_DEFAULT_LIMIT = 10;
 export const FOLD_QUERY_MAX_LIMIT = 100;
 
