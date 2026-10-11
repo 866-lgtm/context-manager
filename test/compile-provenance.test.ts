@@ -146,7 +146,7 @@ describe('attributeEntries', () => {
     const result = attributeEntries([copy(h1)], [h0, h1]);
     assert.deepEqual(result.sources[0], { kind: 'raw', bodies: [{ messageId: 'f0', sequence: 1, complete: false, missing: ['shards'] }] });
     assert.equal(result.rawComplete.get('f1'), false);
-    assert.deepEqual([...rawBodiesOf(result.sources, [h0, h1]).entries()].map(([k, v]) => [k, v.map((m) => m.id)]), [['f0', ['f0', 'f1']]]);
+    assert.deepEqual([...rawBodiesOf(result).entries()].map(([k, v]) => [k, v.map((m) => m.id)]), [['f0', ['f0', 'f1']]]);
 
     // A group written before sizes were declared: complete means every
     // stored member was carried, and a hidden one was not.
@@ -189,7 +189,7 @@ describe('a body is an ingestion, not its content hash', () => {
     const result = attributeEntries([copy(a0), copy(a1), copy(mid), copy(b0), copy(b1), copy(c0), copy(c1)], stored);
     const heads = result.sources.flatMap((s) => (s.kind === 'raw' ? s.bodies.map((b) => [b.messageId, b.complete]) : []));
     assert.deepEqual(heads, [['a0', true], ['a0', true], ['mid', true], ['b0', true], ['b0', true], ['c0', true], ['c0', true]]);
-    const bodies = rawBodiesOf(result.sources, stored);
+    const bodies = rawBodiesOf(result);
     assert.deepEqual([...bodies.entries()].map(([k, v]) => [k, v.map((m) => m.id)]), [
       ['a0', ['a0', 'a1']], ['mid', ['mid']], ['b0', ['b0', 'b1']], ['c0', ['c0', 'c1']],
     ]);
@@ -198,6 +198,50 @@ describe('a body is an ingestion, not its content hash', () => {
     // earlier one, and does not borrow it.
     const later = attributeEntries([copy(c0), copy(c1)], stored);
     assert.deepEqual(later.sources[0], { kind: 'raw', bodies: [{ messageId: 'c0', sequence: 6, complete: true }] });
+  });
+
+  it('reads bodies as body-runs.ts does, whatever the list', async () => {
+    const { bodyBoundsIn } = await import('../src/index.js');
+    const g = { bodyGroupId: 'bg-rule', shardCount: 2 };
+    const lists: StoredMessage[][] = [
+      // back to back, apart, and a shard 0 removed
+      [msg('a0', 1, [text('a')], { ...g, shardIndex: 0 }), msg('a1', 2, [text('b')], { ...g, shardIndex: 1 }),
+        msg('b0', 3, [text('a')], { ...g, shardIndex: 0 }), msg('b1', 4, [text('b')], { ...g, shardIndex: 1 }),
+        msg('x', 5, [text('solo')]), msg('c1', 6, [text('b')], { ...g, shardIndex: 1 })],
+      // a list in which something sits between two rising shards of one group
+      [msg('p0', 1, [text('a')], { ...g, shardIndex: 0 }), msg('mid', 2, [text('between')]), msg('p1', 3, [text('b')], { ...g, shardIndex: 1 })],
+    ];
+    for (const stored of lists) {
+      const { bodies } = attributeEntries(stored.map((m) => copy(m)), stored);
+      stored.forEach((m, i) => {
+        const { from, to } = bodyBoundsIn(stored, i);
+        assert.deepEqual(bodies.get(m.id)!.map((b) => b.id), stored.slice(from, to + 1).map((b) => b.id), m.id);
+      });
+    }
+  });
+
+  it('two back-to-back ingestions merge as two composites, each its own complete body', async () => {
+    const { AutobiographicalStrategy } = await import('../src/index.js');
+    class Merger extends AutobiographicalStrategy {
+      merge(entries: ContextEntry[], messages: StoredMessage[]): ContextEntry[] {
+        return this.mergeAdjacentBodyGroupRaw(entries, {} as never, messages);
+      }
+    }
+    // A retried addMessage whose first call landed: the same text twice, nothing between.
+    const g = { bodyGroupId: 'bg-twice', shardCount: 2 };
+    const a0 = msg('a0', 1, [text('same ')], { ...g, shardIndex: 0 });
+    const a1 = msg('a1', 2, [text('text')], { ...g, shardIndex: 1 });
+    const b0 = msg('b0', 3, [text('same ')], { ...g, shardIndex: 0 });
+    const b1 = msg('b1', 4, [text('text')], { ...g, shardIndex: 1 });
+    const stored = [a0, a1, b0, b1];
+    const merged = new Merger({}).merge(stored.map((m) => copy(m)), stored);
+    assert.deepEqual(merged.map((e) => e.sourceMessageIds ?? [e.sourceMessageId]), [['a0', 'a1'], ['b0', 'b1']]);
+    const result = attributeEntries(merged, stored);
+    assert.deepEqual(result.sources, [
+      { kind: 'raw', bodies: [{ messageId: 'a0', sequence: 1, complete: true }] },
+      { kind: 'raw', bodies: [{ messageId: 'b0', sequence: 3, complete: true }] },
+    ]);
+    assert.deepEqual([...rawBodiesOf(result).entries()].map(([k, v]) => [k, v.map((m) => m.id)]), [['a0', ['a0', 'a1']], ['b0', ['b0', 'b1']]]);
   });
 
   it('keeps an interrupted ingestion and its re-ingestion apart', () => {
@@ -256,6 +300,16 @@ describe('a body is an ingestion, not its content hash', () => {
       assert.equal(result.rawBodies!.get(second)!.length, firstShards);
       assert.ok(result.rawBodies!.get(second)!.every((m) => m.sequence > result.rawBodies!.get(first)!.at(-1)!.sequence), 'the repost carries only its own shards');
       assert.equal(cm.acceptRound({ provenance: result.provenance! }), null, 'arrivals only: the first copy did not change form');
+
+      // The same text again, straight after the repost, as a retried write would land.
+      const third = cm.addMessage('alice', [text(doc)]);
+      const again = await cm.compile();
+      const heads = new Map(again.provenance!.messages.flatMap((m) => (m.kind === 'raw' ? m.bodies : [])).map((b) => [b.messageId, b]));
+      assert.equal(heads.get(second)?.complete, true, 'the repost keeps its own shards');
+      assert.equal(heads.get(third)?.complete, true, 'the back-to-back copy is its own complete body');
+      assert.equal(again.rawBodies!.get(second)!.length, firstShards);
+      assert.equal(again.rawBodies!.get(third)!.length, firstShards);
+      assert.equal(again.rawBodies!.get(third)![0]!.sequence > again.rawBodies!.get(second)!.at(-1)!.sequence, true);
       cm.close();
     } finally {
       rmSync(path, { recursive: true, force: true });

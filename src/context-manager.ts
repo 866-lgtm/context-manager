@@ -1134,7 +1134,7 @@ export class ContextManager {
     }
 
     const finish = (result: CompileResult, injected: ContentBlock[][]): CompileResult => {
-      result.rawBodies = rawBodiesOf(attribution.sources, storedMessages);
+      result.rawBodies = rawBodiesOf(attribution);
       result.provenance = {
         compileId: randomUUID(),
         namespace: this.strategyNamespace,
