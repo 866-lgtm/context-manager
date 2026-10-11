@@ -1,6 +1,7 @@
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import { NativeFormatter } from '@animalabs/membrane';
+import { registerStateIfAbsent } from '../state-registration.js';
 import { phaseChannel } from '../phase-channel.js';
 import type {
   ContextStrategy,
@@ -1864,23 +1865,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Register the Chronicle state slots this strategy uses.
-   * Re-registration preserves the existing slot; all other failures abort
-   * initialization rather than leaving partially registered strategy state.
+   * Register the Chronicle state slots this strategy uses. A slot that
+   * already exists is kept as it is (see isStateExistsFor). Any other
+   * registration failure propagates and stops initialization. Registrations
+   * are separate and durable, so the slots registered before the failing one
+   * stay registered, and the next start registers the rest.
    */
   protected registerStates(): void {
     if (!this.store) return;
     const store = this.store;
     const registerState = (registration: Parameters<JsStore['registerState']>[0]): void => {
-      try {
-        store.registerState(registration);
-      } catch (error) {
-        // Chronicle exposes StateExists as a generic N-API Error, without a
-        // distinct code. Match its complete message for this slot only.
-        if (!(error instanceof Error) || error.message !== `State already exists: ${registration.id}`) {
-          throw error;
-        }
-      }
+      registerStateIfAbsent(store, registration);
     };
     registerState({
       id: this.summariesStateId,

@@ -44,6 +44,7 @@ import {
   isRenderStatsCapable,
   isHotConfigurableStrategy,
 } from './types/index.js';
+import { isStateExistsFor } from './state-registration.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
@@ -158,16 +159,55 @@ interface ContextManagerStoreConfig extends ContextManagerBaseConfig {
 export type ContextManagerConfig = ContextManagerPathConfig | ContextManagerStoreConfig;
 
 /**
+ * Rejection of a strategy initialization that a newer one superseded.
+ *
+ * From switchBranch() or fork(), the call's branch selection, and a fork's
+ * branch creation, had already happened: `branch` names the branch, and
+ * `created` says whether this call created it. A caller never needs to retry
+ * a fork to learn whether it happened. From setStrategy(), `branch` is
+ * undefined.
+ */
+export class InitializationSupersededError extends Error {
+  readonly branch: string | undefined;
+  readonly created: boolean;
+
+  constructor(selection?: { branch: string; created: boolean }) {
+    super(
+      selection
+        ? `ContextManager.${selection.created ? 'fork created and selected' : 'switchBranch selected'} ` +
+          `branch "${selection.branch}", but its strategy initialization was superseded by a newer initialization`
+        : 'Strategy initialization was superseded by a newer initialization',
+    );
+    this.name = 'InitializationSupersededError';
+    this.branch = selection?.branch;
+    this.created = selection?.created ?? false;
+  }
+}
+
+/**
  * Context Manager - the main interface for managing conversation context.
  *
  * Sits between the application/agent layer and Membrane, managing what goes
  * into the context window. Uses Chronicle for persistent storage.
  *
  * Mutations and strategy operations require a completed initialization attempt.
- * Pending or failed attempts refuse that work; raw reads and branch inspection
- * remain available for recovery with switchBranch() or setStrategy(). Transitions
- * do not roll back earlier writes. Direct Chronicle switches retain their existing
- * strategy-specific semantics; this fence does not pin a manager to a branch.
+ * Pending or failed attempts refuse that work. They also refuse the
+ * strategy-state queries, whose answers could then belong to another branch or
+ * be partial: isReady, getPendingWork, getHotContextSettings, previewContext,
+ * listPins, searchSummaries, getSummary, getSummariesInRange,
+ * getMaxSummaryLevel and getRenderStats. Raw message reads and branch
+ * inspection remain available for recovery with switchBranch() or
+ * setStrategy(). So do compression holds (holdCompression,
+ * releaseCompression) and request settings (setToolDefinitions,
+ * setSystemPrompt): they live in memory, and the strategy hears of a released
+ * hold only once an attempt succeeds.
+ *
+ * The fence governs operations that start while an attempt is pending or
+ * failed. Work already in flight when a transition begins, and a superseded
+ * initializer's own writes before it returns, are the strategy's to guard;
+ * transitions do not roll back earlier writes. Direct Chronicle switches retain
+ * their existing strategy-specific semantics; this fence does not pin a manager
+ * to a branch.
  */
 export class ContextManager {
   private store: JsStore;
@@ -281,16 +321,37 @@ export class ContextManager {
       throw new Error('ContextManagerConfig must have either "path" or "store"');
     }
 
+    // Opening can fail from here on: a registration Chronicle refuses, a
+    // configuration error, or a strategy that refuses the store (e.g.
+    // StoreTopologyError). A store we opened must not stay locked behind a
+    // rejected promise: release it, then rethrow.
+    try {
+      return await ContextManager.openOn(store, ownsStore, config);
+    } catch (error) {
+      if (ownsStore) {
+        try { store.close(); } catch { /* the open error is the one to report */ }
+      }
+      throw error;
+    }
+  }
+
+  private static async openOn(
+    store: JsStore,
+    ownsStore: boolean,
+    config: ContextManagerConfig,
+  ): Promise<ContextManager> {
     // Namespace for messages: only when `isolate` is true
     if (config.isolate && !config.namespace) {
       throw new Error('ContextManagerConfig: "isolate" requires "namespace" to be set');
     }
     const messageNamespace = config.isolate ? config.namespace : undefined;
 
-    // Register states if needed (idempotent)
+    // Register states if needed. A slot that already exists is kept; any
+    // other registration failure propagates (see isStateExistsFor).
     try {
       MessageStore.register(store, messageNamespace);
-    } catch {
+    } catch (error) {
+      if (!isStateExistsFor(error, MessageStore.registrationFor(messageNamespace).id)) throw error;
       // State already registered. Registrations persist in the store, so
       // on existing stores the snapshot cadence stays pinned to whatever
       // the FIRST registration said — retune it to the current constants
@@ -319,8 +380,8 @@ export class ContextManager {
 
     try {
       ContextLog.register(store, config.namespace);
-    } catch {
-      // State already registered
+    } catch (error) {
+      if (!isStateExistsFor(error, ContextLog.stateIdFor(config.namespace))) throw error;
     }
 
     const messageStore = new MessageStore(store, {
@@ -355,8 +416,8 @@ export class ContextManager {
       seenAuxSlots.add(slotId);
       try {
         MessageStore.register(store, aux.namespace);
-      } catch {
-        /* already registered */
+      } catch (error) {
+        if (!isStateExistsFor(error, slotId)) throw error;
       }
       return [new MessageStore(store, {
         estimator: config.tokenEstimator,
@@ -383,17 +444,7 @@ export class ContextManager {
     );
     if (config.now) manager.now = config.now;
 
-    // Initialize strategy. A strategy that refuses the store (e.g.
-    // StoreTopologyError) must not leave a store we opened locked behind a
-    // rejected promise: release it, then rethrow.
-    try {
-      await manager.initializeStrategy();
-    } catch (error) {
-      if (ownsStore) {
-        try { store.close(); } catch { /* the initialize error is the one to report */ }
-      }
-      throw error;
-    }
+    await manager.initializeStrategy();
     return manager;
   }
 
@@ -845,11 +896,17 @@ export class ContextManager {
    * branch and any initialization writes remain. Inspect currentBranch();
    * mutations and strategy operations stay blocked until a successful
    * switchBranch() or setStrategy(). Inspection and close remain available.
+   * If a newer initialization supersedes this one, the call rejects with
+   * InitializationSupersededError naming the branch it selected.
    */
   async switchBranch(branchId: string): Promise<void> {
-    this.store.switchBranch(branchId);
+    await this.selectBranch(branchId, false);
+  }
+
+  private async selectBranch(name: string, created: boolean): Promise<void> {
+    this.store.switchBranch(name);
     const requested = markStoreBranchSwitch(this.store);
-    await this.initializeStrategy(requested);
+    await this.initializeStrategy(requested, { branch: requested.name, created });
   }
 
   /**
@@ -866,7 +923,10 @@ export class ContextManager {
    * Returns the new branch's name. The strategy is re-initialized on the
    * new branch so it picks up the forked state. If initialization rejects,
    * the new branch remains present and selected unless another operation
-   * switches it. The same recovery contract as switchBranch() applies.
+   * switches it. The same recovery contract as switchBranch() applies. If a
+   * newer initialization supersedes this one, the call rejects with
+   * InitializationSupersededError naming the branch it created, so a caller
+   * never retries a fork to learn whether it happened.
    */
   async fork(name?: string): Promise<string> {
     this.requireInitialized('fork');
@@ -874,7 +934,7 @@ export class ContextManager {
     const currentBranch = this.store.currentBranch();
     const currentSeq = this.store.currentSequence();
     const branch = this.store.createBranchAt(branchName, currentBranch.name, currentSeq);
-    await this.switchBranch(branch.name);
+    await this.selectBranch(branch.name, true);
     return branch.name;
   }
 
@@ -1337,6 +1397,7 @@ export class ContextManager {
 
   private async initializeStrategy(
     expectedBranch?: StoreBranchGeneration,
+    selection?: { branch: string; created: boolean },
   ): Promise<void> {
     const attempt = ++this.initializationAttempt;
     this.initializedAttempt = null;
@@ -1347,7 +1408,7 @@ export class ContextManager {
       await strategy.initialize(this.createStrategyContext());
     }
     if (attempt !== this.initializationAttempt || strategy !== this.strategy) {
-      throw new Error('Strategy initialization was superseded by a newer initialization');
+      throw new InitializationSupersededError(selection);
     }
     const current = observeStoreBranch(this.store);
     const currentBranchId = this.store.currentBranch().id;

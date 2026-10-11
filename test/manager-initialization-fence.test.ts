@@ -4,10 +4,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore, type JsStateRegistration } from '@animalabs/chronicle';
-import { ContextManager, AutobiographicalStrategy, PassthroughStrategy } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, InitializationSupersededError, PassthroughStrategy } from '../src/index.js';
 import type { ContextStrategy } from '../src/types/index.js';
 
 const text = (s: string) => [{ type: 'text' as const, text: s }];
+type IngressDecision = { bodyGroupId: string; shards: Array<{ content: ReturnType<typeof text>; shardIndex: number }> };
 const fenced = /requires successful strategy initialization/;
 
 function gate() {
@@ -21,7 +22,7 @@ class GatedStrategy extends PassthroughStrategy {
   nextInitialization: Promise<void> = Promise.resolve();
   ingressCalls = 0;
   initialize(): Promise<void> { return this.nextInitialization; }
-  chunkIngressMessage() { this.ingressCalls++; return null; }
+  chunkIngressMessage(): IngressDecision | null { this.ingressCalls++; return null; }
 }
 
 async function fixture(strategy: ContextStrategy, run: (manager: ContextManager, store: JsStore) => Promise<void>) {
@@ -52,6 +53,14 @@ async function assertFenced(manager: ContextManager, id: string) {
   await assert.rejects(manager.resetHeadWindow('transition'), fenced);
   assert.throws(() => manager.isReady(), fenced);
   assert.throws(() => manager.getPendingWork(), fenced);
+  assert.throws(() => manager.getHotContextSettings(), fenced);
+  assert.throws(() => manager.previewContext({ maxTokens: 1000 } as never), fenced);
+  assert.throws(() => manager.listPins(), fenced);
+  assert.throws(() => manager.searchSummaries({} as never), fenced);
+  assert.throws(() => manager.getSummary('unknown-summary'), fenced);
+  assert.throws(() => manager.getSummariesInRange({}), fenced);
+  assert.throws(() => manager.getMaxSummaryLevel(), fenced);
+  assert.throws(() => manager.getRenderStats(), fenced);
   assert.equal(store.currentSequence(), sequence, 'blocked work must not append/edit any state');
   assert.deepEqual(manager.getAllMessages(), messages, 'raw inspection remains available');
   assert.deepEqual(manager.listBranches().map(branch => branch.name), branches, 'blocked forks create nothing');
@@ -274,10 +283,120 @@ describe('ContextManager initialization fence', () => {
   it('a rejected native branch selection leaves the loaded branch usable', async () => {
     await fixture(new PassthroughStrategy(), async (manager) => {
       const current = manager.currentBranch().name;
-      await assert.rejects(manager.switchBranch('missing'));
+      await assert.rejects(manager.switchBranch('missing'), /Branch not found: missing/);
       assert.equal(manager.currentBranch().name, current);
       manager.addMessage('user', text('selection never changed'));
       assert.equal(manager.getMessageCount(), 1);
     });
   });
+
+  // The head-transition re-check pins the attempt and the native branch id, as
+  // well as the branch name and generation the other transition tests change.
+  class SlowTransitionStrategy extends PassthroughStrategy {
+    constructor(private readonly summary: Promise<void>) { super(); }
+    resetCalls = 0;
+    async generateTransitionSummary(): Promise<string> {
+      await this.summary;
+      return 'summary of the old attempt';
+    }
+    resetHeadWindow(): void { this.resetCalls++; }
+  }
+
+  it('a delayed head transition cannot append after setStrategy on the same branch', async () => {
+    const summaryGate = gate();
+    const strategy = new SlowTransitionStrategy(summaryGate.promise);
+    await fixture(strategy, async (manager, store) => {
+      manager.addMessage('user', text('original'));
+      const transition = manager.resetHeadWindow();
+      await manager.setStrategy(new PassthroughStrategy());
+      const sequence = store.currentSequence();
+      summaryGate.resolve();
+      await assert.rejects(transition, /Branch or strategy changed during ContextManager.resetHeadWindow/);
+      assert.equal(store.currentSequence(), sequence);
+      assert.equal(manager.getMessageCount(), 1);
+      assert.equal(strategy.resetCalls, 0);
+    });
+  });
+
+  it('a delayed head transition cannot append to a same-name branch recreated under it', async () => {
+    const summaryGate = gate();
+    const strategy = new SlowTransitionStrategy(summaryGate.promise);
+    await fixture(strategy, async (manager, store) => {
+      manager.addMessage('user', text('original'));
+      await manager.fork('reused');
+      const transition = manager.resetHeadWindow();
+      store.switchBranch('main');
+      store.deleteBranch('reused');
+      store.createBranch('reused');
+      store.switchBranch('reused');
+      const sequence = store.currentSequence();
+      summaryGate.resolve();
+      await assert.rejects(transition, /Branch or strategy changed during ContextManager.resetHeadWindow/);
+      assert.equal(store.currentSequence(), sequence);
+      assert.equal(strategy.resetCalls, 0);
+    });
+  });
+
+  // A fenced add places no hold, sharded or not, and leaves no pending-hold state.
+  class ShardingStrategy extends GatedStrategy {
+    chunkIngressMessage(): IngressDecision {
+      this.ingressCalls++;
+      return { bodyGroupId: 'group', shards: [{ content: text('a'), shardIndex: 0 }, { content: text('b'), shardIndex: 1 }] };
+    }
+  }
+
+  for (const sharded of [false, true]) {
+    it(`a fenced ${sharded ? 'sharded ' : ''}add with holdCompression places no hold`, async () => {
+      const strategy = sharded ? new ShardingStrategy() : new GatedStrategy();
+      await fixture(strategy, async (manager, store) => {
+        store.createBranch('target');
+        const pending = gate();
+        strategy.nextInitialization = pending.promise;
+        const switching = manager.switchBranch('target');
+        const sequence = store.currentSequence();
+        const ingress = strategy.ingressCalls;
+        assert.throws(
+          () => manager.addMessage('user', text('held while fenced'), undefined, undefined, { holdCompression: true }),
+          fenced,
+        );
+        assert.equal(store.currentSequence(), sequence);
+        assert.equal(strategy.ingressCalls, ingress, 'nothing reached the ingress hook');
+        assert.equal(manager.getCompressionHolds().size, 0);
+        const internals = manager as unknown as {
+          holdingAdds: unknown; holdingAddOptions: unknown; compressionHoldGroups: Map<unknown, unknown>;
+        };
+        assert.equal(internals.holdingAdds, null);
+        assert.equal(internals.holdingAddOptions, undefined);
+        assert.equal(internals.compressionHoldGroups.size, 0);
+        pending.resolve();
+        await switching;
+      });
+    });
+  }
+
+  // A superseded switch or fork names the branch it selected or created.
+  for (const operation of ['switch', 'fork'] as const) {
+    it(`a superseded ${operation} rejects naming the branch it ${operation === 'fork' ? 'created' : 'selected'}`, async () => {
+      const strategy = new GatedStrategy();
+      await fixture(strategy, async (manager, store) => {
+        manager.addMessage('user', text('original'));
+        if (operation === 'switch') store.createBranch('target');
+        const pending = gate();
+        strategy.nextInitialization = pending.promise;
+        const transition = operation === 'switch' ? manager.switchBranch('target') : manager.fork('target');
+        const replacement = manager.setStrategy(new PassthroughStrategy());
+        pending.resolve();
+        await assert.rejects(transition, (error: unknown) => {
+          assert.ok(error instanceof InitializationSupersededError);
+          assert.equal(error.branch, 'target');
+          assert.equal(error.created, operation === 'fork');
+          assert.match(error.message, operation === 'fork' ? /fork created and selected branch "target"/ : /switchBranch selected branch "target"/);
+          return true;
+        });
+        await replacement;
+        assert.ok(manager.listBranches().some(branch => branch.name === 'target'), 'the branch exists');
+        assert.equal(manager.currentBranch().name, 'target', 'the selection stands');
+      });
+    });
+  }
 });

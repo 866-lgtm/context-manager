@@ -1,5 +1,5 @@
 // Main class
-export { ContextManager } from './context-manager.js';
+export { ContextManager, InitializationSupersededError } from './context-manager.js';
 export type { ContextManagerConfig } from './context-manager.js';
 
 // Phase channel (liveness-watchdog observability hook)

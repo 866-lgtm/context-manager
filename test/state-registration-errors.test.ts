@@ -4,7 +4,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore, type JsStateRegistration } from '@animalabs/chronicle';
-import { AutobiographicalStrategy, ContextManager } from '../src/index.js';
+import {
+  AutobiographicalStrategy,
+  ContextManager,
+  PassthroughStrategy,
+  WindowedPassthroughStrategy,
+} from '../src/index.js';
 
 const namespace = 'registration-test';
 const stateIds = [
@@ -60,6 +65,8 @@ describe('AutobiographicalStrategy state registration', () => {
   }
 
   for (const failure of [
+    null,
+    undefined,
     'State already exists: registration-test/autobio:summaries',
     new Error('State already exists: a-different-slot'),
     new Error('IO failure: directory already exists'),
@@ -81,7 +88,10 @@ describe('AutobiographicalStrategy state registration', () => {
   }
 
   it('accepts native duplicate registrations and preserves state through reinitialization', async () => {
-    await withStore(async (store) => {
+    const directory = mkdtempSync(join(tmpdir(), 'cm-state-registration-'));
+    const path = join(directory, 'store');
+    try {
+      const store = JsStore.openOrCreate({ path });
       const manager = await ContextManager.open({ store, namespace, strategy: strategy() });
       const counterId = `${namespace}/autobio:counter`;
       store.setStateJson(counterId, 37);
@@ -92,9 +102,89 @@ describe('AutobiographicalStrategy state registration', () => {
       await manager.switchBranch(main);
       assert.equal(store.getStateJson(counterId), 37);
       await manager.close();
-      const reopened = await ContextManager.open({ store, namespace, strategy: strategy() });
-      assert.equal(store.getStateJson(counterId), 37);
-      await reopened.close();
+      store.close();
+      // A fresh handle over the existing store: the path every resident takes at each start.
+      const fresh = JsStore.openOrCreate({ path });
+      try {
+        const reopened = await ContextManager.open({ store: fresh, namespace, strategy: strategy() });
+        assert.equal(fresh.getStateJson(counterId), 37);
+        await reopened.close();
+      } finally {
+        fresh.close();
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('opens a store whose slots were registered with another strategy kind or cadence', async () => {
+    await withStore(async (store) => {
+      // Chronicle answers a duplicate registration by id alone, so these stand
+      // as they are: an append-log slot at another cadence, and a slot the
+      // strategy registers as a snapshot, registered as an append log.
+      store.registerState({ id: `${namespace}/autobio:summaries`, strategy: 'append_log', deltaSnapshotEvery: 5, fullSnapshotEvery: 2 });
+      store.registerState({ id: `${namespace}/kvunified:presentation-receipt`, strategy: 'append_log' });
+      const manager = await ContextManager.open({ store, namespace, strategy: strategy() });
+      await manager.close();
     });
+  });
+});
+
+describe('state registration outside the autobiographical strategy', () => {
+  const sites = [
+    { name: 'the message slot', id: 'messages', strategy: () => new PassthroughStrategy() },
+    { name: 'the context log', id: `${namespace}/context`, strategy: () => new PassthroughStrategy() },
+    { name: 'an auxiliary view', id: 'other-writer/messages', strategy: () => new PassthroughStrategy() },
+    { name: "the windowed strategy's anchor", id: `${namespace}/windowed:anchor`, strategy: () => new WindowedPassthroughStrategy() },
+  ];
+  const open = (store: JsStore, site: (typeof sites)[number]) => ContextManager.open({
+    store,
+    namespace,
+    strategy: site.strategy(),
+    auxiliaryMessageViews: [{ namespace: 'other-writer' }],
+  });
+
+  for (const site of sites) {
+    it(`propagates a registration failure for ${site.name}`, async (t) => {
+      await withStore(async (store) => {
+        const failure = new Error(`IO failure registering ${site.id}`);
+        const register = store.registerState.bind(store);
+        t.mock.method(store, 'registerState', (registration: JsStateRegistration) => {
+          if (registration.id === site.id) throw failure;
+          register(registration);
+        });
+        await assert.rejects(open(store, site), (error: unknown) => error === failure);
+      });
+    });
+
+    it(`keeps ${site.name} when it already exists`, async () => {
+      await withStore(async (store) => {
+        await (await open(store, site)).close();
+        await (await open(store, site)).close();
+      });
+    });
+  }
+
+  it('releases a store it opened when a registration fails', async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), 'cm-state-registration-'));
+    const path = join(directory, 'store');
+    try {
+      const failure = new Error('IO failure registering messages');
+      const register = JsStore.prototype.registerState;
+      const mocked = t.mock.method(JsStore.prototype, 'registerState', function (this: JsStore, registration: JsStateRegistration) {
+        if (registration.id === 'messages') throw failure;
+        return register.call(this, registration);
+      });
+      await assert.rejects(
+        ContextManager.open({ path, strategy: new PassthroughStrategy() }),
+        (error: unknown) => error === failure,
+      );
+      mocked.mock.restore();
+      // The failed open released its lock, so the store opens again.
+      const manager = await ContextManager.open({ path, strategy: new PassthroughStrategy() });
+      await manager.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
