@@ -8569,15 +8569,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       if (msg.bodyGroupId) {
         // Collect this body's consecutive shards. Another ingestion of the
-        // same text right after it shares the group id but is its own body:
-        // run together and sorted by shard index, the two used to interleave.
+        // same text right after it shares the group id but is its own body.
         const groupStart = i;
         // Read no further than this segment: nothing past it is emitted here.
         i = bodyEnd(Math.min(segEnd, messages.length), (k) => messages[k], groupStart) + 1;
         // Store order: a body's shards are already in rising shard order, and
         // the walk stops where an index doesn't rise, which also keeps a
         // region that starts mid-body apart from the next copy (body-runs.ts).
-        const sortedShards = messages.slice(groupStart, i);
+        const shards = messages.slice(groupStart, i);
 
         // Walk shards in order, accumulating "runs":
         //  - a 'raw' run is consecutive shards at L0; flushed as ONE User
@@ -8593,7 +8592,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           | { kind: 'raw'; parts: string[]; ids: string[] }
           | { kind: 'summary'; ancestor: SummaryEntry };
         let currentRun: Run | null = null;
-        const participant = sortedShards[0].participant;
+        const participant = shards[0].participant;
 
         const flushRun = (): void => {
           if (!currentRun) return;
@@ -8660,7 +8659,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           currentRun = null;
         };
 
-        for (const shard of sortedShards) {
+        for (const shard of shards) {
           const resolution = result.finalResolutions.get(shard.id) ?? 0;
           if (resolution === 0) {
             if (currentRun?.kind !== 'raw') {
@@ -8809,16 +8808,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // The newest stored message is the triggering turn for this compile. A
     // structural repair may rewrite tool blocks, but it must never erase that
-    // turn. A body's shards merge under its first shard's source id, so any
-    // surviving shard of the newest body proves the newest shard is present.
-    // Only that body's: an earlier ingestion of the same text shares the
-    // group id, and its survival proves nothing about the newest turn.
+    // turn. A body's shards merge into one entry, so any surviving shard of the
+    // newest body proves the newest shard is present: a head or recent-window
+    // merge keeps its first shard's id as sourceMessageId, and a middle-region
+    // composite carries every shard's id in sourceMessageIds (its
+    // sourceMessageId is unset), which is where the newest body lands when its
+    // newest shard alone outgrows the recent window. Only that body's shards
+    // count: an earlier ingestion of the same text shares the group id, and its
+    // survival proves nothing about the newest turn.
     const newest = messages[messages.length - 1];
     if (newest) {
       const newestBody = bodyBoundsIn(messages, messages.length - 1);
       const newestGroupIds = new Set(messages.slice(newestBody.from, newestBody.to + 1).map(m => m.id));
       const newestRetained = merged.some(
-        entry => entry.sourceMessageId && newestGroupIds.has(entry.sourceMessageId),
+        entry => (entry.sourceMessageId !== undefined && newestGroupIds.has(entry.sourceMessageId)) ||
+          (entry.sourceMessageIds ?? []).some(id => newestGroupIds.has(id)),
       );
       if (!newestRetained) {
         throw this.overBudgetError(budget, {
@@ -9277,8 +9281,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Look up bodyGroup metadata by sourceMessageId, memoized for the
     // duration of this pass. Entries reference the same messages repeatedly
-    // (run-extension checks + the shardIndex sort comparator below), and
-    // store.get() also resolves blobs — fetch each message at most once.
+    // (the run-extension checks below), and store.get() also resolves
+    // blobs — fetch each message at most once.
     // Read the metadata off the full listing (the caller's, so a filtered
     // view is not listed twice) instead of one `store.get()` per raw entry:
     // each get re-fetched the record from chronicle and resolved its blobs — ~0.7 s per compile on a 75k-message
@@ -9321,12 +9325,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // Head and tail emission keep store order, so the run's shards are
       // already in rising shard order (body-runs.ts).
-      const sortedRun = run;
       // Build merged text content. Non-text blocks (rare in shards) are
       // preserved on the first shard's entry only.
       const mergedTextParts: string[] = [];
       const nonTextBlocks: ContentBlock[] = [];
-      for (const r of sortedRun) {
+      for (const r of run) {
         for (const block of r.content) {
           if (block.type === 'text') mergedTextParts.push(block.text);
           else nonTextBlocks.push(block);
@@ -9338,14 +9341,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ];
       out.push({
         index: out.length,
-        sourceMessageId: sortedRun[0].sourceMessageId,
+        sourceMessageId: run[0].sourceMessageId,
         // Keep every shard's id: this composite represents all of them, and
         // the coverage invariant reads provenance, not just the first source.
-        sourceMessageIds: sortedRun
+        sourceMessageIds: run
           .map(e => e.sourceMessageId)
           .filter((id): id is string => !!id),
         sourceRelation: 'copy',
-        participant: sortedRun[0].participant,
+        participant: run[0].participant,
         content: mergedContent,
       });
       i = j;
@@ -10278,9 +10281,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     ids: Iterable<string>,
     allMessages: readonly StoredMessage[],
     ctx: StrategyContext,
-  ): { messages: StoredMessage[]; totalTokens: number } | null {
+  ): { totalTokens: number } | null {
     const wanted = [...ids];
-    if (wanted.length === 0) return null;
     const at = allMessages.findIndex((m) => m.id === wanted[0]);
     if (at < 0 || !allMessages[at]!.bodyGroupId) return null;
     const { from, to } = bodyBoundsIn(allMessages, at);
@@ -10289,7 +10291,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!wanted.every((id) => inBody.has(id))) return null;
     let totalTokens = 0;
     for (const m of messages) totalTokens += ctx.messageStore.estimateTokens(m);
-    return { messages, totalTokens };
+    return { totalTokens };
   }
 
   /**
@@ -10308,7 +10310,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     chunk: Chunk,
     ctx: StrategyContext,
   ): { totalTokens: number; chunkTokens: number } | null {
-    if (chunk.messages.length === 0) return null;
+    // A chunk of whole messages is no part of a sharded body: answer before
+    // listing the store, as every chunk asks.
+    if (chunk.messages.length === 0 || !chunk.messages[0]!.bodyGroupId) return null;
     const body = this.shardedBodyOf(chunk.messages.map((m) => m.id), ctx.messageStore.getAll(), ctx);
     if (!body) return null;
     const totalTokens = body.totalTokens;

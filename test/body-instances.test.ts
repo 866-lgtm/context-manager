@@ -52,6 +52,13 @@ function assertTwoWholeCopies(messages: ReadonlyArray<{ content: ContentBlock[] 
   for (const t of starts) assert.ok(paragraphs(t).filter((p) => p === 'P00').length === 1, 'no message holds both copies');
 }
 
+/** Where each copy lies wholly in one region, the render joins it into exactly one message. */
+function assertOneMessagePerCopy(messages: ReadonlyArray<{ content: ContentBlock[] }>): void {
+  const holding = messages.map((m) => textOf(m.content)).filter((t) => paragraphs(t).length > 0);
+  assert.equal(holding.length, 2, 'one message per copy');
+  for (const t of holding) assert.deepEqual(paragraphs(t), inOrder, 'each the whole copy, in order');
+}
+
 class Exposed extends AutobiographicalStrategy {
   /** Message ids whose entries are dropped after the merge (the guard test). */
   drop = new Set<string>();
@@ -121,6 +128,13 @@ describe('body runs', () => {
   it('an interrupted write and its retry are two bodies', () => {
     // 0 and 1 of three, then the retry's 0, 1, 2.
     assert.deepEqual(bounds([s('g', 0), s('g', 1), s('g', 0), s('g', 1), s('g', 2)]), ['0-1', '0-1', '2-4', '2-4', '2-4']);
+    // A write cut after its first shard, then retried.
+    assert.deepEqual(bounds([s('g', 0), s('g', 0), s('g', 1), s('g', 2)]), ['0-0', '1-3', '1-3', '1-3']);
+  });
+
+  it('an equal index starts a new body, and so does another group id at a higher index', () => {
+    assert.deepEqual(bounds([s('g', 1), s('g', 1)]), ['0-0', '1-1'], 'an index must rise, not merely not fall');
+    assert.deepEqual(bounds([s('g', 0), s('h', 1)]), ['0-0', '1-1'], 'a higher index of another group continues nothing');
   });
 
   it('a sequence cut inside a body keeps its remainder apart from the next copy', () => {
@@ -137,7 +151,21 @@ describe('two copies of one document', () => {
 
   it('render each copy whole and in order, in the middle of the context', async () => {
     const { cm } = await twoCopies({ recentWindowTokens: 1 });
-    assertTwoWholeCopies((await cm.compile(BUDGET)).messages);
+    const { messages } = await cm.compile(BUDGET);
+    assertTwoWholeCopies(messages);
+    assertOneMessagePerCopy(messages);
+    cm.close();
+  });
+
+  it('accept a render that kept the newest body in the middle of the context, as one composite', async () => {
+    // Without the trailing message, the newest message is the second copy's last shard. A one-token
+    // recent window holds none of it, so the whole copy renders in the middle region as one composite,
+    // which carries its shards' ids in sourceMessageIds.
+    const { cm } = await twoCopies({ recentWindowTokens: 1 });
+    const last = cm.getAllMessages().at(-1)!.id;
+    cm.removeMessages(last, last);
+    const { messages } = await cm.compile(BUDGET);
+    assertTwoWholeCopies(messages);
     cm.close();
   });
 
@@ -170,7 +198,9 @@ describe('two copies of one document', () => {
 
   it('render each copy whole and in order, in the recent window', async () => {
     const { cm } = await twoCopies({ recentWindowTokens: 1_000_000 });
-    assertTwoWholeCopies((await cm.compile(BUDGET)).messages);
+    const { messages } = await cm.compile(BUDGET);
+    assertTwoWholeCopies(messages);
+    assertOneMessagePerCopy(messages);
     cm.close();
   });
 

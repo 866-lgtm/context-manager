@@ -457,9 +457,11 @@ export class ContextManager {
         // These appends must stay synchronous: one body's shards in one loop, in
         // shard order, with no await between them. The body-runs rule (body-runs.ts)
         // reads a body as consecutive messages of one group id whose shard indices
-        // rise, so a body's shards must land together. Any message appended between
-        // them splits the body, and since a group id is a content hash, a second
-        // ingestion of the same text would interleave with it (P00 P00 P01 P01).
+        // rise, so a body's shards must land together: a message appended between
+        // them would split the body. Nothing in context-manager appends a message
+        // anywhere but here and below, so nothing of its own can. A host's
+        // onMessage listener runs inside each append, and its contract rules out
+        // adding a message from there synchronously.
         for (const shard of decision.shards) {
           const message = this.messageStore.append(
             participant,
@@ -713,6 +715,12 @@ export class ContextManager {
    * Subscribe to message-store mutations (add/edit/remove/removeRange).
    * Returns a detacher. Unlike trace events, this fires for ALL stored
    * messages including assistant turns and tool results.
+   *
+   * A listener runs synchronously inside the write that emitted its event,
+   * so it can run while a sharded addMessage is still storing that body's
+   * remaining shards. It must not add a message synchronously: one added there
+   * would land between a body's shards and split the body (body-runs.ts).
+   * Add it after the call returns (a microtask or later) instead.
    */
   onMessage(listener: MessageStoreListener): () => void {
     return this.messageStore.addListener(listener);

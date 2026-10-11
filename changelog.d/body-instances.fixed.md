@@ -20,4 +20,8 @@
   pairwise, so it also holds where a render region begins inside a body: the
   cut body's remainder is never joined to the next copy. `continuesBody`,
   `bodyStart`, `bodyEnd`, `bodyBounds` and `bodyBoundsIn` give that reading
-  to hosts.
+  to hosts. A stored conversation holding a reposted sharded document renders
+  differently after the upgrade, so its first request misses the prompt cache.
+- The newest-turn guard no longer refuses a render that kept the newest body
+  in the middle region (which happens when its newest shard alone outgrows the
+  recent window): it now also reads a composite's `sourceMessageIds`.

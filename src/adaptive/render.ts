@@ -1,9 +1,10 @@
 /**
  * Render helpers for the adaptive-resolution design.
  *
- * The main operation is "group consecutive same-bodyGroupId messages into
- * a single API message via body concatenation," which is how a chunked
- * document or large message is reassembled at the API boundary.
+ * The main operation is "join each body's consecutive shards into a single
+ * API message via body concatenation," which is how a chunked document or
+ * large message is reassembled at the API boundary. A body is read by the
+ * pairwise rule in body-runs.ts, not by group id alone.
  *
  * See `docs/adaptive-resolution-design.md` §3.6.
  */

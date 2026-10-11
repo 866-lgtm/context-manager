@@ -627,9 +627,10 @@ export class MessageStore {
   }
 
   /**
-   * Remove every shard of the bodyGroup containing `messageId`. If the
-   * message is not part of a bodyGroup, falls back to single-message
-   * remove. Atomic from the caller's perspective.
+   * Remove every shard of the body containing `messageId`: one ingestion,
+   * so another copy of the same text, under the same group id, stays (see
+   * body-runs.ts). If the message is not part of a body, falls back to
+   * single-message remove. Atomic from the caller's perspective.
    */
   removeBodyGroup(messageId: MessageId): void {
     const index = this.lookupIndex(messageId);
@@ -664,9 +665,11 @@ export class MessageStore {
   /**
    * Remove a range of messages from the store.
    *
-   * If the range starts or ends in the middle of a bodyGroup, throws —
-   * removeRange must align to bodyGroup boundaries. (Use `removeBodyGroup`
-   * to remove an entire group, then call `removeRange` over plain messages.)
+   * If the range starts or ends in the middle of a body, throws: removeRange
+   * must align to body boundaries. A boundary between two bodies of one
+   * group id (two copies of one text) is a body boundary. (Use
+   * `removeBodyGroup` to remove one whole body, then call `removeRange` over
+   * plain messages.)
    */
   removeRange(fromId: MessageId, toId: MessageId): void {
     const fromIndex = this.lookupIndex(fromId);
