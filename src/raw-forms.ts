@@ -36,18 +36,19 @@
  * depends on what it carried: with encrypted content it is a
  * `redacted_thinking` block, which membrane's converter sends as an id-less
  * reasoning item with that content; without, it is a plain `thinking` block,
- * which the converter has no form for, so a released one is not sent at all.
- * That is the only shape it could take: without its id and without encrypted
- * content, the provider has nothing to resolve it from.
+ * which membrane's converter has no form for, so a released one is not sent
+ * at all: without its id and without encrypted content, there is nothing to
+ * resolve it from.
  *
  * An opaque item (a Responses item membrane has no block for: an encrypted
  * compaction item, a hosted tool's call such as a web search, a custom tool
  * call) rides on a zero-width text block whose raw item is its whole content:
- * no field can render it. So an opaque carrier is never released; a pairing
- * released through it leaves it whole, with its id, which is how main sends
- * it. In a pairing it is an item like any other, since a tool call follows the
- * reasoning that led to it, except a compaction item: that is compacted
- * context, not something a reasoning item leads to, so it is never a follower.
+ * no field can render it. So an opaque carrier is never released. In a
+ * pairing it is an item like any other, so a hosted tool's call is the
+ * follower of the reasoning that led to it. A pairing released through one
+ * leaves it whole, with its id: when its reasoning is stripped, as compression
+ * input strips all reasoning, it ships with its id and no reasoning, as main
+ * sends it. Only dropping it could change that.
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
@@ -74,11 +75,6 @@ export function isOpaqueCarrier(block: ContentBlock): boolean {
   if (block.type !== 'text') return false;
   const raw = (block as RawFormCarrier).rawItem;
   return !!raw && typeof raw === 'object' && (raw as { type?: unknown }).type !== 'message';
-}
-
-/** An opaque carrier of a compaction item: compacted context, never a reasoning item's follower. */
-function isCompactionCarrier(block: ContentBlock): boolean {
-  return isOpaqueCarrier(block) && ((block as RawFormCarrier).rawItem as { type?: unknown }).type === 'compaction';
 }
 
 function itemKey(block: ContentBlock): string | undefined {
@@ -155,15 +151,15 @@ export function releaseEditedRawForms(
 /**
  * The keys of a message's reasoning pairings, read from its content as it was:
  * each run of reasoning items pairs with the next item that isn't reasoning,
- * an opaque tool call included, and a compaction item excluded. Reasoning with
- * no such item after it in the message pairs with nothing here.
+ * an opaque one included. Reasoning with no such item after it in the message
+ * pairs with nothing here.
  */
 function pairingsOf(before: readonly ContentBlock[]): string[][] {
   const pairings: string[][] = [];
   let pending: string[] = [];
   for (const block of before) {
     const key = itemKey(block);
-    if (!key || isCompactionCarrier(block)) continue;
+    if (!key) continue;
     if (isReasoningItem(block)) {
       if (!pending.includes(key)) pending.push(key);
       continue;
@@ -196,11 +192,12 @@ function releasePairings(before: readonly ContentBlock[], released: Set<string>)
 }
 
 /**
- * Reconcile a message's content after blocks were dropped from it, releasing
- * only what a drop made untrue: the reasoning pairing of an item that no block
- * still carries. A dropped part of an item that a surviving sibling still
- * carries leaves everything as it was, since the item still ships whole through
- * the sibling (with the dropped part inside it).
+ * Reconcile a message's content after blocks were dropped from it. A dropped
+ * block with content gives up its raw forms in every block that shares them,
+ * as an edit does, since a sibling's replay would still carry it. An empty
+ * text part is narrower: while a surviving sibling still carries its item,
+ * nothing changes, since only whitespace rides along inside that item; an
+ * item none of whose parts survive releases the reasoning that led to it.
  *
  * `after` must keep each surviving block by identity, as a filter does.
  * Returns `after` itself when nothing has to change.
@@ -214,7 +211,8 @@ export function releaseVanishedRawForms(
   const released = new Set<string>();
   for (const block of before) {
     if (kept.has(block)) continue;
-    for (const key of rawFormKeys(block)) if (!surviving.has(key)) released.add(key);
+    const empty = isEmptyTextPart(block);
+    for (const key of rawFormKeys(block)) if (!empty || !surviving.has(key)) released.add(key);
   }
   if (released.size === 0) return after;
   releasePairings(before, released);
@@ -225,6 +223,13 @@ export function releaseVanishedRawForms(
     return next;
   });
   return changed ? result : after;
+}
+
+/** A text part with nothing but whitespace: not an opaque carrier, whose raw item is its content. */
+function isEmptyTextPart(block: ContentBlock): boolean {
+  if (block.type !== 'text' || isOpaqueCarrier(block)) return false;
+  const text = (block as { text?: unknown }).text;
+  return typeof text !== 'string' || text.trim().length === 0;
 }
 
 /**
@@ -238,7 +243,7 @@ export function releaseTrailingReasoning(content: ContentBlock[]): ContentBlock[
   for (let i = content.length - 1; i >= 0; i--) {
     const block = content[i];
     const key = itemKey(block);
-    if (!key || isCompactionCarrier(block)) continue;
+    if (!key) continue;
     if (!isReasoningItem(block)) break;
     trailing.add(key);
   }

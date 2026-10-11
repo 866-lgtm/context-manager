@@ -38,6 +38,7 @@ import {
   withoutRawForms,
 } from '../src/raw-forms.js';
 import { wrapRecallAnswerContent } from '../src/recall-envelope.js';
+import { stripEmptyTextBlocks } from '../src/strategies/autobiographical.js';
 import { hoistToolProse, toolProseStub } from '../src/tool-prose-hoist.js';
 
 type Raw = { rawXml?: string; rawItem?: unknown };
@@ -180,18 +181,15 @@ describe('raw forms: opaque carriers, drops and appends', () => {
     assert.equal(rawOf(dropped[0]).rawItem, undefined);
   });
 
-  it('a compaction carrier is never a follower: the reasoning before it pairs past it', () => {
+  it('a compaction carrier after reasoning is its follower, as any item is', () => {
     const think = reasoning();
     const compaction = opaqueCarrier();
     const parts = [itemText('first part'), itemText('second part')];
     const content = [think, compaction, ...parts];
     const edited = releaseEditedRawForms(content, [think, compaction, { ...parts[0], text: 'cut' } as ContentBlock, parts[1]]);
-    assert.equal(rawOf(edited[0]).rawItem, undefined, 'the reasoning paired with the edited message is released');
-    assert.equal(edited[1], compaction, 'the compaction item between them is untouched, by identity');
-    assert.equal(rawOf(edited[3]).rawItem, undefined);
-    const dropped = releaseEditedRawForms(content, [compaction, ...parts]);
-    assert.equal(dropped[0], compaction, 'dropping the reasoning leaves the compaction item as it was');
-    assert.equal(rawOf(dropped[1]).rawItem, undefined, 'and releases the message the reasoning led to');
+    assert.equal(edited[0], think, 'the reasoning keeps its id, with the item that follows it');
+    assert.equal(edited[1], compaction);
+    assert.equal(rawOf(edited[3]).rawItem, undefined, 'the edited message alone gives up its raw form');
   });
 
   it('a drop releases the reasoning of an item none of whose parts survive, and nothing for a part whose sibling survives', () => {
@@ -222,8 +220,33 @@ describe('raw forms: opaque carriers, drops and appends', () => {
     assert.equal(ledToSearch[1], search);
     const compaction = opaqueCarrier();
     const beforeCompaction = releaseTrailingReasoning([think, compaction]);
-    assert.equal(rawOf(beforeCompaction[0]).rawItem, undefined, 'a compaction item after it is no follower, so the reasoning is at the end');
+    assert.equal(beforeCompaction[0], think, 'so is reasoning followed by a compaction item');
     assert.equal(beforeCompaction[1], compaction);
+  });
+
+  it('a dropped part with content gives up its item in every part, as an edit does', () => {
+    const think = reasoning();
+    const parts = [itemText('first part'), itemText('second part')];
+    const out = releaseVanishedRawForms([think, ...parts], [think, parts[0]]);
+    assert.equal(rawOf(out[1]).rawItem, undefined, 'the surviving part would otherwise replay the dropped one');
+    assert.equal(rawOf(out[0]).rawItem, undefined, 'and the reasoning paired with the item goes id-less');
+  });
+
+  it('stripEmptyTextBlocks releases what its drops made untrue, and nothing else', () => {
+    const think = reasoning();
+    const vanished = stripEmptyTextBlocks([think, itemText('  ')]);
+    assert.equal(vanished.length, 1);
+    assert.equal(rawOf(vanished[0]).rawItem, undefined, 'the item is gone, so its reasoning goes id-less');
+    const sibling = itemText('second part');
+    const kept = stripEmptyTextBlocks([think, itemText(''), sibling]);
+    assert.equal(kept.length, 2);
+    assert.equal(kept[0], think, 'the item still ships whole through its surviving part');
+    assert.equal(kept[1], sibling);
+    const search = searchCall();
+    const dropped = stripEmptyTextBlocks([think, search, sibling]);
+    assert.deepEqual(dropped.map((b) => b.type), ['redacted_thinking', 'text']);
+    assert.equal(rawOf(dropped[0]).rawItem, undefined, 'a dropped carrier was its reasoning\'s follower');
+    assert.equal(dropped[1], sibling, 'and the message after it was not');
   });
 });
 
@@ -516,11 +539,28 @@ describe('raw forms: the recall envelope', () => {
   });
 
   it('never wraps an opaque carrier as prose', () => {
-    const opaque = opaqueCarrier();
-    const wrapped = wrapRecallAnswerContent([opaque, itemText('first part'), itemText('second part')], summary, 'xml');
-    assert.equal(wrapped[0], opaque, 'the carrier keeps its identity and its raw item');
-    assert.match((wrapped[1] as { text: string }).text, /^<cm-recall/);
-    assert.match((wrapped[2] as { text: string }).text, /<\/cm-recall>$/);
+    for (const opaque of [opaqueCarrier(), searchCall()]) {
+      const wrapped = wrapRecallAnswerContent([opaque, itemText('first part'), itemText('second part')], summary, 'xml');
+      assert.equal(wrapped[0], opaque, 'the carrier keeps its identity and its raw item');
+      assert.match((wrapped[1] as { text: string }).text, /^<cm-recall/);
+      assert.match((wrapped[2] as { text: string }).text, /<\/cm-recall>$/);
+    }
+  });
+
+  it('the combined recall answer releases each answer\'s trailing reasoning before the separator after it', () => {
+    class Exposed extends AutobiographicalStrategy {
+      combined(entries: SummaryEntry[]): ContentBlock[] { return this.combinedRecallAnswerContent(entries, 0); }
+    }
+    const trailing = { type: 'redacted_thinking', data: 'opaque-2', rawItem: { type: 'reasoning', id: 'rs_2', encrypted_content: 'opaque-2' } } as ContentBlock;
+    const first = { ...summary, id: 'L1-1', responseContent: [itemText('first answer'), trailing] };
+    const second = { ...summary, id: 'L1-2', responseContent: [itemText('second answer', { ...MESSAGE_ITEM, id: 'msg_2' })] };
+    for (const recallEnvelope of [undefined, 'xml'] as const) {
+      const content = new Exposed({ recallEnvelope }).combined([first, second]);
+      const at = content.findIndex((b) => b.type === 'redacted_thinking');
+      assert.ok(at >= 0, `the reasoning is kept (${recallEnvelope ?? 'no envelope'})`);
+      assert.equal(rawOf(content[at]!).rawItem, undefined, `a separator follows it, so it goes id-less (${recallEnvelope ?? 'no envelope'})`);
+      assert.equal((content[at + 1] as { text: string }).text.includes('---'), true, 'the separator is what follows it');
+    }
   });
 
   it('the live-strip answer releases the item its stripped reasoning led to', () => {
@@ -689,6 +729,44 @@ describe('raw forms: on the wire, through membrane\'s formatters', () => {
     const kept = await wire(xml(), withRawForms(hoisted, (b) =>
       b.type === 'tool_use' && (b as { id: string }).id === 'call_1' ? { rawXml: calls } : undefined));
     assert.equal(occurrences(kept, prose), 2, 'with the raw form kept, the original prose ships beside the hoisted copy');
+  });
+
+  it('Responses: a hoisted call ships its stub, its prose once, and the reasoning that led to it id-less', async () => {
+    const prose = 'q'.repeat(400);
+    const callItem = { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'skip_reply', arguments: JSON.stringify({ reason: prose }) };
+    const history: Sent = [
+      { participant: 'user', content: [{ type: 'text', text: 'go' } as ContentBlock] },
+      { participant: 'Claude', content: [
+        reasoning(),
+        { type: 'tool_use', id: 'call_1', name: 'skip_reply', input: { reason: prose }, rawItem: callItem } as ContentBlock,
+      ] },
+      { participant: 'user', content: [{ type: 'tool_result', toolUseId: 'call_1', content: 'ok', rawItem: { type: 'function_call_output', call_id: 'call_1', output: 'ok' } } as ContentBlock] },
+    ];
+    const { messages: hoisted, hoisted: count } = hoistToolProse(history, {
+      intoTool: 'journal', field: 'content', result: '{"recorded":true}', minChars: 100, fromTools: ['skip_reply'],
+    });
+    assert.equal(count, 1);
+    const sent = await wire(new OpenAIResponsesFormatter(), hoisted);
+    assert.equal(occurrences(sent, prose), 1, 'the prose ships once, in the journal call');
+    assert.equal(occurrences(sent, 'fc_1'), 0, 'the original call is not replayed');
+    assert.equal(occurrences(sent, 'rs_1'), 0, 'nor is the reasoning that led to it, by its id');
+
+    const kept = await wire(new OpenAIResponsesFormatter(), withRawForms(hoisted, (b) =>
+      b.type === 'tool_use' && (b as { id: string }).id === 'call_1' ? { rawItem: callItem } : undefined));
+    assert.equal(occurrences(kept, prose), 2, 'with the raw form kept, the original prose ships beside the hoisted copy');
+  });
+
+  it('Responses: an answer with no prose ships its envelope after reasoning that has given up its id', async () => {
+    const summary: SummaryEntry = {
+      id: 'L1-7', level: 1, content: 'memory', tokens: 4, sourceLevel: 0,
+      sourceIds: ['m-1'], sourceRange: { first: 'm-1', last: 'm-4' }, created: 0,
+    };
+    const wrapped = wrapRecallAnswerContent([reasoning()], summary, 'xml');
+    const ask = { participant: 'user', content: [{ type: 'text', text: 'what do you remember?' } as ContentBlock] };
+    const sent = (await wire(new OpenAIResponsesFormatter(), [ask, { participant: 'Claude', content: wrapped }])) as Array<Record<string, unknown>>;
+    assert.equal(occurrences(sent, '<cm-recall'), 1, 'the envelope is on the wire');
+    assert.equal(occurrences(sent, 'rs_1'), 0, 'the reasoning is not replayed by its id');
+    assert.deepEqual(sent.filter((i) => i.type === 'reasoning').map((i) => [i.id, i.encrypted_content]), [[undefined, 'opaque']]);
   });
 
   it('Responses: a wrapped recall answer ships wrapped', async () => {

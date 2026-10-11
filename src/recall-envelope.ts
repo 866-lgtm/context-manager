@@ -70,12 +70,13 @@ export function recallEnvelopeAddedText(
  * stored entry is never mutated. A rewritten block gives up its raw replay
  * form, along with every block that shares it and a Responses reasoning item
  * paired with it, so the tags reach the wire (see raw-forms.ts). A released
- * carrier keeps its content fields byte for byte; only its raw item goes.
+ * reasoning or message block keeps its content fields byte for byte; only its
+ * raw item goes.
  *
  * An answer with no prose gets the envelope as a block of its own, after the
- * carriers. A Responses reasoning item at its end then gives up its id, since
- * the envelope would follow it on the wire as an item the provider never
- * produced.
+ * carriers. A Responses reasoning item at its end then gives up its id (or,
+ * without encrypted content, isn't sent at all), since the envelope would
+ * follow it on the wire as an item the provider never produced.
  */
 export function wrapRecallAnswerContent(
   content: ContentBlock[],
@@ -89,7 +90,8 @@ export function wrapRecallAnswerContent(
     if (block.type === 'text' && !isOpaqueCarrier(block)) textPositions.push(position);
   });
   if (textPositions.length === 0) {
-    // Carriers but no prose: still delimit the memory, and rewrite no carrier.
+    // Carriers but no prose: still delimit the memory. No carrier's content is
+    // rewritten; the reasoning at the end gives up its raw item.
     return [...releaseTrailingReasoning(content), { type: 'text', text: `${open}\n${close}` }];
   }
   const firstText = textPositions[0];

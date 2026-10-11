@@ -67,7 +67,7 @@ import type {
 } from '../adaptive/folding-strategy.js';
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
-import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseVanishedRawForms } from '../raw-forms.js';
+import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms } from '../raw-forms.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
@@ -805,17 +805,22 @@ function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?
  * which — thrown inside the speculative-compression drain — halts ALL
  * compression. Non-text blocks (tool_use/tool_result/image) pass through
  * unchanged, so tool pairing is preserved; callers drop any message left with
- * an empty content array.
+ * an empty content array. membrane's zero-width carriers of opaque Responses
+ * items (a compaction item, a hosted tool's call) are empty text too, so they
+ * are dropped from compression requests as well, as they always were.
  *
  * Released narrowly (releaseVanishedRawForms, not releaseEditedRawForms): an
  * empty part dropped from a Responses message item while a sibling part
  * survives still rides inside the sibling's raw item, and only whitespace can
  * ship that way, so releasing would re-render the whole item (and its reasoning
  * pairing) from fields for no content change. An item none of whose parts
- * survive is gone from the wire, so the reasoning paired with it gives up its
- * id rather than be replayed without its follower.
+ * survive is gone from the wire, a dropped carrier's item included, so the
+ * reasoning paired with it gives up its id rather than be replayed without its
+ * follower.
+ *
+ * Exported for its tests; not part of the package's API.
  */
-function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
+export function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
   return releaseVanishedRawForms(content, content.filter((b) => {
     if (b.type !== 'text') return true;
     const text = (b as { text?: unknown }).text;
@@ -11826,8 +11831,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * recall still replays its signed blocks byte-verbatim. Mutating a carrier
    * here would break the signature that the mint surface depends on — hence
    * omission, never rewriting. Every surviving block is passed through by
-   * reference, except a Responses item a stripped reasoning item led to, which
-   * is copied without its id (see raw-forms.ts).
+   * reference, except a Responses item a stripped reasoning item led to: every
+   * block that shares it is copied without its raw item, and so without its id
+   * (see raw-forms.ts).
    *
    * A carrier-only entry (reasoning captured, no prose block — degenerate, and
    * guarded against at mint time) would strip to an empty assistant turn,
@@ -11912,16 +11918,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     summaries: SummaryEntry[],
     maxTokens: number,
   ): ContentBlock[] {
+    // A separator follows the answer before it on the wire, so the reasoning at
+    // that answer's end gives up its id first (see raw-forms.ts).
+    const separated = (content: ContentBlock[]): ContentBlock[] => [
+      ...releaseTrailingReasoning(content),
+      { type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT },
+    ];
     if (this.config.recallEnvelope !== 'xml') {
-      const content: ContentBlock[] = [];
+      let content: ContentBlock[] = [];
       summaries.forEach((s, idx) => {
-        if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
+        if (idx > 0) content = separated(content);
         content.push(...this.liveWindowAnswerContent(s));
       });
       return maxTokens > 0 ? this.truncateContent(content, maxTokens) : content;
     }
 
-    const content: ContentBlock[] = [];
+    let content: ContentBlock[] = [];
     const separatorCost = this.estimateTextOnlyTokens(
       { content: [{ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT }] } as StoredMessage,
     );
@@ -11932,7 +11944,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (maxTokens > 0 && proseBudget <= 0) break;
       const prose = this.liveWindowAnswerProse(s);
       const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
-      if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
+      if (idx > 0) content = separated(content);
       content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
       if (maxTokens > 0) {
         remainingTokens -=
