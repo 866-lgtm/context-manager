@@ -39,6 +39,14 @@ describe('coversStoredContent', () => {
     assert.equal(coversStoredContent([text('hello world'), image('AAAA')], stored), false);
   });
 
+  it('accepts text blocks a strategy joined into one, in order, and nothing out of order', () => {
+    const stored = [text('first part. '), text('second part.'), image('AAAA')];
+    assert.ok(coversStoredContent([text('first part. second part.'), image('AAAA')], stored), 'joined into one block');
+    assert.ok(coversStoredContent([text('[h] first part. second part. [t]'), image('AAAA')], stored), 'joined, with a header and a tail');
+    assert.equal(coversStoredContent([text('second part. first part.'), image('AAAA')], stored), false, 'out of order');
+    assert.equal(coversStoredContent([text('first part. '), image('AAAA'), text('second part.')], stored), false, 'past the image');
+  });
+
   it('compares media exactly: same length and same ends are not the same bytes', () => {
     const head = 'A'.repeat(64);
     const stored = [image(`${head}${'B'.repeat(100)}${head}`)];
@@ -591,6 +599,36 @@ describe('sharded writes declare their group size', () => {
       cm.close();
     } finally {
       console.error = error;
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it("a first shard whose own append threw after it landed is removed too", async () => {
+    const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    class Sharding extends PassthroughStrategy {
+      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+        return { bodyGroupId: 'three', shards: content.map((block, i) => ({ content: [block], shardIndex: i })) };
+      }
+    }
+    const path = './test-shard-zero-rollback';
+    rmSync(path, { recursive: true, force: true });
+    try {
+      const cm = await ContextManager.open({ path, strategy: new Sharding() });
+      cm.addMessage('bob', [text('before')]);
+      // The manager's own listener fails on the first shard's add: that append throws after landing.
+      const manager = cm as unknown as { handleMessageStoreEvent: (event: { type: string }) => void };
+      const handle = manager.handleMessageStoreEvent.bind(cm);
+      let adds = 0;
+      manager.handleMessageStoreEvent = (event) => {
+        if (event.type === 'add' && ++adds === 1) throw new Error('propagation failed');
+        handle(event);
+      };
+      assert.throws(() => cm.addMessage('alice', [text('one '), text('two '), text('three')]), /propagation failed/);
+      manager.handleMessageStoreEvent = handle;
+      assert.deepEqual(cm.getAllMessages().map((m) => textOf(m)), ['before'], 'shard 0 is gone too');
+      cm.close();
+    } finally {
       rmSync(path, { recursive: true, force: true });
     }
   });

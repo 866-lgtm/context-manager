@@ -11,8 +11,8 @@
  * to raw, rendered to omitted, omitted to rendered, or a raw copy becoming
  * partial or complete. Messages that arrived since the last accepted round
  * are arrivals, not folds. The first accepted round on a branch the journal
- * has never recorded writes a baseline receipt that says history before it
- * is unknown.
+ * has never recorded, or whose newest record it can't read, writes a
+ * baseline receipt that says history before it is unknown.
  *
  * Storage is Chronicle typed records, not branch state: typed records are
  * enumerable from any branch and survive branch deletion, so every branch's
@@ -33,16 +33,18 @@
  *   snapshot holds the whole layout, the history behind the window as its
  *   members; it is written only once the records since the last one would
  *   outweigh it, so snapshots cost about as much again as the deltas between
- *   them, and the bytes stored per acceptance don't grow with the session.
+ *   them. On average, then, the bytes stored per acceptance don't grow with
+ *   the session, though each snapshot holds the whole view's members.
  *
  * Typed records are enumerable from any branch, but each one takes the next
  * sequence of the branch selected when it is written, as any record does:
  * the journal's own records sit between a branch's messages.
  *
  * The records are the journal's only truth, and a use reads only the ones
- * it needs. Every acceptance compares with the branch's newest record,
- * whichever journal on the store wrote it, read back from the store's newest
- * record. A compile is accepted once: it carries where the journal stood
+ * it needs. Every acceptance compares with the branch's newest record in its
+ * namespace, whichever journal on the store wrote it, read back from the
+ * store's newest record; the records present at open are read back at most
+ * once per store object, each branch noted as it's met. A compile is accepted once: it carries where the journal stood
  * when it ran (a durable record, see JournalMark), and a retry finds the
  * record its first acceptance wrote among the records after that, whether
  * that acceptance changed the layout or not, reported success or failure
@@ -128,7 +130,11 @@ export interface FoldReceiptSource {
 
 export interface FoldReceipt {
   v: 1;
-  /** The journal record's id: stable, ordered, usable as `afterId`. */
+  /**
+   * The journal record's id: ordered, usable as `afterId`, and stable, with
+   * one exception Chronicle allows: if the store's last record rots, open
+   * drops it, and its id goes to the next record written.
+   */
   id: string;
   kind: 'baseline' | 'change';
   /** When the confirming round was accepted. Context only, never identity. */
@@ -192,7 +198,7 @@ export interface FoldQueryResult {
   branch: BranchRef | null;
   /** Newest first; with `afterId`, oldest first from just after it. */
   receipts: FoldReceipt[];
-  /** Newest receipt id on that branch, if any. */
+  /** Newest receipt id on that branch in this namespace, if any. */
   latestId: string | null;
   /**
    * The query matched more receipts than `limit` let it return. With
@@ -312,6 +318,19 @@ function recordBytes(record: AcceptedLayoutRecord): number {
   return Buffer.byteLength(JSON.stringify(record), 'utf8');
 }
 
+/**
+ * The record's size with `field` set to `base` plus that size: a counter
+ * that includes its own record counts its own digits too.
+ */
+function sizeCounting(record: AcceptedLayoutRecord, field: 'sb' | 'db', base: number): number {
+  let size = recordBytes({ ...record, [field]: base });
+  for (;;) {
+    const next = recordBytes({ ...record, [field]: base + size });
+    if (next === size) return size;
+    size = next;
+  }
+}
+
 function isLayoutRecord(record: AcceptedLayoutRecord | null): record is AcceptedLayoutRecord {
   return !!record && record.v === RECORD_VERSION && typeof record.ns === 'string'
     && typeof record.compileId === 'string' && !!record.branch;
@@ -339,8 +358,9 @@ function headOf(id: string, record: Partial<AcceptedLayoutRecord> | null): Recor
     ns: record.ns,
     branch: record.branch,
     compileId: record.compileId,
-    receiptAt: record.receipt ? Date.parse(record.receipt.acceptedAt) : null,
-    prevReceipt: typeof record.pr === 'string' ? record.pr : null,
+    // Another format's receipt and links aren't read: only its envelope places it.
+    receiptAt: record.v === RECORD_VERSION && record.receipt ? Date.parse(record.receipt.acceptedAt) : null,
+    prevReceipt: record.v === RECORD_VERSION && typeof record.pr === 'string' ? record.pr : null,
     readable: record.v === RECORD_VERSION,
   };
 }
@@ -356,6 +376,11 @@ interface BranchState {
    *  a query needs them, or kept from the branch's first record when this
    *  store object wrote it; extended as records are written. */
   receipts?: Array<{ id: string; at: number }>;
+  /** Where that walk stopped short: the receipt whose link couldn't be read. */
+  receiptsCutAt?: string;
+  /** A record after `newest` that couldn't be read at all, so it may have
+   *  been this branch's newest: the next acceptance writes a baseline. */
+  shadowedBy?: string;
 }
 
 /**
@@ -381,6 +406,13 @@ interface StoreIndex {
   /** Each branch found so far, by namespace and branch key; null when the
    *  records hold none of it. */
   branches: Map<string, BranchState | null>;
+  /** How far back the records present at open have been read, by position:
+   *  every record from here on is known, its branch noted. Reading back
+   *  notes every branch it meets, so the history is read at most once per
+   *  store object, whichever lookups need it; at 0, every branch is known. */
+  unread: number;
+  /** The newest unreadable record a backward read has passed, if any. */
+  unreadableAbove: string | null;
   /** Records already reported as unreadable. */
   warned: Set<string>;
 }
@@ -397,7 +429,8 @@ function stateKey(namespace: string, branch: Pick<BranchRef, 'id' | 'created'>):
 function storeIndex(store: JsStore): StoreIndex {
   let index = storeIndexes.get(store);
   if (!index) {
-    const built: StoreIndex = { ids: store.getRecordIdsByType(ACCEPTED_LAYOUT_RECORD), stale: false, durable: 0, mark: null, newest: null, branches: new Map(), warned: new Set() };
+    const ids = store.getRecordIdsByType(ACCEPTED_LAYOUT_RECORD);
+    const built: StoreIndex = { ids, stale: false, durable: 0, mark: null, newest: null, branches: new Map(), unread: ids.length, unreadableAbove: null, warned: new Set() };
     if (built.ids.length > 0) {
       // One sync makes everything present at open durable, so a compile can
       // carry any of it as its mark: a record a crash could still take might
@@ -451,12 +484,43 @@ function noteRecord(index: StoreIndex, head: RecordHead): void {
     known.ref = head.branch;
     known.newest = head;
     known.newestReceipt = newestReceipt;
+    delete known.shadowedBy;
     if (known.receipts && head.receiptAt !== null) known.receipts.push({ id: head.id, at: head.receiptAt });
     return;
   }
   // A branch the records held none of starts here, so its receipts are known.
   const receipts = known === null ? (head.receiptAt !== null ? [{ id: head.id, at: head.receiptAt }] : []) : undefined;
   index.branches.set(key, { ref: head.branch, newest: head, newestReceipt, ...(receipts ? { receipts } : {}) });
+}
+
+/**
+ * Read back through the records present at open, from where the last read
+ * stopped, noting each branch the first time it's met (its newest record),
+ * until `until`'s branch is met or every record has been read. A record
+ * that can't be read at all may have been any branch's newest, so a branch
+ * first met below one is shadowed by it.
+ */
+function readBack(store: JsStore, index: StoreIndex, until?: string): void {
+  while (index.unread > 0) {
+    const position = index.unread - 1;
+    const id = index.ids[position]!;
+    const head = readHead(store, index, id);
+    index.unread = position;
+    if (!head) {
+      index.unreadableAbove ??= id;
+      continue;
+    }
+    const key = stateKey(head.ns, head.branch);
+    if (index.branches.get(key) === undefined) {
+      index.branches.set(key, {
+        ref: head.branch,
+        newest: head,
+        newestReceipt: head.receiptAt !== null ? head.id : head.prevReceipt,
+        ...(index.unreadableAbove !== null ? { shadowedBy: index.unreadableAbove } : {}),
+      });
+    }
+    if (key === until) return;
+  }
 }
 
 /** Everything listed is durable now: a sync has just succeeded. */
@@ -556,6 +620,10 @@ export class FoldJournal {
         // in the log with its durability unknown: durable before heard of.
         this.makeDurable(index, receipt.id);
         this.announce(receipt);
+        // A listener may have accepted another round meanwhile, and if that
+        // write failed after landing, the index is stale: list what it left
+        // before reading the branch's newest record or writing after it.
+        if (index.stale) storeIndex(this.store);
       }
     }
     // A compile is accepted once, whichever journal accepted it, and whether
@@ -616,13 +684,9 @@ export class FoldJournal {
     const key = stateKey(this.namespace, ref);
     const known = index.branches.get(key);
     if (known !== undefined) return known;
-    for (let i = index.ids.length - 1; i >= 0; i--) {
-      const head = readHead(this.store, index, index.ids[i]!);
-      if (!head || stateKey(head.ns, head.branch) !== key) continue;
-      const state: BranchState = { ref: head.branch, newest: head, newestReceipt: head.receiptAt !== null ? head.id : head.prevReceipt };
-      index.branches.set(key, state);
-      return state;
-    }
+    readBack(this.store, index, key);
+    const found = index.branches.get(key);
+    if (found !== undefined) return found;
     index.branches.set(key, null);
     return null;
   }
@@ -634,10 +698,17 @@ export class FoldJournal {
     let id = branch.newestReceipt;
     while (id !== null) {
       const head = readHead(this.store, index, id);
-      if (!head || head.receiptAt === null) break;
+      if (!head || head.receiptAt === null) {
+        branch.receiptsCutAt = id;
+        break;
+      }
       list.push({ id, at: head.receiptAt });
       // Each link points to an earlier record; anything else ends the walk.
-      id = head.prevReceipt !== null && Number(head.prevReceipt) < Number(id) ? head.prevReceipt : null;
+      if (head.prevReceipt !== null && Number(head.prevReceipt) >= Number(id)) {
+        branch.receiptsCutAt = head.prevReceipt;
+        break;
+      }
+      id = head.prevReceipt;
     }
     branch.receipts = list.reverse();
     return branch.receipts;
@@ -657,8 +728,11 @@ export class FoldJournal {
   }
 
   /**
-   * Receipts of one branch, newest first, filtered per `query`. Reads only
-   * the receipts it returns.
+   * This namespace's receipts on one branch, newest first, filtered per
+   * `query`. The first query of a branch walks its receipts back once,
+   * reading only receipts; a branch not yet seen is found by reading back
+   * through the records present at open, once per store object. A history
+   * that can't be read whole says so in `note`.
    */
   query(query: FoldQuery = {}): FoldQueryResult {
     const index = storeIndex(this.store);
@@ -674,6 +748,9 @@ export class FoldJournal {
     const since = query.since !== undefined ? parseSince(query.since) : undefined;
     const state = this.branchState(index, branch);
     const list = state ? this.receiptsOf(index, state) : [];
+    // A receipt is durable before anyone hears of it, here as in accept: one
+    // whose write failed after landing is synced before it's handed out.
+    if (list.length > 0) this.makeDurable(index, list[list.length - 1]!.id);
     const latestId = list.length > 0 ? list[list.length - 1]!.id : null;
     const matches = (entry: { at: number }) => since === undefined || entry.at >= since;
     const receipts: FoldReceipt[] = [];
@@ -686,15 +763,23 @@ export class FoldJournal {
       }
       const receipt = this.loadReceipt(entry.id);
       if (receipt) receipts.push(receipt);
+      else unloadable.push(entry.id);
       return true;
     };
+    const unloadable: string[] = [];
     if (after !== undefined) {
       // Ids ascend: start just after the cursor and read forward.
       for (let i = firstAfter(list, after); i < list.length && take(list[i]!); i++);
     } else {
       for (let i = list.length - 1; i >= 0 && take(list[i]!); i--);
     }
-    return { branch, receipts, latestId, more };
+    // A history that couldn't be read whole says so, rather than passing as complete.
+    const notes: string[] = [];
+    if (state?.receiptsCutAt) {
+      notes.push(`Receipts before ${list[0]?.id ?? 'the newest'} aren't listed: record ${state.receiptsCutAt}, which links to them, can't be read.`);
+    }
+    if (unloadable.length > 0) notes.push(`Receipt${unloadable.length === 1 ? '' : 's'} ${unloadable.join(', ')} can't be read and ${unloadable.length === 1 ? 'is' : 'are'} left out.`);
+    return { branch, receipts, latestId, more, ...(notes.length > 0 ? { note: notes.join(' ') } : {}) };
   }
 
   /** The store's id (minted on first use). */
@@ -721,18 +806,15 @@ export class FoldJournal {
     const match = live.find((b) => b.name === branch);
     if (match) return { id: match.id, name: match.name, created: match.created };
     // A deleted branch's receipts remain in the journal: the most recently
-    // recorded branch of that name that has any. The first record met of
-    // each branch, reading back, is its newest, and says so.
-    const seen = new Set<string>();
-    for (let i = index.ids.length - 1; i >= 0; i--) {
-      const head = readHead(this.store, index, index.ids[i]!);
-      if (!head || head.ns !== this.namespace || head.branch.name !== branch) continue;
-      const key = stateKey(head.ns, head.branch);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      if (head.receiptAt !== null || head.prevReceipt !== null) return head.branch;
+    // recorded branch of that name that has any. Every branch is noted once
+    // the records have all been read, which happens once per store object.
+    readBack(this.store, index);
+    let found: BranchState | null = null;
+    for (const [key, state] of index.branches) {
+      if (!state || !key.startsWith(`${this.namespace}\u0000`) || state.ref.name !== branch || state.newestReceipt === null) continue;
+      if (!found || Number(state.newest.id) > Number(found.newest.id)) found = state;
     }
-    return null;
+    return found ? found.ref : null;
   }
 
   private sourceFor(provenance: CompileProvenance): FoldReceiptSource {
@@ -853,7 +935,7 @@ export class FoldJournal {
         ...base, kind: 'delta', prev: prev.recordId, ...layoutDelta(prev, next),
         chain: prev.chain + 1, sb: prev.snapshotBytes, db: 0, ...receipt,
       };
-      const db = prev.deltaBytes + recordBytes(delta);
+      const db = prev.deltaBytes + sizeCounting(delta, 'db', prev.deltaBytes);
       if (db <= prev.snapshotBytes) record = { ...delta, db };
     }
     if (!record) {
@@ -861,7 +943,7 @@ export class FoldJournal {
         ...base, kind: 'snapshot', m: encodeSequences(next.members), units: next.units,
         chain: 0, sb: 0, db: 0, ...receipt,
       };
-      record = { ...snapshot, sb: recordBytes(snapshot) };
+      record = { ...snapshot, sb: sizeCounting(snapshot, 'sb', 0) };
     }
 
     let written: { id: string };
@@ -914,6 +996,12 @@ export class FoldJournal {
       warnUnreadable(index, id, `it is of another format; branch ${branch.ref.name} is treated as unrecorded`);
       return null;
     }
+    if (branch.shadowedBy) {
+      // The unreadable record (reported when read) may have been this
+      // branch's newest, so don't diff against what came before it.
+      console.error(`[fold-journal] branch ${branch.ref.name}'s newest readable record, ${id}, is older than unreadable record ${branch.shadowedBy}; treating the branch as unrecorded`);
+      return null;
+    }
     const record = readRecord<AcceptedLayoutRecord>(this.store, id);
     let layout: StoredLayout | null = null;
     try {
@@ -944,9 +1032,13 @@ export class FoldJournal {
       if (!current.prev) throw new Error(`delta ${current.compileId} names no record before it`);
       const older: AcceptedLayoutRecord | null = readRecord<AcceptedLayoutRecord>(this.store, current.prev);
       if (!isLayoutRecord(older)) throw new Error(`record ${current.prev} in its chain can't be read`);
+      if (older.ns !== record.ns || branchKey(older.branch) !== branchKey(record.branch)) {
+        throw new Error(`record ${current.prev} in its chain belongs to another namespace or branch`);
+      }
       current = older;
     }
-    if (current.m === undefined || !current.units) throw new Error('its snapshot holds no layout');
+    if (current.kind !== 'snapshot' || current.m === undefined || !current.units) throw new Error('its chain ends in no snapshot');
+    if (chain.length !== record.chain) throw new Error(`its chain has ${chain.length} deltas where the record counts ${record.chain}`);
     const layout = applyLayoutChain({ members: decodeSequences(current.m), units: current.units }, chain.reverse());
     if (!wellFormed(layout)) throw new Error('members and units disagree');
     return layout;
@@ -990,13 +1082,16 @@ function parseAfterId(afterId: string): number {
 }
 
 /** An ISO 8601 date or date-time; anything else, a bare number included, is refused. */
-const ISO_TIME = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+/** A date (midnight UTC), or a date and time with its offset: a time without
+ *  one would be read in the host's own zone. */
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2}))?$/;
 
 function parseSince(since: string): number {
   const ms = ISO_TIME.test(since) ? Date.parse(since) : NaN;
   if (!Number.isFinite(ms)) {
     const hint = /^\d+$/.test(since) ? ' To continue after a receipt, pass its id as afterId.' : '';
-    throw new Error(`since must be an ISO 8601 time such as 2026-10-09T14:00:00Z (got ${JSON.stringify(since)}).${hint}`);
+    const zone = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(since) ? ' Give its offset (Z for UTC), since a time without one would be read in this host\'s zone.' : '';
+    throw new Error(`since must be an ISO 8601 time such as 2026-10-09T14:00:00Z (got ${JSON.stringify(since)}).${zone}${hint}`);
   }
   return ms;
 }

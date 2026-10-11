@@ -241,6 +241,8 @@ export class ContextManager {
    * persisted, so a restart can never leave compression permanently stalled.
    */
   private compressionHolds = new Set<MessageId>();
+  /** Summaries the strategy rendered but couldn't describe, already reported. */
+  private undescribedSummariesReported = new Set<string>();
   /** Sharded adds held on ingress: first-shard id -> every shard id. */
   private compressionHoldGroups = new Map<MessageId, MessageId[]>();
   /** heldAt / expiresAt per held id (expiresAt absent = no timeout). */
@@ -547,6 +549,7 @@ export class ContextManager {
         // written) is shard 0's: the body's identity in compile provenance.
         const ordered = [...decision.shards].sort((a, b) => a.shardIndex - b.shardIndex);
         let firstId: MessageId | null = null;
+        const lengthBefore = this.messageStore.length();
         // These appends must stay synchronous: one body's shards in one loop, in
         // shard order, with no await between them. The body-runs rule (body-runs.ts)
         // reads a body as consecutive messages of one group id whose shard indices
@@ -574,10 +577,16 @@ export class ContextManager {
           // A write that fails partway leaves no part of the body behind:
           // remove what it wrote (the failing shard too, if it landed), so a
           // retry writes one body. If that fails as well, the shards stay,
-          // and shardCount marks the body short.
-          if (firstId !== null) {
+          // and shardCount marks the body short. The first shard's own
+          // append can throw after it landed: then it's the store's last.
+          let landed = firstId;
+          if (landed === null && this.messageStore.length() > lengthBefore) {
+            const last = this.messageStore.getTail(1)[0];
+            if (last?.bodyGroupId === decision.bodyGroupId) landed = last.id;
+          }
+          if (landed !== null) {
             try {
-              this.messageStore.removeBodyGroup(firstId);
+              this.messageStore.removeBodyGroup(landed);
             } catch (removal) {
               console.error(`[context-manager] a sharded addMessage failed partway, and its shards could not be removed: ${(removal as Error).message}`);
             }
@@ -1261,11 +1270,15 @@ export class ContextManager {
       : new Map<string, RenderedSummaryInfo>();
     const undescribed = [...summaryIds].filter((id) => !summaryInfo.has(id));
     if (undescribed.length > 0) {
-      console.warn(
-        `[context-manager] ${this.strategy.name} rendered summaries it cannot describe ` +
-        `(${undescribed.slice(0, 5).join(', ')}${undescribed.length > 5 ? ', …' : ''}); ` +
-        'no rendered layout is reported for this compile',
-      );
+      const fresh = undescribed.filter((id) => !this.undescribedSummariesReported.has(id));
+      if (fresh.length > 0) {
+        for (const id of fresh) this.undescribedSummariesReported.add(id);
+        console.warn(
+          `[context-manager] ${this.strategy.name} rendered summaries it cannot describe ` +
+          `(${fresh.slice(0, 5).join(', ')}${fresh.length > 5 ? ', …' : ''}); ` +
+          'no rendered layout is reported for a compile that renders them',
+        );
+      }
       return null;
     }
     // Estimators are store-level: the strategy view's estimates and its
@@ -1300,22 +1313,27 @@ export class ContextManager {
    * repeat calls (later rounds of the same compile, or a retry after an
    * uncertain failure, from this manager or another on the store, before or
    * after a reopen) are no-ops. Compares the compile's rendered layout with
-   * the last layout accepted on the compile's own branch, by any manager on
-   * the store — even when another branch is selected by now — and appends a
-   * fold receipt when any message changed form, or a baseline when that
-   * branch has no record.
+   * the last layout accepted on the compile's own branch in its namespace,
+   * by any manager of it on the store — even when another branch is selected
+   * by now — and appends a fold receipt when any message changed form, or a
+   * baseline when that branch has no record it can read.
    * `usage` is the confirming round's own usage as the provider reported it;
    * leave a field undefined when it was not reported. `presentation` is how
    * that round carried the compile, as its producer reported (`verbatim`,
    * `altered`, or `unknown`, the default); receipts record it beside the
    * layout, which is the compile's.
    *
-   * Returns the receipt, or null: no change, or a strategy that does not
-   * report its layout. A compile accepted before returns what that
-   * acceptance returned, its receipt or null, so a retry after an uncertain
-   * failure learns the outcome, and a receipt can come back again (key on
-   * its id). A provenance from another manager's namespace is refused with
-   * an error: accept a compile on the manager that compiled it.
+   * Returns the receipt, or null: no change, or a compile with no layout to
+   * record (`provenance.layout` is null): a strategy that doesn't report its
+   * layout, or one that rendered a summary it can't describe, reported once
+   * per summary. Nothing is recorded for such a compile, so the next one
+   * accepted is compared with the last layout recorded before it, and its
+   * receipt carries the changes of both rounds. A compile accepted before
+   * returns what that acceptance returned, its receipt or null, so a retry
+   * after an uncertain failure learns the outcome, and a receipt can come
+   * back again (key on its id). A provenance from another manager's
+   * namespace is refused with an error: accept a compile on the manager that
+   * compiled it.
    */
   acceptRound(args: {
     provenance: CompileProvenance;

@@ -381,11 +381,28 @@ function compositeCovers(content: ContentBlock[], members: StoredMessage[]): boo
 export function coversStoredContent(rendered: readonly ContentBlock[], stored: readonly ContentBlock[]): boolean {
   if (rendered === stored) return true;
   let j = 0;
+  // Within rendered[j], when it's text: where the next stored text may
+  // start, since a strategy can join several text blocks into one.
+  let from = 0;
   for (const block of stored) {
     if (block.type === 'text' && block.text === '') continue; // carries nothing
-    while (j < rendered.length && !covers(rendered[j]!, block)) j++;
-    if (j >= rendered.length) return false;
-    j++;
+    for (;;) {
+      if (j >= rendered.length) return false;
+      const r = rendered[j]!;
+      if (block.type === 'text' && r.type === 'text') {
+        const at = r.text.indexOf(block.text, from);
+        if (at !== -1) {
+          from = at + block.text.length;
+          break;
+        }
+      } else if (covers(r, block)) {
+        j++;
+        from = 0;
+        break;
+      }
+      j++;
+      from = 0;
+    }
   }
   return true;
 }
