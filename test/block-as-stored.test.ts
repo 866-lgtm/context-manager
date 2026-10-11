@@ -147,7 +147,7 @@ describe('blockAsStored', () => {
     const ref = { type: 'blob_ref', ref: { hash: 'h', mediaType: 'image/png', originalType: 'image' } } as unknown as ContentBlock;
     assert.throws(() => blockAsStored(untypedDocument), /document block without a media type has no stored form/);
     assert.throws(() => blockAsStored(untypedUnsniffable), /image block without a media type its bytes supply has no stored form/);
-    assert.throws(() => blockAsStored(noData), /audio block without base64 data has no stored form/);
+    assert.throws(() => blockAsStored(noData), /audio block whose data the store can't read as base64 has no stored form/);
     assert.throws(() => blockAsStored(ref), /blob_ref reads back as the media it references/);
     // The store refuses the same blocks on write.
     const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
@@ -169,6 +169,16 @@ describe('blockAsStored', () => {
     assert.equal(BlobManager.estimateMediaSize(named('a URL image')), 0);
     assert.equal(BlobManager.hasStorableMedia(named('audio')), true);
     assert.equal(BlobManager.hasStorableMedia(named('text')), false);
+  });
+
+  it('reads data as the store does: a Buffer is bytes, stored and given back as base64', async () => {
+    const bytes = { type: 'document', source: { type: 'base64', mediaType: 'application/pdf', data: Buffer.from('%PDF-1.4') } } as unknown as ContentBlock;
+    const expected = blockAsStored(bytes);
+    assert.deepStrictEqual(expected, { type: 'document', source: { type: 'base64', data: 'JVBERi0xLjQ=', mediaType: 'application/pdf' } });
+    const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+    const id = manager.addMessage('user', [bytes]);
+    assert.deepStrictEqual(manager.getMessage(id)!.content[0], expected, 'the store accepts it, and gives back the same');
+    manager.close();
   });
 
   it('stores an untyped image whose bytes carry a signature under the sniffed type', async () => {

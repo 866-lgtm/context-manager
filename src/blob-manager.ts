@@ -132,10 +132,10 @@ function blockFromBlob(kind: BlobReference['originalType'], data: string, mediaT
  * holding part of its content, which this doesn't predict.
  *
  * It throws for a block the store refuses on write, which has no stored form:
- * an inline media block without base64 data, or one with no media type that,
- * for an image, its bytes don't supply either. It also throws for a
- * `blob_ref`, which reads back as the media it references, and that takes the
- * store to know.
+ * inline media whose data the store can't read as base64, or one without a
+ * media type (for an image: none declared, and no recognized signature in its
+ * bytes). It also throws for a `blob_ref`, which reads back as the media it
+ * references, and that takes the store to know.
  *
  * Pure and synchronous: no store and no I/O, so a body can be hashed as the
  * store will keep it before anything is written.
@@ -147,10 +147,13 @@ export function blockAsStored(block: ContentBlock): ContentBlock {
   const kind = blobKindOf(block);
   if (!kind) return block;
   const { data, mediaType } = (block as { source: Base64Source }).source;
-  if (typeof data !== 'string') {
-    throw new Error(`blockAsStored: a ${kind} block without base64 data has no stored form: the store refuses it`);
+  // The store's own read of the data (storeBase64), so this refuses exactly what it refuses.
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(data, 'base64');
+  } catch {
+    throw new Error(`blockAsStored: a ${kind} block whose data the store can't read as base64 has no stored form: the store refuses it`);
   }
-  const bytes = Buffer.from(data, 'base64');
   const storedType = blobMediaType(bytes, mediaType, kind);
   if (typeof storedType !== 'string') {
     throw new Error(`blockAsStored: a ${kind} block without a media type${kind === 'image' ? ' its bytes supply' : ''} has no stored form: the store refuses it`);
