@@ -59,7 +59,7 @@ function validateApiShape(messages: readonly ApiMessage[]): void {
         const matched = next?.content.some(
           (b) =>
             b.type === 'tool_result' &&
-            (b as { toolUseId: string }).toolUseId === id,
+            ((b as { tool_use_id?: string }).tool_use_id ?? (b as { toolUseId?: string }).toolUseId) === id,
         );
         if (!matched) {
           throw new Error(
@@ -69,14 +69,14 @@ function validateApiShape(messages: readonly ApiMessage[]): void {
       }
 
       if (block.type === 'tool_result') {
-        const tid = (block as { toolUseId: string }).toolUseId;
+        const tid = (block as { tool_use_id?: string }).tool_use_id ?? (block as { toolUseId?: string }).toolUseId;
         const prev = messages[i - 1];
         const matched = prev?.content.some(
           (b) => b.type === 'tool_use' && (b as { id: string }).id === tid,
         );
         if (!matched) {
           throw new Error(
-            `messages[${i}]: tool_result toolUseId=${tid} was not preceded by a matching tool_use in messages[${i - 1}]`,
+            `messages[${i}]: tool_result id=${tid} was not preceded by a matching tool_use in messages[${i - 1}]`,
           );
         }
       }
