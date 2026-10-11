@@ -487,9 +487,12 @@ describe('Merge terminal-disposition gate', () => {
     const mock = scripted([{ error: authErr }]);
     const fx = await fixture(mock.membrane);
     await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /401/);
-    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts ?? 0, 0, 'no merge attempt spent');
+    assert.equal(fx.strategy.mergeQueueView().length, 1, 'the merge is still queued');
+    assert.deepEqual(fx.strategy.mergeQueueView()[0]!.sourceIds, fx.sourceIds);
+    assert.equal(fx.strategy.mergeQueueView()[0]!.attempts ?? 0, 0, 'no merge attempt spent');
     await fx.strategy.tick(ctx(fx.manager));
     assert.equal(mock.calls.length, 1, 'paused: no second call');
+    assert.equal(fx.strategy.mergeQueueView().length, 1, 'and still queued for when the pause ends');
     await fx.manager.close();
   });
 
@@ -557,6 +560,87 @@ describe('Merge terminal-disposition gate', () => {
     fx.strategy.sweepMergeQuarantineForTest();
     assert.equal(fx.strategy.getMergeQuarantineStatus().count, 0, 'paid-off record swept');
     assert.equal(storedMergeQuarantine(fx.manager).length, 0);
+    await fx.manager.close();
+  });
+});
+
+// ── The review's further cases (sw-cm138) ──────────────────────────────────
+
+describe('merge lane: classification, attribution and ownership (sw-cm138)', () => {
+  after(cleanup);
+
+  /** Wait for `n` provider calls, failing rather than hanging. */
+  async function calledAtLeast(calls: unknown[], n: number, ms = 10_000): Promise<void> {
+    const deadline = Date.now() + ms;
+    while (calls.length < n) {
+      if (Date.now() > deadline) assert.fail(`the provider was called ${calls.length} time(s), not ${n}`);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+  }
+
+  for (const type of ['context_length', 'invalid_request', 'safety', 'unsupported']) {
+    it(`a ${type} rejection is evidence about the merge request: it spends an attempt and pauses nothing (I17)`, async () => {
+      const rejection = Object.assign(new Error(`zz ${type}`), { type, retryable: false });
+      const mock = scripted([{ error: rejection }]);
+      const fx = await fixture(mock.membrane);
+      await fx.strategy.tick(ctx(fx.manager)); // recorded, not thrown
+      assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1, 'the bounded policy spent an attempt');
+      const lane = fx.strategy as unknown as { compressionPause: unknown };
+      assert.equal(lane.compressionPause, null, 'no lane pause');
+      await fx.manager.close();
+    });
+  }
+
+  it('a merge failure is the dispatched model\'s, not the one configured when it lands (I21)', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const calls: Array<{ config?: { model?: string } }> = [];
+    const membrane = {
+      complete: async (request: { config?: { model?: string } }) => {
+        calls.push(structuredClone(request));
+        if (calls.length === 1) {
+          await gate;
+          throw Object.assign(new Error('zz network down'), { type: 'network', retryable: true });
+        }
+        return { stopReason: 'end_turn', content: [t('merged under model B')], usage: { inputTokens: 100, outputTokens: 20 } };
+      },
+    } as never;
+    const fx = await fixture(membrane);
+    const tick = fx.strategy.tick(ctx(fx.manager));
+    await calledAtLeast(calls, 1);
+    assert.equal(calls[0]!.config?.model, MODEL);
+    (fx.strategy as unknown as { config: { compressionModel: string } }).config.compressionModel = 'zz-model-b';
+    release();
+    await assert.rejects(tick, /zz network down/);
+    const lane = fx.strategy as unknown as { compressionPause: { model?: string } | null };
+    assert.equal(lane.compressionPause?.model, MODEL, 'the pause names the model the merge was sent to');
+    await fx.strategy.tick(ctx(fx.manager));
+    assert.equal(calls.length, 2, 'model B is not held by that failure');
+    assert.equal(calls[1]!.config?.model, 'zz-model-b');
+    await fx.manager.close();
+  });
+
+  it("a merge settling after other work took the lane leaves that work's ownership alone (I16)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const calls: unknown[] = [];
+    const membrane = {
+      complete: async (request: unknown) => {
+        calls.push(request);
+        await gate;
+        return { stopReason: 'end_turn', content: [t('a merged parent')], usage: { inputTokens: 100, outputTokens: 20 } };
+      },
+    } as never;
+    const fx = await fixture(membrane);
+    const lane = fx.strategy as unknown as { pendingCompression: Promise<void> | null };
+    const tick = fx.strategy.tick(ctx(fx.manager));
+    await calledAtLeast(calls, 1);
+    // As after a branch switch: newer work owns the lane while this merge is in flight.
+    const newer = new Promise<void>(() => {});
+    lane.pendingCompression = newer;
+    release();
+    await tick;
+    assert.equal(lane.pendingCompression, newer, 'the newer work still owns the lane, so no second call can start');
     await fx.manager.close();
   });
 });

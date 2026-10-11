@@ -100,6 +100,14 @@ class ProbeStrategy extends AutobiographicalStrategy {
   mergeCandidates(unmerged: SummaryEntry[], threshold: number): SummaryEntry[] | null {
     return this.contiguousMergeCandidates(unmerged, threshold);
   }
+  /** White-box clock for the progress sweep's cadence: as if it last ran `ago` ms ago. */
+  progressSweptAgo(ago: number): void {
+    (this as unknown as { compressionProgressSweptAt: number }).compressionProgressSweptAt = Date.now() - ago;
+  }
+  /** Per-branch warning state (white-box). */
+  warnedSkips(): Set<string> {
+    return (this as unknown as { warnedQuarantineSkips: Set<string> }).warnedQuarantineSkips;
+  }
   /** Set the pause's constraints relative to now (white-box clock for the release seam). */
   shiftPause(backoffFromNow: number, statedFromNow: number | null): void {
     const pause = this.lanePause()!;
@@ -113,6 +121,14 @@ function managerContext(manager: ContextManager): StrategyContext {
 /** The strategy's request identity (sha256 of the request's JSON). */
 const sha256 = (request: NormalizedRequest): string => createHash('sha256').update(JSON.stringify(request)).digest('hex');
 const tool = (name: string): ToolDefinition => ({ name, description: 'd', inputSchema: { type: 'object', properties: {} } } as never);
+/** Wait for the first provider call, failing rather than hanging if it never comes. */
+async function firstCall(calls: unknown[], ms = 10_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (calls.length === 0) {
+    if (Date.now() > deadline) assert.fail('the provider was never called');
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
 const progressSlot = (manager: ContextManager): unknown[] => {
   const value = manager.getStore().getStateJson('default/autobio:compression-family-progress');
   return Array.isArray(value) ? value : [];
@@ -267,7 +283,7 @@ describe('compression ladder: transient failures never spend it', () => {
     const main = fx.manager.currentBranch().name;
     const fork = fx.manager.getStore().createBranchAt('zz-fork', main, fx.manager.getStore().currentSequence()).name;
     const run = fx.strategy.run(fx.target(), managerContext(fx.manager));
-    while (mock.calls.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+    await firstCall(mock.calls);
     await fx.manager.switchBranch(fork);
     release();
     await run;
@@ -319,18 +335,21 @@ describe('compression lane pacing', () => {
   it('the backoff doubles per failure from 30 s and caps at 10 minutes', async () => {
     const mock = scripted([{ throw: failure('network') }]);
     const fx = await queued(mock.membrane);
-    const seen: number[] = [];
-    for (let i = 0; i < 7; i++) {
+    const expected = [30, 60, 120, 240, 480, 600, 600];
+    for (let i = 0; i < expected.length; i++) {
       // Each failure consumes the chunk it tried; requeue to keep the lane busy.
       await fx.strategy.onNewMessage(fx.manager.queryMessages({}).messages.at(-1)!, managerContext(fx.manager));
       const start = Date.now();
       await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
+      const end = Date.now();
       const pause = fx.strategy.pause()!;
-      seen.push(Math.round((pause.until - start) / 1_000));
+      // The backoff runs from the failure, which lies between start and end:
+      // bracketed, so a stalled tick can't shift it out of the window.
+      assert.ok(pause.until - end <= expected[i]! * 1_000 && expected[i]! * 1_000 <= pause.until - start,
+        `failure ${i + 1}: a ${expected[i]} s backoff (${pause.until - end}..${pause.until - start} ms)`);
       assert.equal(pause.source, 'backoff');
       fx.strategy.expirePause();
     }
-    assert.deepEqual(seen, [30, 60, 120, 240, 480, 600, 600]);
     fx.manager.close();
   });
 
@@ -451,7 +470,7 @@ describe('the pause belongs to the call that failed (#46271 #3)', () => {
     const mock = scripted([{ gate, then: { throw: failure('network') } }, OK('B memory')]);
     const fx = await queued(mock.membrane);
     const tick = fx.strategy.tick(managerContext(fx.manager));
-    while (mock.calls.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+    await firstCall(mock.calls);
     assert.equal(mock.calls[0]!.config.model, 'same-model');
     fx.strategy.setCompressionModel('zz-model-b');
     release();
@@ -684,12 +703,14 @@ describe("a caller's admission deferral is an external wait, not a failed call (
   it('on a fresh lane: no failure is counted, no backoff is invented, the admission is asked again within 30 s; a release resumes at once', async () => {
     const mock = scripted([{ throw: deferred(120_000) }, OK('after the release')]);
     const fx = await queued(mock.membrane);
+    const start = Date.now();
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /no call was made/);
+    const end = Date.now();
     const pause = fx.strategy.pause()!;
     assert.equal(pause.failures, 0, 'nothing failed here');
     assert.ok(pause.backoffUntil <= Date.now(), 'no local backoff');
-    assert.ok(pause.statedUntil! <= Date.now() + 30_000 && pause.statedUntil! > Date.now() + 29_000,
-      'the cached answer lasts 30 s, not the admission\'s 120 s deadline');
+    assert.ok(pause.statedUntil! - end <= 30_000 && 30_000 <= pause.statedUntil! - start,
+      'the cached answer lasts 30 s from the deferral, not the admission\'s 120 s deadline');
     assert.match(fx.strategy.checkReadiness().description ?? '', /then the caller's provider admission is asked again, failure 0/);
     assert.equal(progressSlot(fx.manager).length, 1);
     assert.deepEqual((progressSlot(fx.manager) as Array<{ outcomes: unknown[]; failureStreak?: unknown }>)[0]!.outcomes, [], 'no rung spent');
@@ -720,8 +741,10 @@ describe("a caller's admission deferral is an external wait, not a failed call (
     await requeue(fx);
     const start = Date.now();
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz network failure/);
+    const end = Date.now();
     assert.equal(fx.strategy.pause()!.failures, 2);
-    assert.equal(Math.round((fx.strategy.pause()!.backoffUntil - start) / 1_000), 60, 'doubling continues from the genuine count');
+    const backoffUntil = fx.strategy.pause()!.backoffUntil;
+    assert.ok(backoffUntil - end <= 60_000 && 60_000 <= backoffUntil - start, 'doubling continues from the genuine count: 60 s');
     fx.manager.close();
   });
 
@@ -813,7 +836,7 @@ describe('pending work stays discoverable after a transient failure or a deferra
     const mock = scripted([{ gate, then: { throw: failure('network') } }, OK('should not be called')]);
     const fx = await queued(mock.membrane);
     const tick = fx.strategy.tick(managerContext(fx.manager));
-    while (mock.calls.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+    await firstCall(mock.calls);
     // While the call is in flight, a rebuild under a larger holdback withdraws
     // every still-raw chunk from the queue (they still exist, uncompressed).
     (fx.strategy as unknown as { config: { l1HoldbackChunks: number } }).config.l1HoldbackChunks = 100;
@@ -835,7 +858,7 @@ describe('pending work stays discoverable after a transient failure or a deferra
     const fx = await queued(mock.membrane);
     const head = fx.strategy.compressionQueueView()[0]!;
     const tick = fx.strategy.tick(managerContext(fx.manager));
-    while (mock.calls.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+    await firstCall(mock.calls);
     // While the call is in flight, the chunk becomes compressed (another producer).
     (fx.strategy as unknown as { chunks: Array<{ compressed: boolean }> }).chunks[head]!.compressed = true;
     release();
@@ -970,6 +993,218 @@ describe('compression lane: failures are evidence only by the company they keep'
     // The request answered for this writer: the run ends durably.
     self.recordCompressionFamilyProgress(self.captureCompressionBranch(), record, [], undefined, undefined, new Set(['zz-request']), ['m1']);
     assert.equal(stored(), undefined, 'no stored run comes back for a request that answered');
+    fx.manager.close();
+  });
+});
+
+// ── The review's further cases (sw-cm138) ──────────────────────────────────
+
+/** The strategy's hash of a chunk's message ids (chunkSourceHash). */
+const idsHash = (ids: string[]): string => createHash('sha256').update(JSON.stringify(ids), 'utf8').digest('hex');
+const families = (manager: ContextManager): string[] =>
+  (progressSlot(manager) as Array<{ familyKey: string }>).map((entry) => entry.familyKey).sort();
+const PROGRESS_SLOT = 'default/autobio:compression-family-progress';
+const DAY = 24 * 60 * 60_000;
+
+describe('an abort is neither evidence nor a reason to pause (sw-cm138 I8)', () => {
+  for (const [label, error] of [
+    ['an AbortError', Object.assign(new Error('zz aborted'), { name: 'AbortError' })],
+    ["a membrane error of type 'abort'", failure('abort')],
+  ] as const) {
+    it(`${label}: no pause, no rung spent, the family not exhausted, and the next run calls the canonical again`, async () => {
+      const mock = scripted([{ throw: error }, OK('after the abort')]);
+      const fx = await build(mock.membrane);
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz abort/);
+      assert.equal(fx.strategy.pause(), null, 'a cancellation pauses nothing');
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
+      for (const entry of progressSlot(fx.manager) as Array<{ outcomes: unknown[] }>) {
+        assert.deepEqual(entry.outcomes, [], 'and is no rung\'s outcome');
+      }
+      await fx.strategy.run(fx.target(), managerContext(fx.manager));
+      assert.equal(mock.calls.length, 2);
+      assert.ok(isCanonical(mock.calls[1]!), 'the canonical, asked again');
+      fx.manager.close();
+    });
+  }
+});
+
+describe('ladder progress goes when its debt is paid, and is swept on its own cadence (sw-cm138)', () => {
+  /** Two persisted chunk records (messages 1-4 compressed, 5-8 raw), an L1 over 5-6, and seven families. */
+  async function sweepFixture() {
+    const mock = scripted([{ throw: failure('network') }]);
+    const fx = await queued(mock.membrane);
+    const store = fx.manager.getStore();
+    store.setStateJson('default/autobio:chunks', [
+      { id: 'c-0', sourceIds: ['1', '2', '3', '4'], compressed: true, summaryId: 'L1-900' },
+      { id: 'c-1', sourceIds: ['5', '6', '7', '8'], compressed: false },
+    ]);
+    fx.strategy.seed({ id: 'L1-901', level: 1, content: 'covers 5 and 6', tokens: 10, sourceLevel: 0, sourceIds: ['5', '6'], sourceRange: { first: '5', last: '6' }, created: 1 });
+    const now = Date.now();
+    const entry = (familyKey: string, chunkSourceHash: string, extra: Record<string, unknown> = {}) =>
+      ({ familyKey, chunkSourceHash, outcomes: [], updated: now, ...extra });
+    store.setStateJson(PROGRESS_SLOT, [
+      entry('fam-compressed', idsHash(['1', '2', '3', '4'])),
+      entry('fam-raw', idsHash(['5', '6', '7', '8'])),
+      entry('fam-abandoned', idsHash(['5', '6', '7', '8']), { updated: now - 31 * DAY }),
+      entry('fam-covered', idsHash(['5', '6']), { sourceIds: ['5', '6'] }),
+      entry('fam-gone', idsHash(['7', 'zz-gone']), { sourceIds: ['7', 'zz-gone'] }),
+      entry('fam-live', idsHash(['7', '8']), { sourceIds: ['7', '8'] }),
+      entry('fam-old-shape', idsHash(['7', '8', 'x'])),
+    ]);
+    return { ...fx, mock, store };
+  }
+
+  it('from tick, with the quarantine alarm off and the lane paused: covered, gone and abandoned spans go; live ones stay, a missing record included (I5, I20, I34, I36)', async () => {
+    const fx = await sweepFixture();
+    const ctx = managerContext(fx.manager);
+    fx.strategy.notePause(failure('network'), ctx); // tick returns at the pause, after the sweep
+    await fx.strategy.tick(ctx);
+    assert.equal(fx.mock.calls.length, 0, 'paused: no call');
+    assert.deepEqual(families(fx.manager), ['fam-live', 'fam-raw'],
+      'kept: a raw record\'s, and a missing record\'s whose messages are all there and uncovered');
+    fx.manager.close();
+  });
+
+  it('at most every 10 minutes', async () => {
+    const fx = await sweepFixture();
+    const ctx = managerContext(fx.manager);
+    fx.strategy.notePause(failure('network'), ctx);
+    await fx.strategy.tick(ctx);
+    assert.deepEqual(families(fx.manager), ['fam-live', 'fam-raw']);
+    // A family paid off after that sweep waits for the next one.
+    fx.store.setStateJson(PROGRESS_SLOT, [
+      ...progressSlot(fx.manager),
+      { familyKey: 'fam-late', chunkSourceHash: idsHash(['1', '2', '3', '4']), outcomes: [], updated: Date.now() },
+    ]);
+    fx.strategy.progressSweptAgo(9 * 60_000);
+    await fx.strategy.tick(ctx);
+    assert.deepEqual(families(fx.manager), ['fam-late', 'fam-live', 'fam-raw'], 'nine minutes on: not swept again');
+    fx.strategy.progressSweptAgo(10 * 60_000);
+    await fx.strategy.tick(ctx);
+    assert.deepEqual(families(fx.manager), ['fam-live', 'fam-raw'], 'ten: swept');
+    fx.manager.close();
+  });
+
+  it('with no chunk records to judge spans by, only age decides', async () => {
+    const fx = await sweepFixture();
+    fx.store.setStateJson('default/autobio:chunks', []);
+    const ctx = managerContext(fx.manager);
+    fx.strategy.notePause(failure('network'), ctx);
+    await fx.strategy.tick(ctx);
+    assert.deepEqual(families(fx.manager),
+      ['fam-compressed', 'fam-covered', 'fam-gone', 'fam-live', 'fam-old-shape', 'fam-raw'], 'never blind: only the abandoned family goes');
+    fx.manager.close();
+  });
+
+  it("a ladder never writes back a family dropped while it ran (I4)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const mock = scripted([REFUSAL, { throw: failure('network') }, { gate, then: { throw: failure('network') } }]);
+    const fx = await build(mock.membrane, { hoist: true });
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz network failure/);
+    assert.equal(progressSlot(fx.manager).length, 1, 'the canonical refusal is kept');
+    // The resumed ladder starts from that progress; while its hoist rung is
+    // in flight, the family is dropped (another strategy minted it, say).
+    const run = fx.strategy.run(fx.target(), managerContext(fx.manager));
+    const deadline = Date.now() + 10_000;
+    while (mock.calls.length < 3) {
+      if (Date.now() > deadline) assert.fail('the resumed rung was never called');
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    fx.manager.getStore().setStateJson(PROGRESS_SLOT, []);
+    release();
+    await assert.rejects(run, /zz network failure/);
+    assert.equal(progressSlot(fx.manager).length, 0, 'the ladder\'s snapshot does not bring the family back');
+    fx.manager.close();
+  });
+
+  it('the dedup guard pays off the span\'s progress (I25)', async () => {
+    const mock = scripted([OK('never called')]);
+    const fx = await build(mock.membrane);
+    const target = fx.target();
+    const ids = target.messages.map((message) => message.id);
+    // Every message is covered, by L1s cut at other boundaries.
+    fx.strategy.seed({ id: 'L1-200', level: 1, content: 'covers the first two', tokens: 10, sourceLevel: 0, sourceIds: ids.slice(0, 2), sourceRange: { first: ids[0]!, last: ids[1]! }, created: 1 });
+    fx.strategy.seed({ id: 'L1-201', level: 1, content: 'covers the last', tokens: 10, sourceLevel: 0, sourceIds: ids.slice(2), sourceRange: { first: ids[2]!, last: ids.at(-1)! }, created: 1 });
+    fx.manager.getStore().setStateJson(PROGRESS_SLOT, [
+      { familyKey: 'fam-target', chunkSourceHash: idsHash(ids), outcomes: [], updated: Date.now() },
+      { familyKey: 'fam-other', chunkSourceHash: idsHash(['zz']), outcomes: [], updated: Date.now() },
+    ]);
+    await fx.strategy.run(target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 0, 'dropped, not compressed');
+    assert.equal(target.compressed, true);
+    assert.deepEqual(families(fx.manager), ['fam-other'], "the covered span's progress is gone; another's stays");
+    fx.manager.close();
+  });
+
+  it("an operator's clear takes the family's progress with it (I27)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const mock = scripted([REFUSAL, { gate, then: REFUSAL }]);
+    const fx = await build(mock.membrane, { hoist: true });
+    const run = fx.strategy.run(fx.target(), managerContext(fx.manager));
+    const deadline = Date.now() + 10_000;
+    while (mock.calls.length < 2) {
+      if (Date.now() > deadline) assert.fail('the second rung was never called');
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const progress = progressSlot(fx.manager);
+    assert.equal(progress.length, 1, 'the canonical refusal is recorded before the next rung');
+    release();
+    await run;
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'exhausted');
+    // A crash between exhaustion's ledger write and its progress drop leaves this.
+    fx.manager.getStore().setStateJson(PROGRESS_SLOT, progress);
+    await fx.strategy.clearCompressionRefusalQuarantine();
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
+    assert.equal(progressSlot(fx.manager).length, 0, 'nothing recorded before the clear outlives it');
+    fx.manager.close();
+  });
+});
+
+describe("an admission hold warns once (sw-cm138 I24)", () => {
+  const deferred = (retryAfterMs?: number) => Object.assign(
+    new Error('Provider wait: same-model is held for resident; no call was made'),
+    { type: 'rate_limit', retryable: true, providerAdmission: 'deferred', ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) },
+  );
+
+  it('however often the lane rechecks it, and again when its deadline changes or a release leaves it standing', async () => {
+    const fx = await queued(scripted([OK('unused')]).membrane);
+    const ctx = managerContext(fx.manager);
+    const warnings: string[] = [];
+    const orig = console.warn;
+    console.warn = (...args: unknown[]) => {
+      if (typeof args[0] === 'string' && args[0].includes("held by the caller's provider admission")) warnings.push(args[0]);
+    };
+    try {
+      fx.strategy.notePause(deferred(120_000), ctx);
+      // Rechecks: the same deadline, restated as the time left.
+      fx.strategy.notePause(deferred(119_990), ctx);
+      fx.strategy.notePause(deferred(119_980), ctx);
+      assert.equal(warnings.length, 1, 'one hold, one warning');
+      fx.strategy.notePause(deferred(600_000), ctx);
+      assert.equal(warnings.length, 2, 'a new deadline is news');
+      fx.strategy.notePause(deferred(), ctx);
+      fx.strategy.notePause(deferred(), ctx);
+      assert.equal(warnings.length, 3, 'so is none, once');
+      assert.equal(fx.strategy.releaseCompressionPause(), true);
+      fx.strategy.notePause(deferred(), ctx);
+      assert.equal(warnings.length, 4, 'a hold that outlasts a release warns again');
+    } finally {
+      console.warn = orig;
+    }
+    fx.manager.close();
+  });
+});
+
+describe('the quarantine-skip warning is per branch (sw-cm138 I28)', () => {
+  it('a branch switch clears what was warned on the old branch', async () => {
+    const fx = await queued(scripted([OK('unused')]).membrane);
+    fx.strategy.warnedSkips().add('zz-chunk-hash');
+    const main = fx.manager.currentBranch().name;
+    const fork = fx.manager.getStore().createBranchAt('zz-fork', main, fx.manager.getStore().currentSequence()).name;
+    await fx.manager.switchBranch(fork);
+    assert.equal(fx.strategy.warnedSkips().size, 0);
     fx.manager.close();
   });
 });

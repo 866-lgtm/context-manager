@@ -188,7 +188,8 @@ describe('split-stitch L1 fallback', () => {
   });
 
   it('a transient error on a sub-request interrupts the rung: nothing installed, no further sub-calls, family not exhausted', async () => {
-    const { calls, membrane } = cumulativeMembrane({ refuseAt: 2, throwOn: 'raw-1' });
+    const opts: { refuseAt: number; throwOn?: string } = { refuseAt: 2, throwOn: 'raw-1' };
+    const { calls, membrane } = cumulativeMembrane(opts);
     const fx = await build(membrane, { split: true, placeholder: true });
     // An untyped transport error says nothing about the request (room-225
     // L3): the rung is one atomic retry unit, so it propagates and the rung
@@ -204,6 +205,19 @@ describe('split-stitch L1 fallback', () => {
     assert.equal(att.calls, subs.length, 'attempted.calls counts the thrown sub-call too');
     assert.equal(att.errors, 1);
     assert.equal(att.complete, false);
+
+    // The transport recovers: a later run re-runs the whole rung, from its
+    // first piece, and pays nothing again for the rungs before it.
+    delete opts.throwOn;
+    const whole = (c: NormalizedRequest) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 4;
+    const wholeBefore = calls.filter(whole).length;
+    const before = calls.length;
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(calls.filter(whole).length, wholeBefore, 'the refused whole-chunk rungs are reused from progress, not sent again');
+    const rerun = calls.slice(before);
+    assert.ok(texts(rerun[0]!).some((t) => t.startsWith('raw-0 ')), 'the rung re-runs from its first piece');
+    assert.equal(fx.strategy.entries().length, 1, 'and installs its one L1');
+    assert.equal(fx.strategy.attempted()!.complete, true, 'the re-run is recorded as complete');
   });
 
   it('a deterministic rejection of a sub-request aborts the rung: nothing installed, family exhausted', async () => {
@@ -224,6 +238,13 @@ describe('split-stitch L1 fallback', () => {
     assert.equal(fx.strategy.entries().length, 0, 'nothing installed after a rejected piece');
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'the ladder ended deterministically');
     assert.equal(fx.strategy.attempted()!.complete, false);
+    const subs = calls.filter((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length < 4);
+    const rejected = subs.findIndex((c) => {
+      const targets = texts(c).filter((t) => /^raw-\d+ /.test(t));
+      return targets.length === 1 && targets[0]!.startsWith('raw-1');
+    });
+    assert.ok(rejected >= 0, 'the rejected piece was sent');
+    assert.equal(subs.length, rejected + 1, 'nothing after it: no retry of raw-1, no later piece');
   });
 
   it('per-window call cap aborts the rung and installs nothing', async () => {

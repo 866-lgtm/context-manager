@@ -619,7 +619,9 @@ interface CompressionRefusalQuarantineRecord {
  * Kept separate from the quarantine ledger, whose projection IS the
  * quarantined set (status and the klaxon count it). Branch-scoped like the
  * rest of the strategy's state. Deleted at meaningful boundaries only: the
- * chunk mints (or its debt is paid), or the family exhausts into quarantine.
+ * chunk mints or its span is otherwise covered, the family exhausts into
+ * quarantine or an operator clears that quarantine, or the tick's sweep finds
+ * the span paid off or the progress abandoned (sweepPaidOffCompressionProgress).
  */
 interface CompressionFamilyProgress {
   familyKey: string;
@@ -664,6 +666,13 @@ interface CompressionLanePause {
    * call was made). Null with `statedUntil`.
    */
   statedBy: 'provider' | 'admission' | null;
+  /**
+   * The deadline the caller's provider admission last gave while it holds
+   * the lane (null: it gave none), so one hold warns and logs once, and again
+   * only when its deadline changes. Unset on a pause no admission holds, and
+   * cleared by releaseCompressionPause.
+   */
+  admissionDeadline?: number | null;
   /** Consecutive paused failures; resets on any provider answer. */
   failures: number;
   membrane: unknown;
@@ -1263,7 +1272,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected chunks: Chunk[] = [];
   protected pendingCompression: Promise<void> | null = null;
   protected compressionQueue: number[] = [];
-  /** Once per source chunk for this strategy instance, across queue rebuilds. */
+  /** Once per source chunk on the loaded branch, across queue rebuilds:
+   *  cleared with the other branch mirrors, so another branch warns afresh. */
   private warnedQuarantineSkips = new Set<string>();
   protected _compressionCount = 0;
   /**
@@ -1323,6 +1333,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  provider call (the admission refuses again while its wait binds), so
    *  this bounds a cache, not a provider deadline. */
   static readonly COMPRESSION_ADMISSION_RECHECK_MS = 30_000;
+  /** An admission deadline restated within this much of the last one is the
+   *  same deadline: it arrives as a relative wait (`retryAfterMs`), so each
+   *  restatement lands a little later on this clock. */
+  static readonly COMPRESSION_ADMISSION_DEADLINE_SLACK_MS = 1_000;
+  /** How often tick sweeps ladder progress that can never be resumed, at most. */
+  static readonly COMPRESSION_PROGRESS_SWEEP_INTERVAL_MS = 10 * 60_000;
+  /** Ladder progress nothing has advanced for this long is abandoned: the
+   *  sweep drops it, whatever its chunk's state. */
+  static readonly COMPRESSION_PROGRESS_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 
   /** Distinct quarantined request shapes tolerated per chunk before the
    *  quarantine goes sticky by chunk hash. Shape changes legitimately
@@ -1585,6 +1604,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Explicit operator escape hatch. A retry remains canonical-first; clearing
    * this state only permits the same as-of request family to be issued again.
+   * A cleared family's ladder progress goes with it, so the retry pays for
+   * its answers afresh rather than re-exhausting on outcomes recorded before
+   * the clear (a crash between exhaustion's ledger write and its progress
+   * drop would otherwise leave them).
    */
   async clearCompressionRefusalQuarantine(key?: string): Promise<void> {
     this.requireLoadedBranch('clearCompressionRefusalQuarantine');
@@ -1607,14 +1630,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       () => {
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       const current = this.readCompressionQuarantineProjection();
+      const clearedFamilies = new Set<string>();
       for (const target of targets) {
-        if (current.get(target.key)?.generationId !== target.generationId) continue;
+        const active = current.get(target.key);
+        if (active?.generationId !== target.generationId) continue;
         this.appendCompressionQuarantineEvent({
           kind: 'clear',
           key: target.key,
           targetClaimId: target.generationId,
           created: Date.now(),
         });
+        clearedFamilies.add(active.record.familyKey);
+      }
+      if (clearedFamilies.size > 0) {
+        this.forgetCompressionFamilyProgress((entry) => clearedFamilies.has(entry.familyKey));
       }
       this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
       this.checkpointCompressionQuarantineIfNeeded(sourceBranch);
@@ -2038,6 +2067,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.headWindowStartId = null;
     this._cachedHeadStartIndex = null;
     this.compressionRefusalQuarantine.clear();
+    this.warnedQuarantineSkips.clear();
     this.pins = [];
     this.pinIdCounter = 0;
     this.resolutions.clear();
@@ -3659,6 +3689,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private quarantineAlarmLastAt = 0;
   /** True while an alarm episode is open (alarmed and not yet all-cleared). */
   private quarantineAlarmActive = false;
+  /** When tick last swept ladder progress (sweepCompressionProgressIfDue). */
+  private compressionProgressSweptAt = 0;
   private onQuarantineAlarm?: (status: CompressionQuarantineStatus) => void;
 
   /**
@@ -3694,7 +3726,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
     // Sweep BEFORE reading status: the klaxon must reflect real debt only.
     await this.sweepPaidOffQuarantineRecords();
-    this.sweepPaidOffCompressionProgress();
     const status = this.getCompressionQuarantineStatus();
     if (status.count === 0) {
       // All-clear must travel the SAME channel the alarm did — after an
@@ -3772,24 +3803,75 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Ladder progress whose span is already covered, or whose chunk no longer
-   * exists, can never be resumed: drop it, judged against the persisted
-   * chunk records exactly as the quarantine sweep is (never blind).
+   * Sweep ladder progress on its own cadence, from tick: at most every
+   * COMPRESSION_PROGRESS_SWEEP_INTERVAL_MS, whatever the quarantine alarm's
+   * state (it can be off, and an active alarm would otherwise sweep on every
+   * tick), and a slot with no progress costs one small read.
    */
-  private sweepPaidOffCompressionProgress(): void {
+  private sweepCompressionProgressIfDue(ctx: StrategyContext): void {
+    const now = Date.now();
+    if (now - this.compressionProgressSweptAt < AutobiographicalStrategy.COMPRESSION_PROGRESS_SWEEP_INTERVAL_MS) return;
+    this.compressionProgressSweptAt = now;
+    this.sweepPaidOffCompressionProgress(ctx);
+  }
+
+  /**
+   * Drop ladder progress that can never be resumed, or that nothing has
+   * advanced for COMPRESSION_PROGRESS_MAX_AGE_MS (a family abandoned when its
+   * chunk's boundaries or the recall frontier moved). A span is judged by
+   * the persisted chunk records, never blind:
+   *  - matching record, compressed → covered: drop;
+   *  - matching record, raw → live: keep;
+   *  - no matching record → drop only when the span is known to be paid
+   *    off: every message of it is covered by an L1, or one of its messages
+   *    is gone from the store, so no chunk can be cut with these ids again.
+   *    A record can go missing while its chunk lives (records are rewritten
+   *    as whole snapshots, and a stale writer can drop one), and dropping
+   *    live progress would pay its answered rungs again. An entry that
+   *    doesn't carry its span's ids keeps the old rule: dropped.
+   */
+  private sweepPaidOffCompressionProgress(ctx: StrategyContext): void {
     if (!this.store) return;
     try {
-      if (this.readCompressionFamilyProgress().size === 0) return;
+      const progress = this.readCompressionFamilyProgress();
+      if (progress.size === 0) return;
+      const now = Date.now();
+      const aged = (entry: CompressionFamilyProgress): boolean =>
+        typeof entry.updated === 'number' && now - entry.updated > AutobiographicalStrategy.COMPRESSION_PROGRESS_MAX_AGE_MS;
       const records = this.store.getStateJson(this.chunksStateId);
       const chunkRecords = Array.isArray(records) ? (records as ChunkRecord[]) : [];
-      if (chunkRecords.length === 0) return;
+      if (chunkRecords.length === 0) {
+        // Nothing to judge spans by (no records yet, or chunk persistence
+        // off): only age decides.
+        this.forgetCompressionFamilyProgress(aged);
+        return;
+      }
       const byHash = new Map<string, ChunkRecord>();
       for (const r of chunkRecords) {
         if (r && Array.isArray(r.sourceIds)) byHash.set(sha256Json(r.sourceIds), r);
       }
+      // Built only if an entry's record is missing.
+      let coveredByL1: Set<string> | null = null;
+      let storedIds: Set<string> | null = null;
+      const paidOff = (sourceIds: string[]): boolean => {
+        if (!coveredByL1) {
+          coveredByL1 = new Set<string>();
+          for (const summary of this.summaries) {
+            if (summary.level === 1 && Array.isArray(summary.sourceIds)) {
+              for (const id of summary.sourceIds) coveredByL1.add(id);
+            }
+          }
+        }
+        if (sourceIds.length > 0 && sourceIds.every((id) => coveredByL1!.has(id))) return true;
+        if (!storedIds) storedIds = new Set(ctx.messageStore.getAll().map((message) => message.id));
+        // An empty store says nothing about which messages are gone.
+        return storedIds.size > 0 && sourceIds.some((id) => !storedIds!.has(id));
+      };
       this.forgetCompressionFamilyProgress((entry) => {
+        if (aged(entry)) return true;
         const match = byHash.get(entry.chunkSourceHash);
-        return !match || match.compressed === true;
+        if (match) return match.compressed === true;
+        return Array.isArray(entry.sourceIds) ? paidOff(entry.sourceIds) : true;
       });
     } catch (error) {
       console.warn(`[autobiographical] compression progress sweep failed (progress remains): ${describeCompressionFailure(error)}`);
@@ -4061,6 +4143,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const released = pause.statedBy === 'admission' ? "the caller's cached admission deferral" : "the provider's stated wait";
     pause.statedUntil = null;
     pause.statedBy = null;
+    // A hold that continues after the release is news: it warns again.
+    delete pause.admissionDeadline;
     // A release is the caller's word on the wait, not an answer from the
     // provider: the failure count stays, so a failure after it keeps doubling
     // the backoff from the genuine count (only an answer resets it).
@@ -4076,12 +4160,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Pause compression calls after a failure that says nothing about the
    * request, until both constraints have passed: the lane's own backoff (30 s
    * doubling to 10 min) and the provider's stated wait, which is never
-   * shortened. A stated wait that cannot be held as an instant (not finite,
-   * or past the last instant a Date can hold) is an explicit hold until a
-   * restart, a change of membrane or model, or releaseCompressionPause. The
+   * shortened. A stated wait is a non-negative `retryAfterMs`; NaN, or any
+   * other value, states none (a garbage value must not hold the lane until a
+   * restart). One that cannot be held as an instant (Infinity, or past the
+   * last instant a Date can hold) is an explicit hold until a restart, a
+   * change of membrane or model, or releaseCompressionPause. The
    * pause belongs to the model the failed call was dispatched with.
    * Discarded or stale-branch work installs nothing. One warning per pause,
-   * plus a structured log event.
+   * plus a structured log event (compression:lane-paused); a hold by the
+   * caller's provider admission warns and logs (compression:lane-held-by-
+   * admission) once per hold, and again when its deadline changes.
    */
   private pauseCompressionLane(
     source: CompressionOperationBranch,
@@ -4134,7 +4222,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         pause.statedBy = 'admission';
       }
       pause.reason = describeCompressionFailure(error);
+      // One hold, one warning and one log event: the lane asks again every
+      // COMPRESSION_ADMISSION_RECHECK_MS at most, and a recheck that finds
+      // the same hold under the same deadline says nothing new.
+      const last = previous?.admissionDeadline;
+      const sameHold = last !== undefined && (
+        last === statedUntil ||
+        (last !== null && statedUntil !== null &&
+          Math.abs(last - statedUntil) <= AutobiographicalStrategy.COMPRESSION_ADMISSION_DEADLINE_SLACK_MS)
+      );
+      pause.admissionDeadline = statedUntil;
       this.compressionPause = pause;
+      if (sameHold) return;
       const deadline = statedUntil === null
         ? 'it gave no deadline'
         : Number.isFinite(statedUntil)
@@ -5260,6 +5359,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (after sweeping records whose debt is already paid).
     await this.soundQuarantineAlarmIfNeeded();
     if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+    this.sweepCompressionProgressIfDue(ctx);
     this.soundMergeQuarantineAlarmIfNeeded();
     if (this.pendingCompression) return;
 
@@ -5372,10 +5472,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this.mergeBlockedByHold(merge.sourceIds, ctx.messageStore)) return;
       this._drainProgress++; // executing a merge is real work, even if a
       // follow-on merge gets enqueued and the queue length nets out unchanged
-      this.pendingCompression = this.executeMerge(merge.level, merge.sourceIds, ctx);
+      const merging = this.executeMerge(merge.level, merge.sourceIds, ctx);
+      this.pendingCompression = merging;
 
       try {
-        await this.pendingCompression;
+        await merging;
         if (!this.isCompressionBranchCurrent(sourceBranch)) return;
         // Success: drop from head and persist the shorter queue. We
         // re-check that head is still our merge in case some future code
@@ -5398,16 +5499,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.recordMergeRejection(merge, error);
           return;
         }
-        // A NON-RETRYABLE provider error (membrane retryable:false — e.g.
-        // context_length, invalid_request) is deterministic: the identical
-        // request fails identically on every tick, and the rethrow path
-        // below has no attempt accounting — a hot retry loop (opus4
+        // A request-attributable rejection (compressionFailureKind's
+        // 'rejection': the membrane's errorType is context_length,
+        // invalid_request, safety or unsupported) is deterministic: the
+        // identical request fails identically on every tick, and the rethrow
+        // path below has no attempt accounting — a hot retry loop (opus4
         // 2026-08-03: 442 context_length 400s at ~6s intervals, 2.7GB of
         // full-payload error logs). Route it through the same bounded
         // attempts/quarantine policy as disposition rejections; the merge
         // prompt halves its recall budget per attempt (see executeMerge),
-        // so each retry is a genuinely smaller request. Retryable errors
-        // (429, network, timeout) keep the pre-existing rethrow semantics.
+        // so each retry is a genuinely smaller request. The rule keys on the
+        // errorType, not on the membrane's retryable flag: everything else
+        // (429, network, timeout, credentials, quota) pauses the lane.
         const membraneType = (error as { type?: unknown; retryable?: unknown }) ?? {};
         const failureKind = compressionFailureKind(error);
         // Only a request-attributable rejection is evidence about this merge
@@ -5481,7 +5584,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
         throw error;
       } finally {
-        this.pendingCompression = null;
+        // As for L1 above: a branch switch may have installed different
+        // pending work, whose ownership this stale merge must not release.
+        if (this.pendingCompression === merging) this.pendingCompression = null;
       }
     }
   }
@@ -6341,13 +6446,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //    can't intersect the recent-exclusion window); if that assumption is
     //    ever weakened, reinstate a raw fallback (chunk-level `coveredBy`)
     //    rather than dropping. The chunk record (if any) is deliberately
-    //    left uncompressed as an operator breadcrumb.
+    //    left uncompressed as an operator breadcrumb (a compressed record
+    //    with no summary of its own is reset to raw on load). The span is
+    //    covered all the same, so its ladder progress and any quarantine
+    //    debt are paid off here, as adoption does: the paid-off sweep judges
+    //    by the persisted mark, which this path doesn't set.
     if (chunk.messages.length > 0 && chunk.messages.every(m => coveredByL1.has(m.id))) {
       console.warn(
         `[autobiographical] dedup guard: chunk ${chunk.recordId ?? `#${chunk.index}`} ` +
         `is fully covered by existing L1s under different boundaries — dropped, not re-compressed.`,
       );
       chunk.compressed = true;
+      await this.clearQuarantineForCompressedChunk(chunk);
       return;
     }
 
@@ -6961,6 +7071,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       const coalescedSummary = this.findExactL1(chunkIdKey);
       if (coalescedSummary) {
+        // The producer shares this namespace (the in-flight key says so), and
+        // its success path has already marked the chunk record and paid off
+        // the span's progress and quarantine debt in the shared slots.
         chunk.compressed = true;
         chunk.summaryId = coalescedSummary.id;
       }
@@ -7141,6 +7254,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let failureStreak = progress?.failureStreak;
       const answeredRequests = new Set<string>();
       const persistProgress = (): void => {
+        // A family that had progress when this ladder began, and has none in
+        // the slot now, was dropped meanwhile (minted, exhausted, cleared or
+        // swept, here or by another strategy on this store): this ladder's
+        // snapshot must not bring it back. The check and the write are
+        // synchronous, with no await between them.
+        if (progress && !this.readCompressionFamilyProgress().has(quarantineRecord.familyKey)) return;
         this.recordCompressionFamilyProgress(
           sourceBranch, quarantineRecord, progressOutcomes, progressCanonicalInputTokens, failureStreak, answeredRequests,
           chunk.messages.map((message) => message.id),

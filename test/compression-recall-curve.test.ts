@@ -127,6 +127,33 @@ function quarantineEventsFor(
   return Array.isArray(value) ? value as Array<Record<string, unknown>> : [];
 }
 
+/** Wait for `cond`, failing rather than hanging. */
+async function until(cond: () => boolean, what: string, ms = 10_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
+/**
+ * Count lookups in the compression in-flight registry that find a call
+ * already in flight: a producer joining it. The registry is module-private,
+ * so this watches Map lookups by its key's shape (the namespace's quarantine
+ * ledger id among \u0000-joined parts) that return a pending result. Restore
+ * it before anything else runs.
+ */
+function observeInFlightJoins(): { count: () => number; restore: () => void } {
+  const realGet = Map.prototype.get;
+  let joins = 0;
+  Map.prototype.get = function (this: Map<unknown, unknown>, key: unknown) {
+    const value = realGet.call(this, key);
+    if (typeof key === 'string' && key.includes('\u0000') && key.includes('autobio:') && value instanceof Promise) joins++;
+    return value;
+  };
+  return { count: () => joins, restore: () => { Map.prototype.get = realGet; } };
+}
+
 class ProbeStrategy extends AutobiographicalStrategy {
   seed(entry: SummaryEntry): void {
     this.pushSummary(entry);
@@ -2075,11 +2102,22 @@ describe('compression refusal recall curves', () => {
     ).filter(Boolean) as StoredMessage[];
     const secondChunk = { ...first.target, messages: secondMessages, compressed: false };
 
-    const runs = Promise.all([
-      first.strategy.run(first.target, managerContext(first.manager)),
-      second.run(secondChunk, secondCtx),
-    ]);
-    setTimeout(release, 20);
+    // Release the held call only once the second producer has joined it:
+    // arriving later, it would reload the durable summary instead, and the
+    // test would pass without the in-flight registry.
+    const joins = observeInFlightJoins();
+    let runs: Promise<unknown>;
+    try {
+      runs = Promise.all([
+        first.strategy.run(first.target, managerContext(first.manager)),
+        second.run(secondChunk, secondCtx),
+      ]);
+      await until(() => joins.count() >= 1, 'the second producer to join the in-flight call');
+      assert.equal(entered, 1, 'joined while the first call is held');
+    } finally {
+      joins.restore();
+      release();
+    }
     await runs;
     assert.equal(mock.calls.length, 1, 'same-key in-flight registry permits only one provider call');
     const persisted = first.manager.getStore().getStateJson('default/autobio:summaries');
@@ -2171,7 +2209,13 @@ describe('compression refusal recall curves', () => {
       first.strategy.run(first.target, managerContext(first.manager)),
       second.run(secondChunk, secondCtx),
     ]);
-    setTimeout(release, 20);
+    // Both calls in flight at once before either is released: had the second
+    // joined the first, this would never be reached.
+    try {
+      await until(() => calls.length >= 2, 'both namespaces to call the provider');
+    } finally {
+      release();
+    }
     await runs;
     assert.equal(calls.length, 2, 'namespace state identities cannot coalesce');
     const targetKey = first.target.messages.map((message) => message.id).join(':');
