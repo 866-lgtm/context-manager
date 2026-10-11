@@ -22,21 +22,30 @@
  * proof the resident uses it: an isolated slot outlives a switch to shared
  * messages. So a chosen slot must be registered; without a choice the sole
  * registered slot is read, and when both are registered nothing is
- * inspected until one is chosen. The overview and the files name the slot
- * they read.
+ * inspected until one is chosen. The overview, messages.md and the sample
+ * name the slot they read.
  *
  * Mutation-free strategy inspection: the store is opened with JsStore.open
  * (it is never created), the strategy's persisted state is read as stored,
- * and no strategy or ContextManager is constructed. So inspection creates no
- * strategy, chunk or namespace state and registers nothing for a namespace;
- * a namespace without strategy state is reported and nothing else is done.
- * Messages are read through a MessageStore, whose construction re-registers
- * the message slot's history indexes, idempotently, as every open of the
- * store does, rebuilding any that are missing or stale.
+ * and without --sample-compile no strategy or ContextManager is constructed.
+ * So inspection creates no strategy, chunk or namespace state and registers
+ * no strategy state; a namespace without strategy state is reported and
+ * nothing else is done. Messages are read through a MessageStore, whose
+ * construction re-registers the message slot's history indexes,
+ * idempotently, as every MessageStore construction does, rebuilding any that
+ * are missing or stale; for an isolated slot those are the namespace's own.
  *
- * Inspection is mutation-free logically, not byte-for-byte. Chronicle has no
- * read-only open: opening takes the store's lock, so run this on a stopped
- * resident's store or on a copy. Every close rewrites state.bin,
+ * Summaries and resolutions are read as stored, before the strategy's
+ * load-time repair (which drops empty summaries, dedupes ids and clears
+ * dangling parents), so a count can include entries a resident drops when it
+ * loads. A state that holds something other than what the strategy writes
+ * (a summaries state that isn't a list, a resolutions state that isn't a map
+ * of numbers) is reported on stderr and in the overview, never read as empty.
+ *
+ * Inspection is mutation-free logically, not byte-for-byte. Chronicle (as of
+ * 0.4.0) has no read-only open: opening takes the store's lock, so run this on
+ * a stopped resident's store or on a copy; a store whose lock is held is
+ * refused with exit 1. Every close rewrites state.bin,
  * state-indexes.bin (where a rebuilt history index lands) and branches.bin,
  * whose bytes can change even when what they hold doesn't. And when the
  * store wasn't closed cleanly, opening may correct stale branch heads, which
@@ -49,15 +58,23 @@
  * `--sample-compile <tokens>` additionally writes one compile at that
  * budget from a live, audit-only open of the same message slot, using this
  * tool's default strategy configuration (not the resident's own, so it is a
- * sample, not a reproduction of the resident's view). That open registers
- * the namespace's states and may migrate legacy chunk records: use it on a
- * copy. With no message slot there is no history to compile, so it is
- * refused.
+ * sample, not a reproduction of the resident's view). That open writes: it
+ * registers the namespace's states, re-applies the message slot's
+ * registration (its snapshot cadence; the shared slot is store-global),
+ * may migrate legacy chunk records, and may rewrite the summaries state as the
+ * strategy repairs it on load. Use it on a copy. With no message slot there
+ * is no history to compile, so it is refused.
  *
- * Exit code 0 = inspected; 2 = nothing inspected because the store doesn't
- * settle the selection (the namespace has no strategy state, or its message
- * slot is absent or must be chosen); 1 = could not open, or a malformed
- * invocation.
+ * Exit codes:
+ *   0 = inspected. With no message slot registered and no --sample-compile,
+ *       the summaries are inspected and the messages reported as none.
+ *   2 = nothing inspected, because the store doesn't settle the selection:
+ *       the namespace has no strategy state, a chosen message slot isn't
+ *       registered, both slots are registered and none was chosen, or a
+ *       sample compile was asked for with no message slot.
+ *   1 = a malformed invocation, a store that can't be opened (absent, not a
+ *       store, or locked), or a failure after inspection began; outputs
+ *       written before such a failure stay where they are.
  */
 
 import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
@@ -122,13 +139,16 @@ function invocation(args: string[]): Invocation {
     throw new UsageError(`--message-slot takes isolated or shared, not ${JSON.stringify(slotRaw)}`);
   }
   const sampleRaw = given.get('sampleCompile')?.value;
-  const sampleTokens = sampleRaw === undefined ? undefined : Number(sampleRaw);
-  if (sampleTokens !== undefined && !(Number.isInteger(sampleTokens) && sampleTokens > 0)) {
+  // Decimal digits only, so 0x7d0, 1e3 or " 50" can't pass as a budget, and the sample's file is named as given.
+  if (sampleRaw !== undefined && !/^[1-9][0-9]*$/.test(sampleRaw)) {
     throw new UsageError(`--sample-compile takes a positive whole number of tokens, not ${JSON.stringify(sampleRaw)}`);
   }
+  const sampleTokens = sampleRaw === undefined ? undefined : Number(sampleRaw);
+  const namespaceGiven = given.get('namespace');
+  if (namespaceGiven !== undefined && namespaceGiven.value === '') throw new UsageError(`${namespaceGiven.name} needs a non-empty value`);
   return {
     storePath,
-    namespace: given.get('namespace')?.value ?? 'default',
+    namespace: namespaceGiven?.value ?? 'default',
     slotChoice: slotRaw,
     outputDir: given.get('output')?.value ?? './inspection-output',
     sampleTokens,
@@ -160,10 +180,16 @@ async function main(): Promise<number> {
   const log = `${storePath}/records.log`;
   const logSize = () => (existsSync(log) ? statSync(log).size : 0);
   const sizeBefore = logSize();
-  let store: JsStore;
+  let store: JsStore | undefined;
+  let openError: unknown;
   try {
     store = JsStore.open({ path: storePath });
-  } finally {
+  } catch (error) {
+    openError = error;
+  }
+  // Reported whether or not the open succeeded, and guarded, so a failure here can neither hide the open's own
+  // error nor leave an opened store unclosed.
+  try {
     const size = logSize();
     if (size < sizeBefore) {
       const dropped = sizeBefore - size;
@@ -174,6 +200,18 @@ async function main(): Promise<number> {
           'resident writes. Those bytes are gone from this store, and later opens won\'t report them.',
       );
     }
+  } catch (error) {
+    console.error(`⚠️ Could not check records.log for a torn tail the open may have truncated: ${String(error)}`);
+  }
+  if (store === undefined) {
+    if (/locked/i.test(String((openError as Error | undefined)?.message ?? openError))) {
+      console.error(
+        `⚠️ The store at ${storePath} is locked: a running resident (or another process) holds it open. ` +
+          'Stop it, or inspect a copy of the store. Nothing was inspected.',
+      );
+      return 1;
+    }
+    throw openError;
   }
   try {
     const stateIds = new Set(store.listStates().map((state) => state.id));
@@ -209,7 +247,8 @@ async function main(): Promise<number> {
       console.error(
         `⚠️ "${namespace}" has both message slots registered, ${slotIds.isolated} (isolated) and ${slotIds.shared} (shared), ` +
           'and the store doesn\'t record which one its resident uses (ContextManager\'s isolate): a registered slot can be left ' +
-          'over from an earlier configuration. Nothing was inspected; choose with --message-slot isolated or --message-slot shared.',
+          'over from an earlier configuration, and the shared slot is store-global, so another namespace\'s resident can have ' +
+          'registered it. Nothing was inspected; choose with --message-slot isolated or --message-slot shared.',
       );
       return 2;
     } else {
@@ -225,13 +264,28 @@ async function main(): Promise<number> {
     const slotLabel = slot === undefined ? 'no message slot' : `the ${slot} message slot ${slotIds[slot]}`;
 
     const messages = slot === undefined ? [] : new MessageStore(store, slot === 'isolated' ? { namespace } : {}).getAll();
+    // Read as stored. A value the strategy wouldn't have written is reported, never read as empty.
+    const shapeOf = (value: unknown) => (value === null ? 'null' : Array.isArray(value) ? 'a list' : typeof value === 'object' ? 'a map' : `a ${typeof value}`);
     const stored = store.getStateJson(summariesId);
+    const summariesUnreadable = stored !== undefined && stored !== null && !Array.isArray(stored);
+    if (summariesUnreadable) {
+      console.error(`⚠️ ${summariesId} holds ${shapeOf(stored)}, not a list of summaries; the summaries are shown as unreadable.`);
+    }
     const summaries = (Array.isArray(stored) ? stored : []) as SummaryEntry[];
-    const resolutionState = store.getStateJson(`${namespace}/autobio:resolutions`);
+    const resolutionsId = `${namespace}/autobio:resolutions`;
+    const resolutionState = store.getStateJson(resolutionsId);
     const resolutions = new Map<string, number>();
-    if (resolutionState && typeof resolutionState === 'object') {
+    let resolutionsUnreadable = 0;
+    if (resolutionState !== undefined && resolutionState !== null && (typeof resolutionState !== 'object' || Array.isArray(resolutionState))) {
+      console.error(`⚠️ ${resolutionsId} holds ${shapeOf(resolutionState)}, not a map of message ids to levels; no resolutions are shown.`);
+      resolutionsUnreadable = -1;
+    } else if (resolutionState) {
       for (const [id, level] of Object.entries(resolutionState as Record<string, unknown>)) {
-        if (typeof level === 'number' && level > 0) resolutions.set(id, level);
+        if (typeof level !== 'number') resolutionsUnreadable++;
+        else if (level > 0) resolutions.set(id, level);
+      }
+      if (resolutionsUnreadable > 0) {
+        console.error(`⚠️ ${resolutionsId} has ${resolutionsUnreadable} entr${resolutionsUnreadable === 1 ? 'y' : 'ies'} whose level isn't a number; they aren't shown.`);
       }
     }
 
@@ -246,12 +300,16 @@ async function main(): Promise<number> {
     }
     console.log(`=== Overview (${namespace}) ===`);
     console.log(`Messages: ${messages.length} (${slotLabel})`);
-    console.log(`Summaries: ${summaries.length} (${JSON.stringify(byLevel)})`);
+    console.log(summariesUnreadable
+      ? `Summaries: unreadable (${summariesId} holds ${shapeOf(stored)})`
+      : `Summaries: ${summaries.length} (${JSON.stringify(byLevel)}), as stored`);
     console.log(`BodyGroups: ${bodyGroups.size}`);
     for (const [gid, count] of [...bodyGroups.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)) {
       console.log(`  ${gid}: ${count} shards`);
     }
-    console.log(`Resolutions recorded: ${resolutions.size}`);
+    console.log(resolutionsUnreadable < 0
+      ? `Resolutions recorded: unreadable (${resolutionsId} holds ${shapeOf(resolutionState)})`
+      : `Resolutions recorded: ${resolutions.size}${resolutionsUnreadable > 0 ? ` (${resolutionsUnreadable} unreadable entr${resolutionsUnreadable === 1 ? 'y' : 'ies'} not shown)` : ''}`);
     const resDist: Record<number, number> = {};
     for (const level of resolutions.values()) resDist[level] = (resDist[level] ?? 0) + 1;
     console.log(`Resolution distribution: ${JSON.stringify(resDist)}`);
@@ -305,7 +363,9 @@ async function main(): Promise<number> {
     if (sampleTokens !== undefined) {
       console.error(
         `--sample-compile: a live, audit-only sample of "${namespace}" from ${slotLabel}, using this tool's default strategy ` +
-          'configuration (not the resident\'s); this open registers the namespace\'s states and may migrate legacy chunk records',
+          'configuration (not the resident\'s). This open writes: it registers the namespace\'s states, re-applies the message ' +
+          'slot\'s registration (its snapshot cadence), may migrate legacy chunk records, and may rewrite the summaries state ' +
+          'as the strategy repairs it on load',
       );
       const strategy = new AutobiographicalStrategy({
         adaptiveResolution: true,
@@ -326,7 +386,7 @@ async function main(): Promise<number> {
         const lines: string[] = [
           `# Sample compile (${sampleTokens}-token budget)\n`,
           `A live, audit-only sample of "${namespace}" from ${slotLabel}, using inspect-store's default strategy configuration, not the resident's own.\n`,
-          "Producing it opened the store live, which registers the namespace's states and may migrate legacy chunk records; make samples from a copy of the store.\n",
+          "Producing it opened the store live, which registers the namespace's states, re-applies the message slot's registration (its snapshot cadence), may migrate legacy chunk records, and may rewrite the summaries state as the strategy repairs it on load; make samples from a copy of the store.\n",
           `Entries: ${compiled.messages.length}\n`,
         ];
         compiled.messages.forEach((m, i) => {
