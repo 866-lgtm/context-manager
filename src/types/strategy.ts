@@ -119,6 +119,16 @@ export interface ReadinessState {
   pendingWork?: Promise<void>;
   /** Description of pending work */
   description?: string;
+  /**
+   * Set while the compression lane is stalled: failures have gone on for an
+   * hour with nothing landing (AutobiographicalStrategy). `since` is when the
+   * failures began (ISO time), `subject` the work that kept failing, and
+   * `failureClass` its failure (membrane's error type and HTTP status). A
+   * request that fails while nothing else lands is never counted against
+   * itself, so it backs off indefinitely: if it is the request's own fault,
+   * exhausting it takes an operator. Cleared when a compression lands.
+   */
+  compressionStall?: { since: string; subject: string; failureClass: string };
 }
 
 /**

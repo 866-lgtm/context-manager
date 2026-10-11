@@ -432,35 +432,49 @@ describe('Merge terminal-disposition gate', () => {
     await fx.manager.close();
   });
 
-  it('persistent retryable server errors on the merge head are bounded (the rhys 500-loop)', async () => {
+  it('a merge that keeps failing while other work lands is bounded; one that fails in an outage is not (the rhys 500-loop)', async () => {
     // rhys 2026-08-06: 514 consecutive merge 500s across a week-long
-    // provider episode — retryable:true meant pure rethrow, zero attempt
-    // accounting, forever. Below the streak bound the transient semantics
-    // hold (rethrow, no attempt burn); at the bound the failure routes into
-    // the normal bounded rejection policy.
+    // provider episode, zero accounting. A failure that is not a rejection is
+    // evidence about the merge only while other compression lands between its
+    // failures (room-203 #70922): an outage, in which nothing lands, never
+    // counts; a merge that keeps failing the same way while other work lands
+    // routes, at the bound, into the normal bounded rejection policy.
     const serverErr = Object.assign(new Error('500 {"type":"api_error"}'), {
-      type: 'server', retryable: true,
+      type: 'server', retryable: true, httpStatus: 500,
     });
     const mock = scripted([{ error: serverErr }]);
     const fx = await fixture(mock.membrane);
-
-    const LIMIT = (AutobiographicalStrategy as unknown as { MERGE_SERVER_ERROR_STREAK_LIMIT: number })
-      .MERGE_SERVER_ERROR_STREAK_LIMIT;
-    // Each failure also pauses the compression lane (room-225 L3): a tick
-    // during the pause makes no call. Expire it between ticks to stand for
-    // the time passing, so this test still sees one call per tick.
-    const lane = fx.strategy as unknown as { compressionPause: { backoffUntil: number; statedUntil: number | null } | null };
-    for (let i = 1; i < LIMIT; i++) {
-      await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /500/, `tick ${i} rethrows (transient tier)`);
-      assert.equal(fx.strategy.mergeQueueView()[0]?.attempts ?? 0, 0, 'no attempt burn below the bound');
+    const BOUND = (AutobiographicalStrategy as unknown as { COMPRESSION_PERSISTENT_FAILURES: number })
+      .COMPRESSION_PERSISTENT_FAILURES;
+    // Each failure also pauses the compression lane: a tick during the pause
+    // makes no call. Expire it between ticks to stand for the time passing.
+    const lane = fx.strategy as unknown as {
+      compressionPause: { backoffUntil: number; statedUntil: number | null } | null;
+      noteCompressionLanded(): void;
+    };
+    const expire = () => { lane.compressionPause!.backoffUntil = 0; lane.compressionPause!.statedUntil = null; };
+    const streak = () => (fx.strategy.mergeQueueView()[0] as { failureStreak?: { failures: number; failureClass: string } }).failureStreak;
+    // An outage: nothing lands, so twelve failures count as one.
+    for (let i = 0; i < 12; i++) {
+      await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /500/, `tick ${i} rethrows`);
+      expire();
+    }
+    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts ?? 0, 0, 'no attempt burned in an outage');
+    assert.deepEqual([streak()?.failures, streak()?.failureClass], [1, 'server:500']);
+    // Other work lands before each of the next failures: each counts.
+    for (let i = 2; i < BOUND; i++) {
+      lane.noteCompressionLanded();
+      await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /500/);
       const calls = mock.calls.length;
       await fx.strategy.tick(ctx(fx.manager));
       assert.equal(mock.calls.length, calls, 'no call while the lane is paused');
-      lane.compressionPause!.backoffUntil = 0;
-      lane.compressionPause!.statedUntil = null;
+      expire();
+      assert.equal(fx.strategy.mergeQueueView()[0]?.attempts ?? 0, 0, 'no attempt burned below the bound');
     }
-    await fx.strategy.tick(ctx(fx.manager)); // streak hits the bound: recorded, not thrown
-    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1, 'bounded policy engaged at the streak limit');
+    assert.equal(streak()?.failures, BOUND - 1);
+    lane.noteCompressionLanded();
+    await fx.strategy.tick(ctx(fx.manager)); // the bound: recorded, not thrown
+    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1, 'bounded policy engaged at the bound');
     await fx.manager.close();
   });
 

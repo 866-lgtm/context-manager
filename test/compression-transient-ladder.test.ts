@@ -91,9 +91,14 @@ class ProbeStrategy extends AutobiographicalStrategy {
   notePause(error: unknown, ctx: StrategyContext): void {
     const self = this as unknown as {
       captureCompressionBranch(): unknown;
-      pauseCompressionLane(source: unknown, ctx: StrategyContext, error: unknown, lane: 'l1' | 'merge'): void;
+      pauseCompressionLane(source: unknown, ctx: StrategyContext, error: unknown, lane: 'l1' | 'merge', subject: string): void;
     };
-    self.pauseCompressionLane(self.captureCompressionBranch(), ctx, error, 'l1');
+    self.pauseCompressionLane(self.captureCompressionBranch(), ctx, error, 'l1', 'the probe');
+  }
+  /** Stand for other compression landing (white-box): the lane's evidence advances. */
+  land(): void { (this as unknown as { noteCompressionLanded(): void }).noteCompressionLanded(); }
+  mergeCandidates(unmerged: SummaryEntry[], threshold: number): SummaryEntry[] | null {
+    return this.contiguousMergeCandidates(unmerged, threshold);
   }
   /** Set the pause's constraints relative to now (white-box clock for the release seam). */
   shiftPause(backoffFromNow: number, statedFromNow: number | null): void {
@@ -197,23 +202,61 @@ describe('compression ladder: transient failures never spend it', () => {
     fx.manager.close();
   });
 
-  it('server errors: the 12th consecutive one on the same request ends it deterministically, counted across a restart', async () => {
+  it('a failure counts against its request only while other work lands, and the 8th of one class decides it, across a restart', async () => {
     const path = freshPath();
     const always503 = () => scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
+    const streak = (manager: ContextManager) =>
+      (progressSlot(manager) as Array<{ failureStreak?: { failures: number; failureClass: string } }>)[0]?.failureStreak;
     const first = always503();
     const a = await build(first.membrane, { path });
-    for (let i = 0; i < 11; i++) {
+    // An outage: nothing lands between the failures, so none adds to the run.
+    for (let i = 0; i < 12; i++) {
       await assert.rejects(a.strategy.run(a.target(), managerContext(a.manager)), /zz server failure/);
     }
-    assert.equal(a.strategy.getCompressionQuarantineStatus().count, 0, 'eleven is below the bound');
+    assert.equal(a.strategy.getCompressionQuarantineStatus().count, 0, 'an outage exhausts nothing');
+    assert.deepEqual([streak(a.manager)?.failures, streak(a.manager)?.failureClass], [1, 'server:503'],
+      'twelve failures with nothing landing are a run of one');
+    // Other work lands before each of the next six, so each counts.
+    for (let i = 0; i < 6; i++) {
+      a.strategy.land();
+      await assert.rejects(a.strategy.run(a.target(), managerContext(a.manager)), /zz server failure/);
+    }
+    assert.equal(streak(a.manager)?.failures, 7);
+    assert.equal(a.strategy.getCompressionQuarantineStatus().count, 0, 'seven is below the bound');
     a.manager.close();
 
     const second = always503();
     const b = await build(second.membrane, { path });
+    b.strategy.land();
     await b.strategy.run(b.target(), managerContext(b.manager));
     assert.equal(second.calls.length, 1, 'one more attempt after the restart');
-    assert.equal(b.strategy.getCompressionQuarantineStatus().count, 1, 'the twelfth ends the family');
+    assert.equal(b.strategy.getCompressionQuarantineStatus().count, 1, 'the eighth, after other work landed, ends the family');
     b.manager.close();
+  });
+
+  it('a failure of another class restarts the run, and an admission deferral changes nothing', async () => {
+    const deferral = Object.assign(new Error('zz held; no call was made'), { type: 'rate_limit', retryable: true, providerAdmission: 'deferred' });
+    const mock = scripted([
+      { throw: failure('server', { httpStatus: 503 }) },
+      { throw: failure('server', { httpStatus: 503 }) },
+      { throw: failure('server', { httpStatus: 503 }) },
+      { throw: deferral },
+      { throw: failure('timeout') },
+    ]);
+    const fx = await build(mock.membrane);
+    const streak = () => (progressSlot(fx.manager) as Array<{ failureStreak?: { failures: number; failureClass: string } }>)[0]!.failureStreak!;
+    for (let i = 0; i < 3; i++) {
+      fx.strategy.land();
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+    }
+    assert.deepEqual([streak().failures, streak().failureClass], [3, 'server:503']);
+    fx.strategy.land();
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /no call was made/);
+    assert.deepEqual([streak().failures, streak().failureClass], [3, 'server:503'], 'a deferral is no failure');
+    fx.strategy.land();
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz timeout failure/);
+    assert.deepEqual([streak().failures, streak().failureClass], [1, 'timeout'], 'another class starts a new run');
+    fx.manager.close();
   });
 
   it('progress is never written from stale-branch work', async () => {
@@ -577,7 +620,7 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
     fx.manager.close();
   });
 
-  it("the stripped request's server errors are its own: eleven, a restart, then the twelfth ends it, the carrier request paid once (#48315)", async () => {
+  it("the stripped request's failures are its own: seven with work landing, a restart, then the eighth ends it, the carrier request paid once (#48315)", async () => {
     const path = freshPath();
     const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
     const first = scripted([{ throw: rejected }, { throw: failure('server', { httpStatus: 503 }) }]);
@@ -587,14 +630,19 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
       { type: 'thinking', thinking: 'zz carried reasoning', signature: 'zz-signature' } as never,
       text('authored L1-100'),
     ];
-    for (let i = 0; i < 11; i++) {
+    for (let i = 0; i < 7; i++) {
+      a.strategy.land();
       await assert.rejects(a.strategy.run(a.target(), managerContext(a.manager)), /zz server failure/);
     }
     assert.equal(first.calls.filter(carriesThinking).length, 1, 'the carrier request was sent once');
-    assert.equal(first.calls.length, 12);
+    assert.equal(first.calls.length, 8);
     const stripped = sha256(first.calls[1]!);
-    const progress = progressSlot(a.manager) as Array<{ serverErrorStreak?: { requestHash: string; count: number } }>;
-    assert.deepEqual(progress[0]!.serverErrorStreak, { requestHash: stripped, count: 11 }, 'counted against the stripped request');
+    const progress = progressSlot(a.manager) as Array<{ failureStreak?: { requestHash: string; failures: number; failureClass: string } }>;
+    assert.deepEqual(
+      [progress[0]!.failureStreak?.requestHash, progress[0]!.failureStreak?.failures, progress[0]!.failureStreak?.failureClass],
+      [stripped, 7, 'server:503'],
+      'counted against the stripped request',
+    );
     a.manager.close();
 
     const second = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
@@ -603,11 +651,12 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
       { type: 'thinking', thinking: 'zz carried reasoning', signature: 'zz-signature' } as never,
       text('authored L1-100'),
     ];
+    b.strategy.land();
     await b.strategy.run(b.target(), managerContext(b.manager));
     assert.equal(second.calls.length, 1, 'only the stripped request after the restart');
     assert.ok(!carriesThinking(second.calls[0]!));
     assert.equal(sha256(second.calls[0]!), stripped, 'the same stripped request');
-    assert.equal(b.strategy.getCompressionQuarantineStatus().count, 1, 'the twelfth ends the family');
+    assert.equal(b.strategy.getCompressionQuarantineStatus().count, 1, 'the eighth ends the family');
     b.manager.close();
   });
 
@@ -643,7 +692,7 @@ describe("a caller's admission deferral is an external wait, not a failed call (
       'the cached answer lasts 30 s, not the admission\'s 120 s deadline');
     assert.match(fx.strategy.checkReadiness().description ?? '', /then the caller's provider admission is asked again, failure 0/);
     assert.equal(progressSlot(fx.manager).length, 1);
-    assert.deepEqual((progressSlot(fx.manager) as Array<{ outcomes: unknown[]; serverErrorStreak?: unknown }>)[0]!.outcomes, [], 'no rung spent');
+    assert.deepEqual((progressSlot(fx.manager) as Array<{ outcomes: unknown[]; failureStreak?: unknown }>)[0]!.outcomes, [], 'no rung spent');
 
     // The operator releases the wait through agent-framework 10 s later: no
     // invented 20 s of failure pacing remain.
@@ -739,12 +788,14 @@ describe('pending work stays discoverable after a transient failure or a deferra
     assert.ok(queuedAtStart.length >= 1);
 
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz network failure/);
-    assert.deepEqual(fx.strategy.compressionQueueView(), queuedAtStart, 'the failed chunk is back at the head');
+    // After a failure the chunk goes to the back, so the chunks behind it run first.
+    const afterFailure = [...queuedAtStart.slice(1), queuedAtStart[0]!];
+    assert.deepEqual(fx.strategy.compressionQueueView(), afterFailure, 'the failed chunk is back, at the end of the queue');
     assert.equal(fx.strategy.checkReadiness().ready, false, 'pending work is visible to maintenance');
 
     fx.strategy.expirePause();
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /no call was made/);
-    assert.deepEqual(fx.strategy.compressionQueueView(), queuedAtStart, 'and again after the deferral');
+    assert.deepEqual(fx.strategy.compressionQueueView(), afterFailure, 'and a deferral keeps the queue as it was');
 
     // The operator releases the wait; the backoff has passed. The next
     // maintenance tick, with nothing else happening, compresses the chunk.
@@ -790,6 +841,135 @@ describe('pending work stays discoverable after a transient failure or a deferra
     release();
     await assert.rejects(tick, /zz network failure/);
     assert.equal(fx.strategy.compressionQueueView().includes(head), false);
+    fx.manager.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Evidence, not streaks (room-203 #70846, #70922, #70929): a failure counts
+// against its request only while other compression lands; a failed request
+// goes to the back of its queue; the evidence is durable; a stall alerts.
+// ---------------------------------------------------------------------------
+
+describe('compression lane: failures are evidence only by the company they keep', () => {
+  const evidenceSlot = 'default/autobio:compression-lane-evidence';
+
+  it('a failed chunk goes to the back of the queue, so the chunk behind it runs next', async () => {
+    const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }, OK('the second chunk')]);
+    const fx = await queued(mock.membrane);
+    const queue = fx.strategy.compressionQueueView();
+    assert.ok(queue.length >= 2, 'two chunks queued');
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz server failure/);
+    assert.deepEqual(fx.strategy.compressionQueueView(), [...queue.slice(1), queue[0]], 'the failed chunk is now last');
+    fx.strategy.expirePause();
+    await fx.strategy.tick(managerContext(fx.manager));
+    const second = fx.strategy.chunksView()[queue[1]!]!;
+    const minted = fx.strategy.summariesView().find((s) => s.content === 'the second chunk');
+    assert.ok(minted, 'the next chunk compressed');
+    assert.equal(minted!.sourceIds[0], second.messages[0]!.id, 'the one that had been behind the failed chunk');
+    fx.manager.close();
+  });
+
+  it('an aborted or deferred attempt keeps its chunk at the head', async () => {
+    const aborted = Object.assign(new Error('zz aborted'), { name: 'AbortError' });
+    const deferral = Object.assign(new Error('zz held; no call was made'), { type: 'rate_limit', retryable: true, providerAdmission: 'deferred' });
+    for (const error of [aborted, deferral]) {
+      const mock = scripted([{ throw: error }]);
+      const fx = await queued(mock.membrane);
+      const queue = fx.strategy.compressionQueueView();
+      await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz (aborted|held)/);
+      assert.deepEqual(fx.strategy.compressionQueueView(), queue, `${error.message}: the chunk keeps its place`);
+      fx.manager.close();
+    }
+  });
+
+  it('a landed L1 advances the lane\'s durable evidence, after its result is written', async () => {
+    const mock = scripted([OK('a memory')]);
+    const fx = await queued(mock.membrane);
+    const landed = () => (fx.manager.getStore().getStateJson(evidenceSlot) as { landed?: number } | null)?.landed ?? 0;
+    assert.equal(landed(), 0);
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(landed(), 1);
+    assert.ok(fx.strategy.summariesView().some((s) => s.content === 'a memory'), 'the L1 it counts is pushed');
+    fx.manager.close();
+  });
+
+  it('failures for an hour with nothing landing alert once, through checkReadiness, until something lands', async () => {
+    const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
+    const fx = await queued(mock.membrane);
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+    try {
+      await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
+      assert.equal(fx.strategy.checkReadiness().compressionStall, undefined, 'a failure is no stall');
+      // Stand for an hour of failures: the clock is the durable start of the failures since the last landed success.
+      const store = fx.manager.getStore();
+      const evidence = store.getStateJson(evidenceSlot) as Record<string, unknown>;
+      assert.equal(typeof evidence.failingSince, 'number', 'the failures\' start is kept durably');
+      store.setStateJson(evidenceSlot, { ...evidence, failingSince: Date.now() - 61 * 60_000 });
+      for (let i = 0; i < 2; i++) {
+        fx.strategy.expirePause();
+        await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
+      }
+      const stall = fx.strategy.checkReadiness().compressionStall;
+      assert.ok(stall, 'the readiness report carries the stall');
+      assert.equal(stall!.failureClass, 'server:503');
+      assert.match(stall!.subject, /^the chunk of \d+ message\(s\) from /);
+      assert.match(fx.strategy.checkReadiness().description ?? '', /compression stalled since /);
+      assert.equal(warnings.filter((w) => w.includes('compression stalled')).length, 1, 'one alert per stall');
+      fx.strategy.land();
+      assert.equal(fx.strategy.checkReadiness().compressionStall, undefined, 'a landed success ends it');
+    } finally {
+      console.warn = warn;
+    }
+    fx.manager.close();
+  });
+
+  it('a hole that a retry will fill keeps the run before it waiting, instead of merging it early', async () => {
+    const fx = await queued(scripted([OK('unused')]).membrane);
+    const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
+    const l1 = (id: string, first: number, last: number): SummaryEntry => ({
+      id, level: 1, content: id, tokens: 10, sourceLevel: 0,
+      sourceIds: ids.slice(first, last + 1), sourceRange: { first: ids[first]!, last: ids[last]! }, created: 1,
+    });
+    // Two L1s, a hole over messages 4-5, then two more: the first run is interior.
+    const unmerged = [l1('L1-a', 0, 1), l1('L1-b', 2, 3), l1('L1-c', 6, 6), l1('L1-d', 7, 7)];
+    for (const entry of unmerged) fx.strategy.seed(entry);
+    // A threshold of four: the four are enough to be considered, and the newest run of two is short of it.
+    assert.deepEqual(fx.strategy.mergeCandidates(unmerged, 4)?.map((s) => s.id), ['L1-a', 'L1-b'],
+      'a stranded interior run consolidates at two');
+    // Now the chunk over the hole failed and will be retried.
+    const store = fx.manager.getStore();
+    store.setStateJson('default/autobio:compression-family-progress', [{
+      familyKey: 'zz-family', chunkSourceHash: 'zz-hash', sourceIds: ids.slice(4, 6), outcomes: [],
+      failureStreak: { requestHash: 'zz-request', failureClass: 'server:503', failures: 1, atLanded: 0, firstFailedAt: Date.now() },
+      updated: Date.now(),
+    }]);
+    assert.equal(fx.strategy.mergeCandidates(unmerged, 4), null, 'the run waits for the retry, as the newest run does');
+    fx.manager.close();
+  });
+
+  it('a progress write keeps another writer\'s longer run for the same request, and drops a run whose request answered', async () => {
+    const fx = await build(scripted([OK('unused')]).membrane);
+    const self = fx.strategy as unknown as {
+      captureCompressionBranch(): unknown;
+      recordCompressionFamilyProgress(
+        source: unknown, record: { familyKey: string; chunkSourceHash: string }, outcomes: unknown[],
+        tokens: number | undefined, streak: unknown, answered: ReadonlySet<string>, sourceIds: readonly string[],
+      ): void;
+    };
+    const record = { familyKey: 'zz-family', chunkSourceHash: 'zz-hash' };
+    const run = (failures: number, requestHash = 'zz-request') =>
+      ({ requestHash, failureClass: 'server:503', failures, atLanded: failures, firstFailedAt: 1 });
+    const stored = () => (progressSlot(fx.manager) as Array<{ failureStreak?: { failures: number } }>)[0]!.failureStreak;
+    // Another writer counted further on the same request.
+    self.recordCompressionFamilyProgress(self.captureCompressionBranch(), record, [], undefined, run(5), new Set(), ['m1']);
+    self.recordCompressionFamilyProgress(self.captureCompressionBranch(), record, [], undefined, run(3), new Set(), ['m1']);
+    assert.equal(stored()?.failures, 5, 'the longer run is kept');
+    // The request answered for this writer: the run ends durably.
+    self.recordCompressionFamilyProgress(self.captureCompressionBranch(), record, [], undefined, undefined, new Set(['zz-request']), ['m1']);
+    assert.equal(stored(), undefined, 'no stored run comes back for a request that answered');
     fx.manager.close();
   });
 });
