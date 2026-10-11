@@ -79,7 +79,7 @@
 
 import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
-import { ContextManager, AutobiographicalStrategy, MessageStore } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, MessageStore, bodyBoundsIn } from '../src/index.js';
 
 interface SummaryEntry {
   id: string;
@@ -294,18 +294,24 @@ async function main(): Promise<number> {
     // === Overview ===
     const byLevel: Record<number, number> = {};
     for (const s of summaries) byLevel[s.level] = (byLevel[s.level] ?? 0) + 1;
-    const bodyGroups = new Map<string, number>();
-    for (const m of messages) {
-      if (m.bodyGroupId) bodyGroups.set(m.bodyGroupId, (bodyGroups.get(m.bodyGroupId) ?? 0) + 1);
-    }
+    // Sharded messages read as bodies (body-runs.ts): one ingestion each, so a
+    // document posted twice is two bodies under one group id.
+    const bodyOf = new Map<number, { from: number; to: number }>();
+    const bodies: Array<{ from: number; to: number; groupId: string }> = [];
+    messages.forEach((m, i) => {
+      if (!m.bodyGroupId) return;
+      const bounds = bodyBoundsIn(messages, i);
+      bodyOf.set(i, bounds);
+      if (bounds.from === i) bodies.push({ ...bounds, groupId: m.bodyGroupId });
+    });
     console.log(`=== Overview (${namespace}) ===`);
     console.log(`Messages: ${messages.length} (${slotLabel})`);
     console.log(summariesUnreadable
       ? `Summaries: unreadable (${summariesId} holds ${shapeOf(stored)})`
       : `Summaries: ${summaries.length} (${JSON.stringify(byLevel)}), as stored`);
-    console.log(`BodyGroups: ${bodyGroups.size}`);
-    for (const [gid, count] of [...bodyGroups.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)) {
-      console.log(`  ${gid}: ${count} shards`);
+    console.log(`Bodies: ${bodies.length}`);
+    for (const body of [...bodies].sort((a, b) => (b.to - b.from) - (a.to - a.from)).slice(0, 5)) {
+      console.log(`  ${body.groupId}: ${body.to - body.from + 1} shards (messages ${body.from}–${body.to})`);
     }
     console.log(resolutionsUnreadable < 0
       ? `Resolutions recorded: unreadable (${resolutionsId} holds ${shapeOf(resolutionState)})`
@@ -352,7 +358,8 @@ async function main(): Promise<number> {
     const listing: string[] = ['# Messages\n', `Total stored: ${messages.length} (${slotLabel})\n`];
     messages.forEach((m, i) => {
       const text = textOf(m.content as Array<{ type?: string; text?: string }>);
-      const shard = m.bodyGroupId ? ` [shard ${m.shardIndex}/${bodyGroups.get(m.bodyGroupId)} of ${m.bodyGroupId.slice(0, 12)}…]` : '';
+      const body = bodyOf.get(i);
+      const shard = m.bodyGroupId && body ? ` [shard ${m.shardIndex}/${body.to - body.from + 1} of ${m.bodyGroupId.slice(0, 12)}…]` : '';
       const res = resolutions.has(m.id) ? ` res=L${resolutions.get(m.id)}` : '';
       listing.push(`[${String(i).padStart(3, '0')}] ${m.participant} ${Math.ceil(text.length / 4)}t${shard}${res}: ${text.slice(0, 100).replace(/\n/g, '\\n')}`);
     });
