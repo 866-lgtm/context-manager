@@ -1864,6 +1864,17 @@ describe("the stall clock's idle rule: failures, attempts and the waits they cau
     fx.manager.close();
   });
 
+  it("a shorter pause after a longer one in the same stretch doesn't end the wait: siblings on other routes pause on their own (Basil-1007)", async () => {
+    const routeA = scripted([OK('unused')]);
+    const routeB = scripted([OK('unused')]);
+    const fx = await build(routeA.membrane);
+    const before = Date.now();
+    fx.strategy.notePause(failure('rate_limit', { httpStatus: 429, retryAfterMs: 3 * HOUR }), managerContext(fx.manager));
+    fx.strategy.notePause(failure('server', { httpStatus: 503 }), { ...managerContext(fx.manager), membrane: routeB.membrane });
+    assert.ok(stallClock(fx.manager)!.waitingUntil! >= before + 3 * HOUR, "route A's three hours still stand");
+    fx.manager.close();
+  });
+
   it('an attempt that runs over an hour is no idle time: its failure continues the stretch (sheet I45)', async () => {
     let release: () => void = () => {};
     const gate = new Promise<void>((resolve) => { release = resolve; });

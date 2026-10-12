@@ -770,8 +770,11 @@ interface CompressionStallClock {
   /** When the lane was last seen failing, starting an attempt, or waiting on a pause with work pending. */
   activeAt: number | null;
   /**
-   * When the pause the latest failure installed ends, if that is an instant:
-   * the lane is waiting until then, not idle, even with no tick to see it.
+   * When the longest pause a failure of this stretch installed ends, if that
+   * is an instant: the lane is waiting until then, not idle, even with no
+   * tick to see it. Strategies sharing the namespace through other routes
+   * pause on their own, so a shorter pause after a longer one doesn't end
+   * the wait.
    */
   waitingUntil: number | null;
   /** The latest failure: what failed, its class, and its lane. */
@@ -4657,10 +4660,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const now = Date.now();
     const clock = this.readStallClock();
     const continues = clock.failingSince !== null;
+    const paused = Number.isFinite(pausedUntil) ? pausedUntil : null;
+    const waitingUntil = continues && clock.waitingUntil !== null && (paused === null || clock.waitingUntil > paused)
+      ? clock.waitingUntil
+      : paused;
     const next: CompressionStallClock = {
       failingSince: continues ? clock.failingSince : now,
       activeAt: now,
-      waitingUntil: Number.isFinite(pausedUntil) ? pausedUntil : null,
+      waitingUntil,
       last: { subject, failureClass: compressionFailureClass(error), lane },
       stall: continues ? clock.stall : null,
     };
