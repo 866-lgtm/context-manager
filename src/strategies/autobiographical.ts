@@ -210,6 +210,12 @@ interface CompressionFailureStreak {
   atLanded: number;
   /** When the run began. */
   firstFailedAt: number;
+  /**
+   * An L1 run's subject (chunkRunSubject: the chunk's sources by id and
+   * content). The same sources with another content are another subject,
+   * whose run another content's ladder never takes, ends or replaces.
+   */
+  subject?: string;
 }
 
 /**
@@ -4178,7 +4184,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           typeof run.key === 'string' && typeof run.failureClass === 'string' &&
           Number.isSafeInteger(run.failures) && run.failures! >= 1 &&
           Number.isFinite(run.atLanded) && Number.isFinite(run.firstFailedAt) &&
-          (run.domain === undefined || typeof run.domain === 'string')
+          (run.domain === undefined || typeof run.domain === 'string') &&
+          (run.subject === undefined || typeof run.subject === 'string')
         );
         if (wellFormed) {
           progress.set(candidate.familyKey, candidate as CompressionFamilyProgress);
@@ -4200,10 +4207,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * chosen by time: a family that no longer holds the run can't stand in for
    * the one that does.
    */
-  private chunkRun(chunkSourceHash: string, exceptFamily: string): { familyKey: string; run: CompressionFailureStreak } | undefined {
+  private chunkRun(
+    chunkSourceHash: string, exceptFamily: string, subject: string,
+  ): { familyKey: string; run: CompressionFailureStreak } | undefined {
     let found: { familyKey: string; run: CompressionFailureStreak } | undefined;
     for (const entry of this.readCompressionFamilyProgress().values()) {
       if (entry.chunkSourceHash !== chunkSourceHash || entry.familyKey === exceptFamily || !entry.failureStreak) continue;
+      if (entry.failureStreak.subject !== subject) continue;
       if (!found || entry.failureStreak.failures > found.run.failures) found = { familyKey: entry.familyKey, run: entry.failureStreak };
     }
     return found;
@@ -4261,11 +4271,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     if (streak && answered.has(streak.key)) streak = undefined;
-    // One run per chunk: when this write carries one, it is the chunk's now
-    // (chunkRun), so the chunk's other families keep their answers but not a
-    // run. A run an answer ended is gone from all of them either way.
+    // One run per chunk and subject: when this write carries one, it is the
+    // chunk's now (chunkRun), so the chunk's other families keep their
+    // answers but not a run of this subject. A run an answer ended is gone
+    // from all of them either way. A run of another content of the same
+    // sources is another subject's, and stays: a late write for content
+    // since edited can't replace the run of the content the chunk has now.
     for (const [familyKey, entry] of progress) {
       if (familyKey === record.familyKey || entry.chunkSourceHash !== record.chunkSourceHash || !entry.failureStreak) continue;
+      if (entry.failureStreak.subject !== runSubject) continue;
       if (!streak && !answered.has(entry.failureStreak.key)) continue;
       const { failureStreak: _carried, ...rest } = entry;
       progress.set(familyKey, rest);
@@ -7852,7 +7866,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // whether or not the family has answers of its own.
       const carried = progress?.failureStreak
         ? undefined
-        : this.chunkRun(quarantineRecord.chunkSourceHash, quarantineRecord.familyKey);
+        : this.chunkRun(quarantineRecord.chunkSourceHash, quarantineRecord.familyKey, runSubject);
       let failureStreak = progress?.failureStreak ?? carried?.run;
       // The run as this ladder found it, its family's or carried; one it
       // counts itself is its own.
@@ -7935,10 +7949,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // bound is the rung's.
           const failureClass = compressionFailureClass(error);
           const dispatched = (error !== null && typeof error === 'object' ? dispatchedCompressionModel.get(error) : undefined) ?? model;
-          const streak = nextFailureStreak(
-            failureStreak, chunkRunKey(runSubject, curveLabel, streakHash !== requestHash), failureClass,
-            compressionDomain(ctx.membrane!, dispatched), domainLanded(ctx.membrane!, dispatched), Date.now(),
-          );
+          const streak: CompressionFailureStreak = {
+            ...nextFailureStreak(
+              failureStreak, chunkRunKey(runSubject, curveLabel, streakHash !== requestHash), failureClass,
+              compressionDomain(ctx.membrane!, dispatched), domainLanded(ctx.membrane!, dispatched), Date.now(),
+            ),
+            subject: runSubject,
+          };
           if (streak.failures >= AutobiographicalStrategy.COMPRESSION_PERSISTENT_FAILURES) {
             failureStreak = undefined;
             return { curveLabel, requestHash, outcome: 'provider_error', errorType: `persistent-${failureClass}` };

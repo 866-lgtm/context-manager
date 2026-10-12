@@ -1757,7 +1757,56 @@ describe("a run's evidence belongs to the chunk's sources, and one family holds 
     fx.strategy.land(mock.membrane);
     await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, "the old content's failures don't decide the new");
-    assert.deepEqual(runsOf(fx.manager), [1], 'the edited sources start a run of one, and it is the only run');
+    assert.deepEqual(runsOf(fx.manager).sort((a, b) => a - b), [1, 7],
+      "the edited sources start a run of one; the old content's run stays with its family, which nothing of the new content takes");
+    fx.manager.close();
+  });
+
+  it("a late failure of a source's old content leaves the run of its new content: each content is its own subject (Andrew-2310's late-old-source case)", async () => {
+    let hold: Promise<void> | null = null;
+    let release: () => void = () => {};
+    const calls: NormalizedRequest[] = [];
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        calls.push(structuredClone(request));
+        const held = hold;
+        hold = null;
+        if (held) await held;
+        throw failure('server', { httpStatus: 503 });
+      },
+    };
+    const fx = await build(membrane);
+    for (let i = 0; i < 3; i++) {
+      fx.strategy.land(membrane);
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+    }
+    assert.deepEqual(runsOf(fx.manager), [3], "the old content's run");
+    // The old content's next call is held.
+    fx.strategy.land(membrane);
+    hold = new Promise<void>((resolve) => { release = resolve; });
+    const before = calls.length;
+    const late = fx.strategy.run(fx.target(), managerContext(fx.manager));
+    while (calls.length === before) await new Promise((resolve) => setTimeout(resolve, 1));
+    // Meanwhile the source is edited, and a sibling counts two failures of the new content.
+    fx.manager.editMessage(fx.ids[10]!, [text('raw-10 edited in place ' + 'substantive '.repeat(12))]);
+    const strategy = new ProbeStrategy(config({}));
+    const manager = await ContextManager.open({ store: fx.manager.getStore(), strategy, membrane: membrane as never });
+    manager.setToolDefinitions(['skip_reply', 'journal'].map(tool));
+    for (let i = 0; i < 2; i++) {
+      strategy.land(membrane);
+      await assert.rejects(strategy.run(fx.target(), managerContext(manager)), /zz server failure/);
+    }
+    assert.ok(runsOf(fx.manager).includes(2), "the new content's run is two");
+    release();
+    await assert.rejects(late, /zz server failure/);
+    assert.deepEqual(runsOf(fx.manager).sort((a, b) => a - b), [2, 4], "the old content's late failure counts on its own run, and leaves the new content's");
+    // A new L1 grows the frontier: the new content's next family takes its own content's run, not the longer old one.
+    strategy.seed(l1(fx.ids, 'L1-101', 2, 3));
+    strategy.land(membrane);
+    await assert.rejects(strategy.run(fx.target(), managerContext(manager)), /zz server failure/);
+    assert.ok(runsOf(fx.manager).includes(3), "the new content's next failure counts on");
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
+    manager.close();
     fx.manager.close();
   });
 
