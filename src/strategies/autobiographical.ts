@@ -69,6 +69,7 @@ import type {
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
+import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms } from '../raw-forms.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
@@ -1052,14 +1053,27 @@ function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?
  * which — thrown inside the speculative-compression drain — halts ALL
  * compression. Non-text blocks (tool_use/tool_result/image) pass through
  * unchanged, so tool pairing is preserved; callers drop any message left with
- * an empty content array.
+ * an empty content array. membrane's zero-width carriers of opaque Responses
+ * items (a compaction item, a hosted tool's call) are empty text too, so they
+ * are dropped from compression requests as well, as they always were.
+ *
+ * Released narrowly (releaseVanishedRawForms, not releaseEditedRawForms): an
+ * empty part dropped from a Responses message item while a sibling part
+ * survives still rides inside the sibling's raw item, and only whitespace can
+ * ship that way, so releasing would re-render the whole item (and its reasoning
+ * pairing) from fields for no content change. An item none of whose parts
+ * survive is gone from the wire, a dropped carrier's item included, so the
+ * reasoning paired with it gives up its id rather than be replayed without its
+ * follower.
+ *
+ * Exported for its tests; not part of the package's API.
  */
-function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
-  return content.filter((b) => {
+export function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
+  return releaseVanishedRawForms(content, content.filter((b) => {
     if (b.type !== 'text') return true;
     const text = (b as { text?: unknown }).text;
     return typeof text === 'string' && text.trim().length > 0;
-  });
+  }));
 }
 
 /**
@@ -1083,9 +1097,16 @@ function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
  * ("thinking blocks ... cannot be modified", observed 2026-07-16 on the
  * `full` replay arm). Passing raw thinking through requires keeping those
  * turns byte-identical — a follow-up experiment, not a blanket strip removal.
+ *
+ * A stripped Responses reasoning item releases the raw item it was paired
+ * with, so the follower isn't replayed with an id whose reasoning is gone
+ * (see raw-forms.ts).
  */
 function stripThinkingBlocks(content: ContentBlock[]): ContentBlock[] {
-  return content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
+  return releaseEditedRawForms(
+    content,
+    content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking'),
+  );
 }
 
 /**
@@ -1498,6 +1519,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private runtimeTransitionPaceTokens: number | undefined;
   /** Diagnostics from the most recent dry-run select. Not persisted. */
   private _lastPreview: PreviewResult | undefined;
+  /** The last dry select's own render stats, which select() keeps apart from
+   *  the live ones for previewContext. */
+  private _lastPreviewStats: RenderStats | undefined;
+  /** Set while a dry select runs: its chunking persists no chunk record. */
+  private _dryRunSelect = false;
   /** Serializes previews against each other (see previewContext). */
   private _previewInFlight = false;
 
@@ -1685,32 +1711,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       throw new Error('previewContext is already running; previews must not overlap');
     }
     this._previewInFlight = true;
+    // The config swap below is this method's own to undo. What the dry select
+    // leaves for observers (transition status, render stats, calibration),
+    // select() puts back for every dry run, whichever of selectAdaptive's
+    // OverBudgetError sites throws; any throw is turned into a report below.
     const savedConfig = this.config;
     const savedPicker = this._adaptivePicker;
     const savedHeadCache = this._cachedHeadStartIndex;
-    // selectAdaptive has FOUR OverBudgetError sites — an early head+tail check
-    // that fires before the picker even runs, the post-pick check, and two
-    // late render-stage checks. Rather than gate each (fragile, and a new site
-    // would silently break previews), restore bookkeeping here in `finally`
-    // and convert any throw into a report below.
-    const savedFrontier = this.lastFrontierTokens;
-    const savedBlocked = this.transitionBlocked;
-    const savedKvStable = this._lastKvStable;
-    // select() calls rsBegin(), which RESETS the render-stats family. Those feed
-    // getRenderStats() -> /debug/context/makeup and the Context panel, so a dry
-    // run would leave the operator's live segment breakdown showing numbers from
-    // a hypothetical compile until the next real one. Save and restore them:
-    // "commits nothing" has to include in-memory observability, not just
-    // Chronicle.
-    // `_lastRenderStats` is the one that matters: select() ends with
-    // `_lastRenderStats = r; _rs = null`, and getRenderStats() reads
-    // _lastRenderStats. Guarding only _rs (null by then) protected nothing.
-    const savedRs = this._rs;
-    const savedLastRs = this._lastRenderStats;
-    const savedDrops = this._uncoveredDrops;
-    const savedEmitted = this._emittedSummaryIds;
-    const savedPlannedTokens = this._plannedTokens;
-    const savedPlannedMeta = this._plannedMeta;
     this._lastPreview = undefined;
     try {
       // Drop explicit undefined/null overrides BEFORE spreading: a spread
@@ -1771,31 +1778,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview',
         );
       }
-      // Segment breakdown for the hypothetical compile, captured BEFORE the
-      // finally block restores the live one. Lets a caller show the previewed
+      // Segment breakdown for the hypothetical compile, which select() kept
+      // apart from the live one. Lets a caller show the previewed
       // head/middle/tail split without re-deriving it.
       return {
         ...preview,
-        // Read _lastRenderStats, not _rs: select() has already committed and
-        // nulled _rs by this point.
         ...(opts?.render
-          ? { entries: rendered, stats: this._lastRenderStats ?? undefined }
+          ? { entries: rendered, stats: this._lastPreviewStats }
           : {}),
       };
     } finally {
       this.config = savedConfig;
       this._adaptivePicker = savedPicker;
       this._cachedHeadStartIndex = savedHeadCache;
-      this.lastFrontierTokens = savedFrontier;
-      this.transitionBlocked = savedBlocked;
-      this._lastKvStable = savedKvStable;
-      this._rs = savedRs;
-      this._lastRenderStats = savedLastRs;
-      this._uncoveredDrops = savedDrops;
-      this._emittedSummaryIds = savedEmitted;
-      this._plannedTokens = savedPlannedTokens;
-      this._plannedMeta = savedPlannedMeta;
       this._lastPreview = undefined;
+      this._lastPreviewStats = undefined;
       this._previewInFlight = false;
     }
   }
@@ -5629,23 +5626,85 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   select(
     store: MessageStoreView,
     log: ContextLogView,
-      budget: TokenBudget,
-      opts?: SelectOptions
-    ): ContextEntry[] {
-      this.requireLoadedBranch('select');
-      const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
-      const _t0 = _diag ? Date.now() : 0;
+    budget: TokenBudget,
+    opts?: SelectOptions
+  ): ContextEntry[] {
+    this.requireLoadedBranch('select');
+    const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
+    const _t0 = _diag ? Date.now() : 0;
+    if (opts?.dryRun !== true) {
       this.rebuildChunks(store);
       if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
+      return this.selectPath(store, budget, opts);
+    }
+    // A dry run commits nothing, and that includes what a select leaves for
+    // the next one and for observers: the cache-marker baseline the next
+    // compile measures its stable prefix against, the transition status
+    // (getHotContextSettings), the render stats (getRenderStats, with its
+    // plan-vs-actual), calibration's estimate, arming and store view, the
+    // store order and the head-window memo stay as the last committing select
+    // left them. They are put back here, on every path out, throws included;
+    // each select path gates its own persistence and enqueueing. The dry run's
+    // own render stats are its output, as its plan is (_lastPreview), and
+    // previewContext reads them from _lastPreviewStats.
+    // Chunking runs dry too: a chunk the dry run closes gets no record, and
+    // the chunks, the compression queue and whether chunk records are trusted
+    // (a dry rebuild at a preview's chunk size can read them as orphaned) go
+    // back to the last committing rebuild's, so no tick compresses what only
+    // a dry run (or a preview's overridden chunk size) cut.
+    const saved = {
+      chunks: this.chunks,
+      compressionQueue: this.compressionQueue,
+      chunkRecordsOrphaned: this.chunkRecordsOrphaned,
+      orphanWarned: this._orphanWarned,
+      prevCacheKeys: this._prevCacheKeys,
+      lastFrontierTokens: this.lastFrontierTokens,
+      transitionBlocked: this.transitionBlocked,
+      lastRenderStats: this._lastRenderStats,
+      lastCompileEstimate: this._lastCompileEstimate,
+      calibrationArmed: this._calibrationArmed,
+      storeView: this._storeView,
+      storeOrder: this._storeOrder,
+      headStartMemo: this._cachedHeadStartIndex,
+    };
+    this._lastPreviewStats = undefined;
+    this._dryRunSelect = true;
+    try {
+      this.rebuildChunks(store);
+      if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
+      return this.selectPath(store, budget, opts);
+    } finally {
+      this._dryRunSelect = false;
+      // Only stats this dry run produced are its preview's: on a throw before
+      // they're written, the previous select's must not pose as the preview's.
+      if (this._lastRenderStats !== saved.lastRenderStats) {
+        this._lastPreviewStats = this._lastRenderStats ?? undefined;
+      }
+      this.chunks = saved.chunks;
+      this.compressionQueue = saved.compressionQueue;
+      this.chunkRecordsOrphaned = saved.chunkRecordsOrphaned;
+      this._orphanWarned = saved.orphanWarned;
+      this._prevCacheKeys = saved.prevCacheKeys;
+      this.lastFrontierTokens = saved.lastFrontierTokens;
+      this.transitionBlocked = saved.transitionBlocked;
+      this._lastRenderStats = saved.lastRenderStats;
+      this._lastCompileEstimate = saved.lastCompileEstimate;
+      this._calibrationArmed = saved.calibrationArmed;
+      this._storeView = saved.storeView;
+      this._storeOrder = saved.storeOrder;
+      this._cachedHeadStartIndex = saved.headStartMemo;
+    }
+  }
 
+  private selectPath(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
     // Image stripping runs inside each select path (before stats commit / cache
     // markers), so the returned entries are already bounded — see
     // applyImageStripping.
     if (this.config.adaptiveResolution) {
       return this.selectAdaptive(store, budget, opts);
     }
-    // selectHierarchical commits nothing (no state-slot writes, no enqueue),
-    // so it is already dry-run-safe and needs no gating.
+    // selectHierarchical persists and enqueues nothing; what it leaves for
+    // observers (render stats) select() restores for a dry run.
     return this.selectHierarchical(store, budget);
   }
 
@@ -9649,15 +9708,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       opts?.kvUnifiedImmutablePrefixHash,
       opts?.kvUnifiedContinuityRelaxation,
     );
-    // NOTE: a dry run also disturbs transition bookkeeping below
+    // NOTE: a dry run also writes transition bookkeeping below
     // (`lastFrontierTokens` feeds `prepared` in getHotContextSettings(), so a
-    // low-budget preview could make a converging transition look prepared and
-    // get it settled by the next real compile). That is restored by
-    // previewContext's `finally`, which owns it for ALL throw paths — do not
+    // low-budget dry run could make a converging transition look prepared).
+    // select() puts it back for every dry run, on ALL throw paths — do not
     // also restore it here, or the two owners will disagree.
     if (_diag) { console.error(`[cm-cache] selectAdaptive: inputs-built ${Date.now() - _t}ms`); _t = Date.now(); }
     const result = picker.run(pickerInputs, foldingBudget);
-    if (this.config.foldingStrategy === 'kv-unified' && !dryRun) {
+    if (this.config.foldingStrategy === 'kv-unified') {
+      // The plan's check runs dry or not, so a dry select refuses what a real
+      // compile would; only the draft it builds is a real compile's alone.
       const tree = new SummaryTree(pickerInputs);
       const nextSequence = (this.kvUnifiedReceipts.head?.sequence ?? 0) + 1;
       const leaves = new Map<ChunkId, PresentedLeaf>();
@@ -9667,6 +9727,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (level > 0 && !summaryId) {
           throw new Error(`kv-unified selected unavailable L${level} for ${chunk.id}`);
         }
+        if (dryRun) continue;
         const repHash = level === 0 ? `raw:${chunk.id}` : `summary:${summaryId}`;
         const previous = this.kvUnifiedReceipts.leaves.get(chunk.id);
         leaves.set(chunk.id, {
@@ -9678,12 +9739,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               : nextSequence,
         });
       }
-      this.kvUnifiedDraft = {
-        leaves,
-        layout: renderLayout(pickerInputs, tree, result.finalResolutions),
-        immutablePrefixHash: opts?.kvUnifiedImmutablePrefixHash,
-        markerUnitIndices: [],
-      };
+      if (!dryRun) {
+        this.kvUnifiedDraft = {
+          leaves,
+          layout: renderLayout(pickerInputs, tree, result.finalResolutions),
+          immutablePrefixHash: opts?.kvUnifiedImmutablePrefixHash,
+          markerUnitIndices: [],
+        };
+      }
     }
     if (_diag) { console.error(`[cm-cache] selectAdaptive: picker.run ${Date.now() - _t}ms`); _t = Date.now(); }
     this.lastFrontierTokens = result.finalTokens;
@@ -9791,9 +9854,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // Record what a dry run needs, then restore the transition bookkeeping the
-    // pick just clobbered. Done before the over-budget check so an infeasible
-    // preview still reports instead of leaving state disturbed.
+    // Record what a dry run needs (select() puts back the transition
+    // bookkeeping the pick just wrote). Done before the over-budget check so
+    // an infeasible preview still reports.
     if (dryRun) {
       this._lastPreview = {
         finalTokens: result.finalTokens,
@@ -10153,7 +10216,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // real strategy to ~50% (docs/kv-stable-context-control.md — marker
     // placement is the dominant KV lever).
     this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
-    if (this.config.foldingStrategy === 'kv-unified' && this.kvUnifiedDraft) {
+    // A dry run made no draft of its own (see the draft's creation), so the
+    // draft here is the last real compile's, which a dry layout must not
+    // re-mark.
+    if (this.config.foldingStrategy === 'kv-unified' && this.kvUnifiedDraft && !dryRun) {
       this.kvUnifiedDraft.markerUnitIndices = this.reconcileKvUnifiedMarkerIndices(
         merged, this.kvUnifiedDraft.layout, headMessageIds, tailMessageIds,
       );
@@ -11976,8 +12042,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         compressed: false,
       };
       // Persist the boundary the moment it closes — from here on this
-      // span is owned and never re-keyed by config drift or restarts.
-      if (this.chunkPersistenceEnabled) {
+      // span is owned and never re-keyed by config drift or restarts. A dry
+      // select's chunks stay unrecorded: select() puts the last committing
+      // rebuild's chunks back after it.
+      if (this.chunkPersistenceEnabled && !this._dryRunSelect) {
         const record: ChunkRecord = {
           id: `c-${this.chunkIdCounter++}`,
           sourceIds: chunk.messages.map(m => m.id),
@@ -12341,8 +12409,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // browser carries most of its image bytes NESTED in tool results, not as
     // top-level blocks. Capping only the top level left those untouched and
     // membrane's transport shed kept firing at 27MB (2026-07-12).
-    const capBlocks = (blocks: ContentBlock[]): ContentBlock[] =>
-      blocks.map((b) => {
+    // A block is copied only when an image in it is replaced, so an untouched
+    // block keeps its identity and its raw replay form (see raw-forms.ts).
+    const capBlocks = (blocks: ContentBlock[]): ContentBlock[] => {
+      let changed = false;
+      const capped = blocks.map((b) => {
         if (b.type === 'image') {
           const bytes = AutobiographicalStrategy.imageBlockBytes(b);
           if (kept + bytes <= capBytes) {
@@ -12350,14 +12421,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             return b;
           }
           dropped++;
+          changed = true;
           return { type: 'text', text: AutobiographicalStrategy.IMAGE_PLACEHOLDER } as ContentBlock;
         }
         const nested = (b as { type: string; content?: unknown }).content;
         if (b.type === 'tool_result' && Array.isArray(nested)) {
-          return { ...b, content: capBlocks(nested as ContentBlock[]) } as ContentBlock;
+          const inner = capBlocks(nested as ContentBlock[]);
+          if (inner === nested) return b;
+          changed = true;
+          return { ...b, content: inner } as ContentBlock;
         }
         return b;
       });
+      return changed ? releaseEditedRawForms(blocks, capped) : blocks;
+    };
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       if (!Array.isArray(m.content)) continue;
@@ -12700,7 +12777,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
         if (filtered.length !== entry.content.length) {
           entry.content = filtered.length > 0
-            ? filtered
+            ? releaseEditedRawForms(entry.content, filtered)
             : [{ type: 'text', text: '[tool call omitted]' }];
         }
       }
@@ -12798,19 +12875,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           b => b.type === 'tool_result' && b.toolUseId === id,
         );
         if (bi === -1) continue;
-        const real = src.content[bi];
-        const rest = src.content.filter((_, k) => k !== bi);
+        const source = src.content;
+        const real = source[bi];
+        const rest = source.filter((_, k) => k !== bi);
+        // A raw replay form shared with the results left behind (one
+        // <function_results> holding several) is true of neither side once
+        // they're apart; each gives it up (see raw-forms.ts).
         src.content = rest.length > 0
-          ? rest
+          ? releaseEditedRawForms(source, rest)
           : [{ type: 'text', text: '[tool result moved during context repair]' }];
-        return real;
+        return releaseSharedRawFormsOnMove(real, source);
       }
       return this.createToolResultStub(id);
     });
   }
 
   /**
-   * Prune tool_use / tool_result blocks in-place:
+   * Prune tool_use / tool_result blocks in place on the entries (an edited
+   * entry gets its own copy of its content array, never the store's):
    *  1. Truncate `tool_use.input` blocks whose serialized JSON exceeds
    *     `toolUseInputMaxTokens`.
    *  2. For each tool name, keep only the last N `tool_result` blocks
@@ -12823,6 +12905,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * affect chunk formation or the recall/pin layout.
    */
   protected pruneToolEntries(entries: ContextEntry[]): void {
+    // Each edited entry's content as it was, so the edit's raw replay forms can
+    // be released once both passes are done (see raw-forms.ts).
+    //
+    // An entry's content array can be its message's own, from the store's
+    // cached getAll() view (immutable to callers), whenever no message cap cut
+    // it. So the first edit gives the entry a copy and leaves that array as it
+    // was. An edit written into it would reach every getAll() caller until the
+    // next store write, and the next compile would start from the marker
+    // instead of the original (the compile-twice test in raw-forms.test.ts).
+    const originals = new Map<ContextEntry, ContentBlock[]>();
+    const replaceBlock = (entry: ContextEntry, index: number, block: ContentBlock): void => {
+      if (!originals.has(entry)) {
+        originals.set(entry, entry.content);
+        entry.content = entry.content.slice();
+      }
+      entry.content[index] = block;
+    };
+
     // Pass 1: build toolUseId → toolName map and apply input truncation
     const toolUseInputCap = this.config.toolUseInputMaxTokens ?? 0;
     const toolUseIdToName = new Map<string, string>();
@@ -12838,14 +12938,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const inputTokens = Math.ceil(inputJson.length / 4);
           if (inputTokens > toolUseInputCap) {
             const keys = Object.keys(block.input).slice(0, 5);
-            entry.content[i] = {
+            replaceBlock(entry, i, {
               ...block,
               input: {
                 _truncated: true,
                 _originalTokens: inputTokens,
                 _keys: keys,
               },
-            };
+            });
           }
         }
       }
@@ -12873,27 +12973,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Pass 3: apply per-tool max-last-N
     const cfg = this.config.toolResultMaxLastN;
-    if (cfg === undefined) return;
+    if (cfg !== undefined) {
+      for (const [toolName, occs] of occurrencesByTool) {
+        let limit: number | undefined;
+        if (typeof cfg === 'number') limit = cfg;
+        else if (typeof cfg === 'object') limit = cfg[toolName];
+        if (limit === undefined || limit < 0) continue;
 
-    for (const [toolName, occs] of occurrencesByTool) {
-      let limit: number | undefined;
-      if (typeof cfg === 'number') limit = cfg;
-      else if (typeof cfg === 'object') limit = cfg[toolName];
-      if (limit === undefined || limit < 0) continue;
+        const excessCount = occs.length - limit;
+        if (excessCount <= 0) continue;
 
-      const excessCount = occs.length - limit;
-      if (excessCount <= 0) continue;
-
-      for (let i = 0; i < excessCount; i++) {
-        const { entry, blockIndex } = occs[i];
-        const orig = entry.content[blockIndex];
-        if (orig.type !== 'tool_result') continue;
-        const fresherCount = occs.length - i - 1;
-        entry.content[blockIndex] = {
-          ...orig,
-          content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
-        };
+        for (let i = 0; i < excessCount; i++) {
+          const { entry, blockIndex } = occs[i];
+          const orig = entry.content[blockIndex];
+          if (orig.type !== 'tool_result') continue;
+          const fresherCount = occs.length - i - 1;
+          replaceBlock(entry, blockIndex, {
+            ...orig,
+            content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
+          });
+        }
       }
+    }
+
+    for (const [entry, before] of originals) {
+      entry.content = releaseEditedRawForms(before, entry.content);
     }
   }
 
@@ -13072,11 +13176,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Under `'full'` (default) this IS `summaryAnswerProse`, block for block.
    * Under `'live-strip'` the captured reasoning carriers are omitted from the
-   * live render alone: whole blocks dropped, every surviving block passed
-   * through untouched, so the same entry's mint-side recall still replays its
-   * signed blocks byte-verbatim. Mutating a carrier here would break the
-   * signature that the mint surface depends on — hence omission, never
-   * rewriting.
+   * live render alone: whole blocks dropped, so the same entry's mint-side
+   * recall still replays its signed blocks byte-verbatim. Mutating a carrier
+   * here would break the signature that the mint surface depends on — hence
+   * omission, never rewriting. Every surviving block is passed through by
+   * reference, except a Responses item a stripped reasoning item led to: every
+   * block that shares it is copied without its raw item, and so without its id
+   * (see raw-forms.ts).
    *
    * A carrier-only entry (reasoning captured, no prose block — degenerate, and
    * guarded against at mint time) would strip to an empty assistant turn,
@@ -13161,16 +13267,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     summaries: SummaryEntry[],
     maxTokens: number,
   ): ContentBlock[] {
+    // A separator follows the answer before it on the wire, so the reasoning at
+    // that answer's end gives up its id first (see raw-forms.ts).
+    const separated = (content: ContentBlock[]): ContentBlock[] => [
+      ...releaseTrailingReasoning(content),
+      { type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT },
+    ];
     if (this.config.recallEnvelope !== 'xml') {
-      const content: ContentBlock[] = [];
+      let content: ContentBlock[] = [];
       summaries.forEach((s, idx) => {
-        if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
+        if (idx > 0) content = separated(content);
         content.push(...this.liveWindowAnswerContent(s));
       });
       return maxTokens > 0 ? this.truncateContent(content, maxTokens) : content;
     }
 
-    const content: ContentBlock[] = [];
+    let content: ContentBlock[] = [];
     const separatorCost = this.estimateTextOnlyTokens(
       { content: [{ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT }] } as StoredMessage,
     );
@@ -13181,7 +13293,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (maxTokens > 0 && proseBudget <= 0) break;
       const prose = this.liveWindowAnswerProse(s);
       const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
-      if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
+      if (idx > 0) content = separated(content);
       content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
       if (maxTokens > 0) {
         remainingTokens -=
@@ -13191,6 +13303,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return content;
   }
 
+  /**
+   * Cut a message's text and string tool-result content to `maxTokens`. A cut
+   * or dropped block gives up its raw replay form, along with every block
+   * sharing it, so the cut reaches the wire (see raw-forms.ts).
+   */
   protected truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
     if (maxTokens <= 0) return content;
     const est = this.estimateTextOnlyTokens({ content } as StoredMessage);
@@ -13244,6 +13361,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    return result;
+    return releaseEditedRawForms(content, result);
   }
 }
