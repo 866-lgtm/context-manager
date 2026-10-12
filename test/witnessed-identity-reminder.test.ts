@@ -2,13 +2,15 @@
  * Witnessed vs live identity reminders, pinned on the wire.
  *
  * A resident whose Chronicle begins with reviewed inherited history
- * (witnessedBeforeSequence) needs two reminders: a frozen one for wholly
- * inherited material, and a neutral, revisable one for everything it lived.
- * The rule:
- *   - all-witnessed source material  -> witnessedIdentityReminder
- *   - wholly live material            -> identityReminder
- *   - mixed inherited/live merges     -> identityReminder (the sources' own
- *     witnessed stamps keep attribution inside the resulting memory)
+ * (witnessedBeforeSequence) can set two reminders: one for wholly inherited
+ * material, and one for everything else. The rule:
+ *   - an L1 chunk whose every message is before the pin, or a merge whose
+ *     every source is stamped witnessed            -> witnessedIdentityReminder
+ *   - every other target, including a mixed one: a chunk that spans the pin
+ *     (and each piece the split rung folds it into), or a merge of inherited
+ *     and lived sources                            -> identityReminder
+ * A mixed target's request shows inherited and lived material together under
+ * the live instruction and reminder, with no label saying which is which.
  * These tests read the actual compression requests the model would receive.
  */
 import { describe, it, before, after } from 'node:test';

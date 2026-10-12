@@ -7698,9 +7698,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               targetTokens,
             )
           : this.getMergeInstruction(targetLevel, sources, targetTokens),
-      // Mixed inherited/live merges are NOT witnessed: they carry the live
-      // reminder, and source attribution inside them is preserved by the
-      // sources' own witnessed stamps.
+      // Only a merge whose every source is witnessed takes the witnessed
+      // reminder. A mixed merge takes the live instruction and reminder, and
+      // its request shows inherited and lived material together, with no
+      // label saying which is which. The sources' witnessed stamps decide
+      // this predicate, the merge instruction and the new summary's stamp;
+      // the request never shows them.
       sources.length > 0 && sources.every((s) => s.witnessed),
     );
     if (mergeSourceOnly) {
@@ -10194,8 +10197,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * `witnessed`: the target is WHOLLY inherited record (an L1 chunk entirely
    * before witnessedBeforeSequence, or a merge whose every source is
    * witnessed). Such targets use `witnessedIdentityReminder` when one is
-   * configured; everything else, including mixed inherited/live merges,
-   * uses `identityReminder`.
+   * configured. Every other target uses `identityReminder`, including a
+   * mixed one (a chunk that spans the pin, or a merge of inherited and
+   * lived sources), whose request shows both kinds of material under the
+   * live reminder with no label saying which is which.
    */
   protected applyIdentityReminder(instruction: string, witnessed = false): string {
     const reminder = (witnessed && this.config.witnessedIdentityReminder?.trim())
