@@ -665,8 +665,8 @@ export interface KvUnifiedConfig {
   /**
    * Certified hysteresis exit (see `docs/kv-unified-hysteresis-certificate.md`):
    * when the accepted presentation provably remains the policy's selection,
-   * skip label propagation. Exact — never chooses a different layout than the
-   * full solve would. Off unless set.
+   * skip label propagation. Proves the exact hysteresis policy; it does not
+   * guarantee identity with every bucketed approximate solve. Off unless set.
    */
   hysteresisCertificate?: boolean;
 }
@@ -895,6 +895,19 @@ export interface AutobiographicalConfig {
    * Default 20MB (of base64; the API cap is 32MB total).
    */
   maxLiveImageBytes?: number;
+
+  /**
+   * Opt-in, cost-conscious image trimming (default off). Without it the live
+   * image window slides one image at a time: once a limit binds
+   * (`maxLiveImages`, `imageStripDepthTokens`, `maxLiveImageBytes`), each new
+   * image strips the oldest live one, a change mid-history that invalidates
+   * the prompt cache from that message on, on every image. With a ratio in
+   * (0, 1), a binding limit instead trims down to ratio × each limit and
+   * records a watermark (a message sequence, persisted): every image at or
+   * before it stays stripped, so the stripped set changes once per trim, not
+   * once per image. E.g. 0.7. Costs up to (1 - ratio) of the image budget.
+   */
+  imageStripHysteresisRatio?: number;
 
   /**
    * Image byte budget for COMPRESSION prompts (summarizer). Tighter than the

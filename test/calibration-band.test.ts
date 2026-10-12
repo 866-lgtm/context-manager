@@ -74,4 +74,26 @@ describe('estimator calibration band', () => {
     assert.ok(internals._calibration > 1.0 && internals._calibration < 1.5, `got ${internals._calibration}`);
     cm.close();
   });
+  it('a drift inside 2% is not applied; once the EMA passes 2% it is', async () => {
+    const { cm, strategy, internals } = await openManager('deadband');
+    await cm.compile(BUDGET);
+    assert.equal(internals._calibration, 1);
+    // real/est = 1.01 every compile: the EMA creeps toward 1.01 and never
+    // leaves the band, so nothing is repriced between compiles.
+    for (let i = 0; i < 12; i++) {
+      strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.01);
+      assert.equal(internals._calibration, 1, `sample ${i} must not move the applied multiplier`);
+      await cm.compile(BUDGET);
+    }
+    // real/est = 1.10: the EMA passes 2% within a few samples and is applied.
+    let applied = false;
+    for (let i = 0; i < 6 && !applied; i++) {
+      strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.1);
+      applied = internals._calibration !== 1;
+      await cm.compile(BUDGET);
+    }
+    assert.ok(applied, 'a sustained 10% error must be applied');
+    assert.ok(internals._calibration > 1.02 && internals._calibration < 1.1, `got ${internals._calibration}`);
+    cm.close();
+  });
 });
