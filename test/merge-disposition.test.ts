@@ -686,3 +686,134 @@ describe('merge lane: classification, attribution and ownership (sw-cm138)', () 
     await fx.manager.close();
   });
 });
+
+describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
+  after(cleanup);
+  async function calledAtLeast(calls: unknown[], n: number, ms = 10_000): Promise<void> {
+    const deadline = Date.now() + ms;
+    while (calls.length < n) {
+      if (Date.now() > deadline) assert.fail(`the provider was called ${calls.length} time(s), not ${n}`);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+  }
+  const network = () => Object.assign(new Error('zz network down'), { type: 'network', retryable: true });
+  const lane = (fx: Fixture) => fx.strategy as unknown as {
+    compressionPause: { backoffUntil: number; statedUntil: number | null; failures: number } | null;
+    mergeQueue: Array<{ failureStreak?: { failures: number } }>;
+  };
+  const answer = { stopReason: 'end_turn', content: [t('a merged parent')], usage: { inputTokens: 100, outputTokens: 20 } };
+
+  it('a hold placed on the span during the call keeps the answer out with no failure: no pause, the entry stays queued, its run ends (I5)', async () => {
+    let fx!: Fixture;
+    const calls: unknown[] = [];
+    const membrane = {
+      complete: async (request: unknown) => {
+        calls.push(request);
+        if (calls.length === 1) throw network();
+        // The provider answers; meanwhile a hold lands on a source's span.
+        fx.manager.holdCompression([fx.manager.queryMessages({}).messages[1]!.id]);
+        return answer;
+      },
+    } as never;
+    fx = await fixture(membrane);
+    await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
+    assert.equal(lane(fx).mergeQueue[0]?.failureStreak?.failures, 1, 'a run of one');
+    lane(fx).compressionPause!.backoffUntil = 0;
+    await fx.strategy.tick(ctx(fx.manager)); // answered, held: no throw
+    assert.equal(calls.length, 2);
+    assert.equal(lane(fx).compressionPause, null, 'the answer ended the pause, and the discard installed none');
+    assert.equal(fx.strategy.mergeQueueView().length, 1, 'the entry stays queued for the release');
+    assert.equal(lane(fx).mergeQueue[0]?.failureStreak, undefined, 'its run ended: the request answered');
+    assert.equal(fx.strategy.summariesView().some((s) => s.level === 2), false, 'nothing written');
+    await fx.strategy.tick(ctx(fx.manager));
+    assert.equal(calls.length, 2, 'the held merge waits for the release');
+    await fx.manager.close();
+  });
+
+  it('a refusal ends the run: the next failure starts a new one (I19), and the run write is synced (I9)', async () => {
+    const mock = scripted([{ error: network() }, { stop: 'refusal' }, { error: network() }]);
+    const fx = await fixture(mock.membrane);
+    const store = fx.manager.getStore();
+    const sync = store.sync.bind(store);
+    const synced: unknown[] = [];
+    store.sync = () => { synced.push(structuredClone(store.getStateJson('default/autobio:mergeQueue'))); sync(); };
+    await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
+    const run = (queue: unknown) => (queue as Array<{ failureStreak?: { failures: number } }> | null)?.[0]?.failureStreak?.failures;
+    assert.equal(run(synced.at(-1)), 1, 'the run is in the synced queue');
+    lane(fx).compressionPause!.backoffUntil = 0;
+    (fx.strategy as unknown as { noteCompressionLanded(membrane: unknown, model: string): void }).noteCompressionLanded(ctx(fx.manager).membrane, MODEL);
+    await fx.strategy.tick(ctx(fx.manager)); // a refusal: an answer
+    assert.equal(lane(fx).mergeQueue[0]?.failureStreak, undefined, 'the answer ended the run');
+    await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
+    assert.equal(lane(fx).mergeQueue[0]?.failureStreak?.failures, 1, 'a new run, though work landed before the refusal');
+    await fx.manager.close();
+  });
+
+  it('a request-attributable rejection thrown as a plain object is recorded, not re-sent every tick (I26)', async () => {
+    const rejection = { type: 'invalid_request', retryable: false, httpStatus: 400, message: 'zz plain-object 400' };
+    const calls: unknown[] = [];
+    const membrane = { complete: async (request: unknown) => { calls.push(request); throw rejection; } } as never;
+    const fx = await fixture(membrane);
+    await fx.strategy.tick(ctx(fx.manager));
+    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1, 'recorded through the bounded policy');
+    assert.equal(lane(fx).compressionPause, null, 'a rejection pauses nothing');
+    await fx.manager.close();
+  });
+
+  it('an answer that arrives after a branch switch still ends the pause: the pause is the route\'s (I41)', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const calls: unknown[] = [];
+    const membrane = {
+      complete: async (request: unknown) => {
+        calls.push(request);
+        if (calls.length === 1) throw network();
+        await gate;
+        return { stopReason: 'refusal', content: [], usage: { inputTokens: 100, outputTokens: 0 } };
+      },
+    } as never;
+    const fx = await fixture(membrane);
+    await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
+    const pause = lane(fx).compressionPause!;
+    pause.backoffUntil = 0;
+    const store = fx.manager.getStore();
+    const fork = store.createBranchAt('zz-fork', fx.manager.currentBranch().name, store.currentSequence()).name;
+    const tick = fx.strategy.tick(ctx(fx.manager));
+    await calledAtLeast(calls, 2);
+    await fx.manager.switchBranch(fork);
+    release();
+    await tick;
+    assert.equal(lane(fx).compressionPause, null, 'the stale-branch answer ended the pause');
+    await fx.manager.close();
+  });
+
+  it('a written merge is a landing in its domain: a failure of another merge there then counts (I45)', async () => {
+    const calls: unknown[] = [];
+    const membrane = {
+      complete: async (request: unknown) => {
+        calls.push(request);
+        // The merge over L1-102 and L1-103 replays their raw messages.
+        if (JSON.stringify(request).includes('raw-4 substance')) throw network();
+        return answer;
+      },
+    } as never;
+    const fx = await fixture(membrane, {}, freshPath(), false);
+    const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
+    const l1 = (id: string, a: number, b: number): SummaryEntry => ({
+      id, level: 1, content: `authored ${id}`, tokens: 20, sourceLevel: 0,
+      sourceIds: [ids[a]!, ids[b]!], sourceRange: { first: ids[a]!, last: ids[b]! }, created: 1,
+    });
+    for (const [id, a, b] of [['L1-100', 0, 1], ['L1-101', 2, 3], ['L1-102', 4, 5], ['L1-103', 6, 7]] as const) fx.strategy.seed(l1(id, a, b));
+    fx.strategy.qMerge(2, ['L1-102', 'L1-103']); // fails
+    fx.strategy.qMerge(2, ['L1-100', 'L1-101']); // writes
+    const failing = () => lane(fx).mergeQueue.find((entry) => (entry as unknown as { sourceIds: string[] }).sourceIds[0] === 'L1-102');
+    await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
+    assert.equal(failing()?.failureStreak?.failures, 1);
+    lane(fx).compressionPause!.backoffUntil = 0;
+    await fx.strategy.tick(ctx(fx.manager)); // the other merge writes its parent: a landing
+    assert.ok(fx.strategy.summariesView().some((s) => s.level === 2), 'the other merge landed');
+    await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
+    assert.equal(failing()?.failureStreak?.failures, 2, 'the landing made the next failure count');
+    await fx.manager.close();
+  });
+});

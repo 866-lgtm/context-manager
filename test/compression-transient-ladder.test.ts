@@ -1510,6 +1510,44 @@ describe('ladder progress goes when its debt is paid, and is swept on its own ca
     fx.manager.close();
   });
 
+  it('an exact-match adoption pays off the span\'s progress (sheet I15)', async () => {
+    const mock = scripted([OK('never called')]);
+    const fx = await build(mock.membrane);
+    const target = fx.target();
+    const ids = target.messages.map((message) => message.id);
+    fx.strategy.seed({ id: 'L1-210', level: 1, content: 'the same span, already summarized', tokens: 10, sourceLevel: 0, sourceIds: ids, sourceRange: { first: ids[0]!, last: ids.at(-1)! }, created: 1 });
+    fx.manager.getStore().setStateJson(PROGRESS_SLOT, [
+      { familyKey: 'fam-target', chunkSourceHash: idsHash(ids), outcomes: [], updated: Date.now() },
+      { familyKey: 'fam-other', chunkSourceHash: idsHash(['zz']), outcomes: [], updated: Date.now() },
+    ]);
+    await fx.strategy.run(target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 0, 'adopted, not compressed');
+    assert.equal(target.compressed, true);
+    assert.deepEqual(families(fx.manager), ['fam-other'], "the adopted span's progress is gone; another's stays");
+    fx.manager.close();
+  });
+
+  it('the thin-chunk stub pays off the span\'s progress, and is no landing (sheet I12, I32)', async () => {
+    const mock = scripted([OK('never called')]);
+    const fx = await build(mock.membrane);
+    (fx.strategy as unknown as { config: { minChunkCharsForLLM: number } }).config.minChunkCharsForLLM = 200;
+    const before = managerContext(fx.manager).messageStore.getAll().length;
+    fx.manager.addMessage('User', [text('ok')]);
+    fx.manager.addMessage('Claude', [text('ok')]);
+    const messages = managerContext(fx.manager).messageStore.getAll().slice(before);
+    const thin: Chunk = { index: 500, startIndex: before, endIndex: before + 2, messages, tokens: 4, compressed: false };
+    fx.manager.getStore().setStateJson(PROGRESS_SLOT, [
+      { familyKey: 'fam-thin', chunkSourceHash: idsHash(messages.map((m) => m.id)), outcomes: [], updated: Date.now() },
+    ]);
+    fx.manager.getStore().setStateJson(STALL_SLOT, { failingSince: Date.now() - 60_000, activeAt: Date.now(), last: { subject: 'zz', failureClass: 'network', lane: 'l1' }, stall: null });
+    await fx.strategy.run(thin, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 0, 'stubbed, with no call');
+    assert.equal(thin.compressed, true);
+    assert.deepEqual(families(fx.manager), [], "the stubbed span's progress is gone");
+    assert.equal(typeof stallClock(fx.manager)?.failingSince, 'number', 'a stub made no call, so the stall clock runs on');
+    fx.manager.close();
+  });
+
   it("an operator's clear takes the family's progress with it (I27)", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -1528,9 +1566,20 @@ describe('ladder progress goes when its debt is paid, and is swept on its own ca
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'exhausted');
     // A crash between exhaustion's ledger write and its progress drop leaves this.
     fx.manager.getStore().setStateJson(PROGRESS_SLOT, progress);
+    // The progress goes before the clear event (sheet I28): a crash between
+    // them leaves the quarantine standing, never a cleared family with its
+    // old answers.
+    const self = fx.strategy as unknown as { appendCompressionQuarantineEvent(event: { kind: string }): unknown };
+    const append = self.appendCompressionQuarantineEvent.bind(fx.strategy);
+    const progressAtClear: number[] = [];
+    self.appendCompressionQuarantineEvent = (event: { kind: string }) => {
+      if (event.kind === 'clear') progressAtClear.push(progressSlot(fx.manager).length);
+      return append(event);
+    };
     await fx.strategy.clearCompressionRefusalQuarantine();
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
     assert.equal(progressSlot(fx.manager).length, 0, 'nothing recorded before the clear outlives it');
+    assert.deepEqual(progressAtClear, [0], 'the progress was gone before the clear event was written');
     fx.manager.close();
   });
 });

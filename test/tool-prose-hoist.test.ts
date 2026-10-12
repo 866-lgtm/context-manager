@@ -195,7 +195,8 @@ describe('tool-prose hoist rung', () => {
     // An unclassified thrown error says nothing about the request: the ladder
     // stops there and the failure propagates, without exhausting the family
     // (room-225 L3; compression-transient-ladder.test.ts covers resumption).
-    await assert.rejects(a.strategy.run(a.target(), managerContext(a.manager)));
+    await assert.rejects(a.strategy.run(a.target(), managerContext(a.manager)),
+      (error: unknown) => (error as { type?: unknown }).type === 'server_error', 'the provider\'s own error propagates');
     assert.deepEqual(thrown.calls.map(names), ['skip_reply', 'journal+skip_reply', 'skip_reply'],
       'no source-only hoist after a provider error: the rewrite cannot address it');
     assert.equal(a.strategy.getCompressionQuarantineStatus().count, 0, 'not exhausted by a transient failure');
