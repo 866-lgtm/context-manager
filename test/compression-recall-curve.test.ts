@@ -1820,13 +1820,13 @@ describe('compression refusal recall curves', () => {
     };
     // The first instance's compression is the producer: the second starts only
     // once the first is in its provider call, so it finds the family in flight.
+    // compressChunkHierarchical reaches that wait before its first await, so
+    // the second has joined it when run() returns its promise.
     const producer = first.strategy.run(first.target, managerContext(first.manager));
     await producing;
     const waiter = second.run(secondChunk, secondCtx);
     // While the second waits, the first writes to the store's shared mirrors.
     const pinId = first.strategy.pinRange(first.ids[12]!, first.ids[13]!);
-    // Give the second time to reach the in-flight entry before the first finishes.
-    await new Promise((resolve) => setTimeout(resolve, 20));
     release();
     await Promise.all([producer, waiter]);
     assert.equal(calls, 1, 'the second compression waited on the first');
