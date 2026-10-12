@@ -1795,9 +1795,15 @@ describe('compression refusal recall curves', () => {
       { kvUnifiedImmutablePrefixHash: 'immutable-v1' },
     );
     second.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
-    const markerCount = (
-      second as unknown as { kvUnifiedPendingMarkerUnitIndices: number[] }
-    ).kvUnifiedPendingMarkerUnitIndices.length;
+    const presentation = second as unknown as {
+      kvUnifiedDraft: unknown;
+      kvUnifiedPendingLayout: unknown;
+      kvUnifiedPendingMarkerUnitIndices: number[];
+    };
+    const draft = presentation.kvUnifiedDraft;
+    const submittedLayout = presentation.kvUnifiedPendingLayout;
+    assert.ok(draft && submittedLayout, 'compiled and submitted');
+    const markerCount = presentation.kvUnifiedPendingMarkerUnitIndices.length;
 
     const secondCtx = managerContext(secondManager);
     const secondMessages = first.target.messages.map(
@@ -1811,15 +1817,19 @@ describe('compression refusal recall curves', () => {
     const waiter = second.run(secondChunk, secondCtx);
     // While the second waits, the first writes to the store's shared mirrors.
     const pinId = first.strategy.pinRange(first.ids[12]!, first.ids[13]!);
+    // Give the second time to reach the in-flight entry before the first finishes.
+    await new Promise((resolve) => setTimeout(resolve, 20));
     release();
     await Promise.all([producer, waiter]);
     assert.equal(calls, 1, 'the second compression waited on the first');
     assert.equal(secondChunk.compressed, true, 'the waiter took up the durable L1');
     assert.ok(second.pinsView().some((pin) => pin.id === pinId), "the waiter took up the other instance's pin");
     const chain = (second as unknown as {
-      kvUnifiedReceipts: { inFlightSubmissionId: string | null; head: unknown; cache: unknown };
+      kvUnifiedReceipts: { inFlightSubmissionId: string | null; head: unknown; cache: { layout: unknown } | null };
     }).kvUnifiedReceipts;
     assert.equal(chain.inFlightSubmissionId, 's1', 'the submission begun before the wait is still in flight');
+    assert.equal(presentation.kvUnifiedDraft, draft, 'the draft is kept');
+    assert.equal(presentation.kvUnifiedPendingLayout, submittedLayout, 'the submitted layout is kept');
 
     second.reportKvUnifiedAccepted({
       submissionId: 's1',
@@ -1834,7 +1844,7 @@ describe('compression refusal recall curves', () => {
       },
     });
     assert.ok(chain.head, 'the acceptance committed the presentation');
-    assert.ok(chain.cache, 'with the layout it was submitted with');
+    assert.equal(chain.cache?.layout, submittedLayout, 'with the layout it was submitted with');
     secondManager.close();
     first.manager.close();
   });

@@ -1971,9 +1971,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * another instance's in-flight compression of its family, to take up that
    * result (compressChunkHierarchical). That waiter passes
    * `keepKvUnifiedPresentation`: a kv-unified strategy then keeps its own
-   * receipt chain, whose pending submission is never persisted, and its draft
-   * and pending layout, which live only in memory, rather than replacing them
-   * from the store (#166).
+   * receipt chain, whose pending submission is never persisted, rather than
+   * replacing it from the store, and keeps its draft and pending layout (with
+   * the layout's marker indices and immutable prefix hash), which live only in
+   * memory, rather than clearing them (#166).
    */
   protected loadPersistedState(options: { keepKvUnifiedPresentation?: boolean } = {}): void {
     if (!this.store) {
