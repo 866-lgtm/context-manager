@@ -753,7 +753,6 @@ interface CompressionLanePause {
 
 /** The last instant a JavaScript Date can represent (ECMA-262 time value range). */
 const MAX_DATE_MS = 8.64e15;
-/** When the lane may call again: the later of its two constraints. */
 /** The lane's stall clock, stored in compressionStallStateId. */
 interface CompressionStallClock {
   /** The first failure since the last landing, or the restart of its stretch after an idle hour. */
@@ -766,6 +765,7 @@ interface CompressionStallClock {
   stall: { since: number; subject: string; failureClass: string; alertedAt: number } | null;
 }
 
+/** When the lane may call again: the later of its two constraints. */
 const pauseUntil = (pause: CompressionLanePause): number => Math.max(pause.backoffUntil, pause.statedUntil ?? 0);
 /** Which constraint binds: the provider's stated wait only when it outlasts the backoff. */
 const pauseSource = (pause: CompressionLanePause): 'retry-after' | 'backoff' =>
@@ -1566,7 +1566,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * on a pause, the latest failure, and the stall alert once raised. A
    * landing clears it. Branch-scoped like the rest of the strategy's state,
    * and shared by every strategy on the store and namespace, so a restart, a
-   * crash loop or a sibling's landing reads the same clock.
+   * crash loop or a sibling's landing reads the same clock. It is lane-wide
+   * on purpose: a landing on any route or model means the lane isn't stuck,
+   * and no durable key can name a route across processes. Siblings that
+   * compress one namespace through different membranes or models would
+   * therefore hide a stuck route's stall behind another route's landings.
    */
   protected get compressionStallStateId(): string {
     return `${this.ns}/autobio:compression-stall`;
@@ -4138,17 +4142,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * The chunk's run as its newest family records it, for a family with no
-   * progress of its own yet. A chunk's request family changes with the
-   * unmerged frontier its requests carry, and its run goes on across that.
+   * The chunk's run as its newest family records it, and that family, for a
+   * family with no progress of its own yet. A chunk's request family changes
+   * with the unmerged frontier its requests carry, and its run goes on across
+   * that.
    */
-  private latestChunkRun(chunkSourceHash: string): CompressionFailureStreak | undefined {
+  private latestChunkRun(chunkSourceHash: string): { familyKey: string; run: CompressionFailureStreak | undefined } | undefined {
     let newest: CompressionFamilyProgress | undefined;
     for (const entry of this.readCompressionFamilyProgress().values()) {
       if (entry.chunkSourceHash !== chunkSourceHash) continue;
       if (!newest || entry.updated > newest.updated) newest = entry;
     }
-    return newest?.failureStreak;
+    return newest ? { familyKey: newest.familyKey, run: newest.failureStreak } : undefined;
   }
 
   /**
@@ -4188,16 +4193,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     // Another writer's run for the same rung in the same domain (a sibling
     // on this membrane instance and model) is kept when it is longer: it
-    // counted landings this ladder hasn't seen.
+    // counted landings this ladder hasn't seen. The chunk's run may sit in
+    // any of its families, so all of them are compared before the one run
+    // moves here.
     let streak = failureStreak ? { ...failureStreak } : undefined;
     const other = existing?.failureStreak;
-    if (other && !answered.has(other.key)) {
-      if (!streak) streak = { ...other };
-      else if (
-        other.key === streak.key &&
-        other.domain === streak.domain &&
-        other.failures > streak.failures
-      ) streak = { ...other };
+    if (!streak && other && !answered.has(other.key)) streak = { ...other };
+    if (streak) {
+      for (const entry of progress.values()) {
+        const run = entry.chunkSourceHash === record.chunkSourceHash ? entry.failureStreak : undefined;
+        if (run && run.key === streak.key && run.domain === streak.domain && run.failures > streak.failures) streak = { ...run };
+      }
     }
     if (streak && answered.has(streak.key)) streak = undefined;
     // One run per chunk: this family's is the chunk's now (latestChunkRun),
@@ -7642,12 +7648,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let progressCanonicalInputTokens = progress?.canonicalProviderInputTokens;
       // The chunk's run goes on across the families its changing frontier
       // makes: a family with no progress yet takes the newest family's.
-      let failureStreak = progress ? progress.failureStreak : this.latestChunkRun(quarantineRecord.chunkSourceHash);
+      let carried = progress ? undefined : this.latestChunkRun(quarantineRecord.chunkSourceHash);
+      let failureStreak = progress ? progress.failureStreak : carried?.run;
       const answeredRuns = new Set<string>();
       // Whether this family's progress has been in the slot during this
       // ladder: found there when it began, or written by it since.
       let progressSeen = progress !== undefined;
+      /**
+       * A run carried from another family whose progress was dropped while
+       * this ladder ran (the chunk minted or swept, or that family exhausted)
+       * ended with it, so this ladder's first write doesn't bring it back:
+       * its count starts again, as the write-back guard below keeps for this
+       * family's own progress. Synchronous with the write that follows.
+       */
+      const forgetDroppedCarry = (): void => {
+        if (!carried || progressSeen) return;
+        if (this.readCompressionFamilyProgress().has(carried.familyKey)) return;
+        if (failureStreak === carried.run) failureStreak = undefined;
+        carried = undefined;
+      };
       const persistProgress = (): void => {
+        forgetDroppedCarry();
         // A family whose progress was in the slot during this ladder, and is
         // gone from it now, was dropped meanwhile (minted, exhausted, cleared
         // or swept, here or by another strategy on this store): this ladder's
@@ -7695,6 +7716,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         streakHash: string = requestHash,
       ): CompressionRefusalOutcomeRecord => {
         if (!isNoCallDeferral(error)) {
+          forgetDroppedCarry();
           // Counted against the request actually dispatched (the stripped one
           // after a carrier rejection is its own run); the outcome at the
           // bound is the rung's.

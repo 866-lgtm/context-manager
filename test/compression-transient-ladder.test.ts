@@ -1224,6 +1224,59 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
+  it("across the chunk's families: a sibling's longer run of the same rung is kept, and a run carried from a family dropped meanwhile doesn't come back (Basil-1007's review)", async () => {
+    let release: () => void = () => {};
+    let gate: Promise<void> = Promise.resolve();
+    const calls: NormalizedRequest[] = [];
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        calls.push(structuredClone(request));
+        await gate;
+        throw failure('server', { httpStatus: 503 });
+      },
+    };
+    const fx = await build(membrane);
+    const runs = () => (progressSlot(fx.manager) as Array<{ familyKey: string; failureStreak?: { failures: number } }>)
+      .filter((entry) => entry.failureStreak).map((entry) => [entry.familyKey, entry.failureStreak!.failures] as const);
+    const l1 = (id: string, first: number, last: number): SummaryEntry => ({
+      id, level: 1, content: `authored ${id}`, tokens: 20, sourceLevel: 0,
+      sourceIds: fx.ids.slice(first, last + 1), sourceRange: { first: fx.ids[first]!, last: fx.ids[last]! }, created: 1,
+    });
+    /** One failing attempt whose call is held until `during` has run. */
+    const heldFailure = async (during: () => void): Promise<void> => {
+      gate = new Promise<void>((resolve) => { release = resolve; });
+      const before = calls.length;
+      const running = fx.strategy.run(fx.target(), managerContext(fx.manager));
+      while (calls.length === before) await new Promise((resolve) => setTimeout(resolve, 1));
+      during();
+      release();
+      await assert.rejects(running, /zz server failure/);
+      gate = Promise.resolve();
+    };
+    for (let i = 0; i < 3; i++) {
+      fx.strategy.land(membrane);
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+    }
+    const [first] = runs();
+    assert.equal(first![1], 3, 'three counted failures in the first family');
+    // A new L1 grows the frontier, so the next attempt is a new family, carrying the run.
+    fx.strategy.seed(l1('L1-101', 2, 3));
+    fx.strategy.land(membrane);
+    await heldFailure(() => {
+      // Meanwhile a sibling counted further in the first family.
+      const slot = progressSlot(fx.manager) as Array<{ familyKey: string; failureStreak?: { failures: number } }>;
+      slot.find((entry) => entry.familyKey === first![0])!.failureStreak!.failures = 6;
+      fx.manager.getStore().setStateJson(PROGRESS_SLOT, slot);
+    });
+    assert.deepEqual(runs().map(([, failures]) => failures), [6], "the sibling's longer run is kept, and only one family holds it");
+    // Another new family; this time the chunk's progress is dropped during the call (minted, or exhausted, elsewhere).
+    fx.strategy.seed(l1('L1-102', 4, 5));
+    fx.strategy.land(membrane);
+    await heldFailure(() => { fx.manager.getStore().setStateJson(PROGRESS_SLOT, []); });
+    assert.deepEqual(runs().map(([, failures]) => failures), [1], 'the carried run ended with its family: the count starts again');
+    fx.manager.close();
+  });
+
   it('a progress write keeps another writer\'s longer run for the same request in the same domain, and drops a run whose request answered', async () => {
     const fx = await build(scripted([OK('unused')]).membrane);
     const self = fx.strategy as unknown as {
