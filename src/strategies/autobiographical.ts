@@ -162,16 +162,6 @@ function compressionDomain(membrane: object, model: string | undefined): string 
   return `${token}\u0000${model ?? ''}`;
 }
 
-/**
- * The strategies of this process on each store and namespace. A pause lives
- * only in process, on its strategy, and binds its route on every branch, so
- * the stall clock's idle test reads the pauses of all of them
- * (compressionLaneWaitEnd). A strategy joins at initialize and leaves at
- * detach, when its manager closes or replaces it; one collected counts no
- * pause either.
- */
-const compressionLanePeers = new WeakMap<object, Map<string, Set<WeakRef<AutobiographicalStrategy>>>>();
-
 function domainLanded(membrane: object, model: string | undefined): number {
   return domainLandings.get(membrane)?.get(model ?? '') ?? 0;
 }
@@ -230,7 +220,8 @@ function isWellFormedRun(run: unknown): run is CompressionFailureStreak {
   const candidate = run as Partial<CompressionFailureStreak>;
   return typeof candidate.key === 'string' && typeof candidate.failureClass === 'string' &&
     Number.isSafeInteger(candidate.failures) && candidate.failures! >= 1 &&
-    Number.isFinite(candidate.atLanded) && Number.isFinite(candidate.firstFailedAt) &&
+    candidate.failures! < AutobiographicalStrategy.COMPRESSION_PERSISTENT_FAILURES &&
+    Number.isSafeInteger(candidate.atLanded) && candidate.atLanded! >= 0 && Number.isFinite(candidate.firstFailedAt) &&
     (candidate.domain === undefined || typeof candidate.domain === 'string') &&
     (candidate.subject === undefined || typeof candidate.subject === 'string');
 }
@@ -800,8 +791,8 @@ interface CompressionStallClock {
   failingSince: number | null;
   /**
    * When the lane was last seen failing, starting an attempt, or waiting on a
-   * pause with work pending. The pauses themselves are in process
-   * (compressionLaneWaitEnd), so a restart's down time is idle.
+   * pause with work pending (a tick that finds it paused). A pause counts
+   * only through those ticks, so a restart's down time is idle.
    */
   activeAt: number | null;
   /** The latest failure: what failed, its class, and its lane. */
@@ -1562,8 +1553,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected store: JsStore | null = null;
   /** Namespace for state-id scoping. Set in `initialize()`. */
   protected ns: string = '';
-  /** Where this strategy joined compressionLanePeers. */
-  private compressionLaneJoined?: { store: object; namespace: string; ref: WeakRef<AutobiographicalStrategy> };
   protected get summariesStateId(): string { return `${this.ns}/autobio:summaries`; }
   protected get chunksStateId(): string { return `${this.ns}/autobio:chunks`; }
   /** Memories are identity-bearing: a substitute model writing summaries in
@@ -2144,7 +2133,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Bind to the chronicle store + namespace for persistent strategy state.
     this.store = ctx.store;
     this.ns = ctx.namespace;
-    this.joinCompressionLane(ctx.store, ctx.namespace);
     observeStoreBranch(ctx.store);
     const sourceBranch = this.captureCompressionBranch();
     this.initializingBranchIdentity = {
@@ -4656,69 +4644,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Whether the lane has been idle for COMPRESSION_STALL_ALERT_MS at `at`:
-   * neither failing, nor starting an attempt, nor waiting on a pause with
-   * work pending, nor inside a pause a failure installed that still binds
-   * (compressionLaneWaitEnd), an explicit hold included. A hold by the
-   * caller's admission is seen only through the ticks that find the lane
-   * paused. The process being down counts as idle.
+   * an hour with no observed activity (activeAt): no failure, no attempt
+   * starting, and no tick that found it waiting on a pause with work
+   * pending. A pause counts only through those ticks, which is the host's
+   * side: a host that ticks a lane that isn't ready at least once an hour
+   * (agent-framework's maintenance pass does) keeps a long wait from reading
+   * as idle. One that doesn't gets a later alert, never a false one. The
+   * process being down counts as idle.
    */
   private compressionStallIdle(clock: CompressionStallClock, at: number): boolean {
-    if (clock.activeAt === null) return true;
-    const lastActive = Math.max(clock.activeAt, this.compressionLaneWaitEnd());
-    return at - lastActive >= AutobiographicalStrategy.COMPRESSION_STALL_ALERT_MS;
-  }
-
-  /**
-   * When the pauses failures installed on this lane end, as this process
-   * knows them: those of every strategy of the process on this store and
-   * namespace, on whatever branch, since a pause binds its route on every
-   * branch. The pause is the authority: an answer, a release or a change of
-   * route that ends one early ends its wait, and an explicit hold has no end.
-   * Only a failure's own parts count, its backoff and the provider's stated
-   * wait: a hold by the caller's admission is rechecked at ticks, and those
-   * ticks see it.
-   */
-  private compressionLaneWaitEnd(): number {
-    let end = Number.NEGATIVE_INFINITY;
-    const peers = this.store ? compressionLanePeers.get(this.store)?.get(this.ns) : undefined;
-    for (const ref of peers ?? []) {
-      const peer = ref.deref();
-      if (!peer) {
-        peers!.delete(ref);
-        continue;
-      }
-      const pause = peer.compressionPause;
-      if (!pause) continue;
-      const stated = pause.statedBy === 'provider' && pause.statedUntil !== null ? pause.statedUntil : Number.NEGATIVE_INFINITY;
-      end = Math.max(end, pause.backoffUntil, stated);
-    }
-    return end;
-  }
-
-  /**
-   * The manager closed or replaced this strategy: it leaves its compression
-   * lane, so its pause, which nothing will lift now, no longer keeps the
-   * lane's stall clock from reading idle time.
-   */
-  detach(): void {
-    const joined = this.compressionLaneJoined;
-    if (!joined) return;
-    compressionLanePeers.get(joined.store)?.get(joined.namespace)?.delete(joined.ref);
-    this.compressionLaneJoined = undefined;
-  }
-
-  /** Join this process's strategies on `store` and `namespace` (compressionLanePeers). */
-  private joinCompressionLane(store: object, namespace: string): void {
-    const joined = this.compressionLaneJoined;
-    if (joined?.store === store && joined.namespace === namespace) return;
-    if (joined) compressionLanePeers.get(joined.store)?.get(joined.namespace)?.delete(joined.ref);
-    let byNamespace = compressionLanePeers.get(store);
-    if (!byNamespace) compressionLanePeers.set(store, byNamespace = new Map());
-    let peers = byNamespace.get(namespace);
-    if (!peers) byNamespace.set(namespace, peers = new Set());
-    const ref = new WeakRef<AutobiographicalStrategy>(this);
-    peers.add(ref);
-    this.compressionLaneJoined = { store, namespace, ref };
+    return clock.activeAt === null || at - clock.activeAt >= AutobiographicalStrategy.COMPRESSION_STALL_ALERT_MS;
   }
 
   /**
@@ -4753,8 +4688,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * After a failure that pauses the lane, until `pausedUntil`: the stall
-   * clock starts at the first failure after the last landing, or after its
+   * After a failure that pauses the lane: the stall clock starts at the
+   * first failure after the last landing, or after its
    * stretch ended on an idle hour, which the attempt's start decided (see
    * noteCompressionAttemptStarting), so an attempt that ran long is no idle
    * time. Once failures, and the waits they caused, have gone on for
@@ -6208,9 +6143,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       chunks: this.chunks,
       compressionQueue: this.compressionQueue,
       compressionQueueGeneration: this.compressionQueueGeneration,
-      // The dry rebuild orders its queue (orderCompressionQueue), which drops
-      // the orders and waits of chunks its own cut doesn't have, and the
-      // orders of merges not queued now: a dry select changes none of them.
+      // The dry rebuild orders its queue (orderCompressionQueue), which prunes
+      // the failure orders and window waits of chunks its own cut doesn't
+      // have, and the failure orders of merges not queued now. A dry select
+      // commits nothing, so all three are put back as they were.
       compressionFailureOrder: new Map(this.compressionFailureOrder),
       compressionNotBefore: new Map(this.compressionNotBefore),
       mergeFailureOrder: new Map(this.mergeFailureOrder),

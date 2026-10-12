@@ -87,10 +87,6 @@ class ProbeStrategy extends AutobiographicalStrategy {
     pause.backoffUntil = at;
     if (pause.statedUntil !== null && Number.isFinite(pause.statedUntil)) pause.statedUntil = at;
   }
-  /** When the pauses failures installed on this lane end, as the stall clock's idle test reads them. */
-  laneWaitEnd(): number {
-    return (this as unknown as { compressionLaneWaitEnd(): number }).compressionLaneWaitEnd();
-  }
   /** Stand for time passing: every finite constraint has elapsed. */
   expirePause(): void {
     const pause = this.lanePause();
@@ -1979,14 +1975,16 @@ describe("the stall clock's idle rule: failures, attempts and the waits they cau
     fx.manager.close();
   });
 
-  it('a stated wait is no idle time, even with no tick during it: the next failure continues the stretch and alerts (sheet I17)', async () => {
-    const fx = await queued(scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 2 * HOUR }) }]).membrane);
+  it('a tick during a long stated wait keeps the stretch: the failure after the wait continues it and alerts (sheet I17)', async () => {
+    const fx = await queued(scripted([
+      { throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 2 * HOUR }) },
+      { throw: failure('server', { httpStatus: 503 }) },
+    ]).membrane);
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    assert.ok(fx.strategy.laneWaitEnd() - Date.now() > 2 * HOUR - 60_000, 'the pause holds the wait');
-    // Two hours pass with no tick, and the wait ends a minute ago.
+    // The failure was two hours ago, and a tick saw the lane waiting half an hour ago.
     const since = Date.now() - 2 * HOUR - 60_000;
-    clockAt(fx.manager, { failingSince: since, activeAt: since });
-    fx.strategy.endPauseAt(Date.now() - 60_000);
+    clockAt(fx.manager, { failingSince: since, activeAt: Date.now() - 30 * 60_000 });
+    fx.strategy.expirePause();
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
     const stall = fx.strategy.checkReadiness().compressionStall;
     assert.ok(stall, 'stalled');
@@ -1994,46 +1992,32 @@ describe("the stall clock's idle rule: failures, attempts and the waits they cau
     fx.manager.close();
   });
 
-  it("a sibling's shorter pause on another route doesn't end the wait: each strategy's pause counts (Basil-1007)", async () => {
-    const routeA = scripted([OK('unused')]);
-    const routeB = scripted([OK('unused')]);
-    const a = await queued(routeA.membrane);
-    const b = await queued(routeB.membrane, { store: a.manager.getStore() });
-    const before = Date.now();
-    a.strategy.notePause(failure('rate_limit', { httpStatus: 429, retryAfterMs: 3 * HOUR }), managerContext(a.manager));
-    b.strategy.notePause(failure('server', { httpStatus: 503 }), managerContext(b.manager));
-    assert.ok(b.strategy.laneWaitEnd() >= before + 3 * HOUR, "A's three hours stand for B's idle test too");
-    b.manager.close();
-    a.manager.close();
+  it('with no tick for an hour, a long wait reads as idle: the next failure starts a new stretch (the stated cost)', async () => {
+    const fx = await queued(scripted([
+      { throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 2 * HOUR }) },
+      { throw: failure('server', { httpStatus: 503 }) },
+    ]).membrane);
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
+    clockAt(fx.manager, { failingSince: Date.now() - 2 * HOUR - 60_000, activeAt: Date.now() - 2 * HOUR - 60_000 });
+    fx.strategy.expirePause();
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
+    assert.equal(fx.strategy.checkReadiness().compressionStall, undefined, 'a later alert, never a false one');
+    assert.ok(Date.now() - stallClock(fx.manager)!.failingSince! < 60_000, 'the stretch started again');
+    fx.manager.close();
   });
 
-  it('an explicit hold is waiting while it binds, with no tick to see it: the next paused tick alerts (Andrew-2310; cm138-r4 I1)', async () => {
+  it('an explicit hold seen by ticks keeps the stretch, and a paused tick alerts once it has run its hour (cm138-r4 I1)', async () => {
     const fx = await queued(scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: Number.POSITIVE_INFINITY }) }]).membrane);
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    assert.equal(fx.strategy.laneWaitEnd(), Number.POSITIVE_INFINITY, 'a hold has no end');
-    // 61 minutes held, and no tick saw it.
+    // 61 minutes held, and a tick saw the lane paused ten minutes ago.
     const since = Date.now() - 61 * 60_000;
-    clockAt(fx.manager, { failingSince: since, activeAt: since });
+    clockAt(fx.manager, { failingSince: since, activeAt: Date.now() - 10 * 60_000 });
     await fx.strategy.tick(managerContext(fx.manager));
     assert.equal(fx.strategy.checkReadiness().compressionStall?.since, new Date(since).toISOString(), 'stalled since the failure');
     fx.manager.close();
   });
 
-  it("a release shortens its route's wait to the backoff, and an answer ends it (Andrew-2310; cm138-r4 I7)", async () => {
-    const mock = scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 3 * HOUR }) }, REFUSAL]);
-    const fx = await queued(mock.membrane);
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    assert.ok(fx.strategy.laneWaitEnd() > Date.now() + 2 * HOUR);
-    assert.equal(fx.strategy.releaseCompressionPause(), true);
-    assert.equal(fx.strategy.laneWaitEnd(), fx.strategy.pause()!.backoffUntil, 'only the backoff is left');
-    fx.strategy.expirePause();
-    await fx.strategy.tick(managerContext(fx.manager)); // a refusal: an answer, and no landing
-    assert.ok(stallClock(fx.manager)!.failingSince !== null, 'nothing landed');
-    assert.equal(fx.strategy.laneWaitEnd(), Number.NEGATIVE_INFINITY, "the answer ended its route's wait");
-    fx.manager.close();
-  });
-
-  it("a restart's pauses are gone with it: the down time counts as idle", async () => {
+  it("a restart's down time counts as idle", async () => {
     const path = freshPath();
     const first = await queued(scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 3 * HOUR }) }]).membrane, { path });
     await assert.rejects(first.strategy.tick(managerContext(first.manager)));
@@ -2047,35 +2031,7 @@ describe("the stall clock's idle rule: failures, attempts and the waits they cau
     fx.manager.close();
   });
 
-  it('a tick through another route drops the pause, and its wait with it (cm138-r5 I3)', async () => {
-    const routeA = scripted([OK('unused')]);
-    const routeB = scripted([OK('unused')]);
-    const fx = await queued(routeA.membrane);
-    fx.strategy.notePause(failure('rate_limit', { httpStatus: 429, retryAfterMs: 3 * HOUR }), managerContext(fx.manager));
-    assert.ok(fx.strategy.laneWaitEnd() > Date.now() + 2 * HOUR);
-    (fx.strategy as unknown as { activeCompressionPause(ctx: StrategyContext): unknown })
-      .activeCompressionPause({ ...managerContext(fx.manager), membrane: routeB.membrane as never });
-    assert.equal(fx.strategy.laneWaitEnd(), Number.NEGATIVE_INFINITY, 'no wait is left to keep the lane from idling');
-    fx.manager.close();
-  });
-
-  it("a strategy its manager replaced or closed leaves the lane: its hold, which nothing will lift, stops counting (Basil-1007)", async () => {
-    const hold = failure('rate_limit', { httpStatus: 429, retryAfterMs: Number.POSITIVE_INFINITY });
-    const a = await queued(scripted([OK('unused')]).membrane);
-    const b = await queued(scripted([OK('unused')]).membrane, { store: a.manager.getStore() });
-    b.strategy.notePause(hold, managerContext(b.manager));
-    assert.equal(a.strategy.laneWaitEnd(), Number.POSITIVE_INFINITY, "the sibling's hold counts for the lane");
-    b.manager.close(); // b doesn't own the store, which stays open
-    assert.equal(a.strategy.laneWaitEnd(), Number.NEGATIVE_INFINITY, 'a closed manager\'s strategy left the lane');
-
-    a.strategy.notePause(hold, managerContext(a.manager));
-    const replacement = new ProbeStrategy({ compressionModel: 'same-model', autoTickOnNewMessage: false } as never);
-    await a.manager.setStrategy(replacement);
-    assert.equal(replacement.laneWaitEnd(), Number.NEGATIVE_INFINITY, 'a replaced strategy left the lane');
-    a.manager.close();
-  });
-
-  it("a wait released on another branch is released here too: the pause is the authority (Andrew-2310's release-on-fork case)", async () => {
+  it("two unseen hours end the stretch at the next paused tick, wherever the wait was released (Andrew-2310's release-on-fork case)", async () => {
     const fx = await queued(scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 3 * HOUR }) }]).membrane);
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
     const store = fx.manager.getStore();

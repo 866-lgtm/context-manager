@@ -1182,9 +1182,7 @@ export class ContextManager {
    * fenced until another successful initialization; it does not restore the old strategy.
    */
   async setStrategy(strategy: ContextStrategy): Promise<void> {
-    const previous = this.strategy;
     this.strategy = strategy;
-    if (previous !== strategy) previous.detach?.();
     await this.initializeStrategy();
   }
 
@@ -1659,7 +1657,6 @@ export class ContextManager {
    * the app is responsible for closing the store when done.
    */
   close(): void {
-    this.strategy.detach?.();
     if (this.ownsStore) {
       this.store.close();
     }

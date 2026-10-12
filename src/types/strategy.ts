@@ -132,11 +132,14 @@ export interface ReadinessState {
    * answering, the subject may be failing on its own and needs inspecting.
    * Read from the branch's durable stall clock, shared by the strategies on
    * its store and namespace: a restart keeps it, and a landing by any of
-   * those strategies, through any membrane or model, clears it. An hour in
-   * which the lane was neither failing, nor running an attempt, nor waiting
-   * on a pause (nothing pending, or the process down) is idle: the next
-   * attempt or paused tick then ends the old stretch, with no landing, and
-   * the next failure starts the clock again.
+   * those strategies, through any membrane or model, clears it. An hour with
+   * no observed activity (no failure, no attempt starting, and no tick that
+   * found the lane paused with work pending; the process down included) is
+   * idle: the next attempt or paused tick then ends the old stretch, with no
+   * landing, and the next failure starts the clock again. A pause counts only
+   * through the ticks that see it, so a host should tick a lane that isn't
+   * ready at least once an hour (agent-framework's maintenance pass does); one
+   * that doesn't gets a later alert, never a false one.
    */
   compressionStall?: { since: string; subject: string; failureClass: string };
 }
@@ -159,15 +162,6 @@ export interface ContextStrategy {
    * Called when strategy is set on ContextManager.
    */
   initialize?(ctx: StrategyContext): Promise<void>;
-
-  /**
-   * The manager is done with this strategy: it closed, or setStrategy()
-   * replaced it. The strategy lets go of what it holds in the process
-   * (AutobiographicalStrategy leaves its compression lane, so its pause no
-   * longer counts for the lane's stall clock). A later setStrategy() of the
-   * same instance initializes it again.
-   */
-  detach?(): void;
 
   /**
    * Periodic background maintenance.
