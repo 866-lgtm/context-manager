@@ -1830,13 +1830,13 @@ describe('compression refusal recall curves', () => {
     release();
     await Promise.all([producer, waiter]);
     assert.equal(calls, 1, 'the second compression waited on the first');
-    assert.deepEqual(reloads, [{ keepKvUnifiedPresentation: true }], 'it took the coalesced path, reloading once');
     assert.equal(secondChunk.compressed, true, 'the waiter took up the durable L1');
     assert.ok(second.pinsView().some((pin) => pin.id === pinId), "the waiter took up the other instance's pin");
     const chain = (second as unknown as {
       kvUnifiedReceipts: { inFlightSubmissionId: string | null; head: unknown; cache: { layout: unknown } | null };
     }).kvUnifiedReceipts;
     assert.equal(chain.inFlightSubmissionId, 's1', 'the submission begun before the wait is still in flight');
+    assert.deepEqual(reloads, [{ keepKvUnifiedPresentation: true }], 'it took the coalesced path, reloading once');
     assert.equal(presentation.kvUnifiedDraft, draft, 'the draft is kept');
     assert.equal(presentation.kvUnifiedPendingLayout, submittedLayout, 'the submitted layout is kept');
 
