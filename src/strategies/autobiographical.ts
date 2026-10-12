@@ -4843,7 +4843,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (a dry rebuild at a preview's chunk size can read them as orphaned) go
     // back to the last committing rebuild's, so no tick compresses what only
     // a dry run (or a preview's overridden chunk size) cut.
+    // The image watermark (imageStripHysteresisRatio) goes back too, with the
+    // post-strip estimates priced from it. The dry run advances it for its own
+    // render and writes nothing, so a preview can't strip images from the next
+    // live compile. It's loaded here, before it's saved, so the value put back
+    // is the loaded one.
     const saved = {
+      imageWatermark: this.imageWatermark(),
+      postStripMemo: this._postStripMemo,
       chunks: this.chunks,
       compressionQueue: this.compressionQueue,
       chunkRecordsOrphaned: this.chunkRecordsOrphaned,
@@ -4871,6 +4878,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this._lastRenderStats !== saved.lastRenderStats) {
         this._lastPreviewStats = this._lastRenderStats ?? undefined;
       }
+      this._imageWatermark = saved.imageWatermark;
+      this._postStripMemo = saved.postStripMemo;
       this.chunks = saved.chunks;
       this.compressionQueue = saved.compressionQueue;
       this.chunkRecordsOrphaned = saved.chunkRecordsOrphaned;
@@ -11326,6 +11335,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
     if (next === undefined || (w !== undefined && next <= w)) return;
     this._imageWatermark = next;
+    // A dry select advances it for its own render only; select() puts it back.
+    if (this._dryRunSelect) return;
     try {
       this.store?.setStateJson(this.imageWatermarkStateId, { sequence: next, at: Date.now() });
     } catch { /* persistence is best-effort */ }
@@ -11357,13 +11368,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
     // A compile asks for this pass more than once (recent-window scan, then
     // the picker inputs). The listing array is the store's own cached view,
-    // so its identity plus the knobs read here identify the answer. Callers
-    // treat the array as read-only.
+    // so its identity plus the knobs read here identify the answer, the
+    // hysteresis ratio among them: it decides whether and how the watermark
+    // strips. Callers treat the array as read-only.
     const memoCalibration = store.getTokenCalibration?.() ?? 1;
+    const ratio = this.imageHysteresisRatio();
     const memo = this._postStripMemo;
     if (
       memo && memo.messages === messages && memo.calibration === memoCalibration &&
-      memo.stripDepth === stripDepth && memo.maxLive === maxLive && memo.maxLiveBytes === maxLiveBytes
+      memo.stripDepth === stripDepth && memo.maxLive === maxLive && memo.maxLiveBytes === maxLiveBytes &&
+      memo.ratio === ratio
     ) return memo.out;
     const out = new Array<number>(messages.length);
     const stripActive = stripDepth > 0 || maxLive > 0 || maxLiveBytes > 0;
@@ -11405,12 +11419,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Belt and braces: a message never costs less than nothing.
       out[i] = Math.max(0, est);
     }
-    this._postStripMemo = { messages, calibration: memoCalibration, stripDepth, maxLive, maxLiveBytes, out };
+    this._postStripMemo = { messages, calibration: memoCalibration, stripDepth, maxLive, maxLiveBytes, ratio, out };
     return out;
   }
 
   private _postStripMemo: {
-    messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; out: number[];
+    messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; ratio: number | undefined; out: number[];
   } | null = null;
 
   /** Byte wall default: 20MB of base64 (API total-request cap is 32MB). */
