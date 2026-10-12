@@ -2000,6 +2000,18 @@ describe("the stall clock's idle rule: failures, attempts and the waits they cau
     fx.manager.close();
   });
 
+  it("ticks less than an hour apart keep the stretch, though the heartbeat records at most one a minute (Andrew-2310's subhour-ticks-coalesced-heartbeat)", async () => {
+    const fx = await queued(scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: Number.POSITIVE_INFINITY }) }]).membrane);
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
+    // The failure was recorded 60m10s ago. A tick 20 seconds after it fell
+    // inside the heartbeat's minute and wasn't written; this one comes 59m50s later.
+    const since = Date.now() - (60 * 60_000 + 10_000);
+    clockAt(fx.manager, { failingSince: since, activeAt: since });
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(fx.strategy.checkReadiness().compressionStall?.since, new Date(since).toISOString(), 'the stretch ran on and alerts');
+    fx.manager.close();
+  });
+
   it('with no tick for an hour, a long wait reads as idle: the next failure starts a new stretch (the stated cost)', async () => {
     const fx = await queued(scripted([
       { throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 2 * HOUR }) },

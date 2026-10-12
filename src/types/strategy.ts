@@ -137,9 +137,10 @@ export interface ReadinessState {
    * found the lane paused with work pending; the process down included) is
    * idle: the next attempt or paused tick then ends the old stretch, with no
    * landing, and the next failure starts the clock again. A pause counts only
-   * through the ticks that see it, so a host should tick a lane that isn't
-   * ready more often than once an hour (agent-framework's maintenance pass
-   * does, except while its own provider gate skips the agent). Where no tick
+   * through the ticks that see it: ticks less than an hour apart keep the
+   * stretch, so a host should tick a lane that isn't ready regularly, well
+   * inside the hour (once a minute serves). agent-framework's maintenance pass
+   * does, except while its own provider gate skips the agent. Where no tick
    * comes for an hour, there is no alert until the next failure starts
    * another stretch; never a false one.
    */
