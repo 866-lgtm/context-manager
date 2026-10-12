@@ -735,11 +735,16 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     const fx = await fixture(mock.membrane);
     const store = fx.manager.getStore();
     const sync = store.sync.bind(store);
-    const synced: unknown[] = [];
-    store.sync = () => { synced.push(structuredClone(store.getStateJson('default/autobio:mergeQueue'))); sync(); };
+    // Each sync's view of the merge queue and of the stall clock.
+    const synced: Array<{ queue: unknown; clock: unknown }> = [];
+    store.sync = () => {
+      synced.push({ queue: structuredClone(store.getStateJson('default/autobio:mergeQueue')), clock: store.getStateJson('default/autobio:compression-stall') });
+      sync();
+    };
     await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
     const run = (queue: unknown) => (queue as Array<{ failureStreak?: { failures: number } }> | null)?.[0]?.failureStreak?.failures;
-    assert.equal(run(synced.at(-1)), 1, 'the run is in the synced queue');
+    assert.ok(synced.some((at) => run(at.queue) === 1 && at.clock == null),
+      'the run is synced with its own write, before the pause starts the stall clock');
     lane(fx).compressionPause!.backoffUntil = 0;
     (fx.strategy as unknown as { noteCompressionLanded(membrane: unknown, model: string): void }).noteCompressionLanded(ctx(fx.manager).membrane, MODEL);
     await fx.strategy.tick(ctx(fx.manager)); // a refusal: an answer

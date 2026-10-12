@@ -982,6 +982,33 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
+  it('a failing chunk and a failing merge take turns, least recently failed first', async () => {
+    const calls: string[] = [];
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        calls.push(JSON.stringify(request).includes('single L2 memory') ? 'merge' : 'chunk');
+        throw failure('server', { httpStatus: 503 });
+      },
+    };
+    const fx = await queued(membrane, { config: { hierarchical: true } });
+    const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
+    const l1 = (id: string, first: number, last: number): SummaryEntry => ({
+      id, level: 1, content: id, tokens: 10, sourceLevel: 0,
+      sourceIds: ids.slice(first, last + 1), sourceRange: { first: ids[first]!, last: ids[last]! }, created: 1,
+    });
+    fx.strategy.seed(l1('L1-a', 0, 1));
+    fx.strategy.seed(l1('L1-b', 2, 3));
+    (fx.strategy as unknown as { enqueueMerge(merge: { level: number; sourceIds: string[] }): void })
+      .enqueueMerge({ level: 2, sourceIds: ['L1-a', 'L1-b'] });
+    await fx.strategy.tick(managerContext(fx.manager)); // the covered chunk: no call
+    for (let i = 0; i < 4; i++) {
+      fx.strategy.expirePause();
+      await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz server failure/);
+    }
+    assert.deepEqual(calls, ['chunk', 'merge', 'chunk', 'merge']);
+    fx.manager.close();
+  });
+
   it('an aborted or deferred attempt keeps its chunk at the head', async () => {
     const aborted = Object.assign(new Error('zz aborted'), { name: 'AbortError' });
     const deferral = Object.assign(new Error('zz held; no call was made'), { type: 'rate_limit', retryable: true, providerAdmission: 'deferred' });
