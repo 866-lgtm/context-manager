@@ -1155,6 +1155,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return ctx.systemPrompt || this.config.compressionSystemPrompt || undefined;
   }
 
+  /** [local patch] The membrane that carries memory-write requests: the
+   *  host's dedicated compression membrane when one is attached
+   *  (ContextManager.setCompressionMembrane → ctx.compressionMembrane), else
+   *  the primary membrane — upstream behavior. Resolved ONCE per mint/merge
+   *  so every attempt of one job (ladder rungs, refusal escalation, carrier
+   *  fallback) rides the same transport. */
+  protected compressionMembraneFor(ctx: StrategyContext): Membrane | undefined {
+    return ctx.compressionMembrane ?? ctx.membrane;
+  }
+
   /** [local patch] Dispatch a memory-write; on a provider refusal (thrown
    *  content-filter error or stopReason 'refusal') retry ONCE with
    *  compressionRefusalSystemPrompt. Returns the request that authored the
@@ -4618,7 +4628,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.soundMergeQuarantineAlarmIfNeeded();
     if (this.pendingCompression) return;
 
-    if (!ctx.membrane) {
+    if (!this.compressionMembraneFor(ctx)) {
       console.warn('AutobiographicalStrategy: No membrane instance for compression');
       return;
     }
@@ -5627,7 +5637,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected async compressChunkHierarchical(chunk: Chunk, ctx: StrategyContext): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('compressChunkHierarchical');
     phaseChannel.report('compress-chunk'); // liveness-watchdog phase
-    if (!ctx.membrane) {
+    const compressionMembrane = this.compressionMembraneFor(ctx);
+    if (!compressionMembrane) {
       throw new Error('No membrane instance for compression');
     }
 
@@ -6333,7 +6344,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         let acceptedRequest = attemptRequest;
         try {
           const dispatched = await this.completeWithRefusalEscalation(
-            ctx.membrane!, attemptRequest, 'compress_l1', curveLabel,
+            compressionMembrane, attemptRequest, 'compress_l1', curveLabel,
           );
           response = dispatched.response;
           acceptedRequest = dispatched.accepted;
@@ -6354,7 +6365,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             metadata: { curveLabel, error: String(error).slice(0, 300) },
           });
           acceptedRequest = stripReasoningFromRequest(attemptRequest);
-          response = await ctx.membrane!.complete(
+          response = await compressionMembrane.complete(
             acceptedRequest,
             { formatter: this.nativeFormatter },
           );
@@ -7444,7 +7455,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     ctx: StrategyContext
   ): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('executeMerge');
-    if (!ctx.membrane) {
+    const compressionMembrane = this.compressionMembraneFor(ctx);
+    if (!compressionMembrane) {
       throw new Error('No membrane instance for merge');
     }
 
@@ -7972,7 +7984,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let acceptedRequest = dispatchRequest;
       try {
         const dispatched = await this.completeWithRefusalEscalation(
-          ctx.membrane, dispatchRequest, `merge_l${targetLevel}`, `merge_l${targetLevel}`,
+          compressionMembrane, dispatchRequest, `merge_l${targetLevel}`, `merge_l${targetLevel}`,
         );
         response = dispatched.response;
         acceptedRequest = dispatched.accepted;
@@ -7990,7 +8002,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           metadata: { error: String(error).slice(0, 300) },
         });
         acceptedRequest = stripReasoningFromRequest(dispatchRequest);
-        response = await ctx.membrane.complete(acceptedRequest, { formatter: this.nativeFormatter });
+        response = await compressionMembrane.complete(acceptedRequest, { formatter: this.nativeFormatter });
       }
       // Request identity — persisted on the authored summary (provenance) and
       // stamped on every failure receipt, so any parent can be traced back to
@@ -10577,7 +10589,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   async generateTransitionSummary(ctx: StrategyContext): Promise<string> {
     const sourceBranch = this.requireLoadedBranch('generateTransitionSummary');
-    if (!ctx.membrane) {
+    const compressionMembrane = this.compressionMembraneFor(ctx);
+    if (!compressionMembrane) {
       throw new Error('No membrane instance for transition summary generation');
     }
 
@@ -10628,7 +10641,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       },
     };
 
-    const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
+    const response = await compressionMembrane.complete(request, { formatter: this.nativeFormatter });
     if (!this.isCompressionBranchCurrent(sourceBranch)) {
       throw new Error('Transition summary crossed a branch generation; reinitialize before retrying');
     }

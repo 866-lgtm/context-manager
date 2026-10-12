@@ -89,6 +89,19 @@ export interface StrategyContext {
   contextLog: ContextLogView;
   /** Membrane instance for LLM calls (compression) */
   membrane?: Membrane;
+  /**
+   * [local patch] Optional dedicated membrane for compression/summarization
+   * (memory-write) calls. When present, every memory-formation request — L1
+   * mints on every rung of the recall-curve ladder, merges, the refusal-
+   * escalation and carrier-transport retries of both, and transition
+   * summaries — goes through this instance instead of `membrane`. Lets a host
+   * route summarization to a separate (e.g. cheaper, openai-compatible)
+   * endpoint while live conversation stays on the primary provider. Absent →
+   * `membrane`, byte-identical to upstream. ContextManager exposes it as a
+   * live getter, so a ctx captured by a long drain sees a membrane the host
+   * attaches later (ContextManager.setCompressionMembrane).
+   */
+  compressionMembrane?: Membrane;
   /** Current sequence number */
   currentSequence: Sequence;
   /**

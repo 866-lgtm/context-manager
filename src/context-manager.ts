@@ -64,6 +64,12 @@ interface ContextManagerBaseConfig {
   strategy?: ContextStrategy;
   /** Membrane instance for compression strategies */
   membrane?: Membrane;
+  /**
+   * [local patch] Optional dedicated membrane for compression/summarization
+   * calls (see StrategyContext.compressionMembrane). Unset → compression uses
+   * `membrane`. Can also be attached after open() via setCompressionMembrane.
+   */
+  compressionMembrane?: Membrane;
   /** Token estimator function */
   tokenEstimator?: (text: string) => number;
   /**
@@ -215,6 +221,8 @@ export class ContextManager {
   private contextLog: ContextLog;
   private strategy: ContextStrategy;
   private membrane?: Membrane;
+  /** [local patch] Dedicated compression membrane (see setCompressionMembrane). */
+  private compressionMembrane?: Membrane;
   private initializationAttempt = 0;
   private initializedAttempt: number | null = null;
   /** Whether we own the store (created it) vs app owns it (passed in) */
@@ -443,6 +451,7 @@ export class ContextManager {
       auxiliaryStores,
     );
     if (config.now) manager.now = config.now;
+    if (config.compressionMembrane) manager.compressionMembrane = config.compressionMembrane;
 
     await manager.initializeStrategy();
     return manager;
@@ -1503,12 +1512,33 @@ export class ContextManager {
     if (text && text.length > 0) this.systemPrompt = text;
   }
 
+  /**
+   * [local patch] Attach (or, with undefined, detach) a dedicated membrane for
+   * compression/summarization calls. Hosts whose framework opens the manager
+   * without knowledge of a separate compression endpoint attach it post-hoc.
+   * Takes effect for the next memory-write a strategy dispatches — including
+   * one inside an already-running drain, whose ctx reads it live. Requests
+   * are unchanged; only the transport that carries them differs. Unset →
+   * every compression call uses the primary membrane (upstream behavior).
+   */
+  setCompressionMembrane(membrane: Membrane | undefined): void {
+    this.compressionMembrane = membrane;
+  }
+
+  /** [local patch] The dedicated compression membrane, if one is attached. */
+  getCompressionMembrane(): Membrane | undefined {
+    return this.compressionMembrane;
+  }
+
   private createStrategyContext(): StrategyContext {
     const self = this;
     return {
       messageStore: this.strategyMessageView(),
       contextLog: this.contextLog.createView(),
       membrane: this.membrane,
+      // [local patch] Live getter for the same reason as `tools` below: the
+      // host may attach the compression membrane after a drain captured ctx.
+      get compressionMembrane() { return self.compressionMembrane; },
       currentSequence: this.store.currentSequence(),
       store: this.store,
       namespace: this.strategyNamespace,
