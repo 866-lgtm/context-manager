@@ -15,7 +15,6 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
-import { SILENT_IDENTITY_SUFFIX } from '../src/strategies/autobiographical.js';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 
 const STORE = './test-zz-witnessed-identity';
@@ -99,25 +98,10 @@ describe('witnessedIdentityReminder', () => {
     }
   });
 
-  it('identityReminderSilent appends the silence instruction after whichever reminder applies', async () => {
-    const calls = await run({
-      witnessedBeforeSequence: 30, identityReminder: LIVE, witnessedIdentityReminder: WITNESSED,
-      identityReminderSilent: true,
-    });
-    for (const r of calls) {
-      const text = instruction(r);
-      assert.ok(
-        text.endsWith(`\n\n${WITNESSED}\n\n${SILENT_IDENTITY_SUFFIX}`) || text.endsWith(`\n\n${LIVE}\n\n${SILENT_IDENTITY_SUFFIX}`),
-        'reminder followed by the silence instruction',
-      );
-    }
-  });
-
   it('no reminders configured: instructions are untouched', async () => {
     const calls = await run({ witnessedBeforeSequence: 30 });
     for (const r of calls) {
       assert.ok(!instruction(r).includes('REMINDER'));
-      assert.ok(!instruction(r).includes(SILENT_IDENTITY_SUFFIX));
     }
   });
 });

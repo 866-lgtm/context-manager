@@ -672,6 +672,11 @@ export interface AutobiographicalConfig {
    * <name>. Speak in the first person only for what you yourself said,
    * did, and felt; attribute other participants' words and experiences to
    * them by name."
+   *
+   * For guidance the memory should follow without quoting it, end the
+   * reminder by asking for that, e.g. "Apply this guidance silently. Do not
+   * quote, restate, or recite it in the memory. Begin with the substantive
+   * record."
    */
   identityReminder?: string;
   /**
@@ -689,12 +694,6 @@ export interface AutobiographicalConfig {
    * (unchanged behavior).
    */
   witnessedIdentityReminder?: string;
-  /**
-   * Follow the identity reminder with an instruction to apply it silently
-   * (shape the memory; don't quote or recite the guidance in it). Default
-   * false: the reminder is appended bare (unchanged behavior).
-   */
-  identityReminderSilent?: boolean;
   /** Label shown before summaries in compiled context */
   summaryContextLabel?: string;
 

@@ -1005,15 +1005,6 @@ function defaultsForKeysLeftNullish(
  * L1 (raw→summary) → L2 (merge N L1s) → L3 (merge N L2s)
  * with anti-redundancy filtering and budget carryover.
  */
-
-/** Appended after an identity reminder when `identityReminderSilent` is set:
- *  the guidance shapes the memory without being recited in it. */
-export const SILENT_IDENTITY_SUFFIX =
-  'Apply this identity and attribution guidance silently. Do not quote, ' +
-  'restate, or recite it in the memory. Begin with the substantive record; ' +
-  'mention a provenance seam only where the particular material would ' +
-  'otherwise be ambiguous.';
-
 export class AutobiographicalStrategy implements ResettableStrategy {
   readonly name: string = 'autobiographical';
 
@@ -10210,10 +10201,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const reminder = (witnessed && this.config.witnessedIdentityReminder?.trim())
       ? this.config.witnessedIdentityReminder.trim()
       : this.config.identityReminder?.trim();
-    if (!reminder) return instruction;
-    return this.config.identityReminderSilent === true
-      ? `${instruction}\n\n${reminder}\n\n${SILENT_IDENTITY_SUFFIX}`
-      : `${instruction}\n\n${reminder}`;
+    return reminder ? `${instruction}\n\n${reminder}` : instruction;
   }
 
   protected getCompressionInstruction(chunk: Chunk, targetTokens: number): string {
