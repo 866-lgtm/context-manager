@@ -1,6 +1,7 @@
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import { NativeFormatter } from '@animalabs/membrane';
+import { registerStateIfAbsent } from '../state-registration.js';
 import { phaseChannel } from '../phase-channel.js';
 import type {
   ContextStrategy,
@@ -67,6 +68,8 @@ import type {
 } from '../adaptive/folding-strategy.js';
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
+import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
+import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms } from '../raw-forms.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
@@ -804,14 +807,27 @@ function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?
  * which — thrown inside the speculative-compression drain — halts ALL
  * compression. Non-text blocks (tool_use/tool_result/image) pass through
  * unchanged, so tool pairing is preserved; callers drop any message left with
- * an empty content array.
+ * an empty content array. membrane's zero-width carriers of opaque Responses
+ * items (a compaction item, a hosted tool's call) are empty text too, so they
+ * are dropped from compression requests as well, as they always were.
+ *
+ * Released narrowly (releaseVanishedRawForms, not releaseEditedRawForms): an
+ * empty part dropped from a Responses message item while a sibling part
+ * survives still rides inside the sibling's raw item, and only whitespace can
+ * ship that way, so releasing would re-render the whole item (and its reasoning
+ * pairing) from fields for no content change. An item none of whose parts
+ * survive is gone from the wire, a dropped carrier's item included, so the
+ * reasoning paired with it gives up its id rather than be replayed without its
+ * follower.
+ *
+ * Exported for its tests; not part of the package's API.
  */
-function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
-  return content.filter((b) => {
+export function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
+  return releaseVanishedRawForms(content, content.filter((b) => {
     if (b.type !== 'text') return true;
     const text = (b as { text?: unknown }).text;
     return typeof text === 'string' && text.trim().length > 0;
-  });
+  }));
 }
 
 /**
@@ -835,9 +851,16 @@ function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
  * ("thinking blocks ... cannot be modified", observed 2026-07-16 on the
  * `full` replay arm). Passing raw thinking through requires keeping those
  * turns byte-identical — a follow-up experiment, not a blanket strip removal.
+ *
+ * A stripped Responses reasoning item releases the raw item it was paired
+ * with, so the follower isn't replayed with an id whose reasoning is gone
+ * (see raw-forms.ts).
  */
 function stripThinkingBlocks(content: ContentBlock[]): ContentBlock[] {
-  return content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
+  return releaseEditedRawForms(
+    content,
+    content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking'),
+  );
 }
 
 /**
@@ -1212,6 +1235,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private runtimeTransitionPaceTokens: number | undefined;
   /** Diagnostics from the most recent dry-run select. Not persisted. */
   private _lastPreview: PreviewResult | undefined;
+  /** The last dry select's own render stats, which select() keeps apart from
+   *  the live ones for previewContext. */
+  private _lastPreviewStats: RenderStats | undefined;
+  /** Set while a dry select runs: its chunking persists no chunk record. */
+  private _dryRunSelect = false;
   /** Serializes previews against each other (see previewContext). */
   private _previewInFlight = false;
 
@@ -1389,32 +1417,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       throw new Error('previewContext is already running; previews must not overlap');
     }
     this._previewInFlight = true;
+    // The config swap below is this method's own to undo. What the dry select
+    // leaves for observers (transition status, render stats, calibration),
+    // select() puts back for every dry run, whichever of selectAdaptive's
+    // OverBudgetError sites throws; any throw is turned into a report below.
     const savedConfig = this.config;
     const savedPicker = this._adaptivePicker;
     const savedHeadCache = this._cachedHeadStartIndex;
-    // selectAdaptive has FOUR OverBudgetError sites — an early head+tail check
-    // that fires before the picker even runs, the post-pick check, and two
-    // late render-stage checks. Rather than gate each (fragile, and a new site
-    // would silently break previews), restore bookkeeping here in `finally`
-    // and convert any throw into a report below.
-    const savedFrontier = this.lastFrontierTokens;
-    const savedBlocked = this.transitionBlocked;
-    const savedKvStable = this._lastKvStable;
-    // select() calls rsBegin(), which RESETS the render-stats family. Those feed
-    // getRenderStats() -> /debug/context/makeup and the Context panel, so a dry
-    // run would leave the operator's live segment breakdown showing numbers from
-    // a hypothetical compile until the next real one. Save and restore them:
-    // "commits nothing" has to include in-memory observability, not just
-    // Chronicle.
-    // `_lastRenderStats` is the one that matters: select() ends with
-    // `_lastRenderStats = r; _rs = null`, and getRenderStats() reads
-    // _lastRenderStats. Guarding only _rs (null by then) protected nothing.
-    const savedRs = this._rs;
-    const savedLastRs = this._lastRenderStats;
-    const savedDrops = this._uncoveredDrops;
-    const savedEmitted = this._emittedSummaryIds;
-    const savedPlannedTokens = this._plannedTokens;
-    const savedPlannedMeta = this._plannedMeta;
     this._lastPreview = undefined;
     try {
       // Drop explicit undefined/null overrides BEFORE spreading: a spread
@@ -1475,31 +1484,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview',
         );
       }
-      // Segment breakdown for the hypothetical compile, captured BEFORE the
-      // finally block restores the live one. Lets a caller show the previewed
+      // Segment breakdown for the hypothetical compile, which select() kept
+      // apart from the live one. Lets a caller show the previewed
       // head/middle/tail split without re-deriving it.
       return {
         ...preview,
-        // Read _lastRenderStats, not _rs: select() has already committed and
-        // nulled _rs by this point.
         ...(opts?.render
-          ? { entries: rendered, stats: this._lastRenderStats ?? undefined }
+          ? { entries: rendered, stats: this._lastPreviewStats }
           : {}),
       };
     } finally {
       this.config = savedConfig;
       this._adaptivePicker = savedPicker;
       this._cachedHeadStartIndex = savedHeadCache;
-      this.lastFrontierTokens = savedFrontier;
-      this.transitionBlocked = savedBlocked;
-      this._lastKvStable = savedKvStable;
-      this._rs = savedRs;
-      this._lastRenderStats = savedLastRs;
-      this._uncoveredDrops = savedDrops;
-      this._emittedSummaryIds = savedEmitted;
-      this._plannedTokens = savedPlannedTokens;
-      this._plannedMeta = savedPlannedMeta;
       this._lastPreview = undefined;
+      this._lastPreviewStats = undefined;
       this._previewInFlight = false;
     }
   }
@@ -1889,91 +1888,75 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Register the three Chronicle state slots this strategy uses.
-   * Idempotent — chronicle throws if a state is already registered, which we
-   * swallow (the existing slot is what we want).
+   * Register the Chronicle state slots this strategy uses. A slot that
+   * already exists is kept as it is (see isStateExistsFor). Any other
+   * registration failure propagates and stops initialization. Registrations
+   * are separate and durable, so the slots registered before the failing one
+   * stay registered, and the next start registers the rest.
    */
   protected registerStates(): void {
     if (!this.store) return;
-    try {
-      this.store.registerState({
-        id: this.summariesStateId,
+    const store = this.store;
+    const registerState = (registration: Parameters<JsStore['registerState']>[0]): void => {
+      registerStateIfAbsent(store, registration);
+    };
+    registerState({
+      id: this.summariesStateId,
+      strategy: 'append_log',
+      deltaSnapshotEvery: 50,
+      fullSnapshotEvery: 10,
+    });
+    if (this.chunkPersistenceEnabled) {
+      registerState({
+        id: this.chunksStateId,
         strategy: 'append_log',
         deltaSnapshotEvery: 50,
         fullSnapshotEvery: 10,
       });
-    } catch { /* already registered */ }
-    if (this.chunkPersistenceEnabled) {
-      try {
-        this.store.registerState({
-          id: this.chunksStateId,
-          strategy: 'append_log',
-          deltaSnapshotEvery: 50,
-          fullSnapshotEvery: 10,
-        });
-      } catch { /* already registered */ }
     }
     if (this.config.foldingStrategy === 'kv-unified') {
-      try {
-        this.store.registerState({
-          id: this.kvUnifiedReceiptStateId,
-          strategy: 'snapshot',
-        });
-      } catch { /* already registered */ }
+      registerState({
+        id: this.kvUnifiedReceiptStateId,
+        strategy: 'snapshot',
+      });
     }
-    try {
-      this.store.registerState({
-        id: this.counterStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.mergeQueueStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.mergeQuarantineStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.pinsStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.calibrationStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.compressionRefusalQuarantineLedgerStateId,
-        strategy: 'append_log',
-        deltaSnapshotEvery: 50,
-        fullSnapshotEvery: 10,
-      });
-    } catch { /* already registered */ }
+    registerState({
+      id: this.counterStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.mergeQueueStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.mergeQuarantineStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.pinsStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.calibrationStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.compressionRefusalQuarantineLedgerStateId,
+      strategy: 'append_log',
+      deltaSnapshotEvery: 50,
+      fullSnapshotEvery: 10,
+    });
     // Adaptive-resolution state slots — only registered when the flag is on
     // so chronicles without the flag don't accumulate unused slots.
     if (this.config.adaptiveResolution) {
-      try {
-        this.store.registerState({
-          id: this.resolutionsStateId,
-          strategy: 'snapshot',
-        });
-      } catch { /* already registered */ }
-      try {
-        this.store.registerState({
-          id: this.locksStateId,
-          strategy: 'snapshot',
-        });
-      } catch { /* already registered */ }
+      registerState({
+        id: this.resolutionsStateId,
+        strategy: 'snapshot',
+      });
+      registerState({
+        id: this.locksStateId,
+        strategy: 'snapshot',
+      });
     }
   }
 
@@ -4830,23 +4813,85 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   select(
     store: MessageStoreView,
     log: ContextLogView,
-      budget: TokenBudget,
-      opts?: SelectOptions
-    ): ContextEntry[] {
-      this.requireLoadedBranch('select');
-      const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
-      const _t0 = _diag ? Date.now() : 0;
+    budget: TokenBudget,
+    opts?: SelectOptions
+  ): ContextEntry[] {
+    this.requireLoadedBranch('select');
+    const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
+    const _t0 = _diag ? Date.now() : 0;
+    if (opts?.dryRun !== true) {
       this.rebuildChunks(store);
       if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
+      return this.selectPath(store, budget, opts);
+    }
+    // A dry run commits nothing, and that includes what a select leaves for
+    // the next one and for observers: the cache-marker baseline the next
+    // compile measures its stable prefix against, the transition status
+    // (getHotContextSettings), the render stats (getRenderStats, with its
+    // plan-vs-actual), calibration's estimate, arming and store view, the
+    // store order and the head-window memo stay as the last committing select
+    // left them. They are put back here, on every path out, throws included;
+    // each select path gates its own persistence and enqueueing. The dry run's
+    // own render stats are its output, as its plan is (_lastPreview), and
+    // previewContext reads them from _lastPreviewStats.
+    // Chunking runs dry too: a chunk the dry run closes gets no record, and
+    // the chunks, the compression queue and whether chunk records are trusted
+    // (a dry rebuild at a preview's chunk size can read them as orphaned) go
+    // back to the last committing rebuild's, so no tick compresses what only
+    // a dry run (or a preview's overridden chunk size) cut.
+    const saved = {
+      chunks: this.chunks,
+      compressionQueue: this.compressionQueue,
+      chunkRecordsOrphaned: this.chunkRecordsOrphaned,
+      orphanWarned: this._orphanWarned,
+      prevCacheKeys: this._prevCacheKeys,
+      lastFrontierTokens: this.lastFrontierTokens,
+      transitionBlocked: this.transitionBlocked,
+      lastRenderStats: this._lastRenderStats,
+      lastCompileEstimate: this._lastCompileEstimate,
+      calibrationArmed: this._calibrationArmed,
+      storeView: this._storeView,
+      storeOrder: this._storeOrder,
+      headStartMemo: this._cachedHeadStartIndex,
+    };
+    this._lastPreviewStats = undefined;
+    this._dryRunSelect = true;
+    try {
+      this.rebuildChunks(store);
+      if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
+      return this.selectPath(store, budget, opts);
+    } finally {
+      this._dryRunSelect = false;
+      // Only stats this dry run produced are its preview's: on a throw before
+      // they're written, the previous select's must not pose as the preview's.
+      if (this._lastRenderStats !== saved.lastRenderStats) {
+        this._lastPreviewStats = this._lastRenderStats ?? undefined;
+      }
+      this.chunks = saved.chunks;
+      this.compressionQueue = saved.compressionQueue;
+      this.chunkRecordsOrphaned = saved.chunkRecordsOrphaned;
+      this._orphanWarned = saved.orphanWarned;
+      this._prevCacheKeys = saved.prevCacheKeys;
+      this.lastFrontierTokens = saved.lastFrontierTokens;
+      this.transitionBlocked = saved.transitionBlocked;
+      this._lastRenderStats = saved.lastRenderStats;
+      this._lastCompileEstimate = saved.lastCompileEstimate;
+      this._calibrationArmed = saved.calibrationArmed;
+      this._storeView = saved.storeView;
+      this._storeOrder = saved.storeOrder;
+      this._cachedHeadStartIndex = saved.headStartMemo;
+    }
+  }
 
+  private selectPath(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
     // Image stripping runs inside each select path (before stats commit / cache
     // markers), so the returned entries are already bounded — see
     // applyImageStripping.
     if (this.config.adaptiveResolution) {
       return this.selectAdaptive(store, budget, opts);
     }
-    // selectHierarchical commits nothing (no state-slot writes, no enqueue),
-    // so it is already dry-run-safe and needs no gating.
+    // selectHierarchical persists and enqueues nothing; what it leaves for
+    // observers (render stats) select() restores for a dry run.
     return this.selectHierarchical(store, budget);
   }
 
@@ -7821,23 +7866,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // content author's voice. Same principle as the L1 case.
     let mergeReadingContext: { totalTokens: number } | null = null;
     if (sourceLeafIds.size > 0) {
-      const leafBodyGroupIds = new Set<string | undefined>();
-      for (const leafId of sourceLeafIds) {
-        const m = messageById.get(leafId);
-        leafBodyGroupIds.add(m?.bodyGroupId);
-      }
-      if (leafBodyGroupIds.size === 1) {
-        const groupId = [...leafBodyGroupIds][0];
-        if (groupId) {
-          let totalTokens = 0;
-          for (const m of allMessages) {
-            if (m.bodyGroupId === groupId) {
-              totalTokens += ctx.messageStore.estimateTokens(m);
-            }
-          }
-          mergeReadingContext = { totalTokens };
-        }
-      }
+      const body = this.shardedBodyOf(sourceLeafIds, allMessages, ctx);
+      if (body) mergeReadingContext = { totalTokens: body.totalTokens };
     }
     let mergeInstructionText = this.applyIdentityReminder(
       refusalFallback
@@ -8502,11 +8532,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       opts?.kvUnifiedImmutablePrefixHash,
       opts?.kvUnifiedContinuityRelaxation,
     );
-    // NOTE: a dry run also disturbs transition bookkeeping below
+    // NOTE: a dry run also writes transition bookkeeping below
     // (`lastFrontierTokens` feeds `prepared` in getHotContextSettings(), so a
-    // low-budget preview could make a converging transition look prepared and
-    // get it settled by the next real compile). That is restored by
-    // previewContext's `finally`, which owns it for ALL throw paths — do not
+    // low-budget dry run could make a converging transition look prepared).
+    // select() puts it back for every dry run, on ALL throw paths — do not
     // also restore it here, or the two owners will disagree.
     if (_diag) { console.error(`[cm-cache] selectAdaptive: inputs-built ${Date.now() - _t}ms`); _t = Date.now(); }
     const result = picker.run(pickerInputs, foldingBudget);
@@ -8515,7 +8544,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const levelAt: PickerResult['levelAt'] = typeof result.levelAt === 'function'
       ? result.levelAt
       : (_sequence, id) => result.finalResolutions.get(id) ?? 0;
-    if (this.config.foldingStrategy === 'kv-unified' && !dryRun) {
+    if (this.config.foldingStrategy === 'kv-unified') {
+      // The plan's check runs dry or not, so a dry select refuses what a real
+      // compile would; only the draft it builds is a real compile's alone.
       const reuse = this.kvUnifiedReuse;
       // The tree is only needed for a leaf the forest cannot hash at its
       // level and for rendering the layout when the solver did not; build
@@ -8532,14 +8563,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // A forest built from these inputs lists its leaves in the inputs'
       // order when the chunks were already sorted, which the strategy's
       // position-sequenced chunks are; then the leaf is a positional read.
-      const forestChunks = forest?.builtFrom(pickerInputs) ? forest.orderedChunks() : null;
+      const forestCurrent = forest?.builtFrom(pickerInputs) === true;
+      const forestChunks = forestCurrent ? forest!.orderedChunks() : null;
       let dense = forestChunks !== null && forestChunks.length === pickerInputs.chunks.length;
       for (let k = 0; dense && k < forestChunks!.length; k++) dense = forestChunks![k].sequence === k;
       const forestLeaves = dense ? forest!.orderedLeaves() : null;
       for (let k = 0; k < pickerInputs.chunks.length; k++) {
         const chunk = pickerInputs.chunks[k];
         const level = levelAt(chunk.sequence, chunk.id);
-        const leaf = forestLeaves ? forestLeaves[chunk.sequence] : forest?.leaf(chunk.id);
+        const leaf = forestLeaves ? forestLeaves[chunk.sequence] : forestCurrent ? forest!.leaf(chunk.id) : undefined;
         const slot = leaf ? leaf.availableLevels.indexOf(level) : -1;
         let repHash: string;
         if (leaf && slot >= 0) {
@@ -8551,6 +8583,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           repHash = level === 0 ? `raw:${chunk.id}` : `summary:${summaryId}`;
         }
+        if (dryRun) continue;
         const previous = this.kvUnifiedReceipts.leaves.get(chunk.id);
         // An unchanged leaf keeps its receipt object: no allocation, and the
         // chain's diff sees identity before it compares fields.
@@ -8558,20 +8591,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ? previous
           : { repHash, level, lastChangedSeq: nextSequence });
       }
-      // With a live cache the solver's terminal evaluator already rendered the
-      // selected cut's layout (the same units, tokens and offsets renderLayout
-      // produces; asserted equal in the terminal evaluator tests). The size
-      // check ties it to this compile's applied frontier.
-      const last = this._lastKvUnified?.lastResult;
-      const solvedLayout = last?.feasible && last.cacheRelevant && result.levelsBySequence !== undefined &&
-        last.selected.levels === result.levelsBySequence ? last.selected.layout : null;
-      this.kvUnifiedDraft = {
-        leaves,
-        layout: solvedLayout ?? renderLayout(pickerInputs, summaryTree(), result.finalResolutions),
-        immutablePrefixHash: opts?.kvUnifiedImmutablePrefixHash,
-        markerUnitIndices: [],
-      };
-      if (tree) reuse.tree = tree;
+      if (!dryRun) {
+        // With a live cache the solver's terminal evaluator already rendered the
+        // selected cut's layout (the same units, tokens and offsets renderLayout
+        // produces; asserted equal in the terminal evaluator tests). The size
+        // check ties it to this compile's applied frontier.
+        const last = this._lastKvUnified?.lastResult;
+        const solvedLayout = last?.feasible && last.cacheRelevant && result.levelsBySequence !== undefined &&
+          last.selected.levels === result.levelsBySequence ? last.selected.layout : null;
+        this.kvUnifiedDraft = {
+          leaves,
+          layout: solvedLayout ?? renderLayout(pickerInputs, summaryTree(), result.finalResolutions),
+          immutablePrefixHash: opts?.kvUnifiedImmutablePrefixHash,
+          markerUnitIndices: [],
+        };
+        if (tree) reuse.tree = tree;
+      }
     }
     if (_diag) { console.error(`[cm-cache] selectAdaptive: picker.run ${Date.now() - _t}ms`); _t = Date.now(); }
     this.lastFrontierTokens = result.finalTokens;
@@ -8683,9 +8718,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // Record what a dry run needs, then restore the transition bookkeeping the
-    // pick just clobbered. Done before the over-budget check so an infeasible
-    // preview still reports instead of leaving state disturbed.
+    // Record what a dry run needs (select() puts back the transition
+    // bookkeeping the pick just wrote). Done before the over-budget check so
+    // an infeasible preview still reports.
     if (dryRun) {
       this._lastPreview = {
         finalTokens: result.finalTokens,
@@ -8728,8 +8763,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // ----- 5. Emit middle entries in source order -----
     const positionOf = this.positionIndex(messages);
     // Walk middle messages. Handle two cases:
-    //  - bodyGroupId set: collect all consecutive shards from the same group,
-    //    emit ONE combined entry with concatenated content (raw shards + inline
+    //  - bodyGroupId set: collect the consecutive shards of the same body (one
+    //    ingestion; a later ingestion of the same text is another body, see
+    //    body-runs.ts), emit ONE combined entry with concatenated content (raw shards + inline
     //    summary text for folded shards). This preserves KV — the model sees
     //    one continuous user message instead of N turns.
     //  - bodyGroupId absent: emit normally (raw L0 message, or Q+A summary pair).
@@ -8764,21 +8800,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const msg = messages[i];
 
       if (msg.bodyGroupId) {
-        // Collect the full run of consecutive shards sharing this bodyGroupId.
-        const groupId = msg.bodyGroupId;
+        // Collect this body's consecutive shards. Another ingestion of the
+        // same text right after it shares the group id but is its own body.
         const groupStart = i;
-        while (
-          i < segEnd &&
-          i < messages.length &&
-          messages[i].bodyGroupId === groupId
-        ) {
-          i++;
-        }
-        const groupMessages = messages.slice(groupStart, i);
-        // Sort by shardIndex to ensure byte-faithful ordering.
-        const sortedShards = [...groupMessages].sort(
-          (a, b) => (a.shardIndex ?? 0) - (b.shardIndex ?? 0)
-        );
+        // Read no further than this segment: nothing past it is emitted here.
+        i = bodyEnd(Math.min(segEnd, messages.length), (k) => messages[k], groupStart) + 1;
+        // Store order: a body's shards are already in rising shard order, and
+        // the walk stops where an index doesn't rise, which also keeps a
+        // region that starts mid-body apart from the next copy (body-runs.ts).
+        const shards = messages.slice(groupStart, i);
 
         // Walk shards in order, accumulating "runs":
         //  - a 'raw' run is consecutive shards at L0; flushed as ONE User
@@ -8794,7 +8824,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           | { kind: 'raw'; parts: string[]; ids: string[] }
           | { kind: 'summary'; ancestor: SummaryEntry };
         let currentRun: Run | null = null;
-        const participant = sortedShards[0].participant;
+        const participant = shards[0].participant;
 
         const flushRun = (): void => {
           if (!currentRun) return;
@@ -8861,7 +8891,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           currentRun = null;
         };
 
-        for (const shard of sortedShards) {
+        for (const shard of shards) {
           const resolution = levelAt(positionOf.get(shard.id) ?? -1, shard.id);
           if (resolution === 0) {
             if (currentRun?.kind !== 'raw') {
@@ -9011,15 +9041,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // The newest stored message is the triggering turn for this compile. A
     // structural repair may rewrite tool blocks, but it must never erase that
-    // turn. Body-group shards merge under the first shard's source id, so any
-    // surviving member of the same group proves the newest shard is present.
+    // turn. A body's shards merge into one entry, so any surviving shard of the
+    // newest body proves the newest shard is present: a head or recent-window
+    // merge keeps its first shard's id as sourceMessageId, and a middle-region
+    // composite carries every shard's id in sourceMessageIds (its
+    // sourceMessageId is unset), which is where the newest body lands when its
+    // newest shard alone outgrows the recent window. Only that body's shards
+    // count: an earlier ingestion of the same text shares the group id, and its
+    // survival proves nothing about the newest turn.
     const newest = messages[messages.length - 1];
     if (newest) {
-      const newestGroupIds = newest.bodyGroupId
-        ? new Set(messages.filter(m => m.bodyGroupId === newest.bodyGroupId).map(m => m.id))
-        : new Set([newest.id]);
+      const newestBody = bodyBoundsIn(messages, messages.length - 1);
+      const newestBodyIds = new Set(messages.slice(newestBody.from, newestBody.to + 1).map(m => m.id));
       const newestRetained = merged.some(
-        entry => entry.sourceMessageId && newestGroupIds.has(entry.sourceMessageId),
+        entry => (entry.sourceMessageId !== undefined && newestBodyIds.has(entry.sourceMessageId)) ||
+          (entry.sourceMessageIds ?? []).some(id => newestBodyIds.has(id)),
       );
       if (!newestRetained) {
         throw this.overBudgetError(budget, {
@@ -9044,7 +9080,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // real strategy to ~50% (docs/kv-stable-context-control.md — marker
     // placement is the dominant KV lever).
     this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
-    if (this.config.foldingStrategy === 'kv-unified' && this.kvUnifiedDraft) {
+    // A dry run made no draft of its own (see the draft's creation), so the
+    // draft here is the last real compile's, which a dry layout must not
+    // re-mark.
+    if (this.config.foldingStrategy === 'kv-unified' && this.kvUnifiedDraft && !dryRun) {
       this.kvUnifiedDraft.markerUnitIndices = this.reconcileKvUnifiedMarkerIndices(
         merged, this.kvUnifiedDraft.layout, headMessageIds, tailMessageIds,
       );
@@ -9499,8 +9538,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Look up bodyGroup metadata by sourceMessageId, memoized for the
     // duration of this pass. Entries reference the same messages repeatedly
-    // (run-extension checks + the shardIndex sort comparator below), and
-    // store.get() also resolves blobs — fetch each message at most once.
+    // (the run-extension checks below), and store.get() also resolves
+    // blobs — fetch each message at most once.
     // Read the metadata off the full listing (the caller's, so a filtered
     // view is not listed twice) instead of one `store.get()` per raw entry:
     // each get re-fetched the record from chronicle and resolved its blobs — ~0.7 s per compile on a 75k-message
@@ -9514,6 +9553,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       sourceMessageId ? shardMeta.get(sourceMessageId) : undefined;
     const groupOf = (sourceMessageId?: string): string | undefined =>
       metaOf(sourceMessageId)?.groupId;
+    const shardOf = (entry: ContextEntry) => {
+      const meta = metaOf(entry.sourceMessageId);
+      return meta ? { bodyGroupId: meta.groupId, shardIndex: meta.shardIndex } : undefined;
+    };
 
     const out: ContextEntry[] = [];
     let i = 0;
@@ -9525,35 +9568,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         i++;
         continue;
       }
-      // Collect run of consecutive raw entries with same bodyGroupId.
-      const run: ContextEntry[] = [entry];
-      let j = i + 1;
-      while (
-        j < entries.length &&
-        entries[j].sourceRelation === 'copy' &&
-        groupOf(entries[j].sourceMessageId) === groupId
-      ) {
-        run.push(entries[j]);
-        j++;
-      }
+      // Collect the run of consecutive raw entries of the same body. Another
+      // ingestion of the same text shares the group id but restarts its
+      // shard indices, and a window can start mid-body: the run ends where an
+      // index doesn't rise (see body-runs.ts).
+      const end = bodyEnd(entries.length, (k) => (entries[k]!.sourceRelation === 'copy' ? shardOf(entries[k]!) : undefined), i);
+      const run: ContextEntry[] = entries.slice(i, end + 1);
+      const j = end + 1;
       if (run.length === 1) {
         out.push({ ...entry, index: out.length });
         i++;
         continue;
       }
-      // Sort the run by the underlying shardIndex to ensure byte-faithful
-      // ordering. (Head/tail emission keeps chronological order, but defending
-      // against reorderings is cheap.)
-      const sortedRun = [...run].sort((a, b) => {
-        const sa = metaOf(a.sourceMessageId)?.shardIndex ?? 0;
-        const sb = metaOf(b.sourceMessageId)?.shardIndex ?? 0;
-        return sa - sb;
-      });
+      // Head and tail emission keep store order, so the run's shards are
+      // already in rising shard order (body-runs.ts).
       // Build merged text content. Non-text blocks (rare in shards) are
       // preserved on the first shard's entry only.
       const mergedTextParts: string[] = [];
       const nonTextBlocks: ContentBlock[] = [];
-      for (const r of sortedRun) {
+      for (const r of run) {
         for (const block of r.content) {
           if (block.type === 'text') mergedTextParts.push(block.text);
           else nonTextBlocks.push(block);
@@ -9565,14 +9598,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ];
       out.push({
         index: out.length,
-        sourceMessageId: sortedRun[0].sourceMessageId,
+        sourceMessageId: run[0].sourceMessageId,
         // Keep every shard's id: this composite represents all of them, and
         // the coverage invariant reads provenance, not just the first source.
-        sourceMessageIds: sortedRun
+        sourceMessageIds: run
           .map(e => e.sourceMessageId)
           .filter((id): id is string => !!id),
         sourceRelation: 'copy',
-        participant: sortedRun[0].participant,
+        participant: run[0].participant,
         content: mergedContent,
       });
       i = j;
@@ -10510,6 +10543,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * The one sharded body every given message belongs to, with its total
+   * tokens, or null when they don't all belong to one. A body is one
+   * ingestion: another ingestion of the same text shares the group id, and
+   * counting it too doubled the document (see body-runs.ts).
+   */
+  protected shardedBodyOf(
+    ids: Iterable<string>,
+    allMessages: readonly StoredMessage[],
+    ctx: StrategyContext,
+  ): { totalTokens: number } | null {
+    const wanted = [...ids];
+    const at = allMessages.findIndex((m) => m.id === wanted[0]);
+    if (at < 0 || !allMessages[at]!.bodyGroupId) return null;
+    const { from, to } = bodyBoundsIn(allMessages, at);
+    const messages = allMessages.slice(from, to + 1);
+    const inBody = new Set(messages.map((m) => m.id));
+    if (!wanted.every((id) => inBody.has(id))) return null;
+    let totalTokens = 0;
+    for (const m of messages) totalTokens += ctx.messageStore.estimateTokens(m);
+    return { totalTokens };
+  }
+
+  /**
    * If the chunk is part of a substantially larger sharded message (total
    * bodyGroup tokens ≥ 2× the chunk's own tokens), return reading-context
    * metadata for the reading instruction. The 2× threshold means the
@@ -10525,21 +10581,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     chunk: Chunk,
     ctx: StrategyContext,
   ): { totalTokens: number; chunkTokens: number } | null {
-    if (chunk.messages.length === 0) return null;
-    const firstGroupId = chunk.messages[0].bodyGroupId;
-    if (!firstGroupId) return null;
-    // All messages in the chunk must share the same bodyGroupId
-    for (const m of chunk.messages) {
-      if (m.bodyGroupId !== firstGroupId) return null;
-    }
-    // Total tokens of the original message (sum of all shards in the bodyGroup).
-    const allMessages = ctx.messageStore.getAll();
-    let totalTokens = 0;
-    for (const m of allMessages) {
-      if (m.bodyGroupId === firstGroupId) {
-        totalTokens += ctx.messageStore.estimateTokens(m);
-      }
-    }
+    // A chunk of whole messages is no part of a sharded body: answer before
+    // listing the store, as every chunk asks.
+    if (chunk.messages.length === 0 || !chunk.messages[0]!.bodyGroupId) return null;
+    const body = this.shardedBodyOf(chunk.messages.map((m) => m.id), ctx.messageStore.getAll(), ctx);
+    if (!body) return null;
+    const totalTokens = body.totalTokens;
     // Tokens in this chunk specifically.
     let chunkTokens = 0;
     for (const m of chunk.messages) {
@@ -10920,8 +10967,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         compressed: false,
       };
       // Persist the boundary the moment it closes — from here on this
-      // span is owned and never re-keyed by config drift or restarts.
-      if (this.chunkPersistenceEnabled) {
+      // span is owned and never re-keyed by config drift or restarts. A dry
+      // select's chunks stay unrecorded: select() puts the last committing
+      // rebuild's chunks back after it.
+      if (this.chunkPersistenceEnabled && !this._dryRunSelect) {
         const record: ChunkRecord = {
           id: `c-${this.chunkIdCounter++}`,
           sourceIds: chunk.messages.map(m => m.id),
@@ -11303,8 +11352,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // browser carries most of its image bytes NESTED in tool results, not as
     // top-level blocks. Capping only the top level left those untouched and
     // membrane's transport shed kept firing at 27MB (2026-07-12).
-    const capBlocks = (blocks: ContentBlock[]): ContentBlock[] =>
-      blocks.map((b) => {
+    // A block is copied only when an image in it is replaced, so an untouched
+    // block keeps its identity and its raw replay form (see raw-forms.ts).
+    const capBlocks = (blocks: ContentBlock[]): ContentBlock[] => {
+      let changed = false;
+      const capped = blocks.map((b) => {
         if (b.type === 'image') {
           const bytes = AutobiographicalStrategy.imageBlockBytes(b);
           if (kept + bytes <= capBytes) {
@@ -11312,14 +11364,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             return b;
           }
           dropped++;
+          changed = true;
           return { type: 'text', text: AutobiographicalStrategy.IMAGE_PLACEHOLDER } as ContentBlock;
         }
         const nested = (b as { type: string; content?: unknown }).content;
         if (b.type === 'tool_result' && Array.isArray(nested)) {
-          return { ...b, content: capBlocks(nested as ContentBlock[]) } as ContentBlock;
+          const inner = capBlocks(nested as ContentBlock[]);
+          if (inner === nested) return b;
+          changed = true;
+          return { ...b, content: inner } as ContentBlock;
         }
         return b;
       });
+      return changed ? releaseEditedRawForms(blocks, capped) : blocks;
+    };
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       if (!Array.isArray(m.content)) continue;
@@ -11369,9 +11427,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (b > 0 && this.hasToolResult(messages[b])) {
           b--;
           // Adaptive-resolution ingress puts a sharded message's tool_use on
-          // its FIRST shard: step back over the whole body group.
-          const group = messages[b].bodyGroupId;
-          if (group) while (b > 0 && messages[b - 1].bodyGroupId === group) b--;
+          // its FIRST shard: step back to the start of that body (not over an
+          // earlier ingestion of the same text, which shares the group id).
+          b = bodyStart((k) => messages[k], b);
         }
         return b;
       }
@@ -11662,7 +11720,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
         if (filtered.length !== entry.content.length) {
           entry.content = filtered.length > 0
-            ? filtered
+            ? releaseEditedRawForms(entry.content, filtered)
             : [{ type: 'text', text: '[tool call omitted]' }];
         }
       }
@@ -11760,19 +11818,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           b => b.type === 'tool_result' && b.toolUseId === id,
         );
         if (bi === -1) continue;
-        const real = src.content[bi];
-        const rest = src.content.filter((_, k) => k !== bi);
+        const source = src.content;
+        const real = source[bi];
+        const rest = source.filter((_, k) => k !== bi);
+        // A raw replay form shared with the results left behind (one
+        // <function_results> holding several) is true of neither side once
+        // they're apart; each gives it up (see raw-forms.ts).
         src.content = rest.length > 0
-          ? rest
+          ? releaseEditedRawForms(source, rest)
           : [{ type: 'text', text: '[tool result moved during context repair]' }];
-        return real;
+        return releaseSharedRawFormsOnMove(real, source);
       }
       return this.createToolResultStub(id);
     });
   }
 
   /**
-   * Prune tool_use / tool_result blocks in-place:
+   * Prune tool_use / tool_result blocks in place on the entries (an edited
+   * entry gets its own copy of its content array, never the store's):
    *  1. Truncate `tool_use.input` blocks whose serialized JSON exceeds
    *     `toolUseInputMaxTokens`.
    *  2. For each tool name, keep only the last N `tool_result` blocks
@@ -11785,6 +11848,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * affect chunk formation or the recall/pin layout.
    */
   protected pruneToolEntries(entries: ContextEntry[]): void {
+    // Each edited entry's content as it was, so the edit's raw replay forms can
+    // be released once both passes are done (see raw-forms.ts).
+    //
+    // An entry's content array can be its message's own, from the store's
+    // cached getAll() view (immutable to callers), whenever no message cap cut
+    // it. So the first edit gives the entry a copy and leaves that array as it
+    // was. An edit written into it would reach every getAll() caller until the
+    // next store write, and the next compile would start from the marker
+    // instead of the original (the compile-twice test in raw-forms.test.ts).
+    const originals = new Map<ContextEntry, ContentBlock[]>();
+    const replaceBlock = (entry: ContextEntry, index: number, block: ContentBlock): void => {
+      if (!originals.has(entry)) {
+        originals.set(entry, entry.content);
+        entry.content = entry.content.slice();
+      }
+      entry.content[index] = block;
+    };
+
     // Pass 1: build toolUseId → toolName map and apply input truncation
     const toolUseInputCap = this.config.toolUseInputMaxTokens ?? 0;
     const toolUseIdToName = new Map<string, string>();
@@ -11800,14 +11881,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const inputTokens = Math.ceil(inputJson.length / 4);
           if (inputTokens > toolUseInputCap) {
             const keys = Object.keys(block.input).slice(0, 5);
-            entry.content[i] = {
+            replaceBlock(entry, i, {
               ...block,
               input: {
                 _truncated: true,
                 _originalTokens: inputTokens,
                 _keys: keys,
               },
-            };
+            });
           }
         }
       }
@@ -11835,27 +11916,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Pass 3: apply per-tool max-last-N
     const cfg = this.config.toolResultMaxLastN;
-    if (cfg === undefined) return;
+    if (cfg !== undefined) {
+      for (const [toolName, occs] of occurrencesByTool) {
+        let limit: number | undefined;
+        if (typeof cfg === 'number') limit = cfg;
+        else if (typeof cfg === 'object') limit = cfg[toolName];
+        if (limit === undefined || limit < 0) continue;
 
-    for (const [toolName, occs] of occurrencesByTool) {
-      let limit: number | undefined;
-      if (typeof cfg === 'number') limit = cfg;
-      else if (typeof cfg === 'object') limit = cfg[toolName];
-      if (limit === undefined || limit < 0) continue;
+        const excessCount = occs.length - limit;
+        if (excessCount <= 0) continue;
 
-      const excessCount = occs.length - limit;
-      if (excessCount <= 0) continue;
-
-      for (let i = 0; i < excessCount; i++) {
-        const { entry, blockIndex } = occs[i];
-        const orig = entry.content[blockIndex];
-        if (orig.type !== 'tool_result') continue;
-        const fresherCount = occs.length - i - 1;
-        entry.content[blockIndex] = {
-          ...orig,
-          content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
-        };
+        for (let i = 0; i < excessCount; i++) {
+          const { entry, blockIndex } = occs[i];
+          const orig = entry.content[blockIndex];
+          if (orig.type !== 'tool_result') continue;
+          const fresherCount = occs.length - i - 1;
+          replaceBlock(entry, blockIndex, {
+            ...orig,
+            content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
+          });
+        }
       }
+    }
+
+    for (const [entry, before] of originals) {
+      entry.content = releaseEditedRawForms(before, entry.content);
     }
   }
 
@@ -12047,11 +12132,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Under `'full'` (default) this IS `summaryAnswerProse`, block for block.
    * Under `'live-strip'` the captured reasoning carriers are omitted from the
-   * live render alone: whole blocks dropped, every surviving block passed
-   * through untouched, so the same entry's mint-side recall still replays its
-   * signed blocks byte-verbatim. Mutating a carrier here would break the
-   * signature that the mint surface depends on — hence omission, never
-   * rewriting.
+   * live render alone: whole blocks dropped, so the same entry's mint-side
+   * recall still replays its signed blocks byte-verbatim. Mutating a carrier
+   * here would break the signature that the mint surface depends on — hence
+   * omission, never rewriting. Every surviving block is passed through by
+   * reference, except a Responses item a stripped reasoning item led to: every
+   * block that shares it is copied without its raw item, and so without its id
+   * (see raw-forms.ts).
    *
    * A carrier-only entry (reasoning captured, no prose block — degenerate, and
    * guarded against at mint time) would strip to an empty assistant turn,
@@ -12136,16 +12223,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     summaries: SummaryEntry[],
     maxTokens: number,
   ): ContentBlock[] {
+    // A separator follows the answer before it on the wire, so the reasoning at
+    // that answer's end gives up its id first (see raw-forms.ts).
+    const separated = (content: ContentBlock[]): ContentBlock[] => [
+      ...releaseTrailingReasoning(content),
+      { type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT },
+    ];
     if (this.config.recallEnvelope !== 'xml') {
-      const content: ContentBlock[] = [];
+      let content: ContentBlock[] = [];
       summaries.forEach((s, idx) => {
-        if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
+        if (idx > 0) content = separated(content);
         content.push(...this.liveWindowAnswerContent(s));
       });
       return maxTokens > 0 ? this.truncateContent(content, maxTokens) : content;
     }
 
-    const content: ContentBlock[] = [];
+    let content: ContentBlock[] = [];
     const separatorCost = this.estimateTextOnlyTokens(
       { content: [{ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT }] } as StoredMessage,
     );
@@ -12156,7 +12249,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (maxTokens > 0 && proseBudget <= 0) break;
       const prose = this.liveWindowAnswerProse(s);
       const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
-      if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
+      if (idx > 0) content = separated(content);
       content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
       if (maxTokens > 0) {
         remainingTokens -=
@@ -12166,6 +12259,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return content;
   }
 
+  /**
+   * Cut a message's text and string tool-result content to `maxTokens`. A cut
+   * or dropped block gives up its raw replay form, along with every block
+   * sharing it, so the cut reaches the wire (see raw-forms.ts).
+   */
   protected truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
     if (maxTokens <= 0) return content;
     const est = this.estimateTextOnlyTokens({ content } as StoredMessage);
@@ -12219,6 +12317,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    return result;
+    return releaseEditedRawForms(content, result);
   }
 }
