@@ -138,8 +138,10 @@ export interface ReadinessState {
    * idle: the next attempt or paused tick then ends the old stretch, with no
    * landing, and the next failure starts the clock again. A pause counts only
    * through the ticks that see it, so a host should tick a lane that isn't
-   * ready at least once an hour (agent-framework's maintenance pass does); one
-   * that doesn't gets a later alert, never a false one.
+   * ready more often than once an hour (agent-framework's maintenance pass
+   * does, except while its own provider gate skips the agent). Where no tick
+   * comes for an hour, there is no alert until the next failure starts
+   * another stretch; never a false one.
    */
   compressionStall?: { since: string; subject: string; failureClass: string };
 }

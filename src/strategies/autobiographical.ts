@@ -4647,10 +4647,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * an hour with no observed activity (activeAt): no failure, no attempt
    * starting, and no tick that found it waiting on a pause with work
    * pending. A pause counts only through those ticks, which is the host's
-   * side: a host that ticks a lane that isn't ready at least once an hour
-   * (agent-framework's maintenance pass does) keeps a long wait from reading
-   * as idle. One that doesn't gets a later alert, never a false one. The
-   * process being down counts as idle.
+   * side: a host that ticks a lane that isn't ready more often than once an
+   * hour keeps a long wait from reading as idle (agent-framework's
+   * maintenance pass does, except while its own provider gate skips the
+   * agent). Where no tick comes for an hour, the stretch ends: there is no
+   * alert until the next failure starts another, and ticks resuming during
+   * the same hold start none. Never a false one. The process being down
+   * counts as idle.
    */
   private compressionStallIdle(clock: CompressionStallClock, at: number): boolean {
     return clock.activeAt === null || at - clock.activeAt >= AutobiographicalStrategy.COMPRESSION_STALL_ALERT_MS;
