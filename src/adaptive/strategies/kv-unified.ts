@@ -195,29 +195,53 @@ export class KvUnifiedStrategy implements FoldingSolver {
         return score;
       };
       const baseBest = best(base);
+      // A certified what-if exposes only the carried layout and its
+      // extensions, up to certificate.maxImprovement above the what-if's
+      // best cut, so its improvement is understated by that much. Before any
+      // expected-cost solve, no such interval may decide the gate or the
+      // order of the requests: a certified what-if is solved again without
+      // the certificate when its interval spans the gate, or when it passes
+      // the gate and another passing candidate's interval overlaps it.
+      const gain = (entry: (typeof solved)[number]) => baseBest - best(entry.conservative);
+      const slack = (entry: (typeof solved)[number]) => entry.conservative.certificate?.maxImprovement ?? 0;
+      const passing = solved.filter((entry) => gain(entry) + slack(entry) > epsilon);
+      const undecided = solved.filter((entry) => {
+        if (!entry.conservative.certificate) return false;
+        const low = gain(entry);
+        const high = low + slack(entry);
+        if (low <= epsilon) return high > epsilon;
+        return passing.some((other) => other !== entry && gain(other) <= high && gain(other) + slack(other) >= low);
+      });
+      if (undecided.length > 0) {
+        for (const entry of undecided) {
+          const full = solveWithLatentCandidate(
+            inputs, entry.candidate, entry.candidate.conservativeRecallTokens,
+            { ...this.options, hysteresisCertificate: false }, budget.totalBudget,
+          );
+          this.demandSolves++;
+          if (full.feasible) entry.conservative = full;
+          else solved.splice(solved.indexOf(entry), 1);
+        }
+        // The frame may have moved with the new pools; rank everything again
+        // (each pass replaces or removes a certified entry, so this ends).
+        return rank(base, withExpected);
+      }
       const evaluations: LatentDemandEvaluation[] = [];
-      const undecided: typeof solved = [];
       for (const entry of solved) {
         const { candidate, conservative } = entry;
         const conservativeImprovement = baseBest - best(conservative);
-        // A certified what-if exposes only the carried layout and its
-        // extensions, up to certificate.maxImprovement above the what-if's
-        // best cut, so its improvement is understated by that much. When
-        // that gap spans the gate, the what-if is solved again without the
-        // certificate (see below); the pool is decided once that is done.
-        if (conservative.certificate && conservativeImprovement <= epsilon &&
-            conservativeImprovement + conservative.certificate.maxImprovement > epsilon) {
-          undecided.push(entry);
-          continue;
-        }
         let expectedImprovement = conservativeImprovement;
         // Pass 2: the expected (p50) solve only orders emitted requests among
         // themselves, so candidates the gate rejects never pay for it, and it
-        // runs once, against the base the gate is final on.
+        // runs once, against the base the gate is final on. It decides the
+        // order only between requests whose conservative gains tie; those
+        // are solved without the certificate, whose slack could hide a lead.
         if (withExpected && conservativeImprovement > epsilon &&
             candidate.expectedRecallTokens !== candidate.conservativeRecallTokens) {
+          const tied = passing.some((other) => other !== entry && gain(other) === conservativeImprovement);
           const expected = solveWithLatentCandidate(
-            inputs, candidate, candidate.expectedRecallTokens, this.options, budget.totalBudget,
+            inputs, candidate, candidate.expectedRecallTokens,
+            tied ? { ...this.options, hysteresisCertificate: false } : this.options, budget.totalBudget,
           );
           this.demandSolves++;
           if (!expected.feasible) continue;
@@ -247,20 +271,6 @@ export class KvUnifiedStrategy implements FoldingSolver {
         a.request.level - b.request.level ||
         a.request.range.firstChunkId.localeCompare(b.request.range.firstChunkId),
       );
-      if (undecided.length > 0) {
-        for (const entry of undecided) {
-          const full = solveWithLatentCandidate(
-            inputs, entry.candidate, entry.candidate.conservativeRecallTokens,
-            { ...this.options, hysteresisCertificate: false }, budget.totalBudget,
-          );
-          this.demandSolves++;
-          if (full.feasible) entry.conservative = full;
-          else solved.splice(solved.indexOf(entry), 1);
-        }
-        // The frame may have moved with the new pools; rank everything again
-        // (no certified what-if is left undecided, so this ends).
-        return rank(base, withExpected);
-      }
       return evaluations;
     };
     let base = baseline;
@@ -395,11 +405,13 @@ function solveWithLatentCandidate(
     treeifyNonContiguousSummaries: options.treeifyNonContiguousSummaries,
     preserveGapBearingSummaries: options.preserveGapBearingSummaries,
   });
-  // The certificate stays on for what-ifs: its bound is over the what-if
-  // forest (latent parent included), so certifying proves the merge cannot
-  // improve the selection by more than adoptEpsilon — a true "≈0" answer at
-  // ~0.4 s instead of a full solve. Merges worth less than epsilon are not
-  // demanded; that is the hysteresis policy's own tolerance.
+  // The certificate stays on for what-ifs: a certified solve answers in
+  // ~0.4 s instead of a full solve. Its pool is the carried layout and its
+  // extensions, which the certificate allows to score up to
+  // certificate.maxImprovement above the what-if's best cut, so the merge's
+  // improvement is understated by up to that much. That settles a clear
+  // rejection; rankLatentDemand solves again without the certificate where
+  // the slack could decide the gate or the order of the requests.
   return new ParetoKvUnifiedPolicySolver(candidateInputs, forest).solve({
     ...options,
     maxTokens,

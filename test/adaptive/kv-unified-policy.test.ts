@@ -1476,3 +1476,76 @@ test('latent demand decides a certified what-if solve against its unrestricted s
   assert.deepEqual(certified.result.produced, unrestricted.result.produced);
   assert.ok(unrestricted.result.produced.some((r) => r.range.firstChunkId === 'c4'), 'the c4..c7 merge is worth more than epsilon');
 });
+
+/** Eight leaves under four L1s, with earlier L2 costs elsewhere in the
+ * history so a merge's expected (p50) recall cost differs from its
+ * conservative (p80) one. `covered` leaves are presented at their L1. */
+function certifiedWhatIfFixture(o: {
+  raw: number[]; salience: number[]; pairTokens: number; seenL2: number[]; covered: number;
+  budget: number; adoptEpsilon: number; hysteresisCertificate: boolean;
+}) {
+  const chronicle = new MockChronicle({ recallPairTokens: o.pairTokens });
+  for (let i = 0; i < 8; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: o.raw[i] });
+  chronicle.chunks.forEach((chunk, i) => { chunk.salience = o.salience[i]; });
+  const l1s: Array<{ id: string }> = [];
+  for (let i = 0; i < 8; i += 2) l1s.push(chronicle.produceL1([`c${i}`, `c${i + 1}`]));
+  for (const [k, tokens] of o.seenL2.entries()) {
+    const id = `L2-seen-${k}`;
+    chronicle.summaries.set(id, {
+      id, level: 2, content: 'seen', tokens, sourceLevel: 1, sourceIds: [],
+      sourceRange: { first: 'none', last: 'none' }, created: 0,
+    });
+    chronicle.recallPairTokens.set(id, tokens);
+  }
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const leaves = new Map(Array.from({ length: o.covered }, (_, i) =>
+    [`c${i}`, { level: 1, repHash: `summary:${l1s[i >> 1].id}`, lastChangedSeq: 1 }] as const));
+  const strategy = new KvUnifiedStrategy({
+    policy: {
+      alpha: 0, budgetLowRatio: 0.2, budgetHighRatio: 0.5, budgetUnderLambda: 4000, budgetOverLambda: 4000,
+      cacheLambda: 0, continuityLambda: 0,
+    },
+    tokenBucketSize: 1, continuityBucketSize: 1, fidelityBucketSize: 1, labelCeiling: 100_000,
+    adoptEpsilon: o.adoptEpsilon, hysteresisCertificate: o.hysteresisCertificate,
+    latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 8 },
+    presentation: { currentSeq: 1, leaves },
+  });
+  const result = strategy.solve(inputs, { totalBudget: o.budget, targetBudget: o.budget, slack: 0 });
+  return { strategy, result };
+}
+
+test('latent demand orders emitted merges the same with and without the certificate', () => {
+  // Two merges pass the gate with equal conservative gains, so the expected
+  // (p50) gain orders them. A certified expected solve understates its gain
+  // by up to the certificate's slack, which here is enough to hide the lead
+  // of c4..c7 and let the weaker request be summarized first.
+  const build = (hysteresisCertificate: boolean) => certifiedWhatIfFixture({
+    raw: [150, 150, 50, 100, 100, 100, 50, 150], salience: [1, 0.2, 1, 0.2, 0.5, 1, 0.5, 0.5],
+    pairTokens: 100, seenL2: [10, 30, 100, 150], covered: 4, budget: 500, adoptEpsilon: 50, hysteresisCertificate,
+  });
+  const certified = build(true);
+  const unrestricted = build(false);
+  const order = (r: typeof certified) => r.result.produced.map((p) => p.range.firstChunkId);
+  assert.ok(order(unrestricted).length >= 2, 'two merges are requested');
+  assert.deepEqual(order(certified), order(unrestricted));
+  assert.deepEqual(
+    certified.strategy.lastDemandEvaluations.map((e) => Math.round(e.expectedImprovement)),
+    unrestricted.strategy.lastDemandEvaluations.map((e) => Math.round(e.expectedImprovement)),
+  );
+});
+
+test('latent demand runs each expected-cost solve once when a certified what-if is decided late', () => {
+  // The c4..c7 what-if certifies and its slack spans the gate, so it is
+  // solved again without the certificate. The expected (p50) solve of the
+  // already-decided c0..c3 merge must not run a second time for that.
+  const { strategy, result } = certifiedWhatIfFixture({
+    raw: [50, 50, 200, 100, 100, 200, 50, 200], salience: [0.2, 0.5, 1, 1, 0.5, 1, 0.5, 1],
+    pairTokens: 150, seenL2: [10, 20, 30, 40], covered: 2, budget: 800, adoptEpsilon: 200, hysteresisCertificate: true,
+  });
+  assert.equal(result.produced.length, 2);
+  // Two conservative what-ifs, the unrestricted c4..c7 one, one p50 each.
+  assert.equal(strategy.lastTimings?.demandSolves, 5);
+});
