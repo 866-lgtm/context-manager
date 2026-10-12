@@ -436,9 +436,10 @@ describe('Merge terminal-disposition gate', () => {
     // rhys 2026-08-06: 514 consecutive merge 500s across a week-long
     // provider episode, zero accounting. A failure that is not a rejection is
     // evidence about the merge only while other compression lands between its
-    // failures (room-203 #70922): an outage, in which nothing lands, never
-    // counts; a merge that keeps failing the same way while other work lands
-    // routes, at the bound, into the normal bounded rejection policy.
+    // failures on its route and model (room-203 #70922, room-383 #74877): an
+    // outage, in which nothing lands, never counts; a merge that keeps failing
+    // while other work lands routes, at the bound, into the normal bounded
+    // rejection policy.
     const serverErr = Object.assign(new Error('500 {"type":"api_error"}'), {
       type: 'server', retryable: true, httpStatus: 500,
     });
@@ -450,8 +451,9 @@ describe('Merge terminal-disposition gate', () => {
     // makes no call. Expire it between ticks to stand for the time passing.
     const lane = fx.strategy as unknown as {
       compressionPause: { backoffUntil: number; statedUntil: number | null } | null;
-      noteCompressionLanded(): void;
+      noteCompressionLanded(membrane: unknown, model: string): void;
     };
+    const land = () => lane.noteCompressionLanded(ctx(fx.manager).membrane, MODEL);
     const expire = () => { lane.compressionPause!.backoffUntil = 0; lane.compressionPause!.statedUntil = null; };
     const streak = () => (fx.strategy.mergeQueueView()[0] as { failureStreak?: { failures: number; failureClass: string } }).failureStreak;
     // An outage: nothing lands, so twelve failures count as one.
@@ -463,7 +465,7 @@ describe('Merge terminal-disposition gate', () => {
     assert.deepEqual([streak()?.failures, streak()?.failureClass], [1, 'server:500']);
     // Other work lands before each of the next failures: each counts.
     for (let i = 2; i < BOUND; i++) {
-      lane.noteCompressionLanded();
+      land();
       await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /500/);
       const calls = mock.calls.length;
       await fx.strategy.tick(ctx(fx.manager));
@@ -472,14 +474,15 @@ describe('Merge terminal-disposition gate', () => {
       assert.equal(fx.strategy.mergeQueueView()[0]?.attempts ?? 0, 0, 'no attempt burned below the bound');
     }
     assert.equal(streak()?.failures, BOUND - 1);
-    lane.noteCompressionLanded();
+    land();
     await fx.strategy.tick(ctx(fx.manager)); // the bound: recorded, not thrown
     assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1, 'bounded policy engaged at the bound');
     // As in L1, the run is decided before any pause: the deciding failure is
     // the merge's own, so it starts no stall clock and pauses nothing, and the
     // bounded policy's smaller retry is asked at the next tick.
-    const evidence = fx.manager.getStore().getStateJson('default/autobio:compression-lane-evidence') as { failingSince?: number };
-    assert.equal(evidence.failingSince, undefined, 'the deciding failure starts no stall clock');
+    const clock = fx.manager.getStore().getStateJson('default/autobio:compression-stall') as { failingSince?: number | null } | null;
+    assert.equal(clock?.failingSince ?? null, null, 'the deciding failure starts no stall clock');
+    assert.equal(streak(), undefined, 'and the decided run is gone with its accounting');
     const calls = mock.calls.length;
     await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /500/);
     assert.equal(mock.calls.length, calls + 1, 'and installs no pause: the retry is called at once');
@@ -489,29 +492,30 @@ describe('Merge terminal-disposition gate', () => {
   it('a merge entry skipped with no call is neither an answer nor a landing', async () => {
     // executeMerge skips a stale entry (a source already parented) without a
     // call, writing nothing, and tick drops it from the queue. A skip says
-    // nothing about the provider: it must not advance the lane's evidence (in
-    // an outage, each stale entry would let a failing request's next failure
-    // count) or end the pause (the next failure would back off from 30 s
-    // again instead of doubling from the genuine count).
+    // nothing about the provider: it must not be a landing (in an outage,
+    // each stale entry would let a failing request's next failure count, and
+    // would end the stall clock) or end the pause (the next failure would back
+    // off from 30 s again instead of doubling from the genuine count).
     const network = Object.assign(new Error('zz network down'), { type: 'network', retryable: true });
     const mock = scripted([{ error: network }]);
     const fx = await fixture(mock.membrane);
     const lane = fx.strategy as unknown as {
       compressionPause: { backoffUntil: number; failures: number } | null;
-      noteCompressionLanded(): void;
+      noteCompressionLanded(membrane: unknown, model: string): void;
     };
-    const evidence = () => fx.manager.getStore().getStateJson('default/autobio:compression-lane-evidence');
-    lane.noteCompressionLanded(); // other work landed once
+    const evidence = () => fx.manager.getStore().getStateJson('default/autobio:compression-stall');
+    lane.noteCompressionLanded(ctx(fx.manager).membrane, MODEL); // other work landed once
     await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
     assert.equal(lane.compressionPause?.failures, 1);
     lane.compressionPause!.backoffUntil = 0; // the backoff has passed
     // Meanwhile another merge parented L1-100: the queued entry is stale.
     fx.strategy.summariesView().find((s) => s.id === 'L1-100')!.mergedInto = 'L2-900';
     const before = evidence();
+    assert.equal(typeof (before as { failingSince?: unknown } | null)?.failingSince, 'number', 'the failure started the stall clock');
     await fx.strategy.tick(ctx(fx.manager));
     assert.equal(mock.calls.length, 1, 'skipped: no call');
     assert.equal(fx.strategy.mergeQueueView().length, 0, 'the stale entry is dropped');
-    assert.deepEqual(evidence(), before, 'no landing');
+    assert.deepEqual(evidence(), before, 'no landing: the stall clock runs on');
     assert.equal(lane.compressionPause?.failures, 1, 'and no answer: the pause and its failure count stand');
     await fx.manager.close();
   });

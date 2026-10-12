@@ -46,7 +46,7 @@ import { defaultTokenEstimator, MessageStore } from '../message-store.js';
 import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Picker, OverBudgetError, UncoveredDropError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
@@ -118,9 +118,10 @@ function compressionErrorType(error: unknown): string | undefined {
 }
 
 /**
- * A failure's class for the evidence rule: membrane's error type and HTTP
- * status, or the thrown value's name for an untyped one. Only repeats of one
- * class count against a request (see nextFailureStreak).
+ * A failure's class: membrane's error type and HTTP status, or the thrown
+ * value's name for an untyped one. It names a run's latest failure and a
+ * deciding outcome (`persistent-<class>`); it doesn't decide whether a
+ * failure counts (see nextFailureStreak).
  */
 function compressionFailureClass(error: unknown): string {
   const type = compressionErrorType(error)
@@ -135,46 +136,112 @@ function isAdmissionDeferral(error: unknown): boolean {
 }
 
 /**
- * A request's run of failures that did not decide it by their kind (see
- * compressionFailureKind). Such a failure is evidence about the request only
- * while the lane works otherwise: it is counted when some other compression
- * has landed since the request last failed (the lane's answer sequence has
- * moved), and only when it repeats the class of the one before. An outage
- * fails everything, so nothing lands and nothing is counted; a request that
- * keeps failing the same way while other work lands is the request's own
- * problem, and COMPRESSION_PERSISTENT_FAILURES of them decide its rung.
+ * The comparison domain of a compression call: the membrane instance it went
+ * through and the model it named, as this process knows them. A failure is
+ * evidence about its request only against other compressions that landed in
+ * the same domain: another model's or another route's successes say nothing
+ * about whether this one answers. A membrane instance has no identity that
+ * outlives the process, so each gets a token minted here under a nonce of
+ * this process: a run stored by an earlier process never matches a domain of
+ * this one, and its next failure starts a new run. Strategies that share a
+ * membrane instance share its domains. Routing below membrane, such as a
+ * proxy that picks a backend per call, is invisible here.
+ */
+const COMPRESSION_DOMAIN_PROCESS = randomUUID();
+let compressionDomainTokens = 0;
+const membraneDomainTokens = new WeakMap<object, string>();
+/** Compressions landed per membrane instance and model in this process. */
+const domainLandings = new WeakMap<object, Map<string, number>>();
+
+function compressionDomain(membrane: object, model: string | undefined): string {
+  let token = membraneDomainTokens.get(membrane);
+  if (token === undefined) {
+    token = `${COMPRESSION_DOMAIN_PROCESS}:${++compressionDomainTokens}`;
+    membraneDomainTokens.set(membrane, token);
+  }
+  return `${token}\u0000${model ?? ''}`;
+}
+
+function domainLanded(membrane: object, model: string | undefined): number {
+  return domainLandings.get(membrane)?.get(model ?? '') ?? 0;
+}
+
+function noteDomainLanding(membrane: object, model: string | undefined): void {
+  let byModel = domainLandings.get(membrane);
+  if (!byModel) {
+    byModel = new Map();
+    domainLandings.set(membrane, byModel);
+  }
+  byModel.set(model ?? '', (byModel.get(model ?? '') ?? 0) + 1);
+}
+
+/**
+ * A run of failures that did not decide their request by their kind (see
+ * compressionFailureKind), of one subject: an L1 chunk's rung (chunkRunKey)
+ * or a queued merge. Such a failure is evidence about its subject only while
+ * its domain works otherwise: it is counted when some other compression has
+ * landed in the same domain since the subject last failed there. An outage
+ * fails everything, so nothing lands and nothing is counted; a subject that
+ * keeps failing while other work lands on its route and model is failing on
+ * its own, and COMPRESSION_PERSISTENT_FAILURES of them decide it. The count
+ * is in-process evidence; the run itself is stored with its subject (family
+ * progress, a merge's queue entry), so it still holds merges around its span
+ * after a restart (pendingRetrySpans), and its next failure there starts a
+ * new count.
  */
 interface CompressionFailureStreak {
-  /** The request that failed, by the hash of what was sent. */
-  requestHash: string;
-  /** compressionFailureClass of its failures: another class restarts the run. */
+  /** The run's subject: chunkRunKey for an L1 rung, the merge's identity for a merge. */
+  key: string;
+  /** compressionFailureClass of its latest failure. */
   failureClass: string;
+  /** The domain its failures came from (compressionDomain): another starts a new run. */
+  domain?: string;
   /** Failures in the run (the first included). */
   failures: number;
-  /** The lane's landed-success sequence at the request's last failure. */
+  /** Its domain's landed count at the request's last failure. */
   atLanded: number;
   /** When the run began. */
   firstFailedAt: number;
 }
 
 /**
- * The run after one more failure of `requestHash`. The first failure of a
- * request or of a new class starts a run of one. A repeat of the class extends
- * the run only if other work has landed since the last one; otherwise it says
- * nothing new (the lane may be down) and the run stands as it was.
+ * The run after one more failure of `key` in `domain`, whose landed count is
+ * `landed`. The first failure of a subject, or its first in another domain,
+ * starts a run of one. A later one extends the run only if other work has
+ * landed in the domain since the last one, whatever its class; otherwise it
+ * says nothing new (the route may be down) and the run keeps its count. The
+ * eighth failure in a run is therefore the first and seven more, each
+ * separated from the one before by a landing.
  */
 function nextFailureStreak(
   previous: CompressionFailureStreak | undefined,
-  requestHash: string,
+  key: string,
   failureClass: string,
+  domain: string,
   landed: number,
   now: number,
 ): CompressionFailureStreak {
-  if (!previous || previous.requestHash !== requestHash || previous.failureClass !== failureClass) {
-    return { requestHash, failureClass, failures: 1, atLanded: landed, firstFailedAt: now };
+  if (!previous || previous.key !== key || previous.domain !== domain) {
+    return { key, failureClass, domain, failures: 1, atLanded: landed, firstFailedAt: now };
   }
-  if (landed <= previous.atLanded) return previous;
-  return { ...previous, failures: previous.failures + 1, atLanded: landed };
+  if (landed <= previous.atLanded) return { ...previous, failureClass };
+  return { ...previous, failureClass, failures: previous.failures + 1, atLanded: landed };
+}
+
+/**
+ * An L1 run's subject: the chunk's rung, by the chunk's source identity and
+ * the rung's curve label, the stripped retry after a carrier rejection being
+ * its own. Not the request's bytes: a pending chunk's request carries the
+ * whole unmerged frontier as recall pairs, so every other L1 that lands
+ * changes it, and those landings are the evidence a run needs.
+ */
+function chunkRunKey(chunkSourceHash: string, curveLabel: string, stripped: boolean): string {
+  return sha256Json({ chunkSourceHash, curveLabel, stripped });
+}
+
+/** A queued merge's identity in the lane's failure order. */
+function mergeFailureKey(merge: { level: number; sourceIds: readonly string[] }): string {
+  return `${merge.level}\u0000${merge.sourceIds.join('\u0000')}`;
 }
 
 function compressionFailureKind(error: unknown): CompressionFailureKind {
@@ -687,6 +754,18 @@ interface CompressionLanePause {
 /** The last instant a JavaScript Date can represent (ECMA-262 time value range). */
 const MAX_DATE_MS = 8.64e15;
 /** When the lane may call again: the later of its two constraints. */
+/** The lane's stall clock, stored in compressionStallStateId. */
+interface CompressionStallClock {
+  /** The first failure since the last landing, or the restart of its stretch after an idle hour. */
+  failingSince: number | null;
+  /** When the lane was last seen failing, or waiting on a pause with work pending. */
+  activeAt: number | null;
+  /** The latest failure: what failed, its class, and its lane. */
+  last: { subject: string; failureClass: string; lane: 'l1' | 'merge' } | null;
+  /** The stall alert, once raised for this stretch. */
+  stall: { since: number; subject: string; failureClass: string; alertedAt: number } | null;
+}
+
 const pauseUntil = (pause: CompressionLanePause): number => Math.max(pause.backoffUntil, pause.statedUntil ?? 0);
 /** Which constraint binds: the provider's stated wait only when it outlasts the backoff. */
 const pauseSource = (pause: CompressionLanePause): 'retry-after' | 'backoff' =>
@@ -753,6 +832,34 @@ type CompressionAttemptOutcome =
  * the pre-existing transient semantics (entry stays queued, retried on the
  * next tick with no attempt accounting).
  */
+/**
+ * A merge whose answer a compression hold placed on its span during the call
+ * keeps out. The provider answered, so it is no failure: the entry stays
+ * queued for the hold's release, and nothing is counted or paused.
+ */
+class MergeHoldDiscard extends Error {
+  override name = 'MergeHoldDiscard';
+}
+
+/**
+ * The split-stitch rung waits for its call window (at most
+ * compressionSplitMaxCallsPer10Min calls in ten minutes, per strategy
+ * instance) to have room for a whole attempt. A local throttle is no answer
+ * and no failure: nothing is recorded or counted, the lane isn't paused, and
+ * the chunk waits `waitMs` while other work runs.
+ */
+class CompressionSplitWindowWait extends Error {
+  override name = 'CompressionSplitWindowWait';
+  constructor(readonly waitMs: number, used: number, limit: number) {
+    super(`split-stitch waits for its call window: ${used} of ${limit} calls in the last 10 minutes`);
+  }
+}
+
+/** A deferral that made no call: the caller's admission refused it, or the split rung's window had no room. */
+function isNoCallDeferral(error: unknown): boolean {
+  return isAdmissionDeferral(error) || error instanceof CompressionSplitWindowWait;
+}
+
 class MergeDispositionRejection extends Error {
   readonly outcome: CompressionAttemptOutcome;
   readonly stopReason?: string;
@@ -1335,17 +1442,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _overlapBlocked = new Set<string>();
 
   /**
-   * Failures of one request, of one class, each after other compression
-   * landed, that decide its rung (an L1 ladder's or a merge's): the request
-   * is failing on its own while the lane works (see CompressionFailureStreak).
-   * A week-long fault on one payload (rhys 2026-08-06: 514 identical merge
-   * 500s) converges, while an outage, in which nothing lands, never counts.
-   * Eight keeps a flapping provider from deciding a viable request by chance:
-   * at a 30% failure rate, eight in a row is about 0.007% per request, and an
-   * exhaustion is undone only by an operator.
+   * Failures of one request in one domain, the first and seven more each
+   * after other compression landed there, that decide its rung (an L1
+   * ladder's or a merge's): the request is failing on its own while its route
+   * works (see CompressionFailureStreak). A week-long fault on one payload
+   * (rhys 2026-08-06: 514 identical merge 500s) converges, while an outage, in
+   * which nothing lands, never counts. Eight keeps a flapping provider from
+   * deciding a viable request by chance: at a 30% failure rate, eight in a
+   * row is about 0.007% per request, and an exhaustion is undone only by an
+   * operator.
    */
   static readonly COMPRESSION_PERSISTENT_FAILURES = 8;
-  /** How long failures may continue with nothing landing before the lane alerts once (see compressionStall). */
+  /**
+   * How long failures may go on with nothing landing before the lane alerts
+   * once (see compressionStallStateId). An hour in which the lane was neither
+   * failing nor waiting on a pause is idle, and the next failure starts the
+   * clock again.
+   */
   static readonly COMPRESSION_STALL_ALERT_MS = 60 * 60_000;
   /** First compression-lane pause after a transient failure; doubles per failure. */
   static readonly COMPRESSION_PAUSE_BASE_MS = 30_000;
@@ -1448,19 +1561,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return `${this.ns}/autobio:compression-family-progress`;
   }
   /**
-   * The lane's durable evidence that compression works: a sequence advanced
-   * once per landed success (an L1 pushed, a merged summary written), never
-   * before the success's own result is written; when the last one landed; and
-   * when the failures since it began, for the stall alert. Branch-scoped like
-   * the rest of the strategy's state.
+   * The lane's stall clock (CompressionStallClock): when the failures since
+   * the last landing began, when the lane was last seen failing or waiting
+   * on a pause, the latest failure, and the stall alert once raised. A
+   * landing clears it. Branch-scoped like the rest of the strategy's state,
+   * and shared by every strategy on the store and namespace, so a restart, a
+   * crash loop or a sibling's landing reads the same clock.
    */
-  protected get compressionLaneEvidenceStateId(): string {
-    return `${this.ns}/autobio:compression-lane-evidence`;
+  protected get compressionStallStateId(): string {
+    return `${this.ns}/autobio:compression-stall`;
   }
   /** In-process pacing after a transient compression failure (see CompressionLanePause). */
   private compressionPause: CompressionLanePause | null = null;
-  /** The lane's stall alert, once raised (see noteCompressionFailureForStall); ended by a landed success. */
-  private compressionStall: { since: number; subject: string; failureClass: string; alertedAt: number } | null = null;
   /**
    * Counts every wholesale re-decision of the compression queue (each
    * rebuild, and each branch-mirror reset). An attempt that fails while the
@@ -1468,6 +1580,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * changed meanwhile has a newer eligibility decision, which stands.
    */
   private compressionQueueGeneration = 0;
+  /**
+   * The lane's order of failures in this process: each chunk (by source
+   * identity) and each queued merge (by mergeFailureKey) that failed and is
+   * still pending maps to the sequence number of its latest failure. Work
+   * that failed goes behind work that hasn't, least recently failed first
+   * (orderCompressionQueue, and a merge's place in tick). In memory only: a
+   * restart tries the queue in its own order again.
+   */
+  private compressionFailureOrder = new Map<string, number>();
+  private mergeFailureOrder = new Map<string, number>();
+  private compressionFailureSequence = 0;
+  /** A chunk whose split-stitch rung waits for its call window, until when (see CompressionSplitWindowWait). */
+  private compressionNotBefore = new Map<string, number>();
 
   /** Branch-scoped projection of the append-only quarantine event ledger. */
   private compressionRefusalQuarantine = new Map<string, ActiveCompressionQuarantine>();
@@ -1658,20 +1783,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       () => {
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       const current = this.readCompressionQuarantineProjection();
-      const clearedFamilies = new Set<string>();
-      for (const target of targets) {
+      const cleared = targets.flatMap((target) => {
         const active = current.get(target.key);
-        if (active?.generationId !== target.generationId) continue;
+        return active?.generationId === target.generationId ? [{ ...target, familyKey: active.record.familyKey }] : [];
+      });
+      // Progress goes first: a crash before the clear events leaves the
+      // quarantine standing for the operator to clear again, never a cleared
+      // family whose recorded answers would exhaust it again at once.
+      if (cleared.length > 0) {
+        const families = new Set(cleared.map((target) => target.familyKey));
+        this.forgetCompressionFamilyProgress((entry) => families.has(entry.familyKey));
+      }
+      for (const target of cleared) {
         this.appendCompressionQuarantineEvent({
           kind: 'clear',
           key: target.key,
           targetClaimId: target.generationId,
           created: Date.now(),
         });
-        clearedFamilies.add(active.record.familyKey);
-      }
-      if (clearedFamilies.size > 0) {
-        this.forgetCompressionFamilyProgress((entry) => clearedFamilies.has(entry.familyKey));
       }
       this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
       this.checkpointCompressionQuarantineIfNeeded(sourceBranch);
@@ -2235,7 +2364,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       strategy: 'snapshot',
     });
     registerState({
-      id: this.compressionLaneEvidenceStateId,
+      id: this.compressionStallStateId,
       strategy: 'snapshot',
     });
     // Adaptive-resolution state slots — only registered when the flag is on
@@ -4009,6 +4138,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * The chunk's run as its newest family records it, for a family with no
+   * progress of its own yet. A chunk's request family changes with the
+   * unmerged frontier its requests carry, and its run goes on across that.
+   */
+  private latestChunkRun(chunkSourceHash: string): CompressionFailureStreak | undefined {
+    let newest: CompressionFamilyProgress | undefined;
+    for (const entry of this.readCompressionFamilyProgress().values()) {
+      if (entry.chunkSourceHash !== chunkSourceHash) continue;
+      if (!newest || entry.updated > newest.updated) newest = entry;
+    }
+    return newest?.failureStreak;
+  }
+
+  /**
    * Durable before the next rung's call: written and synced, so a crash
    * after it never re-pays a request whose answer it records. Only work on
    * the current branch writes; stale-branch work leaves nothing.
@@ -4026,7 +4169,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     outcomes: CompressionRefusalOutcomeRecord[],
     canonicalProviderInputTokens: number | undefined,
     failureStreak: CompressionFamilyProgress['failureStreak'],
-    answeredRequests: ReadonlySet<string>,
+    answeredRuns: ReadonlySet<string>,
     sourceIds: readonly string[],
   ): void {
     if (!this.store || !this.isCompressionBranchCurrent(source)) return;
@@ -4036,24 +4179,36 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const merged = new Map<string, CompressionRefusalOutcomeRecord>();
     for (const outcome of existing?.outcomes ?? []) merged.set(answerKey(outcome), outcome);
     for (const outcome of outcomes) if (!merged.has(answerKey(outcome))) merged.set(answerKey(outcome), { ...outcome });
-    // A request that answered (an outcome recorded, or a response this ladder
+    // A rung that answered (an outcome recorded, or a response this ladder
     // accepted) has no run of failures left: its run ends durably, so a later
     // write never restores it.
-    const answered = new Set([...merged.values()].map((outcome) => outcome.requestHash));
-    for (const hash of answeredRequests) answered.add(hash);
-    // Another writer's run for the same request and class is kept when it is
-    // longer: it counted landed evidence this ladder hasn't seen.
+    const answered = new Set(answeredRuns);
+    for (const outcome of merged.values()) {
+      for (const stripped of [false, true]) answered.add(chunkRunKey(record.chunkSourceHash, outcome.curveLabel, stripped));
+    }
+    // Another writer's run for the same rung in the same domain (a sibling
+    // on this membrane instance and model) is kept when it is longer: it
+    // counted landings this ladder hasn't seen.
     let streak = failureStreak ? { ...failureStreak } : undefined;
     const other = existing?.failureStreak;
-    if (other && !answered.has(other.requestHash)) {
+    if (other && !answered.has(other.key)) {
       if (!streak) streak = { ...other };
       else if (
-        other.requestHash === streak.requestHash &&
-        other.failureClass === streak.failureClass &&
+        other.key === streak.key &&
+        other.domain === streak.domain &&
         other.failures > streak.failures
       ) streak = { ...other };
     }
-    if (streak && answered.has(streak.requestHash)) streak = undefined;
+    if (streak && answered.has(streak.key)) streak = undefined;
+    // One run per chunk: this family's is the chunk's now (latestChunkRun),
+    // so an older family of the chunk keeps its answers but not a run.
+    if (streak) {
+      for (const [familyKey, entry] of progress) {
+        if (familyKey === record.familyKey || entry.chunkSourceHash !== record.chunkSourceHash || !entry.failureStreak) continue;
+        const { failureStreak: _carried, ...rest } = entry;
+        progress.set(familyKey, rest);
+      }
+    }
     const tokens = canonicalProviderInputTokens ?? existing?.canonicalProviderInputTokens;
     progress.set(record.familyKey, {
       familyKey: record.familyKey,
@@ -4277,18 +4432,60 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Put a chunk whose attempt didn't decide it back in the queue, found by its
-   * source identity among the current chunks: only if it still exists
-   * uncompressed and is not already queued. After a failure it goes to the
-   * back, so the chunks behind it run (and the lane learns whether the
-   * failure is this chunk's own, see nextFailureStreak); a merge spanning it
-   * waits for it (see contiguousMergeCandidates). After a deferral or an
-   * abort, which say nothing about anything, it keeps its place at the head.
+   * source identity among the current chunks. After a failure it goes behind
+   * the work that hasn't failed, so that work runs once the pause ends (and
+   * lands, which tells whether the failure is this chunk's own, see
+   * nextFailureStreak); a merge spanning it waits for it (see
+   * contiguousMergeCandidates). After a deferral or an abort, which say
+   * nothing about anything, it keeps its place at the head. A rebuild during
+   * the call (`superseded`) re-decided the chunk's eligibility: it is put back
+   * only if that rebuild queued it, and a withdrawal stands.
    */
-  private requeuePendingChunk(key: string, place: 'head' | 'back'): void {
+  private requeuePendingChunk(key: string, place: 'head' | 'back', superseded: boolean): void {
+    if (place === 'back') this.compressionFailureOrder.set(key, ++this.compressionFailureSequence);
     const index = this.chunks.findIndex((chunk) => !chunk.compressed && this.chunkKey(chunk) === key);
-    if (index < 0 || this.compressionQueue.includes(index)) return;
-    if (place === 'head') this.compressionQueue.unshift(index);
-    else this.compressionQueue.push(index);
+    if (index >= 0 && !superseded && !this.compressionQueue.includes(index)) {
+      if (place === 'head') this.compressionQueue.unshift(index);
+      else this.compressionQueue.push(index);
+    }
+    this.orderCompressionQueue();
+  }
+
+  /**
+   * The compression queue in the order the lane takes it: chunks that haven't
+   * failed in this process first, in queue order, then those that have, least
+   * recently failed first. Every rebuild applies it too, so a rebuild, which
+   * queues chunks in index order, never puts a failed chunk back at the head.
+   * A failure order whose chunk is no longer pending is dropped.
+   */
+  private orderCompressionQueue(): void {
+    const pending = new Set(this.chunks.filter((chunk) => !chunk.compressed).map((chunk) => this.chunkKey(chunk)));
+    for (const key of this.compressionFailureOrder.keys()) if (!pending.has(key)) this.compressionFailureOrder.delete(key);
+    for (const key of this.compressionNotBefore.keys()) if (!pending.has(key)) this.compressionNotBefore.delete(key);
+    const failedAt = (index: number): number | undefined => {
+      const chunk = this.chunks[index];
+      return chunk ? this.compressionFailureOrder.get(this.chunkKey(chunk)) : undefined;
+    };
+    const fresh = this.compressionQueue.filter((index) => failedAt(index) === undefined);
+    const failed = this.compressionQueue
+      .filter((index) => failedAt(index) !== undefined)
+      .sort((a, b) => failedAt(a)! - failedAt(b)!);
+    this.compressionQueue = [...fresh, ...failed];
+  }
+
+  /**
+   * Whether the head of the merge queue takes its turn before an L1 chunk
+   * that failed at `failedAt` (a compressionFailureOrder sequence): a merge
+   * that hasn't failed since. Fresh L1 work still goes first, as ever; a
+   * failed chunk gives way, so its failure doesn't keep the merges from
+   * running and landing, which is the evidence that decides it.
+   */
+  private mergeTakesTurnBefore(failedAt: number, store: MessageStoreView): boolean {
+    if (!this.config.hierarchical || this.mergeQueue.length === 0) return false;
+    const head = this.mergeQueue[0]!;
+    if (this.mergeBlockedByHold(head.sourceIds, store)) return false;
+    const mergeFailedAt = this.mergeFailureOrder.get(mergeFailureKey(head));
+    return mergeFailedAt === undefined || mergeFailedAt < failedAt;
   }
 
   /** Any answer from the provider ends the lane's pause and its backoff. */
@@ -4298,82 +4495,141 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.compressionPause = null;
   }
 
-  /** The lane's durable evidence (see compressionLaneEvidenceStateId). */
-  private readLaneEvidence(): { landed: number; lastLandedAt: number | null; failingSince: number | null } {
-    const stored = this.store?.getStateJson(this.compressionLaneEvidenceStateId) as
-      { landed?: unknown; lastLandedAt?: unknown; failingSince?: unknown } | null | undefined;
+  /** The lane's stall clock as stored (see compressionStallStateId); empty when absent or malformed. */
+  private readStallClock(): CompressionStallClock {
+    const stored = this.store?.getStateJson(this.compressionStallStateId) as Partial<CompressionStallClock> | null | undefined;
     const time = (value: unknown): number | null => (typeof value === 'number' && Number.isFinite(value) ? value : null);
+    const last = stored?.last;
+    const stall = stored?.stall;
     return {
-      landed: typeof stored?.landed === 'number' && Number.isFinite(stored.landed) ? stored.landed : 0,
-      lastLandedAt: time(stored?.lastLandedAt),
       failingSince: time(stored?.failingSince),
+      activeAt: time(stored?.activeAt),
+      last: last && typeof last.subject === 'string' && typeof last.failureClass === 'string' &&
+          (last.lane === 'l1' || last.lane === 'merge')
+        ? { subject: last.subject, failureClass: last.failureClass, lane: last.lane }
+        : null,
+      stall: stall && time(stall.since) !== null && typeof stall.subject === 'string' &&
+          typeof stall.failureClass === 'string' && time(stall.alertedAt) !== null
+        ? { since: stall.since, subject: stall.subject, failureClass: stall.failureClass, alertedAt: stall.alertedAt }
+        : null,
     };
   }
 
   /**
-   * Write the lane's evidence and sync it, as the progress writer does: a
-   * landing must outlive a crash that follows it (or the next failure of
-   * another request is not counted), and so must the stall clock's start (or
-   * a crash loop restarts it on every boot and the stall never alerts).
+   * Write the stall clock and sync it, as the progress writer does: its start
+   * must outlive a crash (or a crash loop restarts it on every boot and the
+   * stall never alerts), and so must the alert once raised (or every restart
+   * alerts again).
    */
-  private writeLaneEvidence(evidence: { landed: number; lastLandedAt: number | null; failingSince?: number | null }): void {
+  private writeStallClock(clock: CompressionStallClock): void {
     if (!this.store) return;
-    this.store.setStateJson(this.compressionLaneEvidenceStateId, evidence);
+    this.store.setStateJson(this.compressionStallStateId, clock);
     this.store.sync();
   }
 
   /**
-   * A compression landed: its result is written (an L1 pushed and its chunk
-   * record marked, or a merged summary written and its entry dequeued; a
-   * skipped entry is neither). Advance the lane's evidence, which makes the
-   * next failure of any OTHER request count (nextFailureStreak), and end a
-   * stall. Called only after the result is written, never at the answer: a
-   * crash in between loses a success, which only makes the next failure not
-   * count, and never invents one.
+   * A compression landed: the provider answered it, and its result is
+   * written (an L1 pushed and its chunk record marked, or a merged summary
+   * written). A stub, an adoption or a span found covered made no call, so
+   * none of them is a landing. It is evidence that its domain answers, which
+   * makes the next failure of any OTHER request there count
+   * (nextFailureStreak), and it ends the failures since the last landing and
+   * any stall. Called right after the result is written, never at the
+   * answer: a crash in between loses a landing, which only makes the next
+   * failure not count, and never invents one.
    */
-  private noteCompressionLanded(): void {
-    if (this.store) {
-      const { landed } = this.readLaneEvidence();
-      // A landed success ends the failures since the last one (failingSince).
-      this.writeLaneEvidence({ landed: landed + 1, lastLandedAt: Date.now() });
+  private noteCompressionLanded(membrane: object, model: string | undefined): void {
+    noteDomainLanding(membrane, model);
+    if (!this.store) return;
+    const clock = this.readStallClock();
+    if (clock.failingSince === null && clock.last === null && clock.stall === null) return;
+    if (clock.stall) {
+      console.warn(`[autobiographical] compression stall over: ${clock.stall.subject} was stalled since ${new Date(clock.stall.since).toISOString()}`);
     }
-    if (this.compressionStall) {
-      console.warn(`[autobiographical] compression stall over: ${this.compressionStall.subject} was stalled since ${new Date(this.compressionStall.since).toISOString()}`);
-      this.compressionStall = null;
-    }
+    this.writeStallClock({ failingSince: null, activeAt: null, last: null, stall: null });
   }
 
   /**
-   * After a failure that leaves the lane paused: if failures have gone on for
-   * COMPRESSION_STALL_ALERT_MS with nothing landing, alert once per stall. A
-   * request that fails while nothing else is queued has nothing to compare
-   * against, so it is never counted and backs off indefinitely; this is how
-   * an operator hears of it. The clock starts at the first failure after the
-   * last landed success, kept durably, so a restart does not reset it.
+   * After a failure that pauses the lane: the stall clock starts at the first
+   * failure after the last landing, unless the lane has been idle for
+   * COMPRESSION_STALL_ALERT_MS (neither failing nor waiting on a pause, with
+   * nothing pending or the process down), when it starts again here. Once
+   * failures have gone on for COMPRESSION_STALL_ALERT_MS with nothing landing,
+   * the lane alerts once per stall. A request that fails while nothing else
+   * lands in its domain is never counted and backs off indefinitely; this is
+   * how an operator hears of it.
    */
   private noteCompressionFailureForStall(lane: 'l1' | 'merge', subject: string, error: unknown): void {
+    if (!this.store) return;
     const now = Date.now();
-    const evidence = this.readLaneEvidence();
-    let since = evidence.failingSince;
-    if (since === null) {
-      since = now;
-      this.writeLaneEvidence({ ...evidence, failingSince: since });
-    }
-    if (this.compressionStall) return;
-    if (now - since < AutobiographicalStrategy.COMPRESSION_STALL_ALERT_MS) return;
-    const failureClass = compressionFailureClass(error);
-    this.compressionStall = { since, subject, failureClass, alertedAt: now };
+    const clock = this.readStallClock();
+    const idle = clock.activeAt === null || now - clock.activeAt >= AutobiographicalStrategy.COMPRESSION_STALL_ALERT_MS;
+    const continues = clock.failingSince !== null && !idle;
+    const next: CompressionStallClock = {
+      failingSince: continues ? clock.failingSince : now,
+      activeAt: now,
+      last: { subject, failureClass: compressionFailureClass(error), lane },
+      stall: continues ? clock.stall : null,
+    };
+    this.raiseCompressionStallIfDue(next, now);
+    this.writeStallClock(next);
+  }
+
+  /**
+   * A tick that finds the lane paused, or held by the caller's admission,
+   * with work pending: the lane is waiting, not idle. The clock's heartbeat
+   * moves (at most once a minute), and a stall that has run its hour during
+   * a long stated wait or hold alerts now rather than at the next failure.
+   */
+  private noteCompressionLaneWaiting(): void {
+    if (!this.store) return;
+    const clock = this.readStallClock();
+    if (clock.failingSince === null) return;
+    const now = Date.now();
+    const beat = clock.activeAt === null || now - clock.activeAt >= 60_000;
+    const next: CompressionStallClock = { ...clock, activeAt: beat ? now : clock.activeAt };
+    const raised = this.raiseCompressionStallIfDue(next, now);
+    if (beat || raised) this.writeStallClock(next);
+  }
+
+  /**
+   * Raise the stall on `clock` once its failures have gone on for
+   * COMPRESSION_STALL_ALERT_MS with nothing landing: a warning, a
+   * compression:lane-stalled event, and the record checkReadiness reports
+   * until a compression lands. True when it was raised now.
+   */
+  private raiseCompressionStallIfDue(clock: CompressionStallClock, now: number): boolean {
+    if (clock.stall || clock.failingSince === null || !clock.last) return false;
+    if (now - clock.failingSince < AutobiographicalStrategy.COMPRESSION_STALL_ALERT_MS) return false;
+    const { subject, failureClass, lane } = clock.last;
+    clock.stall = { since: clock.failingSince, subject, failureClass, alertedAt: now };
     console.warn(
-      `[autobiographical] compression stalled: nothing has landed since ${new Date(since).toISOString()}, ` +
-        `and ${subject} keeps failing (${failureClass}). A failure counts against its request only once other ` +
-        `compression has landed, so until something lands it backs off indefinitely and is never decided. If the ` +
-        `provider is answering, the request may be failing on its own: inspect it.`,
+      `[autobiographical] compression stalled: nothing has landed since ${new Date(clock.failingSince).toISOString()}, ` +
+        `and ${subject} keeps failing (latest: ${failureClass}). A failure counts against its request only once other ` +
+        `compression has landed on its route and model, so until something lands there it backs off indefinitely and ` +
+        `is never decided. If the provider is answering, the request may be failing on its own: inspect it.`,
     );
     logCompressionCall({
       event: 'compression:lane-stalled',
       operation: lane === 'l1' ? 'compress_l1' : 'merge',
-      metadata: { since: new Date(since).toISOString(), subject, failure_class: failureClass },
+      metadata: { since: new Date(clock.failingSince).toISOString(), subject, failure_class: failureClass },
     });
+    return true;
+  }
+
+  /**
+   * The split-stitch rung's wait for its call window, or null when the window
+   * (at most `limit` calls in any `windowMs`, for this instance) has room for
+   * `needed` more calls now. The wait runs until enough of the window's calls
+   * have aged out of it.
+   */
+  private splitWindowWait(needed: number, limit: number, windowMs: number): CompressionSplitWindowWait | null {
+    const now = Date.now();
+    this.splitCallTimes = this.splitCallTimes.filter((t) => now - t < windowMs).sort((a, b) => a - b);
+    const excess = this.splitCallTimes.length + needed - limit;
+    if (excess <= 0) return null;
+    const freeAt = this.splitCallTimes[Math.min(excess, this.splitCallTimes.length) - 1]! + windowMs;
+    return new CompressionSplitWindowWait(Math.max(0, freeAt - now), this.splitCallTimes.length, limit);
   }
 
   /** Normalized `compressionToolProseFallback`, or undefined when off/invalid. */
@@ -4867,6 +5123,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): void {
     this.requireBranchMutation('recordMergeRejection');
     if (this.mergeQueue[0] !== merge) return; // queue mutated mid-await; nothing to account
+    // An answer, or a run decided, ends the entry's run of failures.
+    delete merge.failureStreak;
     merge.attempts = (merge.attempts ?? 0) + 1;
     if (rejection.stopReason !== undefined) merge.lastStopReason = rejection.stopReason;
     merge.lastOutcome = rejection.outcome;
@@ -5220,12 +5478,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const parts: string[] = [];
       if (this.compressionQueue.length > 0) parts.push(`${this.compressionQueue.length} chunks`);
       if (needsMerge) parts.push(`${this.mergeQueue.length} merges`);
-      const pause = this.compressionPause && Date.now() < pauseUntil(this.compressionPause) ? this.compressionPause : null;
+      // The pause binds the membrane instance and model of the call that
+      // failed. Readiness has no context to name the membrane, so a pause
+      // bound to another instance shows until the next tick drops it; one
+      // bound to another model doesn't show.
+      const pause = this.compressionPause &&
+        this.compressionPause.model === this.config.compressionModel &&
+        Date.now() < pauseUntil(this.compressionPause)
+        ? this.compressionPause
+        : null;
       const paused = pause
         ? `; compression paused ${pauseUntilText(pause)} ` +
           `(${pauseSourceText(pause)}, failure ${pause.failures})`
         : '';
-      const stall = this.compressionStall;
+      const stall = this.readStallClock().stall;
       const stalled = stall
         ? `; compression stalled since ${new Date(stall.since).toISOString()}: ${stall.subject} keeps failing (${stall.failureClass})`
         : '';
@@ -5362,7 +5628,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // A transient provider failure paused the lane: no compression call and
     // no queue item consumed until the pause ends (see pauseCompressionLane).
-    if (this.activeCompressionPause(ctx)) return;
+    // Work waiting on it keeps the stall clock running.
+    if (this.activeCompressionPause(ctx)) {
+      if (this.compressionQueue.length > 0 || (this.config.hierarchical && this.mergeQueue.length > 0)) {
+        this.noteCompressionLaneWaiting();
+      }
+      return;
+    }
 
     // Priority 1: Compress raw chunks → L1. Skipped while at the speculative
     // cap (maxSpeculativeL1s) so we don't pile up more unmerged L1s; the merge
@@ -5392,6 +5664,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return chunk !== undefined && this.chunkKey(chunk) === key;
       });
       if (queueIndex < 0) continue;
+      // A chunk whose split-stitch rung waits for its call window stays
+      // queued and lets the work behind it run.
+      const notBefore = this.compressionNotBefore.get(key);
+      if (notBefore !== undefined) {
+        if (Date.now() < notBefore) continue;
+        this.compressionNotBefore.delete(key);
+      }
+      // A chunk that failed gives its turn to a merge that hasn't failed since.
+      const failedAt = this.compressionFailureOrder.get(key);
+      if (failedAt !== undefined && this.mergeTakesTurnBefore(failedAt, ctx.messageStore)) break;
       const [chunkIndex] = this.compressionQueue.splice(queueIndex, 1);
       const queueGeneration = this.compressionQueueGeneration;
       this._drainProgress++; // consumed a queue item (real work or stale-cleanup)
@@ -5421,27 +5703,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // A failure that did not decide the chunk (transient, a deferral by
         // the caller's provider admission, or an abort) leaves its work
         // pending. Put it back, so the lane finds it once the pause ends
-        // without waiting for a new message or a restart: at the back after a
-        // failure, so the chunks behind it run; at the head after a deferral
-        // or an abort. Only if no newer queue decision superseded the attempt:
-        // a rebuild during the call has already re-decided this chunk's
-        // eligibility (it queues the chunk again if it is still eligible, and
-        // withdrawing it stands), and a chunk compressed meanwhile is never
+        // without waiting for a new message or a restart: behind the work
+        // that hasn't failed after a failure, at the head after a deferral or
+        // an abort. A rebuild during the call has already re-decided the
+        // chunk's eligibility: it is put back only where that rebuild queued
+        // it, and a withdrawal stands. A chunk compressed meanwhile is never
         // put back.
         const kind = compressionFailureKind(error);
-        if (
-          this.isCompressionBranchCurrent(sourceBranch) &&
-          kind !== 'rejection' &&
-          this.compressionQueueGeneration === queueGeneration
-        ) {
-          this.requeuePendingChunk(key, kind === 'transient' && !isAdmissionDeferral(error) ? 'back' : 'head');
+        if (this.isCompressionBranchCurrent(sourceBranch) && kind !== 'rejection') {
+          if (error instanceof CompressionSplitWindowWait) {
+            this.compressionNotBefore.set(key, Date.now() + error.waitMs);
+          }
+          this.requeuePendingChunk(
+            key,
+            kind === 'transient' && !isNoCallDeferral(error) ? 'back' : 'head',
+            this.compressionQueueGeneration !== queueGeneration,
+          );
         }
+        // The chunk's split-stitch rung waits for its window: nothing failed,
+        // and the lane runs other work meanwhile.
+        if (error instanceof CompressionSplitWindowWait) return;
         throw error;
       } finally {
         // A branch switch may have installed different pending work.
         if (this.pendingCompression === compression) this.pendingCompression = null;
       }
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+      // Decided (landed, or exhausted, or skipped): no longer failing.
+      this.compressionFailureOrder.delete(key);
       // Attempts, including fresh refusals, still consume the tick. Existing
       // overrides that omit the optional notification keep that behavior.
       if (!quarantineSkipped) return;
@@ -5467,6 +5756,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Whether the merge wrote its parent (see executeMerge): a skipped
       // entry made no call and wrote nothing.
       let merged = false;
+      // executeMerge builds its request before its first await, so this is
+      // the model the call names.
+      const mergeModel = this.config.compressionModel;
+      const mergeMembrane = ctx.membrane;
       const merging = this.executeMerge(merge.level, merge.sourceIds, ctx).then((wrote) => {
         merged = wrote;
       });
@@ -5482,14 +5775,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (this.mergeQueue[0] === merge) {
           this.dequeueMerge();
         }
-        // Only a written merge is an answer, and a landing. A skip (a stale
-        // entry, a missing source, a crossed merge refused) says nothing about
-        // the provider: counting it would let an outage advance the lane's
-        // evidence, and resuming would reset its backoff.
+        this.mergeFailureOrder.delete(mergeFailureKey(merge));
+        // Only a written merge is a landing. A skip (a stale entry, a missing
+        // source, a crossed merge refused) made no call, so it is neither a
+        // landing nor an answer: counting it would let an outage advance a
+        // domain's evidence, and resuming would reset the lane's backoff.
         if (merged) {
           this.resumeCompressionLane();
           // The merge's summary is written and its entry dequeued: it has landed.
-          this.noteCompressionLanded();
+          this.noteCompressionLanded(mergeMembrane, mergeModel);
         }
       } catch (error) {
         // Terminal-disposition rejection: the LLM answered, but with a
@@ -5497,8 +5791,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // not a crash. Anything else (429, network, timeout) keeps the
         // pre-existing semantics: rethrow, entry stays queued, next tick
         // retries with no attempt accounting.
+        if (error instanceof MergeHoldDiscard) {
+          // The provider answered, but a hold placed on the span during the
+          // call keeps the answer out. Nothing failed: no pause, nothing
+          // counted. The entry stays queued (the next tick waits on the
+          // hold), and its run ends, since its request answered.
+          if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+          this.mergeFailureOrder.delete(mergeFailureKey(merge));
+          if (merge.failureStreak) {
+            delete merge.failureStreak;
+            this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+            this.store?.sync();
+          }
+          return;
+        }
         if (error instanceof MergeDispositionRejection) {
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+          this.mergeFailureOrder.delete(mergeFailureKey(merge));
           this.recordMergeRejection(merge, error);
           return;
         }
@@ -5519,12 +5828,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // Only a request-attributable rejection is evidence about this merge
         // request. A non-retryable failure that is not (spent quota,
         // credentials) pauses the lane like any transient one below.
-        if (
-          error instanceof Error &&
-          failureKind === 'rejection' &&
-          typeof membraneType.type === 'string'
-        ) {
+        if (failureKind === 'rejection' && typeof membraneType.type === 'string') {
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+          this.mergeFailureOrder.delete(mergeFailureKey(merge));
           this.recordMergeRejection(
             merge,
             new MergeDispositionRejection(
@@ -5555,15 +5861,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (failureKind === 'transient') {
           if (!isAdmissionDeferral(error) && this.isCompressionBranchCurrent(sourceBranch)) {
             const failureClass = compressionFailureClass(error);
+            const dispatched = (error !== null && typeof error === 'object' ? dispatchedCompressionModel.get(error) : undefined) ?? mergeModel;
             const streak = nextFailureStreak(
               merge.failureStreak,
               sha256Json({ level: merge.level, sourceIds: merge.sourceIds }),
               failureClass,
-              this.readLaneEvidence().landed,
+              compressionDomain(ctx.membrane, dispatched),
+              domainLanded(ctx.membrane, dispatched),
               Date.now(),
             );
             if (streak.failures >= AutobiographicalStrategy.COMPRESSION_PERSISTENT_FAILURES) {
-              delete merge.failureStreak;
+              this.mergeFailureOrder.delete(mergeFailureKey(merge));
               this.recordMergeRejection(
                 merge,
                 new MergeDispositionRejection(
@@ -5577,11 +5885,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               return;
             }
             merge.failureStreak = streak;
+            this.mergeFailureOrder.set(mergeFailureKey(merge), ++this.compressionFailureSequence);
             if (this.mergeQueue[0] === merge && this.mergeQueue.length > 1) {
               this.mergeQueue.shift();
               this.mergeQueue.push(merge);
             }
+            // Synced like the other run writers: the run's presence holds
+            // merges around its span after a crash (pendingRetrySpans).
             this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+            this.store?.sync();
           }
           this.pauseCompressionLane(
             sourceBranch, ctx, error, 'merge',
@@ -6495,6 +6807,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       chunk.compressed = true;
       chunk.summaryId = exactExisting.id;
       this.markChunkRecordCompressed(chunk.recordId, exactExisting.id);
+      // The span is covered: its ladder progress and quarantine debt are paid
+      // off, as at a mint (the paid-off sweep judges by the persisted mark,
+      // which a store without chunk persistence doesn't keep).
+      await this.clearQuarantineForCompressedChunk(chunk);
       return;
     }
 
@@ -6593,6 +6909,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         chunk.summaryId = stub.id;
         this.markChunkRecordCompressed(chunk.recordId, stub.id);
         this._compressionCount++;
+        // The span is covered, so its progress and quarantine debt are paid
+        // off. A stub made no call, so it is no landing (noteCompressionLanded).
+        await this.clearQuarantineForCompressedChunk(chunk);
         logCompressionCall({
           operation: 'compress_l1',
           system: null,
@@ -7212,7 +7531,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             attemptRequest,
             { formatter: this.nativeFormatter },
           );
-          if (this.isCompressionBranchCurrent(sourceBranch)) this.resumeCompressionLane();
+          // An answer ends the route's pause, on whatever branch.
+          this.resumeCompressionLane();
         } catch (error) {
           const known = error instanceof Error && error.name === 'CompressionKnownCarrierRejection';
           if (!known) {
@@ -7261,12 +7581,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             }
             throw retryError;
           }
-          if (this.isCompressionBranchCurrent(sourceBranch)) this.resumeCompressionLane();
+          this.resumeCompressionLane();
         }
-        // An answer ends the run of failures of the request that gave it,
+        // An answer ends the run of failures of the rung that gave it,
         // durably with the next progress write.
-        answeredRequests.add(sha256Json(acceptedRequest));
-        if (failureStreak?.requestHash === sha256Json(acceptedRequest)) failureStreak = undefined;
+        const answeredRun = chunkRunKey(quarantineRecord.chunkSourceHash, curveLabel, acceptedRequest !== attemptRequest);
+        answeredRuns.add(answeredRun);
+        if (failureStreak?.key === answeredRun) failureStreak = undefined;
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
           this.logCompressionBranchDiscard(sourceBranch, curveLabel, quarantineRecord);
           throw Object.assign(new Error('Compression result crossed a branch boundary'), {
@@ -7319,8 +7640,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       const progressOutcomes: CompressionRefusalOutcomeRecord[] = [...(progress?.outcomes ?? [])];
       let progressCanonicalInputTokens = progress?.canonicalProviderInputTokens;
-      let failureStreak = progress?.failureStreak;
-      const answeredRequests = new Set<string>();
+      // The chunk's run goes on across the families its changing frontier
+      // makes: a family with no progress yet takes the newest family's.
+      let failureStreak = progress ? progress.failureStreak : this.latestChunkRun(quarantineRecord.chunkSourceHash);
+      const answeredRuns = new Set<string>();
       // Whether this family's progress has been in the slot during this
       // ladder: found there when it began, or written by it since.
       let progressSeen = progress !== undefined;
@@ -7333,7 +7656,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // await between them.
         if (progressSeen && !this.readCompressionFamilyProgress().has(quarantineRecord.familyKey)) return;
         this.recordCompressionFamilyProgress(
-          sourceBranch, quarantineRecord, progressOutcomes, progressCanonicalInputTokens, failureStreak, answeredRequests,
+          sourceBranch, quarantineRecord, progressOutcomes, progressCanonicalInputTokens, failureStreak, answeredRuns,
           chunk.messages.map((message) => message.id),
         );
         progressSeen = true;
@@ -7344,9 +7667,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (knownOutcomes.has(key)) return;
         knownOutcomes.set(key, outcome);
         progressOutcomes.push(outcome);
-        // An answer ends that request's run of failures.
-        answeredRequests.add(outcome.requestHash);
-        if (failureStreak?.requestHash === outcome.requestHash) failureStreak = undefined;
+        // An answer ends that rung's run of failures.
+        for (const stripped of [false, true]) {
+          const answered = chunkRunKey(quarantineRecord.chunkSourceHash, outcome.curveLabel, stripped);
+          answeredRuns.add(answered);
+          if (failureStreak?.key === answered) failureStreak = undefined;
+        }
         persistProgress();
       };
       /**
@@ -7366,11 +7692,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         requestHash: string,
         streakHash: string = requestHash,
       ): CompressionRefusalOutcomeRecord => {
-        if (!isAdmissionDeferral(error)) {
+        if (!isNoCallDeferral(error)) {
           // Counted against the request actually dispatched (the stripped one
-          // after a carrier rejection); the outcome at the bound is the rung's.
+          // after a carrier rejection is its own run); the outcome at the
+          // bound is the rung's.
           const failureClass = compressionFailureClass(error);
-          const streak = nextFailureStreak(failureStreak, streakHash, failureClass, this.readLaneEvidence().landed, Date.now());
+          const dispatched = (error !== null && typeof error === 'object' ? dispatchedCompressionModel.get(error) : undefined) ?? model;
+          const streak = nextFailureStreak(
+            failureStreak, chunkRunKey(quarantineRecord.chunkSourceHash, curveLabel, streakHash !== requestHash), failureClass,
+            compressionDomain(ctx.membrane!, dispatched), domainLanded(ctx.membrane!, dispatched), Date.now(),
+          );
           if (streak.failures >= AutobiographicalStrategy.COMPRESSION_PERSISTENT_FAILURES) {
             failureStreak = undefined;
             return { curveLabel, requestHash, outcome: 'provider_error', errorType: `persistent-${failureClass}` };
@@ -7437,9 +7768,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let canonicalStopReason: string | undefined;
       /**
        * The canonical stage ended in a deterministic rejection (thrown and
-       * request-attributable, or a request at the server-error bound): the
-       * same request cannot succeed, so the ladder skips to the one permitted
-       * different request, source-only-final, and exhausts if that fails.
+       * request-attributable, or a request its failures decided, see
+       * COMPRESSION_PERSISTENT_FAILURES): the same request cannot succeed, so
+       * the ladder skips to the one permitted different request,
+       * source-only-final, and exhausts if that fails.
        */
       let canonicalRejection: CompressionRefusalOutcomeRecord | undefined;
       /**
@@ -7869,10 +8201,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // mechanism is not established and is not assumed here. The rung folds the chunk
         // in halves at message boundaries (a tool round — tool_use plus every following
         // tool_result message — is indivisible), source-only shape, same instruction and
-        // model, and commits ONE L1 over the chunk only if every piece settles. Any provider
-        // error aborts the rung (errors never recurse into smaller calls). Bounded by a
-        // per-chunk call cap and a sliding-window cap scoped to this strategy instance
-        // (it resets when the process restarts; it is not a durable quota).
+        // model, and commits ONE L1 over the chunk only if every piece settles. A
+        // deterministic rejection of a piece abandons the rung (errors never recurse into
+        // smaller calls); a transient failure interrupts it, and the whole rung runs again
+        // on a later tick, paying again for the pieces it had settled: it is one atomic
+        // retry unit. Bounded by a per-attempt call cap, whose trip is the rung's outcome,
+        // and a sliding-window cap scoped to this strategy instance (it resets when the
+        // process restarts; it is not a durable quota). The window is a local throttle,
+        // not an answer: a rung starts only when the window has room for a whole attempt,
+        // and otherwise its chunk waits (CompressionSplitWindowWait).
         const splitLeafHash = sha256Json(chunk.messages.map((message) => message.id));
         const knownSplit = knownOutcomes.get(`split-stitch\u0000${splitLeafHash}`);
         if (!fallbackResponse && !canonicalRejection && this.config.compressionSplitFallback === true && sourceOnlyFallbackRequest && knownSplit) {
@@ -7930,7 +8267,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const subset = chunk.messages.slice(a, b + 1);
             if (attempt) {
             if (calls >= MAX_SPLIT_CALLS) { abortReason = 'chunk-call-cap'; return false; }
-            if (this.splitCallTimes.length >= MAX_WINDOW_CALLS) { abortReason = 'window-call-cap'; return false; }
+            // This attempt alone has used the whole window: under these caps
+            // the rung can't finish, which is its outcome, like the per-attempt
+            // cap. Otherwise the window is shared with earlier calls (reached
+            // only when the per-attempt cap exceeds the window), and the rest
+            // of the attempt waits for it like a rung's start.
+            if (calls >= MAX_WINDOW_CALLS) { abortReason = 'window-call-cap'; return false; }
+            const windowWait = this.splitWindowWait(1, MAX_WINDOW_CALLS, WINDOW_MS);
+            if (windowWait) throw windowWait;
             const chars = subset.reduce((n, m) => n + textOf(m).length, 0);
             const target = Math.max(100, Math.round(targetTokens * chars / chunkChars));
             const sub = buildSub(subset, target);
@@ -7948,7 +8292,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               // abort) ends this attempt of it and propagates; only a
               // deterministic rejection of a piece abandons the rung.
               if (compressionFailureKind(error) !== 'rejection') throw error;
-              abortReason = `provider-error:${error instanceof Error ? error.name : typeof error}`;
+              abortReason = `provider-error:${compressionErrorType(error) ?? (error instanceof Error ? error.name : typeof error)}`;
               return false;
             }
             const assessment = this.assessFallbackCompressionResponse(res);
@@ -8002,15 +8346,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           };
           let complete = false;
           try {
+            // A rung starts only when its window has room for a whole attempt.
+            const windowWait = MAX_WINDOW_CALLS > 0
+              ? this.splitWindowWait(Math.min(MAX_SPLIT_CALLS, MAX_WINDOW_CALLS), MAX_WINDOW_CALLS, WINDOW_MS)
+              : null;
+            if (windowWait) throw windowWait;
             complete = await fold(0, chunk.messages.length - 1, false);
           } catch (error) {
             if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
             // The attempt's receipt stands either way.
             this.lastSplitAttempted = { ...attempted, complete: false };
             if (compressionFailureKind(error) === 'abort') throw error;
-            // Interrupted: progress is kept and the whole rung runs again on the
-            // next eligible tick (its existing per-attempt caps still apply). At
-            // the server-error bound it ends here as a provider error instead.
+            // Interrupted, or waiting for the window: the ladder's deterministic
+            // answers are kept (not this attempt's settled pieces), and the
+            // whole rung runs again on a later tick, its per-attempt caps
+            // applying again. When the failures decide the request
+            // (COMPRESSION_PERSISTENT_FAILURES), the rung ends here instead.
             const persistent = interrupt(error, 'split-stitch', leafHash);
             abortReason = `provider-error:${persistent.errorType ?? 'persistent'}`;
           }
@@ -8305,13 +8656,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.markChunkRecordCompressed(chunk.recordId, entry.id);
       this._compressionCount++;
       logSummaryId = entry.id;
+      // The L1 is pushed and its chunk record marked: it has landed, on the
+      // branch that compressed it (noted before the await below, which a
+      // branch switch may cross).
+      this.noteCompressionLanded(ctx.membrane, model);
       // Success pays off quarantine debt recorded against this chunk under
       // EARLIER request shapes (e.g. pre-carrier text-only requests) — the
       // klaxon must go quiet the moment the span is actually covered, or
       // stale records alarm forever and bury the real alarms.
       await this.clearQuarantineForCompressedChunk(chunk);
-      // The L1 is pushed and its chunk record marked: it has landed.
-      this.noteCompressionLanded();
       if (successfulTrace) successfulTrace.persisted = true;
       if (successfulTrace?.expandedParentId) {
         logCompressionCall({
@@ -8328,9 +8681,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.logCompressionBranchDiscard(sourceBranch, 'canonical_error', quarantineRecord);
         return;
       }
+      if (error instanceof CompressionSplitWindowWait) {
+        // Nothing failed: the chunk waits for the split rung's call window.
+        console.warn(`[autobiographical] ${error.message}; the chunk from ${chunk.messages[0]?.id ?? '?'} waits ${Math.ceil(error.waitMs / 1000)} s`);
+        logError = boundFailureLogText(error.message);
+        inFlightError = error;
+        throw error;
+      }
       console.error(`Failed to compress chunk (hierarchical): ${describeCompressionFailure(error)}`);
       // A failure that says nothing about the request pauses the lane; the
-      // chunk keeps its place and its family keeps its progress.
+      // chunk goes behind the work that hasn't failed, and its family keeps
+      // its progress.
       if (compressionFailureKind(error) === 'transient') {
         this.pauseCompressionLane(
           sourceBranch, ctx, error, 'l1',
@@ -8452,13 +8813,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       if (first <= last) spans.push([first, last]);
     };
+    // A family's run holds a span only while its chunk is still pending: an
+    // entry left by a chunk that a rebuild re-cut names no live chunk, and no
+    // retry will fill its span.
     let uncompressedByHash: Map<string, Chunk> | undefined;
     for (const entry of this.readCompressionFamilyProgress().values()) {
       if (!entry.failureStreak) continue;
-      if (entry.sourceIds) {
-        addSpan(entry.sourceIds);
-        continue;
-      }
       uncompressedByHash ??= new Map(
         this.chunks.filter((chunk) => !chunk.compressed).map((chunk) => [sha256Json(chunk.messages.map((message) => message.id)), chunk]),
       );
@@ -8674,9 +9034,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Resolves true when it wrote the merged parent. It resolves false, having
    * written nothing, when it skips the entry with no call (a source missing
    * or already parented, or a crossed merge refused) or its branch went stale
-   * during the call. tick drops a skipped entry from the queue, but only a
-   * written merge is an answer that resumes the lane and a landing that
-   * advances its evidence (noteCompressionLanded).
+   * during the call. tick drops a skipped entry from the queue. Any answer
+   * from the provider resumes the lane, a refusal included, but only a
+   * written merge is a landing (noteCompressionLanded). A hold placed on the
+   * span during the call keeps a valid answer out (MergeHoldDiscard).
    */
   protected async executeMerge(
     targetLevel: SummaryLevel,
@@ -9240,8 +9601,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
       // Any answer from the provider ends the lane's pause and its backoff,
-      // whatever the disposition gate below makes of it (a refusal included).
-      if (this.isCompressionBranchCurrent(sourceBranch)) this.resumeCompressionLane();
+      // whatever the disposition gate below makes of it (a refusal included),
+      // and on whatever branch: the pause is the route's, not the branch's.
+      this.resumeCompressionLane();
       // Request identity — persisted on the authored summary (provenance) and
       // stamped on every failure receipt, so any parent can be traced back to
       // the request that authored it: sha256 of the accepted request's JSON,
@@ -9342,10 +9704,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       };
       logNewSummaryId = newEntry.id;
 
-      // Hold placed mid-request: throw (not a disposition rejection) so the
-      // merge stays queued and retries after release.
+      // Hold placed mid-request: the answer is kept out, and the merge stays
+      // queued and runs after the release (see MergeHoldDiscard).
       if (this.mergeBlockedByHold(sourceIds, ctx.messageStore)) {
-        throw new Error(`merge ${newEntry.id} discarded: a compression hold was placed on its span mid-request`);
+        throw new MergeHoldDiscard(`merge ${newEntry.id} discarded: a compression hold was placed on its span mid-request`);
       }
 
       // Provenance the auditor can READ: store the accepted request under the
@@ -9369,7 +9731,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } catch (error) {
       // Disposition rejections already warned + receipted above — don't
       // double-log them as crashes; tick() consumes them for retry policy.
-      if (!(error instanceof MergeDispositionRejection)) {
+      if (error instanceof MergeHoldDiscard) {
+        console.warn(`[autobiographical] ${error.message}; the merge stays queued until the hold is released`);
+      } else if (!(error instanceof MergeDispositionRejection)) {
         console.error(`Failed to merge summaries into L${targetLevel}: ${describeCompressionFailure(error)}`);
       }
       logError = boundFailureLogText(error instanceof Error ? error.message : String(error));
@@ -12019,7 +12383,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // An audit-only open never mints records: its head window and chunk size
     // are not the resident's, and a record written here would be compressed
     // by the resident at its next boot.
-    if (this.config.auditOnly) return;
+    if (this.config.auditOnly) {
+      this.orderCompressionQueue();
+      return;
+    }
     const messagesToChunk = this.getCompressibleMessages(store)
       .filter(m => !consumed.has(m.id));
     const livePosition = new Map<string, number>();
@@ -12142,6 +12509,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return lastId !== undefined && this._demandedL1Chunks.has(lastId);
       });
     }
+    this.orderCompressionQueue();
   }
 
   /**

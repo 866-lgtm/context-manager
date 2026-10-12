@@ -247,7 +247,23 @@ describe('split-stitch L1 fallback', () => {
     assert.equal(subs.length, rejected + 1, 'nothing after it: no retry of raw-1, no later piece');
   });
 
-  it('per-window call cap aborts the rung and installs nothing', async () => {
+  it("the window cap is a local throttle: a rung that would contend with earlier calls waits for room, recording nothing and exhausting nothing, then runs whole (sheet I4)", async () => {
+    const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
+    const fx = await build(membrane, { split: true, placeholder: true, windowCap: 2, n: 2 });
+    const window = fx.strategy as unknown as { splitCallTimes: number[] };
+    window.splitCallTimes = [Date.now() - 1_000]; // another chunk's split call, a second ago
+    await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /split-stitch waits for its call window/);
+    const pieces = () => calls.filter((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 1);
+    assert.equal(pieces().length, 0, 'no piece is sent while the window lacks room for a whole attempt');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'not exhausted');
+    assert.equal(fx.strategy.entries().length, 0);
+    window.splitCallTimes = []; // the window ages out
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(pieces().length, 2, 'the rung runs whole');
+    assert.equal(fx.strategy.entries().length, 1, 'and installs its one L1');
+  });
+
+  it('an attempt that alone needs more calls than the window allows ends the rung: under these caps it cannot finish', async () => {
     const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
     const fx = await build(membrane, { split: true, placeholder: true, windowCap: 2 });
     await fx.strategy.run(fx.target, managerContext(fx.manager));
