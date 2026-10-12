@@ -913,8 +913,13 @@ describe('pending work stays discoverable after a transient failure or a deferra
 
 const HOUR = 60 * 60_000;
 const STALL_SLOT = 'default/autobio:compression-stall';
-interface StallClock { failingSince: number | null; activeAt: number | null; waitingUntil: number | null; last: { subject: string; failureClass: string } | null; stall: { since: number; subject: string } | null }
+interface StallClock { failingSince: number | null; activeAt: number | null; waits: Record<string, number>; last: { subject: string; failureClass: string } | null; stall: { since: number; subject: string } | null }
 const stallClock = (manager: ContextManager): StallClock | null => manager.getStore().getStateJson(STALL_SLOT) as StallClock | null;
+/** Every wait the clock records, moved to end at `until` (a white-box clock for time passing). */
+const waitsEndingAt = (manager: ContextManager, until: number): Record<string, number> =>
+  Object.fromEntries(Object.keys(stallClock(manager)?.waits ?? {}).map((route) => [route, until]));
+/** When the clock's longest recorded wait ends. */
+const longestWait = (manager: ContextManager): number => Math.max(...Object.values(stallClock(manager)?.waits ?? {}));
 /** Collect console.warn while `body` runs. */
 async function warningsOf(body: (warnings: string[]) => Promise<void>): Promise<void> {
   const warnings: string[] = [];
@@ -1120,7 +1125,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     // Failures began three hours ago, and the lane hasn't been seen failing or
     // waiting for two: the pause its last failure installed ended then too.
     fx.manager.getStore().setStateJson(STALL_SLOT, {
-      ...stallClock(fx.manager)!, failingSince: Date.now() - 3 * HOUR, activeAt: Date.now() - 2 * HOUR, waitingUntil: Date.now() - 2 * HOUR,
+      ...stallClock(fx.manager)!, failingSince: Date.now() - 3 * HOUR, activeAt: Date.now() - 2 * HOUR, waits: waitsEndingAt(fx.manager, Date.now() - 2 * HOUR),
     });
     fx.strategy.expirePause();
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
@@ -1778,6 +1783,54 @@ describe("a run's evidence belongs to the chunk's sources, and one family holds 
     fx.manager.close();
   });
 
+  it("a run ended elsewhere while a ladder ran isn't counted on: a sibling's decision gives no second one (Andrew-2310; cm138-r4 I2)", async () => {
+    let release: () => void = () => {};
+    let gate: Promise<void> = Promise.resolve();
+    const calls: NormalizedRequest[] = [];
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        calls.push(structuredClone(request));
+        await gate;
+        throw failure('server', { httpStatus: 503 });
+      },
+    };
+    const fx = await build(membrane);
+    for (let i = 0; i < 7; i++) {
+      fx.strategy.land(membrane);
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+    }
+    assert.deepEqual(runsOf(fx.manager), [7]);
+    fx.strategy.land(membrane);
+    gate = new Promise<void>((resolve) => { release = resolve; });
+    const before = calls.length;
+    const running = fx.strategy.run(fx.target(), managerContext(fx.manager));
+    while (calls.length === before) await new Promise((resolve) => setTimeout(resolve, 1));
+    // Meanwhile a sibling's decision strips the run from every family, which stays.
+    const slot = progressSlot(fx.manager) as Array<{ failureStreak?: unknown }>;
+    for (const entry of slot) delete entry.failureStreak;
+    fx.manager.getStore().setStateJson(PROGRESS_SLOT, slot);
+    release();
+    await assert.rejects(running, /zz server failure/);
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'no second decision');
+    assert.deepEqual(runsOf(fx.manager), [1], 'the count starts again');
+    fx.manager.close();
+  });
+
+  it("a stored run that isn't well formed is dropped, not counted on (cm138-r4 I22)", async () => {
+    const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
+    const fx = await build(mock.membrane);
+    fx.strategy.land(mock.membrane);
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+    const slot = progressSlot(fx.manager) as Array<{ failureStreak?: { failures: unknown } }>;
+    slot[0]!.failureStreak!.failures = '7';
+    fx.manager.getStore().setStateJson(PROGRESS_SLOT, slot);
+    fx.strategy.land(mock.membrane);
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, "a count of '7' doesn't decide it");
+    assert.deepEqual(runsOf(fx.manager), [1]);
+    fx.manager.close();
+  });
+
   it("a family with progress but no run takes the chunk's run, and the run is the one a family holds, never the newest family's by time (Andrew-2310's boundary 3, sheet I12)", async () => {
     const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
     const fx = await build(mock.membrane);
@@ -1822,6 +1875,13 @@ describe("an answer resumes only its own route's pause (Andrew-2310's boundary 4
     assert.ok(a.strategy.paused(), "B's answer says nothing about A: A's pause stands");
     a.manager.close();
 
+    const otherModel = await build(routeA.membrane);
+    otherModel.strategy.notePause(stated, managerContext(otherModel.manager));
+    otherModel.strategy.setCompressionModel('zz-other-model');
+    await otherModel.strategy.run(otherModel.target(), managerContext(otherModel.manager));
+    assert.ok(otherModel.strategy.paused(), 'an answer naming another model leaves the pause (cm138-r4 I15)');
+    otherModel.manager.close();
+
     const control = await build(routeA.membrane);
     control.strategy.notePause(stated, managerContext(control.manager));
     await control.strategy.run(control.target(), managerContext(control.manager));
@@ -1839,7 +1899,7 @@ describe("the stall clock's idle rule: failures, attempts and the waits they cau
     const fx = await queued(scripted([{ throw: failure('server', { httpStatus: 503 }) }]).membrane);
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
     // Two idle hours: the old pause has long ended.
-    clockAt(fx.manager, { failingSince: Date.now() - 3 * HOUR, activeAt: Date.now() - 2 * HOUR, waitingUntil: Date.now() - 2 * HOUR });
+    clockAt(fx.manager, { failingSince: Date.now() - 3 * HOUR, activeAt: Date.now() - 2 * HOUR, waits: waitsEndingAt(fx.manager, Date.now() - 2 * HOUR) });
     fx.strategy.expirePause();
     const deferral = Object.assign(new Error('Provider wait: held, no call was made'), { type: 'rate_limit', retryable: true, providerAdmission: 'deferred', retryAfterMs: 2 * HOUR });
     fx.strategy.notePause(deferral, managerContext(fx.manager));
@@ -1852,10 +1912,10 @@ describe("the stall clock's idle rule: failures, attempts and the waits they cau
   it('a stated wait is no idle time, even with no tick during it: the next failure continues the stretch and alerts (sheet I17)', async () => {
     const fx = await queued(scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 2 * HOUR }) }]).membrane);
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    assert.ok(stallClock(fx.manager)!.waitingUntil! - Date.now() > 2 * HOUR - 60_000, 'the clock knows the wait');
+    assert.ok(longestWait(fx.manager) - Date.now() > 2 * HOUR - 60_000, 'the clock knows the wait');
     // Two hours pass with no tick, and the wait ends a minute ago.
     const since = Date.now() - 2 * HOUR - 60_000;
-    clockAt(fx.manager, { failingSince: since, activeAt: since, waitingUntil: Date.now() - 60_000 });
+    clockAt(fx.manager, { failingSince: since, activeAt: since, waits: waitsEndingAt(fx.manager, Date.now() - 60_000) });
     fx.strategy.expirePause();
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
     const stall = fx.strategy.checkReadiness().compressionStall;
@@ -1871,7 +1931,49 @@ describe("the stall clock's idle rule: failures, attempts and the waits they cau
     const before = Date.now();
     fx.strategy.notePause(failure('rate_limit', { httpStatus: 429, retryAfterMs: 3 * HOUR }), managerContext(fx.manager));
     fx.strategy.notePause(failure('server', { httpStatus: 503 }), { ...managerContext(fx.manager), membrane: routeB.membrane });
-    assert.ok(stallClock(fx.manager)!.waitingUntil! >= before + 3 * HOUR, "route A's three hours still stand");
+    assert.ok(longestWait(fx.manager) >= before + 3 * HOUR, "route A's three hours still stand");
+    assert.equal(Object.keys(stallClock(fx.manager)!.waits).length, 2, 'each route keeps its own wait');
+    fx.manager.close();
+  });
+
+  it('an explicit hold is waiting while it binds, with no tick to see it: the next paused tick alerts (Andrew-2310; cm138-r4 I1)', async () => {
+    const fx = await queued(scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: Number.POSITIVE_INFINITY }) }]).membrane);
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
+    assert.equal(longestWait(fx.manager), 8.64e15, 'recorded with no end');
+    // 61 minutes held, and no tick saw it.
+    const since = Date.now() - 61 * 60_000;
+    clockAt(fx.manager, { failingSince: since, activeAt: since });
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(fx.strategy.checkReadiness().compressionStall?.since, new Date(since).toISOString(), 'stalled since the failure');
+    fx.manager.close();
+  });
+
+  it("a release shortens its route's wait to the backoff, and an answer ends it (Andrew-2310; cm138-r4 I7)", async () => {
+    const mock = scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 3 * HOUR }) }, REFUSAL]);
+    const fx = await queued(mock.membrane);
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
+    assert.ok(longestWait(fx.manager) > Date.now() + 2 * HOUR);
+    assert.equal(fx.strategy.releaseCompressionPause(), true);
+    assert.equal(longestWait(fx.manager), fx.strategy.pause()!.backoffUntil, 'only the backoff is left');
+    fx.strategy.expirePause();
+    await fx.strategy.tick(managerContext(fx.manager)); // a refusal: an answer, and no landing
+    assert.ok(stallClock(fx.manager)!.failingSince !== null, 'nothing landed');
+    assert.deepEqual(stallClock(fx.manager)!.waits, {}, "the answer ended its route's wait");
+    fx.manager.close();
+  });
+
+  it('a wait an earlier process recorded ended with it: the down time counts as idle', async () => {
+    const fx = await queued(scripted([{ throw: failure('server', { httpStatus: 503 }) }]).membrane);
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
+    // As if an earlier process recorded a long wait two hours ago and stopped then.
+    clockAt(fx.manager, {
+      failingSince: Date.now() - 3 * HOUR, activeAt: Date.now() - 2 * HOUR,
+      waits: { 'zz-earlier-process:1 same-model': Date.now() + HOUR },
+    });
+    fx.strategy.expirePause();
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
+    assert.ok(Date.now() - stallClock(fx.manager)!.failingSince! < 60_000, 'the stretch started again');
+    assert.equal(fx.strategy.checkReadiness().compressionStall, undefined);
     fx.manager.close();
   });
 
@@ -1886,7 +1988,7 @@ describe("the stall clock's idle rule: failures, attempts and the waits they cau
     await firstCallAfter(mock.calls, 1);
     // The attempt started two hours ago, three hours into the stretch.
     const since = Date.now() - 3 * HOUR;
-    clockAt(fx.manager, { failingSince: since, activeAt: Date.now() - 2 * HOUR, waitingUntil: Date.now() - 2 * HOUR });
+    clockAt(fx.manager, { failingSince: since, activeAt: Date.now() - 2 * HOUR, waits: waitsEndingAt(fx.manager, Date.now() - 2 * HOUR) });
     release();
     await assert.rejects(attempt);
     const stall = fx.strategy.checkReadiness().compressionStall;
@@ -1926,6 +2028,23 @@ describe("the stall clock's idle rule: failures, attempts and the waits they cau
   });
 });
 
+describe("a preview keeps the lane's failure orders and window waits (cm138-r4 I3)", () => {
+  it('the dry rebuild prunes them against its own cut, and the select puts them back', async () => {
+    const fx = await queued(scripted([OK('unused')]).membrane);
+    const lane = fx.strategy as unknown as {
+      compressionFailureOrder: Map<string, number>; compressionNotBefore: Map<string, number>; mergeFailureOrder: Map<string, number>;
+    };
+    lane.compressionFailureOrder.set('zz-a chunk the preview cuts otherwise', 1);
+    lane.compressionNotBefore.set('zz-a chunk the preview cuts otherwise', Date.now() + 60_000);
+    lane.mergeFailureOrder.set('zz-a queued merge', 2);
+    await fx.manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true });
+    assert.equal(lane.compressionFailureOrder.get('zz-a chunk the preview cuts otherwise'), 1);
+    assert.ok(lane.compressionNotBefore.has('zz-a chunk the preview cuts otherwise'));
+    assert.equal(lane.mergeFailureOrder.get('zz-a queued merge'), 2);
+    fx.manager.close();
+  });
+});
+
 describe("a dry select during a call leaves the call's chunk to be put back (sheet I3)", () => {
   it('a transient failure after a preview puts the chunk back in the queue', async () => {
     let release: () => void = () => {};
@@ -1958,12 +2077,17 @@ describe("a split-window wait skips its chunk for the wait and lets the tick go 
     const original = lane.compressChunkHierarchical.bind(fx.strategy);
     const attempted: number[] = [];
     let waitMs = 0;
+    let calledAt = 0;
+    let waitBounds: [number, number] = [0, 0];
     lane.compressChunkHierarchical = async (chunk, ctx, onSkip) => {
       attempted.push(chunk.index);
       if (attempted.length === 1) {
         // Its split rung meets a window whose one call was made a second ago.
-        lane.splitCallTimes = [Date.now() - 1_000];
+        calledAt = Date.now() - 1_000;
+        lane.splitCallTimes = [calledAt];
+        const t0 = Date.now();
         const wait = lane.splitWindowWait(1, 1, 60_000);
+        waitBounds = [calledAt + 60_000 - Date.now(), calledAt + 60_000 - t0];
         waitMs = wait.waitMs;
         throw wait;
       }
@@ -1972,11 +2096,39 @@ describe("a split-window wait skips its chunk for the wait and lets the tick go 
     const before = Date.now();
     await fx.strategy.tick(managerContext(fx.manager));
     assert.equal(attempted.length, 2, 'the chunk behind the waiting one ran in the same tick');
-    assert.ok(waitMs > 58_000 && waitMs <= 59_000, `the wait runs until the window's call ages out (${waitMs} ms)`);
+    assert.ok(waitMs >= waitBounds[0] && waitMs <= waitBounds[1], `the wait runs until the window's call ages out (${waitMs} ms)`);
     const [notBefore] = [...lane.compressionNotBefore.values()];
     assert.ok(notBefore! >= before + waitMs && notBefore! <= Date.now() + waitMs, 'the chunk is skipped for that wait');
     await fx.strategy.tick(managerContext(fx.manager));
     assert.ok(!attempted.slice(2).includes(attempted[0]!), 'and skipped again before it ends');
+    fx.manager.close();
+  });
+});
+
+describe('a window wait after a branch switch ends the scan (cm138-r4 I14)', () => {
+  it('no chunk behind it runs under the old branch', async () => {
+    const fx = await queued(scripted([OK('the next chunk')]).membrane);
+    assert.ok(fx.strategy.compressionQueueView().length >= 2, 'two chunks pending');
+    const store = fx.manager.getStore();
+    const fork = store.createBranchAt('zz-fork', fx.manager.currentBranch().name, store.currentSequence()).name;
+    const lane = fx.strategy as unknown as {
+      compressChunkHierarchical(chunk: Chunk, ctx: StrategyContext, onSkip?: () => void): Promise<void>;
+      splitCallTimes: number[];
+      splitWindowWait(needed: number, limit: number, windowMs: number): Error;
+    };
+    const original = lane.compressChunkHierarchical.bind(fx.strategy);
+    let attempts = 0;
+    lane.compressChunkHierarchical = async (chunk, ctx, onSkip) => {
+      attempts++;
+      if (attempts === 1) {
+        await fx.manager.switchBranch(fork);
+        lane.splitCallTimes = [Date.now() - 1_000];
+        throw lane.splitWindowWait(1, 1, 60_000);
+      }
+      return original(chunk, ctx, onSkip);
+    };
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(attempts, 1, 'the scan ended at the switch');
     fx.manager.close();
   });
 });

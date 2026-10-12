@@ -866,4 +866,50 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     assert.equal(failing()?.failureStreak?.failures, 2, 'the landing made the next failure count');
     await fx.manager.close();
   });
+
+  it('a merge written as the branch switches is still a landing in its domain (cm138-r4 I6)', async () => {
+    const membrane = {
+      complete: async (request: unknown) => {
+        if (JSON.stringify(request).includes('raw-4 substance')) throw network();
+        return answer;
+      },
+    } as never;
+    const fx = await fixture(membrane, {}, freshPath(), false);
+    const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
+    const l1 = (id: string, a: number, b: number): SummaryEntry => ({
+      id, level: 1, content: `authored ${id}`, tokens: 20, sourceLevel: 0,
+      sourceIds: [ids[a]!, ids[b]!], sourceRange: { first: ids[a]!, last: ids[b]! }, created: 1,
+    });
+    for (const [id, a, b] of [['L1-100', 0, 1], ['L1-101', 2, 3], ['L1-102', 4, 5], ['L1-103', 6, 7]] as const) fx.strategy.seed(l1(id, a, b));
+    fx.strategy.qMerge(2, ['L1-102', 'L1-103']); // fails
+    fx.strategy.qMerge(2, ['L1-100', 'L1-101']); // writes
+    const failing = () => lane(fx).mergeQueue.find((entry) => entry.sourceIds[0] === 'L1-102');
+    await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
+    assert.equal(failing()?.failureStreak?.failures, 1);
+    lane(fx).compressionPause!.backoffUntil = 0;
+    const store = fx.manager.getStore();
+    const main = fx.manager.currentBranch().name;
+    const fork = store.createBranchAt('zz-fork', main, store.currentSequence()).name;
+    const probe = fx.strategy as unknown as { executeMerge(level: number, sourceIds: string[], c: StrategyContext): Promise<boolean> };
+    const original = probe.executeMerge.bind(fx.strategy);
+    probe.executeMerge = async (level, sourceIds, c) => {
+      const wrote = await original(level, sourceIds, c);
+      // The branch switches after the merge is written, before the tick resumes.
+      await fx.manager.switchBranch(fork);
+      return wrote;
+    };
+    await fx.strategy.tick(ctx(fx.manager));
+    probe.executeMerge = original;
+    await fx.manager.switchBranch(main);
+    let counted: number | undefined;
+    for (let i = 0; i < 3 && counted === undefined; i++) {
+      try {
+        await fx.strategy.tick(ctx(fx.manager));
+      } catch {
+        counted = failing()?.failureStreak?.failures;
+      }
+    }
+    assert.equal(counted, 2, "the merge written as the branch switched made the next failure count");
+    await fx.manager.close();
+  });
 });

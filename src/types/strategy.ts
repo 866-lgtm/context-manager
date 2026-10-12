@@ -131,10 +131,11 @@ export interface ReadinessState {
    * never decided. In an outage that is the intent; if the provider is
    * answering, the subject may be failing on its own and needs inspecting.
    * Read from the branch's durable stall clock, shared by the strategies on
-   * its store and namespace: a restart keeps it, unless the process was down
-   * for an hour (idle time, after which the next failure starts the clock
-   * again), and a landing by any of those strategies, through any membrane or
-   * model, clears it.
+   * its store and namespace: a restart keeps it, and a landing by any of
+   * those strategies, through any membrane or model, clears it. After the
+   * process was down for an hour or more, which is idle time, the next
+   * attempt or paused tick ends the old stretch, and the next failure starts
+   * the clock again.
    */
   compressionStall?: { since: string; subject: string; failureClass: string };
 }

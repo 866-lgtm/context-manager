@@ -162,6 +162,14 @@ function compressionDomain(membrane: object, model: string | undefined): string 
   return `${token}\u0000${model ?? ''}`;
 }
 
+/**
+ * A route's key among the stall clock's waits: its comparison domain, which
+ * names this process, with a space for the NUL (the store's JSON refuses one).
+ */
+function stallWaitRoute(membrane: object, model: string | undefined): string {
+  return compressionDomain(membrane, model).replace('\u0000', ' ');
+}
+
 function domainLanded(membrane: object, model: string | undefined): number {
   return domainLandings.get(membrane)?.get(model ?? '') ?? 0;
 }
@@ -770,13 +778,16 @@ interface CompressionStallClock {
   /** When the lane was last seen failing, starting an attempt, or waiting on a pause with work pending. */
   activeAt: number | null;
   /**
-   * When the longest pause a failure of this stretch installed ends, if that
-   * is an instant: the lane is waiting until then, not idle, even with no
-   * tick to see it. Strategies sharing the namespace through other routes
-   * pause on their own, so a shorter pause after a longer one doesn't end
-   * the wait.
+   * The pauses failures of this stretch installed, by route
+   * (stallWaitRoute, which names this process), with when each
+   * ends: MAX_DATE_MS for an explicit hold, which has no end. While one
+   * binds, the lane is waiting, not idle, even with no tick to see it, and
+   * strategies sharing the namespace through other routes keep their own.
+   * A pause lifted early (an answer, a release, a change of route) leaves
+   * or shortens its entry, and one recorded by another process ended with
+   * that process.
    */
-  waitingUntil: number | null;
+  waits: Record<string, number>;
   /** The latest failure: what failed, its class, and its lane. */
   last: { subject: string; failureClass: string; lane: 'l1' | 'merge' } | null;
   /** The stall alert, once raised for this stretch. */
@@ -785,7 +796,7 @@ interface CompressionStallClock {
 
 /** A stall clock with no failure stretch: after a landing, or a stretch that ended idle. */
 const emptyStallClock = (): CompressionStallClock =>
-  ({ failingSince: null, activeAt: null, waitingUntil: null, last: null, stall: null });
+  ({ failingSince: null, activeAt: null, waits: {}, last: null, stall: null });
 
 /** When the lane may call again: the later of its two constraints. */
 const pauseUntil = (pause: CompressionLanePause): number => Math.max(pause.backoffUntil, pause.statedUntil ?? 0);
@@ -4159,7 +4170,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         typeof candidate.chunkSourceHash === 'string' &&
         Array.isArray(candidate.outcomes)
       ) {
-        progress.set(candidate.familyKey, candidate as CompressionFamilyProgress);
+        // A run that isn't well formed can't be counted on (a non-numeric
+        // count would decide its rung at once): the family keeps its
+        // answers, without the run.
+        const run = candidate.failureStreak as Partial<CompressionFailureStreak> | undefined;
+        const wellFormed = run === undefined || (
+          typeof run.key === 'string' && typeof run.failureClass === 'string' &&
+          Number.isSafeInteger(run.failures) && run.failures! >= 1 &&
+          Number.isFinite(run.atLanded) && Number.isFinite(run.firstFailedAt) &&
+          (run.domain === undefined || typeof run.domain === 'string')
+        );
+        if (wellFormed) {
+          progress.set(candidate.familyKey, candidate as CompressionFamilyProgress);
+        } else {
+          const { failureStreak: _malformed, ...rest } = candidate as CompressionFamilyProgress;
+          progress.set(candidate.familyKey, rest);
+        }
       }
     }
     return progress;
@@ -4290,6 +4316,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!pause) return null;
     if (pause.membrane !== ctx.membrane || pause.model !== this.config.compressionModel) {
       this.compressionPause = null;
+      this.noteCompressionWaitLifted(stallWaitRoute(pause.membrane as object, pause.model));
       return null;
     }
     return Date.now() < pauseUntil(pause) ? pause : null;
@@ -4314,6 +4341,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     pause.statedBy = null;
     // A hold that continues after the release is news: it warns again.
     delete pause.admissionDeadline;
+    this.noteCompressionWaitLifted(stallWaitRoute(pause.membrane as object, pause.model), pause.backoffUntil);
     // A release is the caller's word on the wait, not an answer from the
     // provider: the failure count stays, so a failure after it keeps doubling
     // the backoff from the genuine count (only an answer resets it).
@@ -4444,7 +4472,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       reason,
     };
     this.compressionPause = pause;
-    this.noteCompressionFailureForStall(lane, subject, error, pauseUntil(pause));
+    this.noteCompressionFailureForStall(lane, subject, error, stallWaitRoute(ctx.membrane as object, model), pauseUntil(pause));
     const sourceLabel = pauseSource(pause);
     console.warn(
       `[autobiographical] compression paused ${pauseUntilText(pause)} after a ${lane === 'l1' ? 'chunk' : 'merge'} failure ` +
@@ -4501,14 +4529,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const key of this.compressionNotBefore.keys()) if (!pending.has(key)) this.compressionNotBefore.delete(key);
     const queuedMerges = new Set(this.mergeQueue.map((merge) => mergeFailureKey(merge)));
     for (const key of this.mergeFailureOrder.keys()) if (!queuedMerges.has(key)) this.mergeFailureOrder.delete(key);
-    const failedAt = (index: number): number | undefined => {
+    // Each queued chunk's failure order, looked up once: a chunk's key joins
+    // its message ids, so the sort mustn't recompute it per comparison.
+    const failedAt = new Map<number, number>();
+    for (const index of this.compressionQueue) {
       const chunk = this.chunks[index];
-      return chunk ? this.compressionFailureOrder.get(this.chunkKey(chunk)) : undefined;
-    };
-    const fresh = this.compressionQueue.filter((index) => failedAt(index) === undefined);
+      const order = chunk ? this.compressionFailureOrder.get(this.chunkKey(chunk)) : undefined;
+      if (order !== undefined) failedAt.set(index, order);
+    }
+    const fresh = this.compressionQueue.filter((index) => !failedAt.has(index));
     const failed = this.compressionQueue
-      .filter((index) => failedAt(index) !== undefined)
-      .sort((a, b) => failedAt(a)! - failedAt(b)!);
+      .filter((index) => failedAt.has(index))
+      .sort((a, b) => failedAt.get(a)! - failedAt.get(b)!);
     this.compressionQueue = [...fresh, ...failed];
   }
 
@@ -4528,9 +4560,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * An answer from the provider ends its route's pause and backoff: the pause
-   * of the membrane instance and model the answered call went through, on
-   * whatever branch. Another route's answer says nothing about this one, so
+   * An answer to one of the lane's calls ends its route's pause and backoff:
+   * the pause of the membrane instance and model the answered call went
+   * through, on whatever branch. Another route's answer says nothing about this one, so
    * its pause stands.
    */
   private resumeCompressionLane(membrane: object, model: string | undefined): void {
@@ -4538,6 +4570,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!pause || pause.membrane !== membrane || pause.model !== model) return;
     console.warn(`[autobiographical] compression resumed after ${pause.failures} paused failure(s)`);
     this.compressionPause = null;
+    this.noteCompressionWaitLifted(stallWaitRoute(membrane, model));
   }
 
   /** The model a compression request names, as a pause records it (see pauseCompressionLane). */
@@ -4555,7 +4588,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return {
       failingSince: time(stored?.failingSince),
       activeAt: time(stored?.activeAt),
-      waitingUntil: time(stored?.waitingUntil),
+      waits: Object.fromEntries(
+        Object.entries(stored?.waits && typeof stored.waits === 'object' ? stored.waits : {})
+          .filter((entry): entry is [string, number] => time(entry[1]) !== null),
+      ),
       last: last && typeof last.subject === 'string' && typeof last.failureClass === 'string' &&
           (last.lane === 'l1' || last.lane === 'merge')
         ? { subject: last.subject, failureClass: last.failureClass, lane: last.lane }
@@ -4604,13 +4640,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Whether the lane has been idle for COMPRESSION_STALL_ALERT_MS at `at`:
    * neither failing, nor starting an attempt, nor waiting on a pause with
-   * work pending, nor inside the longest pause a failure of the stretch
-   * installed (waitingUntil). The process being down counts as idle.
+   * work pending, nor inside a pause a failure of the stretch installed in
+   * this process that still binds (waits), an explicit hold included. A hold
+   * by the caller's admission is seen only through the ticks that find the
+   * lane paused. The process being down counts as idle.
    */
   private compressionStallIdle(clock: CompressionStallClock, at: number): boolean {
     if (clock.activeAt === null) return true;
-    const lastActive = Math.max(clock.activeAt, clock.waitingUntil ?? Number.NEGATIVE_INFINITY);
+    let lastActive = clock.activeAt;
+    const thisProcess = `${COMPRESSION_DOMAIN_PROCESS}:`;
+    for (const [route, until] of Object.entries(clock.waits)) {
+      if (route.startsWith(thisProcess) && until > lastActive) lastActive = until;
+    }
     return at - lastActive >= AutobiographicalStrategy.COMPRESSION_STALL_ALERT_MS;
+  }
+
+  /**
+   * A route's pause was lifted early: an answer ended it (`until` absent),
+   * or a release left only its backoff (`until`, its new end). The wait the
+   * stall clock records for that route ends with it.
+   */
+  private noteCompressionWaitLifted(route: string, until?: number): void {
+    if (!this.store) return;
+    const clock = this.readStallClock();
+    const recorded = clock.waits[route];
+    if (recorded === undefined || (until !== undefined && until >= recorded)) return;
+    if (until === undefined) delete clock.waits[route];
+    else clock.waits[route] = until;
+    this.writeStallClock(clock);
   }
 
   /**
@@ -4655,19 +4712,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * is counted no further than its first failure and backs off
    * indefinitely; this is how an operator hears of it.
    */
-  private noteCompressionFailureForStall(lane: 'l1' | 'merge', subject: string, error: unknown, pausedUntil: number): void {
+  private noteCompressionFailureForStall(
+    lane: 'l1' | 'merge', subject: string, error: unknown, route: string, pausedUntil: number,
+  ): void {
     if (!this.store) return;
     const now = Date.now();
     const clock = this.readStallClock();
     const continues = clock.failingSince !== null;
-    const paused = Number.isFinite(pausedUntil) ? pausedUntil : null;
-    const waitingUntil = continues && clock.waitingUntil !== null && (paused === null || clock.waitingUntil > paused)
-      ? clock.waitingUntil
-      : paused;
+    const waits = continues ? { ...clock.waits } : {};
+    waits[route] = Number.isFinite(pausedUntil) ? pausedUntil : MAX_DATE_MS;
     const next: CompressionStallClock = {
       failingSince: continues ? clock.failingSince : now,
       activeAt: now,
-      waitingUntil,
+      waits,
       last: { subject, failureClass: compressionFailureClass(error), lane },
       stall: continues ? clock.stall : null,
     };
@@ -5842,8 +5899,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           );
         }
         // The chunk's split-stitch rung waits for its window: nothing failed
-        // and no call was made, so the scan goes on to the work behind it.
-        if (error instanceof CompressionSplitWindowWait) continue;
+        // and no call was made, so the scan goes on to the work behind it,
+        // unless the branch switched meanwhile.
+        if (error instanceof CompressionSplitWindowWait) {
+          if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+          continue;
+        }
         throw error;
       } finally {
         // A branch switch may have installed different pending work.
@@ -6101,6 +6162,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       chunks: this.chunks,
       compressionQueue: this.compressionQueue,
       compressionQueueGeneration: this.compressionQueueGeneration,
+      // The dry rebuild orders its queue (orderCompressionQueue), which drops
+      // the orders and waits of chunks its own cut doesn't have.
+      compressionFailureOrder: new Map(this.compressionFailureOrder),
+      compressionNotBefore: new Map(this.compressionNotBefore),
+      mergeFailureOrder: new Map(this.mergeFailureOrder),
       chunkRecordsOrphaned: this.chunkRecordsOrphaned,
       orphanWarned: this._orphanWarned,
       prevCacheKeys: this._prevCacheKeys,
@@ -6129,6 +6195,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.chunks = saved.chunks;
       this.compressionQueue = saved.compressionQueue;
       this.compressionQueueGeneration = saved.compressionQueueGeneration;
+      this.compressionFailureOrder = saved.compressionFailureOrder;
+      this.compressionNotBefore = saved.compressionNotBefore;
+      this.mergeFailureOrder = saved.mergeFailureOrder;
       this.chunkRecordsOrphaned = saved.chunkRecordsOrphaned;
       this._orphanWarned = saved.orphanWarned;
       this._prevCacheKeys = saved.prevCacheKeys;
@@ -7781,32 +7850,37 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The chunk's run goes on across the families its changing frontier
       // makes: a family holding no run takes the chunk's, wherever it is,
       // whether or not the family has answers of its own.
-      let carried = progress?.failureStreak
+      const carried = progress?.failureStreak
         ? undefined
         : this.chunkRun(quarantineRecord.chunkSourceHash, quarantineRecord.familyKey);
       let failureStreak = progress?.failureStreak ?? carried?.run;
+      // The run as this ladder found it, its family's or carried; one it
+      // counts itself is its own.
+      const foundRun = failureStreak;
       const answeredRuns = new Set<string>();
       // Whether this family's progress has been in the slot during this
       // ladder: found there when it began, or written by it since.
       let progressSeen = progress !== undefined;
-      // Whether this ladder has written its family's progress, and with it
-      // any run it carried, which the write moves here.
-      let progressWritten = false;
       /**
-       * A run carried from another family whose progress was dropped while
-       * this ladder ran (the chunk minted or swept, or that family exhausted)
-       * ended with it, so this ladder's first write doesn't bring it back:
-       * its count starts again, as the write-back guard below keeps for this
-       * family's own progress. Synchronous with the write that follows.
+       * The run this ladder found, its family's or carried from another,
+       * stands only while some family of the chunk still holds a run with its
+       * key. One no family holds ended while this ladder ran: its family was
+       * dropped (the chunk minted or swept, or that family exhausted), or an
+       * answer or a decision elsewhere stripped it. Its count then starts
+       * again, and no write of this ladder brings it back. A run another
+       * family took on stays, and the write keeps the longer. Synchronous
+       * with the count or write that follows.
        */
-      const forgetDroppedCarry = (): void => {
-        if (!carried || progressWritten) return;
-        if (this.readCompressionFamilyProgress().has(carried.familyKey)) return;
-        if (failureStreak === carried.run) failureStreak = undefined;
-        carried = undefined;
+      const forgetEndedRun = (): void => {
+        if (!failureStreak || failureStreak !== foundRun) return;
+        const key = failureStreak.key;
+        for (const entry of this.readCompressionFamilyProgress().values()) {
+          if (entry.chunkSourceHash === quarantineRecord.chunkSourceHash && entry.failureStreak?.key === key) return;
+        }
+        failureStreak = undefined;
       };
       const persistProgress = (): void => {
-        forgetDroppedCarry();
+        forgetEndedRun();
         // A family whose progress was in the slot during this ladder, and is
         // gone from it now, was dropped meanwhile (minted, exhausted, cleared
         // or swept, here or by another strategy on this store): this ladder's
@@ -7819,7 +7893,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           chunk.messages.map((message) => message.id), runSubject,
         );
         progressSeen = true;
-        progressWritten = true;
       };
       /** Keep one deterministic answer; durable before the next rung's call. */
       const noteOutcome = (outcome: CompressionRefusalOutcomeRecord): void => {
@@ -7845,8 +7918,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
        * the rest each after other compression landed on the same route and
        * model, the rung is failing on its own, and that becomes its
        * deterministic outcome. A no-call deferral (the caller's provider
-       * admission, or the split rung's window) is no failure and changes
-       * nothing.
+       * admission, or the split rung's window) is no failure and counts
+       * nothing; the family's progress is still written, as at any
+       * interruption.
        */
       const interrupt = (
         error: unknown,
@@ -7855,7 +7929,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         streakHash: string = requestHash,
       ): CompressionRefusalOutcomeRecord => {
         if (!isNoCallDeferral(error)) {
-          forgetDroppedCarry();
+          forgetEndedRun();
           // Counted against the request actually dispatched (the stripped one
           // after a carrier rejection is its own run); the outcome at the
           // bound is the rung's.
@@ -8372,7 +8446,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // and a sliding-window cap scoped to this strategy instance (it resets when the
         // process restarts; it is not a durable quota). The window is a local throttle,
         // not an answer: a rung starts only when the window has room for a whole attempt,
-        // and otherwise its chunk waits (CompressionSplitWindowWait).
+        // and otherwise its chunk waits (CompressionSplitWindowWait). An attempt that alone
+        // needs more calls than the window allows can never finish under these caps, so it
+        // ends the rung, like the per-attempt cap.
         const splitLeafHash = sha256Json(chunk.messages.map((message) => message.id));
         const knownSplit = knownOutcomes.get(`split-stitch\u0000${splitLeafHash}`);
         if (!fallbackResponse && !canonicalRejection && this.config.compressionSplitFallback === true && sourceOnlyFallbackRequest && knownSplit) {
@@ -8526,8 +8602,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           try {
             // A rung starts only when its window has room for a whole attempt.
             // A window of 0 never has room: rather than wait for ever, the
-            // rung starts, and its first call ends it as a cap trip, the
-            // outcome of an attempt the caps can never let finish.
+            // rung starts, and its first piece ends it as a cap trip before
+            // its call, the outcome of an attempt the caps can never let
+            // finish.
             const windowWait = MAX_WINDOW_CALLS > 0
               ? this.splitWindowWait(Math.min(MAX_SPLIT_CALLS, MAX_WINDOW_CALLS), MAX_WINDOW_CALLS, WINDOW_MS)
               : null;
@@ -8594,7 +8671,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               curveLabel: 'split-stitch', recallIds: [], recallLevels: [], leafCoverageHash: leafHash,
               requestHash: compositeHash, messageCount: chunk.messages.length, estimatedTokens: 0, latencyMs: 0, persisted: false, outcome: 'success', stopReason: 'end_turn',
             };
-            console.error(`[autobiographical] split-stitch fold stitched for chunk ${chunk.index}: ${parts.length} part(s), ${placeholders.length} placeholder(s), ${calls} call(s); its L1 is written next`);
+            console.error(`[autobiographical] split-stitch fold stitched for chunk ${chunk.index}: ${parts.length} part(s), ${placeholders.length} placeholder(s), ${calls} call(s)`);
             logCompressionCall({ event: 'compression:split-stitch', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, composite_hash: compositeHash, content_hash: contentHash, parts: partsMeta, placeholders, calls, attempted } });
           } else {
             const reason = abortReason ?? 'refused';

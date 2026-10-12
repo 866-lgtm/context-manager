@@ -251,10 +251,14 @@ describe('split-stitch L1 fallback', () => {
     const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
     const fx = await build(membrane, { split: true, placeholder: true, windowCap: 2, n: 2 });
     const window = fx.strategy as unknown as { splitCallTimes: number[] };
-    window.splitCallTimes = [Date.now() - 1_000]; // another chunk's split call, a second ago
+    const calledAt = Date.now() - 1_000;
+    window.splitCallTimes = [calledAt]; // another chunk's split call, a second ago
+    const before = Date.now();
     const wait = await fx.strategy.run(fx.target, managerContext(fx.manager)).then(() => null, (error: unknown) => error as Error & { waitMs?: number });
+    const after = Date.now();
     assert.match(wait?.message ?? '', /split-stitch waits for its call window/);
-    assert.ok(wait!.waitMs! > 598_000 && wait!.waitMs! <= 599_000, `until that call ages out of the 10-minute window (${wait!.waitMs} ms)`);
+    assert.ok(wait!.waitMs! >= calledAt + 600_000 - after && wait!.waitMs! <= calledAt + 600_000 - before,
+      `until that call ages out of the 10-minute window (${wait!.waitMs} ms)`);
     const pieces = () => calls.filter((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 1);
     assert.equal(pieces().length, 0, 'no piece is sent while the window lacks room for a whole attempt');
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'not exhausted');
@@ -293,6 +297,16 @@ describe('split-stitch L1 fallback', () => {
     const projection = (fx.strategy as unknown as { readCompressionQuarantineProjection(): Map<string, { outcomes: Array<{ curveLabel: string; outcome: string; errorType?: string }> }> }).readCompressionQuarantineProjection();
     const split = [...projection.values()][0]?.outcomes.find((outcome) => outcome.curveLabel === 'split-stitch');
     assert.deepEqual([split?.outcome, split?.errorType], ['provider_error', 'provider-error:malformed_response']);
+  });
+
+  it('a window of 0 ends the rung before any piece is sent, as a cap trip (cm138-r4 I8)', async () => {
+    const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
+    const fx = await build(membrane, { split: true, windowCap: 0, n: 2 });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(calls.filter((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 1).length, 0, 'no piece is sent');
+    const projection = (fx.strategy as unknown as { readCompressionQuarantineProjection(): Map<string, { outcomes: Array<{ curveLabel: string; outcome: string; errorType?: string }> }> }).readCompressionQuarantineProjection();
+    const split = [...projection.values()][0]?.outcomes.find((outcome) => outcome.curveLabel === 'split-stitch');
+    assert.deepEqual([split?.outcome, split?.errorType], ['refusal', 'window-call-cap']);
   });
 
   it('an attempt that alone needs more calls than the window allows ends the rung: under these caps it cannot finish', async () => {
