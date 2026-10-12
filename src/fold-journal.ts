@@ -324,7 +324,7 @@ function parseRecord<T>(record: ReturnType<JsStore['getRecord']>): T | null {
   }
 }
 
-/** A record's size as stored: its JSON, in UTF-8 bytes. */
+/** A record's size as counted for the snapshot rule: its whole record as JavaScript's JSON, in UTF-8 bytes. */
 function recordBytes(record: AcceptedLayoutRecord): number {
   return Buffer.byteLength(JSON.stringify(record), 'utf8');
 }
@@ -951,11 +951,12 @@ export class FoldJournal {
    * delta on the branch's previous record, or a snapshot once the delta
    * records written since the last snapshot, this one included, would
    * outweigh that snapshot's record. Sizes are whole records as JSON,
-   * receipts included, so the bound holds on what is stored. The records
-   * after a snapshot never outweigh it, and every snapshot but the newest is
-   * outweighed by the records after it plus the one that tipped the next:
-   * snapshots in all cost about as much again as the deltas between them,
-   * and rebuilding a layout reads at most two snapshots' worth. No count of
+   * receipts included (recordBytes). The records after a snapshot never
+   * outweigh it, and every snapshot but the newest is outweighed by the
+   * records after it plus the one that tipped the next: snapshots are
+   * amortized against the deltas between them, so the bytes per acceptance
+   * stay bounded on average while the deltas do, and rebuilding a layout
+   * reads at most two snapshots' worth. No count of
    * deltas forces a snapshot, so a chain of small deltas behind a large
    * snapshot stays a chain. A failed append may or may not have landed, so
    * the branch's cached latest layout is dropped and the index is listed
