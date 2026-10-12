@@ -191,13 +191,21 @@ export class KvUnifiedStrategy implements FoldingSolver {
         cacheFloor = Math.min(cacheFloor, conservative.cacheFloor);
         continuityFloor = Math.min(continuityFloor, conservative.continuityFloor);
       }
+      // The frame is fixed for this pass, so each pool is scanned once.
+      const scored = new Map<object, number>();
       const best = (result: Extract<ParetoPolicySolveResult, { feasible: true }>): number => {
-        if (result.bestScoreUnder) return result.bestScoreUnder(cacheFloor, continuityFloor);
-        let score = Infinity;
-        for (const c of result.candidates) {
-          score = Math.min(score, policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss,
-            cacheFloor, continuityFloor, policy, multiplier));
+        let score = scored.get(result);
+        if (score !== undefined) return score;
+        if (result.bestScoreUnder) {
+          score = result.bestScoreUnder(cacheFloor, continuityFloor);
+        } else {
+          score = Infinity;
+          for (const c of result.candidates) {
+            score = Math.min(score, policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss,
+              cacheFloor, continuityFloor, policy, multiplier));
+          }
         }
+        scored.set(result, score);
         return score;
       };
       const baseBest = best(base);
