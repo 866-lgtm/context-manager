@@ -9,10 +9,141 @@ import type {
   MessageStoreView,
   MessageQuery,
   MessageQueryResult,
+  TimeRangeQueryOptions,
+  ChannelQueryOptions,
+  TimeAndChannelQueryOptions,
+  IndexedMessageQueryResult,
+  ChannelCount,
+  ChannelTokenStats,
+  ChannelTokenStatsOptions,
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
+import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from './body-runs.js';
 
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
+
+/**
+ * JSON-pointer field paths registered as native chronicle secondary indexes
+ * on the message slot (see MessageStore.registerHistoryIndexes). Shared
+ * constants so registration and every query call agree on the exact path.
+ *
+ * TWO channel-id schemas are indexed, not one (2026-09, downstream
+ * agent-framework review): this codebase's own `MessageQuery.metadata` docs
+ * and the original single-schema design of this feature both assumed
+ * `metadata.external.channelId` — but agent-framework's REAL MCPL
+ * channel-ingestion path (`handleMcplChannelIncoming`,
+ * `agent-framework/src/framework.ts`) writes `metadata.channelId` directly,
+ * with no `external` nesting at all. Neither schema can be treated as
+ * legacy/dead: Mythos/Sol-scale stores already carry months of history
+ * under whichever shape was actually in effect at ingestion time, and the
+ * entire point of this feature is searching THAT real history — not just
+ * whatever gets written going forward. So both fields are registered as
+ * independent string-kind indexes, and every channel-query method below
+ * consults and merges both (see queryChannelOrdinals, getChannelCounts,
+ * extractChannelId).
+ */
+const TIMESTAMP_FIELD = '/timestamp';
+/** Real agent-framework ingestion shape — see the block comment above. */
+const CHANNEL_FIELD_TOP = '/metadata/channelId';
+/** Older/parallel convention this codebase's MessageQuery type already
+ *  documents — kept alongside CHANNEL_FIELD_TOP since something else in
+ *  this ecosystem may still rely on it, and covering it costs little. */
+const CHANNEL_FIELD_EXTERNAL = '/metadata/external/channelId';
+
+/**
+ * Thrown by the query-by-time/channel methods when the underlying chronicle
+ * build predates the field-index capability (registerHistoryIndexes will
+ * have silently skipped registration at construction in that case — see its
+ * doc for why that's a silent skip rather than a throw). Unlike the
+ * point-lookup/slice feature-detects elsewhere in this file, there is no
+ * slow-scan fallback to degrade to here: a best-effort O(n)
+ * re-implementation would defeat the entire point of this API (callers
+ * reach for it specifically to avoid materializing/scanning the whole
+ * store), so callers need to know up front they can't rely on it.
+ */
+const HISTORY_INDEX_UNSUPPORTED_MSG = 'Chronicle history index unsupported — update @animalabs/chronicle';
+
+/**
+ * Thrown when a native index query returns `null` twice in a row — once on
+ * the original call, once again after a self-heal re-registration retry
+ * (see queryIndexOrHeal). Distinct from HISTORY_INDEX_UNSUPPORTED_MSG:
+ * that one means this chronicle build doesn't have the capability at all
+ * (checked once, up front, by each call site's own typeof guard); this one
+ * means the capability exists and the index WAS registered (at
+ * construction, via registerHistoryIndexes) but chronicle is reporting it
+ * as currently unqueryable — e.g. a cross-branch write on the same
+ * `stateId` poisoned it (chronicle drops an index rather than mix two
+ * branches' ordinals — see registerStateFieldIndex's doc in
+ * node_modules/@animalabs/chronicle/index.d.ts), or a parse failure. A
+ * single re-register-and-retry is chronicle's documented recovery path
+ * (registerStateFieldIndex is idempotent/cheap-when-fresh and does a full
+ * rebuild when needed); still-null after that means something is actually
+ * wrong and callers need to know they can't rely on the fast path right
+ * now, rather than silently getting an empty/degraded result.
+ */
+const HISTORY_INDEX_UNAVAILABLE_MSG = 'Chronicle history index unavailable (registered but not queryable — see logs)';
+
+/**
+ * Local mirrors of chronicle's JsIndexRangeQuery/JsIndexEqQuery (index.d.ts)
+ * — a plain inline object type can't be self-referenced via `typeof` inside
+ * a capability-checked method signature (TS2502), so these are named
+ * separately instead of importing the chronicle types directly (this
+ * package's chronicle dependency range doesn't guarantee they exist on
+ * every install — see HISTORY_INDEX_UNSUPPORTED_MSG).
+ */
+interface NativeIndexRangeOpts {
+  gte?: number;
+  lte?: number;
+  limit?: number;
+  offset?: number;
+  reverse?: boolean;
+}
+interface NativeIndexEqOpts {
+  limit?: number;
+  offset?: number;
+}
+
+/**
+ * Cross-instance write versions, keyed by the shared JsStore object and
+ * state id. Multiple MessageStore instances can share one JsStore (same
+ * process only — the store LOCK forbids cross-process sharing), and the
+ * cheap `getAllInternal` revalidation (item count + tail identity) cannot
+ * see an EDIT of an earlier item made through a sibling instance: count
+ * and tail are unchanged, so the first instance would serve stale content
+ * (2026-07-25 review finding on the mythos-wedge ingest fix). Every
+ * mutator bumps the shared version; the cache stores the version it was
+ * built at and revalidates against it — O(1), and the quadratic-ingest fix
+ * stays intact. WeakMap so stores never leak.
+ */
+const sharedWriteVersions = new WeakMap<object, Map<string, number>>();
+
+function bumpWriteVersion(store: object, stateId: string): number {
+  let m = sharedWriteVersions.get(store);
+  if (!m) {
+    m = new Map();
+    sharedWriteVersions.set(store, m);
+  }
+  const next = (m.get(stateId) ?? 0) + 1;
+  m.set(stateId, next);
+  if (typeof process !== 'undefined' && process.env?.CM_CACHE_DIAG) {
+    const site = (new Error().stack ?? '').split('\n')[2]?.trim();
+    console.error(`[cm-cache] writeVersion bump ${stateId} → ${next} at ${site}`);
+  }
+  return next;
+}
+
+function currentWriteVersion(store: object, stateId: string): number {
+  return sharedWriteVersions.get(store)?.get(stateId) ?? 0;
+}
+
+/** CM_CACHE_DIAG=1: log every materialization-cache miss with its REASON and
+ *  cost, every invalidating mutation, and every write-through fallback. The
+ *  full rebuild is ~20s of CPU on a large store on production hardware —
+ *  a silent cache miss IS the latency incident (mythos, 2026-07-26). */
+const CACHE_DIAG = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
+function cacheDiag(msg: string): void {
+  if (CACHE_DIAG) console.error(`[cm-cache] ${msg}`);
+}
 
 /**
  * Event emitted when the message store changes.
@@ -93,6 +224,42 @@ export class MessageStore {
     this.blobManager = new BlobManager(store);
     this.tokenEstimator = options.estimator ?? defaultTokenEstimator;
     this.rebuildIndex();
+    this.registerHistoryIndexes();
+  }
+
+  /**
+   * Register the native chronicle secondary indexes that back
+   * queryByTime/queryByChannel/queryByTimeAndChannel/getChannelCounts/
+   * getChannelTokenStats: `/timestamp` (numeric), plus TWO channel-id
+   * indexes — `/metadata/channelId` and `/metadata/external/channelId`
+   * (both string) — on this store's message slot. See the dual-schema
+   * block comment on CHANNEL_FIELD_TOP/CHANNEL_FIELD_EXTERNAL above for
+   * why there are two.
+   *
+   * Best-effort: `registerStateFieldIndex` is a NEW chronicle capability
+   * (2026-09) that may not exist on an older `@animalabs/chronicle` install
+   * — e.g. a resident whose native module hasn't been rebuilt/updated yet.
+   * Feature-detected exactly like getStateItemJson/getStateSlice elsewhere
+   * in this file: skip silently rather than throw, since registration is
+   * purely a setup step. The query methods above throw a clear, specific
+   * error if called against a store that never got indexes registered
+   * (HISTORY_INDEX_UNSUPPORTED_MSG) — callers need to know they can't rely
+   * on the fast path rather than have it silently degrade into a full scan
+   * that would defeat the reason for calling it.
+   *
+   * Safe to call unconditionally on every construction (including every
+   * sibling MessageStore sharing this JsStore): registration is idempotent
+   * and cheap once the persisted index is fresh — chronicle checks the
+   * slot's item count before doing any rebuild work.
+   */
+  private registerHistoryIndexes(): void {
+    const s = this.store as {
+      registerStateFieldIndex?: (stateId: string, field: string, kind: string) => void;
+    };
+    if (typeof s.registerStateFieldIndex !== 'function') return;
+    s.registerStateFieldIndex(this.stateId, TIMESTAMP_FIELD, 'number');
+    s.registerStateFieldIndex(this.stateId, CHANNEL_FIELD_TOP, 'string');
+    s.registerStateFieldIndex(this.stateId, CHANNEL_FIELD_EXTERNAL, 'string');
   }
 
   /**
@@ -103,13 +270,31 @@ export class MessageStore {
    * @param namespace Optional namespace for multi-agent support
    */
   static register(store: JsStore, namespace?: string): void {
-    const stateId = namespace ? `${namespace}/messages` : DEFAULT_MESSAGE_STATE_ID;
-    store.registerState({
-      id: stateId,
+    // fullSnapshotEvery counts DELTA snapshots, so a full snapshot fires
+    // every deltaSnapshotEvery x fullSnapshotEvery appends — and for an
+    // AppendLog it copies the ENTIRE history into the log. At the old
+    // 50x10=500 cadence, a long-lived store spends most of its disk on
+    // these copies (2026-08-01 Mythos: 5 full snapshots = 57% of the last
+    // GB, 114 MB each). 50x100=5000 keeps reconstruction bounded while
+    // cutting that dominant growth term 10x.
+    //
+    // NOTE: registrations persist in the store; changing these numbers
+    // does nothing for existing stores by itself. ContextManager.open
+    // catches the StateExists error and applies the same values via
+    // updateStateStrategy (using registrationFor below).
+    store.registerState(MessageStore.registrationFor(namespace));
+  }
+
+  /** Registration constants, shared with the update-on-existing-store path. */
+  static registrationFor(namespace?: string): {
+    id: string; strategy: 'append_log'; deltaSnapshotEvery: number; fullSnapshotEvery: number;
+  } {
+    return {
+      id: namespace ? `${namespace}/messages` : DEFAULT_MESSAGE_STATE_ID,
       strategy: 'append_log',
       deltaSnapshotEvery: 50,
-      fullSnapshotEvery: 10,
-    });
+      fullSnapshotEvery: 100,
+    };
   }
 
   /**
@@ -126,7 +311,45 @@ export class MessageStore {
     }
   }
 
+
+  private indexWriteVersion = -1;
+  private indexBranchId = '';
+
+  /**
+   * Id→index lookup that survives both sibling-instance writes and Chronicle
+   * branch switches. Same-instance mutators maintain the index themselves and
+   * stamp indexWriteVersion at their bump; a version the stamp hasn't seen
+   * means a SIBLING MessageStore on this JsStore wrote. Branches can expose
+   * different append-log shapes without changing that process-local version,
+   * so native branch ID is an independent freshness key. Names can be reused
+   * after deletion, including through direct Chronicle calls with no observed
+   * intermediate switch (issue #92). Rebuild once, then
+   * resolve. O(1) on every same-instance, same-branch path (2026-07-25 review
+   * class: a stale index previously threw "Message not found" or, after
+   * shifts, would have mutated or branched from the wrong item).
+   */
+  private lookupIndex(messageId: MessageId): number | undefined {
+    if (
+      this.indexBranchId !== this.store.currentBranch().id ||
+      this.indexWriteVersion !== currentWriteVersion(this.store, this.stateId)
+    ) {
+      this.rebuildIndex();
+    }
+    return this.idToIndex.get(messageId);
+  }
+
+  /** Whether the materialized cache reflects every write to the slot so far, through any instance. */
+  private cacheIsCurrent(): boolean {
+    return (
+      this.allCache !== null &&
+      this.allCache.branchId === this.store.currentBranch().id &&
+      this.allCache.writeVersion === currentWriteVersion(this.store, this.stateId)
+    );
+  }
+
   private rebuildIndex(): void {
+    this.indexBranchId = this.store.currentBranch().id;
+    this.indexWriteVersion = currentWriteVersion(this.store, this.stateId);
     this.idToIndex.clear();
     const messages = this.getAllInternal();
     for (let i = 0; i < messages.length; i++) {
@@ -146,14 +369,14 @@ export class MessageStore {
    * continuously: on a 19.5k-message store, perf showed the agent pinning
    * a full core in serde_json between LLM calls.
    *
-   * Freshness token: chronicle is append-only, so EVERY mutation — this
-   * instance's, another MessageStore instance sharing the JsStore
-   * (multi-agent shared messages), any state's write — advances
-   * `currentSequence()`. Key the memo on (branch name, head sequence) and
-   * it can never serve stale data; unrelated-state writes merely cost one
-   * extra parse. (An instance-local version counter was tried first and
-   * broke multi-instance sharing — integration.test.ts Multi-Agent
-   * Namespacing.)
+   * Freshness tokens: (native branch ID, head sequence) — with a cheap same-slot
+   * revalidation for foreign-state writes — PLUS the process-wide
+   * per-(store, stateId) write version (sharedWriteVersions above), which
+   * makes edits/removals through SIBLING MessageStore instances visible:
+   * count+tail revalidation alone cannot see an in-place edit of an
+   * earlier item. (An instance-local counter was tried first and broke
+   * multi-instance sharing — integration.test.ts Multi-Agent Namespacing;
+   * the shared-map version is cross-instance by construction.)
    *
    * The cached array and its objects MUST be treated as immutable by all
    * callers. Strategy code copies before mutating (verified 2026-07-18:
@@ -161,9 +384,10 @@ export class MessageStore {
    * spreads; image cap/strip replace blocks rather than mutating).
    */
   private allCache: {
-    branch: string;
+    branchId: string;
     sequence: number;
     internals: StoredMessageInternal[];
+    writeVersion: number;
   } | null = null;
 
   /**
@@ -209,6 +433,20 @@ export class MessageStore {
     // writes one record. The reconstructed state sees a fully-populated
     // StoredMessageInternal, and `branchAt(messageId)` forks at this
     // message's own sequence — exactly the post-fork-visible point.
+    // Whether this instance's id index and materialized cache reflected
+    // every write to the slot BEFORE this append — including writes made
+    // through a sibling MessageStore on the same store. A local write may
+    // re-certify only state that was current going in; a stale index or
+    // cache stays stale and is rebuilt on the next lookup. Previously the
+    // append stamped both as current regardless: after a sibling removed
+    // an earlier message, a lookup by id here returned the wrong message
+    // under the right id (Astra's reproducer, 2026-10-07).
+    const branchId = this.store.currentBranch().id;
+    const indexWasCurrent =
+      this.indexBranchId === branchId &&
+      this.indexWriteVersion === currentWriteVersion(this.store, this.stateId);
+    const cacheWasCurrent = this.cacheIsCurrent();
+    const version = bumpWriteVersion(this.store, this.stateId);
     const record = this.store.appendToStateJsonWithIdentity(
       this.stateId,
       partialInternal,
@@ -228,7 +466,52 @@ export class MessageStore {
       ...(extra ?? {}),
     };
 
-    this.idToIndex.set(message.id, index);
+    // Write-through: keep the materialized cache hot across appends.
+    // Ingest-time rebuilds (rebuildChunks in the autobiographical strategy)
+    // call getAll() on every new message; without write-through each append
+    // invalidates the cache and forces a full state-slot re-materialization
+    // — quadratic ingest (2026-07-25 mythos "wedge": ~10s/message at 13.5k
+    // messages, event loop starved for hours by ambient traffic + backfill).
+    //
+    // The cached entry MUST be the chronicle round-trip (serde) form, not a
+    // hand-built object: serde reorders keys and drops undefined fields, and
+    // downstream request hashing stringifies message content — a shape that
+    // differs between a warm cache and a fresh rebuild breaks hash-keyed
+    // dedup (compression in-flight registry, quarantine keys). Fetch the
+    // just-written record back through the point lookup; on chronicle
+    // versions without it, fall back to plain invalidation (old behavior).
+    const canPointLookup =
+      typeof (this.store as { getStateItemJson?: unknown }).getStateItemJson === 'function';
+    const canonical = canPointLookup ? this.getInternal(index) : null;
+    if (
+      canonical &&
+      cacheWasCurrent &&
+      this.allCache &&
+      this.allCache.branchId === this.store.currentBranch().id &&
+      this.allCache.internals.length === index
+    ) {
+      this.allCache.internals.push(canonical);
+      this.allCache.sequence = this.store.currentSequence();
+      // Stamp the post-append write version: this instance made the write,
+      // and the cache now reflects it. Without this, the next getAllInternal
+      // sees a version mismatch and full-rebuilds on EVERY append — the
+      // quadratic ingest this write-through exists to prevent.
+      this.allCache.writeVersion = currentWriteVersion(this.store, this.stateId);
+    } else {
+      if (this.allCache) {
+        cacheDiag(
+          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : !cacheWasCurrent ? 'cache was stale before the append' : this.allCache.branchId !== this.store.currentBranch().id ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
+        );
+      }
+      this.allCache = null;
+    }
+
+    if (indexWasCurrent) {
+      // This instance made the write and its index reflects it.
+      this.idToIndex.set(message.id, index);
+      this.indexWriteVersion = version;
+    }
+    // Else: left stale on purpose; lookupIndex rebuilds it from the slot.
     this.emit({ type: 'add', message });
     return message;
   }
@@ -242,7 +525,7 @@ export class MessageStore {
    * message, remove the whole bodyGroup and re-append.
    */
   edit(messageId: MessageId, newContent: ContentBlock[]): void {
-    const index = this.idToIndex.get(messageId);
+    const index = this.lookupIndex(messageId);
     if (index === undefined) {
       throw new Error(`Message not found: ${messageId}`);
     }
@@ -268,7 +551,33 @@ export class MessageStore {
       content: storedContent,
     };
 
+    const cacheWasCurrent = this.cacheIsCurrent();
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
+
+    // Write-through the materialized cache (see append — the cached entry
+    // must be the chronicle round-trip form, so re-fetch it canonically).
+    const canonicalEdit =
+      typeof (this.store as { getStateItemJson?: unknown }).getStateItemJson === 'function'
+        ? this.getInternal(index)
+        : null;
+    if (
+      canonicalEdit &&
+      this.allCache &&
+      this.allCache.branchId === this.store.currentBranch().id &&
+      this.allCache.internals[index]
+    ) {
+      this.allCache.internals[index] = canonicalEdit;
+      this.allCache.sequence = this.store.currentSequence();
+      // This instance made the write and the cache now reflects it: stamp
+      // the version, as append does, so the next read is a hit rather than
+      // a whole-slot reload — but only if the cache was current before the
+      // write, so a sibling's earlier edit still forces the rebuild it is
+      // owed.
+      if (cacheWasCurrent) this.allCache.writeVersion = this.indexWriteVersion;
+    } else {
+      this.allCache = null;
+    }
 
     this.emit({ type: 'edit', messageId, oldContent, newContent });
   }
@@ -282,7 +591,7 @@ export class MessageStore {
    * `removeBodyGroup(id)` for that case.
    */
   remove(messageId: MessageId): void {
-    const index = this.idToIndex.get(messageId);
+    const index = this.lookupIndex(messageId);
     if (index === undefined) {
       throw new Error(`Message not found: ${messageId}`);
     }
@@ -295,19 +604,36 @@ export class MessageStore {
       );
     }
 
+    const cacheWasCurrent = this.cacheIsCurrent();
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
+    // Write-through the materialized cache (see append); fall back to
+    // invalidation if the cache wasn't current.
+    if (
+      this.allCache &&
+      this.allCache.branchId === this.store.currentBranch().id &&
+      this.allCache.internals.length === this.length() + 1
+    ) {
+      this.allCache.internals.splice(index, 1);
+      this.allCache.sequence = this.store.currentSequence();
+      // See edit(): stamp our own write so it does not cost a full reload.
+      if (cacheWasCurrent) this.allCache.writeVersion = this.indexWriteVersion;
+    } else {
+      this.allCache = null;
+    }
     this.rebuildIndex();
 
     this.emit({ type: 'remove', messageId });
   }
 
   /**
-   * Remove every shard of the bodyGroup containing `messageId`. If the
-   * message is not part of a bodyGroup, falls back to single-message
-   * remove. Atomic from the caller's perspective.
+   * Remove every shard of the body containing `messageId`: one ingestion,
+   * so another copy of the same text, under the same group id, stays (see
+   * body-runs.ts). If the message is not part of a body, falls back to
+   * single-message remove. Atomic from the caller's perspective.
    */
   removeBodyGroup(messageId: MessageId): void {
-    const index = this.idToIndex.get(messageId);
+    const index = this.lookupIndex(messageId);
     if (index === undefined) {
       throw new Error(`Message not found: ${messageId}`);
     }
@@ -315,23 +641,23 @@ export class MessageStore {
     if (!target?.bodyGroupId) {
       // Not sharded — defer to normal remove path (re-look up via getInternal
       // since the normal `remove` checks bodyGroupId).
-      this.store.redactStateItems(this.stateId, index, index + 1);
+      this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    this.store.redactStateItems(this.stateId, index, index + 1);
+      this.allCache = null; // rare path: plain invalidation
       this.rebuildIndex();
       this.emit({ type: 'remove', messageId });
       return;
     }
-    // Find the contiguous run of shards with this bodyGroupId. Shards are
-    // stored consecutively (they're appended one after the other at
-    // ingestion), so we can scan outward from `index`.
-    const groupId = target.bodyGroupId;
+    // Find this body's shards: stored consecutively, one ingestion at a
+    // time. Another ingestion of the same text carries the same group id
+    // and is another body (see body-runs.ts), so the run stops there.
     const all = this.getAllInternal();
-    let from = index;
-    while (from > 0 && all[from - 1].bodyGroupId === groupId) from--;
-    let to = index;
-    while (to + 1 < all.length && all[to + 1].bodyGroupId === groupId) to++;
+    const { from, to } = bodyBoundsIn(all, index);
     const firstId = all[from].id;
     const lastId = all[to].id;
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, from, to + 1);
+    this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
     this.emit({ type: 'removeRange', fromId: firstId, toId: lastId });
   }
@@ -339,13 +665,15 @@ export class MessageStore {
   /**
    * Remove a range of messages from the store.
    *
-   * If the range starts or ends in the middle of a bodyGroup, throws —
-   * removeRange must align to bodyGroup boundaries. (Use `removeBodyGroup`
-   * to remove an entire group, then call `removeRange` over plain messages.)
+   * If the range starts or ends in the middle of a body, throws: removeRange
+   * must align to body boundaries. A boundary between two bodies of one
+   * group id (two copies of one text) is a body boundary. (Use
+   * `removeBodyGroup` to remove one whole body, then call `removeRange` over
+   * plain messages.)
    */
   removeRange(fromId: MessageId, toId: MessageId): void {
-    const fromIndex = this.idToIndex.get(fromId);
-    const toIndex = this.idToIndex.get(toId);
+    const fromIndex = this.lookupIndex(fromId);
+    const toIndex = this.lookupIndex(toId);
 
     if (fromIndex === undefined) {
       throw new Error(`Message not found: ${fromId}`);
@@ -354,22 +682,24 @@ export class MessageStore {
       throw new Error(`Message not found: ${toId}`);
     }
 
-    // Verify the range doesn't bisect a bodyGroup.
+    // Verify the range doesn't bisect a body: neither edge may sit between
+    // two shards of one body. The boundary between two ingestions of the
+    // same text (one group id) is not a bisection.
     const all = this.getAllInternal();
-    const startGroup = all[fromIndex].bodyGroupId;
-    const endGroup = all[toIndex].bodyGroupId;
-    if (startGroup && fromIndex > 0 && all[fromIndex - 1].bodyGroupId === startGroup) {
+    if (fromIndex > 0 && continuesBody(all[fromIndex - 1], all[fromIndex])) {
       throw new Error(
-        `removeRange would bisect bodyGroup ${startGroup} at start. Use removeBodyGroup(${fromId}) first.`,
+        `removeRange would bisect bodyGroup ${all[fromIndex].bodyGroupId} at start. Use removeBodyGroup(${fromId}) first.`,
       );
     }
-    if (endGroup && toIndex + 1 < all.length && all[toIndex + 1].bodyGroupId === endGroup) {
+    if (toIndex + 1 < all.length && continuesBody(all[toIndex], all[toIndex + 1])) {
       throw new Error(
-        `removeRange would bisect bodyGroup ${endGroup} at end. Use removeBodyGroup(${toId}) first.`,
+        `removeRange would bisect bodyGroup ${all[toIndex].bodyGroupId} at end. Use removeBodyGroup(${toId}) first.`,
       );
     }
 
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, fromIndex, toIndex + 1);
+    this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
 
     this.emit({ type: 'removeRange', fromId, toId });
@@ -379,7 +709,7 @@ export class MessageStore {
    * Get a message by ID.
    */
   get(messageId: MessageId): StoredMessage | null {
-    const index = this.idToIndex.get(messageId);
+    const index = this.lookupIndex(messageId);
     if (index === undefined) {
       return null;
     }
@@ -418,10 +748,42 @@ export class MessageStore {
    */
   getAll(): StoredMessage[] {
     const internals = this.getAllInternal();
-    return internals.map((internal, i) =>
+    // Reuse the mapped StoredMessage[] view when the store is unchanged. A
+    // compile calls getAll() ~10-14x with no writes in between; rebuilding the
+    // view (internalToStored + resolveBlobs + new Date() per message) each time
+    // dominated large moves:0 compiles (Sol, 2026-07-31). Key on the same
+    // freshness tokens as allCache: appends bump sequence, edits/redacts bump
+    // the shared writeVersion, branch switches change branch ID — any of which
+    // misses and rebuilds. The mapped array is immutable to callers, same as
+    // getAllInternal's contract.
+    const branchId = this.store.currentBranch().id;
+    const sequence = this.store.currentSequence();
+    const writeVersion = currentWriteVersion(this.store, this.stateId);
+    const c = this.allStoredCache;
+    if (
+      c &&
+      c.branchId === branchId &&
+      c.sequence === sequence &&
+      c.writeVersion === writeVersion &&
+      c.stored.length === internals.length
+    ) {
+      return c.stored;
+    }
+    const stored = internals.map((internal, i) =>
       this.internalToStored(internal, internal.id, i)
     );
+    this.allStoredCache = { branchId, sequence, writeVersion, stored };
+    return stored;
   }
+
+  /** Cached mapped view for getAll(), invalidated by the same freshness tokens
+   *  as allCache (see getAll). */
+  private allStoredCache: {
+    branchId: string;
+    sequence: number;
+    writeVersion: number;
+    stored: StoredMessage[];
+  } | null = null;
 
   /**
    * Get a window of messages by slot index — O(window), not O(all).
@@ -440,25 +802,13 @@ export class MessageStore {
     }
 
     if (opts.alignToBodyGroups) {
-      // Shards of a bodyGroup are contiguous by construction (removeRange
-      // refuses to bisect a group). Walk edges outward with O(item) point
-      // lookups until the group boundary.
-      const first = this.getInternal(start);
-      if (first?.bodyGroupId !== undefined) {
-        while (start > 0) {
-          const prev = this.getInternal(start - 1);
-          if (prev?.bodyGroupId !== first.bodyGroupId) break;
-          start--;
-        }
-      }
-      const last = this.getInternal(end - 1);
-      if (last?.bodyGroupId !== undefined) {
-        while (end < totalCount) {
-          const next = this.getInternal(end);
-          if (next?.bodyGroupId !== last.bodyGroupId) break;
-          end++;
-        }
-      }
+      // A body's shards are contiguous by construction (removeRange refuses
+      // to bisect one). Walk the edges outward with O(item) point lookups to
+      // the body boundary, which falls between two ingestions of the same
+      // text too (see body-runs.ts).
+      const at = (i: number) => this.getInternal(i);
+      start = bodyStart(at, start);
+      end = bodyEnd(totalCount, at, end - 1) + 1;
     }
 
     const internals = this.getSliceInternal(start, end - start);
@@ -536,6 +886,31 @@ export class MessageStore {
   static readonly HIDDEN_THINKING_TOKENS_DEFAULT = 600;
 
   /**
+   * Fallback price for a SIGNED thinking block that carries no stamped
+   * `tokenEstimate`: `signature.length / SIGNATURE_CHARS_PER_TOKEN`. On
+   * keep-all models (Opus >= 4.5, Sonnet >= 4.6, Fable/Mythos) every prior
+   * thinking block is replayed as input and billed at the full hidden chain
+   * of thought; the signature encodes that chain, so its length is the only
+   * client-side trace of the size. Measured 2026-09-21 on Opus 4.8 with
+   * `count_tokens` deltas (signed block in vs out of an assistant turn):
+   * 2.8-3.4 chars/token for blocks over ~3k tokens, up to ~5-9 for tiny
+   * blocks (fixed header dominates). The rate is NOT constant (+-25% at any
+   * size), so this is a floor-level estimate for unstamped history only —
+   * the exact price is the per-block `tokenEstimate` stamped at creation
+   * from the response's `usage.output_tokens` residual (agent-framework).
+   * The old flat 600 under-priced agentic history ~10x (a 128-block, ~790k-
+   * token replay estimated as 77k), which pinned the calibration multiplier
+   * at its ceiling and left the agent at the context ceiling with dead
+   * `max_tokens` turns.
+   */
+  static readonly SIGNATURE_CHARS_PER_TOKEN = 3.3;
+
+  /** Price of a signed thinking block from its signature length alone. */
+  static signedThinkingTokens(signature: string): number {
+    return Math.round(signature.length / MessageStore.SIGNATURE_CHARS_PER_TOKEN);
+  }
+
+  /**
    * Billed-token rate for encrypted reasoning carriers (`redacted_thinking`
    * blocks round-tripped to OpenAI Responses as `reasoning.encrypted_content`).
    * The ciphertext is base64 over an encrypted serialization of the CoT, so
@@ -549,26 +924,81 @@ export class MessageStore {
    */
   static readonly ENCRYPTED_CARRIER_CHARS_PER_TOKEN = 6;
 
+  /** Per-block cache of the raw (calibration-independent) estimate. */
+  private _rawBlockTokens = new WeakMap<ContentBlock, number>();
+
   private estimateBlockTokens(block: ContentBlock): number {
     return Math.round(this.estimateBlockTokensRaw(block) * this.tokenCalibration);
   }
 
+  /** Cached wrapper for the raw per-block estimate. Keyed on the block object:
+   *  blocks are immutable once stored (callers copy before mutating — see the
+   *  allCache immutability note), so the same block reused across a compile's
+   *  3-4 estimation passes is computed once; edits/redacts produce new block
+   *  objects, so the WeakMap auto-invalidates. Calibration is applied on top in
+   *  estimateBlockTokens, so cached raw values survive calibration changes.
+   *  Removes the repeated JSON.stringify(tool_use.input) / tool_result content
+   *  walks that dominated moves:0 compiles at scale (Sol, 2026-07-31). */
   private estimateBlockTokensRaw(block: ContentBlock): number {
+    const cached = this._rawBlockTokens.get(block);
+    if (cached !== undefined) return cached;
+    const raw = this.computeBlockTokensRaw(block);
+    this._rawBlockTokens.set(block, raw);
+    return raw;
+  }
+
+  /**
+   * Membrane's XML-history carriers (membrane#101): a `tool_attempt` is the
+   * model's own tool-call block that dispatched nothing, replayed verbatim; a
+   * `tool_notice` is the harness's notice about refused or warned invokes,
+   * replayed as one `<tool_call_notice>` element each, escaped as membrane's
+   * formatToolCallNotice escapes it. Both reach the provider
+   * as text, so both are priced as the markup they replay as — never 0. Read
+   * structurally, so this holds whatever membrane version typed the block.
+   * Any other unknown block stays at 0. Shared with ContextLog's estimator,
+   * which applies the same uncalibrated rule; the store's calibration still
+   * applies on top of its own estimate, as for every block.
+   */
+  static xmlHistoryCarrierTokens(block: unknown): number {
+    const carrier = block as { type?: unknown; rawXml?: unknown; notices?: unknown };
+    if (carrier.type === 'tool_attempt' && typeof carrier.rawXml === 'string') {
+      return jsonTokenEstimator(carrier.rawXml);
+    }
+    if (carrier.type === 'tool_notice' && Array.isArray(carrier.notices)) {
+      // As membrane's formatToolCallNotice writes it: `&`, `<` and `>` escaped
+      // in the message and the tool name, and `"` too in the tool attribute.
+      const escapeText = (text: string): string =>
+        text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const rendered = carrier.notices
+        .map((notice) => {
+          const { invoke, toolName, kind, message } = (notice ?? {}) as Record<string, unknown>;
+          const tool = escapeText(String(toolName)).replace(/"/g, '&quot;');
+          return `<tool_call_notice invoke="${String(invoke)}" tool="${tool}" kind="${String(kind)}">${escapeText(String(message))}</tool_call_notice>`;
+        })
+        .join('\n');
+      return jsonTokenEstimator(rendered);
+    }
+    return 0;
+  }
+
+  private computeBlockTokensRaw(block: ContentBlock): number {
     switch (block.type) {
       case 'text':
         return this.tokenEstimator(block.text);
       case 'thinking': {
-        // Stamped price wins; a signed-but-empty block is a HIDDEN full CoT
-        // (never "no thinking") — price it at the measured default.
+        // Stamped price wins. Otherwise a signed block is a FULL chain of
+        // thought whatever its visible text says (empty under
+        // display:"omitted", a short summary under "summarized", the full
+        // text on older models): price it by whichever of the text and the
+        // signature is larger — never by a flat constant.
         const stamped = (block as { tokenEstimate?: number }).tokenEstimate;
         if (typeof stamped === 'number') return stamped;
-        const hasSignature =
-          typeof (block as { signature?: string }).signature === 'string' &&
-          ((block as { signature?: string }).signature as string).length > 0;
-        if (hasSignature && (!block.thinking || block.thinking.length === 0)) {
-          return MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
+        const signature = (block as { signature?: string }).signature;
+        const textTokens = this.tokenEstimator(block.thinking ?? '');
+        if (typeof signature === 'string' && signature.length > 0) {
+          return Math.max(textTokens, MessageStore.signedThinkingTokens(signature));
         }
-        return this.tokenEstimator(block.thinking);
+        return textTokens;
       }
       case 'redacted_thinking': {
         // Encrypted reasoning carrier: billed in full when replayed. A per-
@@ -602,7 +1032,7 @@ export class MessageStore {
       case 'video':
         return 1000; // Default estimate for media
       default:
-        return 0;
+        return MessageStore.xmlHistoryCarrierTokens(block);
     }
   }
 
@@ -662,6 +1092,511 @@ export class MessageStore {
       limit: 1,
     });
     return result.messages[0] ?? null;
+  }
+
+  /**
+   * Re-register a single field index — the self-heal step `queryIndexOrHeal`
+   * takes on a `null` result, after `registerHistoryIndexes` already
+   * registered both indexes at construction. `registerStateFieldIndex` is
+   * documented idempotent/cheap when the persisted index is already fresh,
+   * and does a full rebuild when it isn't (e.g. after the cross-branch
+   * poisoning `queryStateIndexRange`'s doc describes) — so re-calling it
+   * with the exact same `(stateId, field, kind)` is chronicle's own
+   * prescribed recovery path, not a guess. No-ops defensively if the
+   * capability has vanished entirely, same as registerHistoryIndexes
+   * (shouldn't happen — queryIndexOrHeal is only reached after the caller's
+   * own typeof guard on the sibling query method already passed, and the
+   * two capabilities land together in one chronicle release).
+   */
+  private reregisterHistoryIndex(field: string, kind: 'number' | 'string'): void {
+    const s = this.store as {
+      registerStateFieldIndex?: (stateId: string, field: string, kind: string) => void;
+    };
+    if (typeof s.registerStateFieldIndex !== 'function') return;
+    s.registerStateFieldIndex(this.stateId, field, kind);
+  }
+
+  /**
+   * Run a native index query that can report `null` — "no such index
+   * currently registered" (unregistered, wrong kind, or poisoned by a
+   * cross-branch write / parse failure — see queryStateIndexRange's doc) —
+   * distinct from an empty array, which is a real "no matches" result and
+   * must pass through untouched.
+   *
+   * Since `registerHistoryIndexes` already registered this index at
+   * construction, a `null` here means something disturbed it since. Self-
+   * heal: re-register (reregisterHistoryIndex) and retry the query exactly
+   * once. If it's STILL `null`, the index is unusable right now — throw
+   * HISTORY_INDEX_UNAVAILABLE_MSG rather than let a `null` silently reach
+   * `.map()`/`.length` downstream (the bug this helper exists to prevent).
+   */
+  private queryIndexOrHeal<T>(query: () => T | null, field: string, kind: 'number' | 'string'): T {
+    const first = query();
+    if (first !== null) return first;
+    this.reregisterHistoryIndex(field, kind);
+    const second = query();
+    if (second !== null) return second;
+    throw new Error(HISTORY_INDEX_UNAVAILABLE_MSG);
+  }
+
+  /**
+   * Capability-checked wrapper over the native numeric-range query call
+   * against the `/timestamp` field index. Throws HISTORY_INDEX_UNSUPPORTED_MSG
+   * if this chronicle build never has the capability at all (see
+   * registerHistoryIndexes); throws HISTORY_INDEX_UNAVAILABLE_MSG if the
+   * capability exists but the specific index can't be queried right now
+   * even after a self-heal retry (see queryIndexOrHeal). Returns ordinals
+   * only — content is fetched separately via ordinalsToMessages.
+   */
+  private queryTimestampOrdinals(opts: NativeIndexRangeOpts): number[] {
+    const s = this.store as {
+      queryStateIndexRange?: (stateId: string, field: string, opts: NativeIndexRangeOpts) => number[] | null;
+    };
+    if (typeof s.queryStateIndexRange !== 'function') {
+      throw new Error(HISTORY_INDEX_UNSUPPORTED_MSG);
+    }
+    return this.queryIndexOrHeal(
+      () => s.queryStateIndexRange!(this.stateId, TIMESTAMP_FIELD, opts),
+      TIMESTAMP_FIELD,
+      'number',
+    );
+  }
+
+  /**
+   * Capability-checked wrapper over the native equality query call,
+   * MERGED across both channel-id field-index schemas this store
+   * maintains (see the dual-schema block comment on
+   * CHANNEL_FIELD_TOP/CHANNEL_FIELD_EXTERNAL) — a message written by real
+   * agent-framework ingestion (`metadata.channelId`) and one written under
+   * the older `metadata.external.channelId` convention must both be
+   * findable by the same `channelId` value. Same throw/ordinal-only
+   * contract as queryTimestampOrdinals (including the UNSUPPORTED vs
+   * UNAVAILABLE distinction and the self-heal retry, applied independently
+   * per field — a poisoned/unregistered CHANNEL_FIELD_TOP index doesn't
+   * imply anything about CHANNEL_FIELD_EXTERNAL's state or vice versa).
+   *
+   * Both native calls are always made UNBOUNDED (native `limit`/`offset`
+   * left unset) — this method has no `opts` param at all, unlike
+   * queryTimestampOrdinals, precisely because its callers (queryByChannel,
+   * queryByTimeAndChannel) always need the FULL merged set to paginate
+   * correctly and can't push pagination down into either individual native
+   * call. Results are unioned via a Set — a message could in principle
+   * carry both schemas at once (a real anomaly, not assumed impossible,
+   * just de-duped defensively rather than double-counted) — and sorted
+   * ascending. Pagination (if any) is the caller's job. This mirrors
+   * queryByTimeAndChannel's own reasoning: native-side pagination on
+   * either individual index can't correspond to the correct page of the
+   * MERGED result, so the merge has to happen on full ordinal sets before
+   * any slicing.
+   */
+  private queryChannelOrdinals(channelId: string): number[] {
+    const s = this.store as {
+      queryStateIndexEq?: (stateId: string, field: string, value: string, opts: NativeIndexEqOpts) => number[] | null;
+    };
+    if (typeof s.queryStateIndexEq !== 'function') {
+      throw new Error(HISTORY_INDEX_UNSUPPORTED_MSG);
+    }
+    const topOrdinals = this.queryIndexOrHeal(
+      () => s.queryStateIndexEq!(this.stateId, CHANNEL_FIELD_TOP, channelId, {}),
+      CHANNEL_FIELD_TOP,
+      'string',
+    );
+    const externalOrdinals = this.queryIndexOrHeal(
+      () => s.queryStateIndexEq!(this.stateId, CHANNEL_FIELD_EXTERNAL, channelId, {}),
+      CHANNEL_FIELD_EXTERNAL,
+      'string',
+    );
+    return Array.from(new Set([...topOrdinals, ...externalOrdinals])).sort((a, b) => a - b);
+  }
+
+  /**
+   * Fetch content for a set of slot ordinals (as returned by the native
+   * index queries above) via point lookups — never materializes the whole
+   * slot for this. Preserves the input order. An ordinal that no longer
+   * resolves (e.g. a redact raced this read) is skipped rather than
+   * thrown, matching this file's other defensive-read behavior.
+   */
+  private ordinalsToMessages(ordinals: number[]): StoredMessage[] {
+    const out: StoredMessage[] = [];
+    for (const ordinal of ordinals) {
+      const internal = this.getInternal(ordinal);
+      if (!internal) continue;
+      out.push(this.internalToStored(internal, internal.id, ordinal));
+    }
+    return out;
+  }
+
+  /**
+   * Query messages by timestamp range — O(log n + k) via the native
+   * `/timestamp` index, not a full scan. Both bounds are inclusive; either
+   * (or both) may be omitted for an open-ended range.
+   *
+   * `matchedCount` here is just the returned page's size (`limit`/`offset`
+   * are applied natively, inside chronicle, before the ordinals ever cross
+   * the NAPI boundary) — NOT a store-wide total match count. Getting a true
+   * total would require a second, unbounded native call; queryByTime
+   * intentionally avoids that extra cost since most callers page through
+   * results and don't need it. Contrast with queryByTimeAndChannel, which
+   * already has the full matched set in hand and reports a true total.
+   */
+  queryByTime(opts: TimeRangeQueryOptions): IndexedMessageQueryResult {
+    const ordinals = this.queryTimestampOrdinals({
+      gte: opts.fromMs,
+      lte: opts.toMs,
+      limit: opts.limit,
+      offset: opts.offset,
+      reverse: opts.reverse,
+    });
+    return { messages: this.ordinalsToMessages(ordinals), matchedCount: ordinals.length };
+  }
+
+  /**
+   * Query messages by exact channel id — O(1) hash lookup + O(k) against
+   * EACH of the two native channel-id indexes this store maintains, merged
+   * (see queryChannelOrdinals and the dual-schema block comment on
+   * CHANNEL_FIELD_TOP/CHANNEL_FIELD_EXTERNAL — a message ingested by real
+   * agent-framework code, under `metadata.channelId`, and one written
+   * under the older `metadata.external.channelId` convention are both
+   * findable by the same call). A message with no channelId under EITHER
+   * schema (system/autobio-injected messages, etc.) is never indexed for
+   * either field (see field_index.rs's `extract_indexed_value`: a
+   * missing/wrong-type field extracts to `None`, not the string
+   * `"undefined"`), so it can never match here.
+   *
+   * `matchedCount` is the TRUE total match count across both schemas, not
+   * just the returned page's size — unlike queryByTime, which still
+   * delegates limit/offset straight into a single native call.
+   * queryChannelOrdinals has to fetch both indexes' FULL, unbounded
+   * ordinal sets to merge them correctly before any pagination, so the
+   * true total is already in hand for free by the time `opts.limit`/
+   * `offset` get applied.
+   */
+  queryByChannel(channelId: string, opts: ChannelQueryOptions = {}): IndexedMessageQueryResult {
+    const ordinals = this.queryChannelOrdinals(channelId);
+    const start = Math.max(0, Math.min(opts.offset ?? 0, ordinals.length));
+    const end =
+      opts.limit !== undefined ? Math.min(start + Math.max(0, opts.limit), ordinals.length) : ordinals.length;
+    const page = ordinals.slice(start, end);
+    return { messages: this.ordinalsToMessages(page), matchedCount: ordinals.length };
+  }
+
+  /**
+   * Query messages matching BOTH a timestamp range and a channel. With only
+   * a channel given, delegates to queryByChannel above (true total
+   * `matchedCount`, per its own doc); with only a time range given,
+   * delegates to queryByTime (page-size-only `matchedCount`, since that one
+   * still uses a single native index with native-side pagination).
+   *
+   * With BOTH given, this can NOT just pass limit/offset into either native
+   * call and filter the resulting page by the other criterion — that
+   * paginates against the wrong universe. (Example: page 2 of "channel X in
+   * the last hour" needs page 2 of the INTERSECTION of the two filters; a
+   * channel-only page 2 filtered down to the last hour would both drop
+   * legitimate matches that landed outside that page's channel-only
+   * position and include none of the matches that landed on channel-only
+   * pages 3+.) The only correct approach is to fetch the FULL, uncapped
+   * ordinal set from both the time-range query and queryChannelOrdinals
+   * (which itself already merges both channel-id schemas, uncapped) —
+   * cheap, since these are plain integer arrays, not content — intersect
+   * them, and only THEN apply limit/offset to the intersection. This also
+   * means, unlike queryByTime, we already hold the true total match count
+   * before slicing, so `matchedCount` here is exact, not page-size-only —
+   * same as queryByChannel.
+   */
+  queryByTimeAndChannel(opts: TimeAndChannelQueryOptions): IndexedMessageQueryResult {
+    const hasTime = opts.fromMs !== undefined || opts.toMs !== undefined;
+    const hasChannel = opts.channelId !== undefined;
+
+    if (hasChannel && !hasTime) {
+      return this.queryByChannel(opts.channelId as string, { limit: opts.limit, offset: opts.offset });
+    }
+    if (hasTime && !hasChannel) {
+      return this.queryByTime({ fromMs: opts.fromMs, toMs: opts.toMs, limit: opts.limit, offset: opts.offset });
+    }
+    if (!hasTime && !hasChannel) {
+      // No filters at all: degenerate case, same shape as an unbounded
+      // queryByTime.
+      return this.queryByTime({ limit: opts.limit, offset: opts.offset });
+    }
+
+    const rangeOrdinals = this.queryTimestampOrdinals({ gte: opts.fromMs, lte: opts.toMs });
+    const channelOrdinalSet = new Set(this.queryChannelOrdinals(opts.channelId as string));
+    // Intersect, then re-sort ascending: rangeOrdinals comes back sorted by
+    // TIMESTAMP VALUE (not necessarily ordinal, if two messages ever share a
+    // timestamp or a timestamp were edited out of append order), so a plain
+    // filter() would inherit that value order instead of a stable,
+    // index-ascending page order. Sorting here keeps pagination
+    // deterministic and matches queryByTime/queryByChannel's default
+    // (non-reverse) ordinal-ascending order.
+    const intersected = rangeOrdinals.filter((o) => channelOrdinalSet.has(o)).sort((a, b) => a - b);
+
+    const start = Math.max(0, Math.min(opts.offset ?? 0, intersected.length));
+    const end =
+      opts.limit !== undefined
+        ? Math.min(start + Math.max(0, opts.limit), intersected.length)
+        : intersected.length;
+
+    return { messages: this.ordinalsToMessages(intersected.slice(start, end)), matchedCount: intersected.length };
+  }
+
+  /**
+   * Distinct channel ids and their message counts across BOTH channel-id
+   * schemas this store maintains (see the dual-schema block comment on
+   * CHANNEL_FIELD_TOP/CHANNEL_FIELD_EXTERNAL).
+   *
+   * Does NOT simply sum the two native value-count indexes' counts per
+   * channelId — a real, reachable ingestion path double-counts under that
+   * approach: agent-framework's `handleMcplChannelIncoming` PRESERVES any
+   * incoming `metadata.external` object it's handed while ALSO adding its
+   * own top-level `metadata.channelId`, so a message ingested from a
+   * source that already carried legacy `{external:{channelId}}` metadata
+   * ends up indexed under BOTH `CHANNEL_FIELD_TOP` and
+   * `CHANNEL_FIELD_EXTERNAL` for the SAME channelId — one real message,
+   * two index entries. Summing the two indexes' counts would report that
+   * message twice (2026-09 downstream review finding).
+   *
+   * Correct approach, reusing already-verified logic rather than inventing
+   * new merge math: `queryChannelOrdinals` already unions both indexes'
+   * ordinal sets via a `Set` for the exact same reason (queryByChannel
+   * already relies on this to avoid double-listing a dual-schema message)
+   * — so for each distinct channelId VALUE seen across either index's
+   * `getStateIndexValueCounts` (values only, not counts, from this first
+   * pass), re-query via `queryChannelOrdinals` and use the de-duplicated
+   * ordinal set's length as the true unique message count. This costs one
+   * extra native eq-query round-trip per distinct channel value instead of
+   * O(1) native value-count calls — acceptable since distinct channel
+   * counts are realistically small (tens, not millions) even at
+   * Mythos/Sol message-volume scale.
+   *
+   * Messages with no channelId under either schema are unindexed for both
+   * fields (see queryByChannel's doc) and so never appear here — they are
+   * excluded, not folded into some `"undefined"` bucket.
+   */
+  getChannelCounts(): ChannelCount[] {
+    const s = this.store as {
+      getStateIndexValueCounts?: (stateId: string, field: string) => Array<{ value: string; count: number }> | null;
+    };
+    if (typeof s.getStateIndexValueCounts !== 'function') {
+      throw new Error(HISTORY_INDEX_UNSUPPORTED_MSG);
+    }
+    const topCounts = this.queryIndexOrHeal(
+      () => s.getStateIndexValueCounts!(this.stateId, CHANNEL_FIELD_TOP),
+      CHANNEL_FIELD_TOP,
+      'string',
+    );
+    const externalCounts = this.queryIndexOrHeal(
+      () => s.getStateIndexValueCounts!(this.stateId, CHANNEL_FIELD_EXTERNAL),
+      CHANNEL_FIELD_EXTERNAL,
+      'string',
+    );
+    const distinctChannelIds = new Set<string>();
+    for (const vc of topCounts) distinctChannelIds.add(vc.value);
+    for (const vc of externalCounts) distinctChannelIds.add(vc.value);
+
+    return Array.from(distinctChannelIds).map((channelId) => ({
+      channelId,
+      // queryChannelOrdinals already unions both indexes' ordinal sets via
+      // a Set (see its own doc) — its length is the true unique count for
+      // this channelId, immune to the double-count a raw count-sum hits.
+      messages: this.queryChannelOrdinals(channelId).length,
+    }));
+  }
+
+  /**
+   * Per-ordinal cache for getChannelTokenStats, keyed by ordinal (branch
+   * identity is tracked separately — see tokenStatsCacheBranchId — rather
+   * than folded into the key, since this cache is cheap enough to just
+   * wipe wholesale on a branch change instead of carrying dead entries for
+   * branches no longer in use).
+   *
+   * Caches the RAW (calibration-independent) token estimate PER TOP-LEVEL
+   * CONTENT BLOCK, not pre-summed for the whole message — mirroring the
+   * estimateBlockTokensRaw/estimateBlockTokens split above, and critically
+   * matching `estimateTokens`' own per-block round-then-sum order: summing
+   * raw block values first and rounding once for the whole message
+   * (`round(sum(raw) * factor)`) is NOT generally equal to summing
+   * individually-rounded calibrated block estimates
+   * (`sum(round(raw * factor))`) for a fractional calibration factor and a
+   * multi-block message — e.g. two 1-token raw blocks at calibration 0.6:
+   * round(2 * 0.6) = 1, but round(1*0.6) + round(1*0.6) = 1 + 1 = 2, which
+   * is what a live `estimateTokens` call actually returns. Storing
+   * `rawBlockEstimates` and replaying the exact same per-block
+   * round-then-sum at read time (see getChannelTokenStats) keeps the
+   * cached and live paths in agreement for every message, not just
+   * single-block ones.
+   *
+   * Values are NOT the calibrated estimate either, for the same reason:
+   * `estimateTokens` bakes in the mutable `tokenCalibration` multiplier
+   * (see setTokenCalibration), and caching ITS output would freeze each
+   * entry at whatever calibration was in effect when first computed —
+   * silently mixing calibration generations within one aggregate response,
+   * since `setTokenCalibration` is called during normal operation (the
+   * autobiographical strategy's closed-loop calibration), not just in
+   * synthetic tests. Calibration is applied at READ time instead (see
+   * getChannelTokenStats), so every entry always reflects the CURRENT
+   * calibration with no invalidation needed when it changes.
+   *
+   * `channelId: undefined` means "looked up, has no (valid string)
+   * channel" (still cached, so a range full of unchanneled messages
+   * doesn't get re-decoded every call) as distinct from "not yet looked
+   * up" (absent from the map). A non-string channelId value (`null`, a
+   * number, …) is normalized to `undefined` here too — see
+   * extractChannelId — matching chronicle's native String-kind field
+   * index, which silently excludes non-string values rather than exposing
+   * them as their own bucket (so byChannel never disagrees with
+   * getChannelCounts about which messages are "channeled").
+   *
+   * There is no native token-estimate index — token estimation isn't a
+   * field that exists on stored messages (see the design plan's "Scope
+   * decision": indexing it natively would mean either rewriting every
+   * historical message to stamp a field that predates the feature, or
+   * leaving the index blank for all existing history; neither is
+   * acceptable). This cache amortizes the one genuinely expensive part —
+   * decoding content (blob resolution) and running raw token estimation —
+   * across repeated getChannelTokenStats calls over overlapping ranges,
+   * filled lazily only for ordinals actually requested.
+   *
+   * KNOWN SIMPLIFICATION, not a bug: entries are never evicted or
+   * write-through'd on edit/remove within a branch — each entry is a
+   * handful of tiny scalars, not message content, so this stays cheap even
+   * at hundreds of thousands of messages, nothing like the content-bearing
+   * allCache this file guards so carefully elsewhere. Acceptable for a
+   * stats/reporting API; revisit if a caller ever needs exactness across
+   * live edits.
+   */
+  private tokenStatsCache = new Map<number, { channelId: string | undefined; rawBlockEstimates: number[] }>();
+
+  /**
+   * Branch this cache was last warmed on, tracked by branch ID (NOT name)
+   * — checked and enforced at the top of getChannelTokenStats. Chronicle
+   * branch names are reusable: a non-current branch can be deleted and a
+   * different branch created under the SAME name afterward, but branch ids
+   * are never reused (same reasoning chronicle's own native field-index
+   * fix uses for its own branch scoping — see registerStateFieldIndex's
+   * doc in node_modules/@animalabs/chronicle/index.d.ts). A name-keyed
+   * check would miss exactly that delete-and-recreate-under-the-same-name
+   * case: the name comparison would see no change and never clear a cache
+   * that in fact belongs to a branch that no longer exists. Ordinals are
+   * branch-relative (chronicle's native `/timestamp` and dual channel-id
+   * field indexes — see CHANNEL_FIELD_TOP/CHANNEL_FIELD_EXTERNAL — are all
+   * branch-aware and self-heal across a `switchBranch` as of chronicle
+   * 0.4.0), so a cached
+   * ordinal→message mapping from one branch isn't just STALE on another,
+   * it's WRONG: a diverged branch can reuse the exact same ordinal for a
+   * completely different message. Wholesale-cleared on any detected
+   * branch-id change rather than keying every cache entry by branch.
+   */
+  private tokenStatsCacheBranchId = '';
+
+  /**
+   * Runtime-validated, DUAL-SCHEMA channelId extraction for the token-stats
+   * cache — the content-decode-side equivalent of the two merged native
+   * indexes (see the block comment on CHANNEL_FIELD_TOP/CHANNEL_FIELD_EXTERNAL
+   * for why there are two: real agent-framework ingestion writes
+   * `metadata.channelId` directly, with no `external` nesting, while an
+   * older/parallel convention this codebase's MessageQuery type already
+   * documents writes `metadata.external.channelId`). Checks the direct
+   * field first, falling back to the nested one, so getChannelTokenStats'
+   * bucketing agrees with what queryByChannel/getChannelCounts find via
+   * the native indexes for the exact same message.
+   *
+   * Also runtime-validates rather than just type-asserting: the TS cast on
+   * `metadata`/`metadata.external` only asserts a shape at compile time, it
+   * never checks the actual runtime value, so a `null`/number/etc.
+   * channelId would otherwise leak through as a truthy-looking
+   * `!== undefined` bucket key in getChannelTokenStats.byChannel — a
+   * result the exported `{ channelId: string }` type doesn't even allow.
+   * Chronicle's native String-kind indexes silently exclude non-string
+   * values (see field_index.rs's `extract_indexed_value`); this matches
+   * that so getChannelTokenStats never disagrees with getChannelCounts
+   * about which messages are "channeled".
+   */
+  private extractChannelId(internal: StoredMessageInternal): string | undefined {
+    const metadata = internal.metadata;
+    if (typeof metadata?.channelId === 'string') return metadata.channelId;
+    const external = metadata?.external as { channelId?: unknown } | undefined;
+    return typeof external?.channelId === 'string' ? external.channelId : undefined;
+  }
+
+  /**
+   * Aggregate message counts and token estimates by channel, optionally
+   * restricted to a timestamp range. `totalMessages`/`totalTokensEstimate`
+   * cover EVERY message in range, channeled or not; `byChannel` breaks down
+   * only the ones that have a valid string channelId (so its entries'
+   * `messages` sum to <= totalMessages when unchanneled or non-string-
+   * channel messages exist in range).
+   *
+   * Structural filtering rides the native `/timestamp` index (same call as
+   * queryByTime, unbounded — every matching ordinal is relevant to the
+   * aggregate, so no limit/offset here). Token estimates are computed
+   * client-side via the existing raw block-estimation machinery (no native
+   * token index — see tokenStatsCache's doc) and cached per-ordinal RAW
+   * across calls, with the CURRENT calibration multiplier applied here at
+   * read time — see tokenStatsCache's doc for why.
+   */
+  getChannelTokenStats(opts: ChannelTokenStatsOptions = {}): ChannelTokenStats {
+    // Branch-scope the cache before touching it, by ID (see
+    // tokenStatsCacheBranchId — NOT name, which chronicle allows reusing
+    // after a delete): a stale-branch cache is not just outdated but wrong
+    // (ordinal reuse across diverged branches), so this must be a hard
+    // wipe, not a lazy per-entry revalidation.
+    const currentBranchId = this.store.currentBranch().id;
+    if (currentBranchId !== this.tokenStatsCacheBranchId) {
+      this.tokenStatsCache.clear();
+      this.tokenStatsCacheBranchId = currentBranchId;
+    }
+
+    const ordinals = this.queryTimestampOrdinals({ gte: opts.fromMs, lte: opts.toMs });
+
+    const byChannel = new Map<string, { messages: number; tokensEstimate: number }>();
+    let totalMessages = 0;
+    let totalTokensEstimate = 0;
+
+    for (const ordinal of ordinals) {
+      let cached = this.tokenStatsCache.get(ordinal);
+      if (!cached) {
+        const internal = this.getInternal(ordinal);
+        if (!internal) continue; // stale ordinal (e.g. raced a redact); skip rather than throw
+        const channelId = this.extractChannelId(internal);
+        // Resolve blobs: an un-resolved blob_ref block has no raw estimate
+        // of its own and would silently price as 0, undercounting any
+        // message carrying inline media — resolveBlobs:true matches how
+        // estimateTokens is used everywhere else in this file (getAll()'s
+        // default).
+        const stored = this.internalToStored(internal, internal.id, ordinal, true);
+        const rawBlockEstimates = stored.content.map((block) => this.estimateBlockTokensRaw(block));
+        cached = { channelId, rawBlockEstimates };
+        this.tokenStatsCache.set(ordinal, cached);
+      }
+      // Calibration applied HERE, every call, PER BLOCK then summed — never
+      // baked into the cached numbers themselves (see tokenStatsCache's
+      // doc), and never pre-summed-then-rounded-once: this replays
+      // estimateBlockTokens' own round(raw * calibration) for each cached
+      // raw block value and sums the results, exactly matching what a live
+      // estimateTokens(message) call computes for the same content.
+      const tokenEstimate = cached.rawBlockEstimates.reduce(
+        (sum, raw) => sum + Math.round(raw * this.tokenCalibration),
+        0,
+      );
+      totalMessages++;
+      totalTokensEstimate += tokenEstimate;
+      if (cached.channelId !== undefined) {
+        const agg = byChannel.get(cached.channelId) ?? { messages: 0, tokensEstimate: 0 };
+        agg.messages++;
+        agg.tokensEstimate += tokenEstimate;
+        byChannel.set(cached.channelId, agg);
+      }
+    }
+
+    return {
+      totalMessages,
+      totalTokensEstimate,
+      byChannel: Array.from(byChannel.entries()).map(([channelId, agg]) => ({
+        channelId,
+        messages: agg.messages,
+        tokensEstimate: agg.tokensEstimate,
+      })),
+    };
   }
 
   /**
@@ -727,19 +1662,64 @@ export class MessageStore {
   }
 
   private getAllInternal(): StoredMessageInternal[] {
-    const branch = this.store.currentBranch().name;
+    const branchId = this.store.currentBranch().id;
     const sequence = this.store.currentSequence();
-    if (
-      this.allCache &&
-      this.allCache.sequence === sequence &&
-      this.allCache.branch === branch
-    ) {
-      return this.allCache.internals;
+    const writeVersion = currentWriteVersion(this.store, this.stateId);
+    let missReason = 'no-cache';
+    if (this.allCache) {
+      missReason =
+        this.allCache.branchId !== branchId
+          ? `branch ${this.allCache.branchId}→${branchId}`
+          : this.allCache.writeVersion !== writeVersion
+            ? `writeVersion ${this.allCache.writeVersion}→${writeVersion}`
+            : 'revalidate-fail';
     }
+    if (this.allCache && this.allCache.branchId === branchId && this.allCache.writeVersion === writeVersion) {
+      if (this.allCache.sequence === sequence) {
+        return this.allCache.internals;
+      }
+      // The store-global sequence moved, but that may be writes to OTHER
+      // state slots (summaries, autobio resolutions, framework/state, …).
+      // All in-process mutations of THIS state flow through the mutators
+      // above, which write through or invalidate the cache explicitly — so
+      // if the messages slot still has the same item count and the same
+      // last record id, the cached array is current: re-stamp, don't
+      // re-materialize. (A full re-materialization here on every foreign
+      // append made ingest quadratic — 2026-07-25 mythos wedge.)
+      // Feature-detect getStateItemJson (chronicle >= 0.2.2): the fallback
+      // inside getInternal() is getAllInternal() itself — calling it here
+      // on an older chronicle would recurse. No point lookup → no cheap
+      // revalidation → keep the old full-rebuild behavior.
+      const canPointLookup =
+        typeof (this.store as { getStateItemJson?: unknown }).getStateItemJson === 'function';
+      const count = canPointLookup ? this.length() : -1;
+      if (count === this.allCache.internals.length) {
+        if (count === 0) {
+          this.allCache.sequence = sequence;
+          return this.allCache.internals;
+        }
+        const lastCached = this.allCache.internals[count - 1];
+        const lastLive = this.getInternal(count - 1);
+        if (
+          lastCached &&
+          lastLive &&
+          lastLive.id === lastCached.id &&
+          lastLive.sequence === lastCached.sequence
+        ) {
+          this.allCache.sequence = sequence;
+          return this.allCache.internals;
+        }
+        missReason = `revalidate-fail last-item (cached ${lastCached?.id}/${lastCached?.sequence} live ${lastLive?.id}/${lastLive?.sequence})`;
+      } else {
+        missReason = `revalidate-fail count (cached ${this.allCache.internals.length} live ${count}${canPointLookup ? '' : ', no point lookup'})`;
+      }
+    }
+    const _t = CACHE_DIAG ? Date.now() : 0;
     const state = this.store.getStateJson(this.stateId);
     const internals =
       !state || !Array.isArray(state) ? [] : (state as StoredMessageInternal[]);
-    this.allCache = { branch, sequence, internals };
+    this.allCache = { branchId, sequence, internals, writeVersion };
+    cacheDiag(`getAllInternal MISS (${missReason}) stateId=${this.stateId} rebuilt ${internals.length} in ${Date.now() - _t}ms`);
     return internals;
   }
 
@@ -832,7 +1812,7 @@ export class MessageStore {
 const PROSE_CHARS_PER_TOKEN = 2.9;
 const DENSE_CHARS_PER_TOKEN = 2.3;
 
-function defaultTokenEstimator(text: string): number {
+export function defaultTokenEstimator(text: string): number {
   if (!text) return 0;
   // Cheap density probe: JSON/code punctuation and non-ASCII share.
   let dense = 0;
@@ -848,7 +1828,7 @@ function defaultTokenEstimator(text: string): number {
 }
 
 /** JSON-ish payloads (tool inputs/results) always use the dense rate. */
-function jsonTokenEstimator(text: string): number {
+export function jsonTokenEstimator(text: string): number {
   if (!text) return 0;
   return Math.ceil(text.length / DENSE_CHARS_PER_TOKEN);
 }

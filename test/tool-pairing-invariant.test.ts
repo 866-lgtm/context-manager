@@ -165,6 +165,8 @@ describe('enforceToolPairing — post-selection pairing validator', () => {
       ),
     );
     assert.ok(preserved, 'the genuine tool result must be relocated, not replaced by a stub');
+    assert.deepStrictEqual(entries.at(-1)?.content, [text('[tool result moved during context repair]')],
+      'the emptied source entry must describe relocation, not claim that a call was omitted');
   });
 
   it('handles consecutive tool_use entries (double budget cut)', () => {
@@ -242,8 +244,9 @@ describe('enforceToolPairing — wired into the adaptive render path (FKM defaul
       protected mergeAdjacentBodyGroupRaw(
         entries: ContextEntry[],
         store: MessageStoreView,
+        messages?: ReturnType<MessageStoreView['getAll']>,
       ): ContextEntry[] {
-        const merged = super.mergeAdjacentBodyGroupRaw(entries, store);
+        const merged = super.mergeAdjacentBodyGroupRaw(entries, store, messages);
         if (merged.length >= 2) {
           merged.splice(1, 0, {
             index: 1,
@@ -260,7 +263,7 @@ describe('enforceToolPairing — wired into the adaptive render path (FKM defaul
     const manager = await ContextManager.open({
       path: STORE,
       strategy,
-      membrane: { complete: async () => ({ content: [{ type: 'text', text: 's' }] }) } as never,
+      membrane: { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 's' }] }) } as never,
     });
 
     for (let i = 0; i < 5; i++) {

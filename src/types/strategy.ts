@@ -26,6 +26,15 @@ export interface MessageStoreView {
   /** Closed-loop estimator calibration (optional — MessageStore provides it). */
   setTokenCalibration?(factor: number): void;
   getTokenCalibration?(): number;
+  /**
+   * Whether a message is under a compression hold (ContextManager
+   * holdCompression / addMessage `holdCompression`). Compressing strategies
+   * must not fold a held message, anything after it, or the tool_use it
+   * answers. Absent on views not built by a ContextManager ⇒ nothing held.
+   */
+  isCompressionHeld?(id: MessageId): boolean;
+  /** Fast path: whether any hold exists (lets strategies skip scanning). */
+  hasCompressionHolds?(): boolean;
 }
 
 /**
@@ -60,6 +69,22 @@ export interface StrategyContext {
    * refused. Optional because ticks can fire before the first activation.
    */
   tools?: ToolDefinition[];
+  /**
+   * The agent's live system prompt, as last supplied by the host (set on
+   * every activation via ContextManager.setSystemPrompt). Memory-writing
+   * requests serve it as their own system prompt: on hosts whose identity
+   * and conduct live in system voice, a summarizer that never sees it is a
+   * different agent from the one whose memory it writes, and merges
+   * re-summarize summaries, so the drift compounds upward.
+   *
+   * This is the host's CURRENT prompt, not a historical one — only the
+   * latest pushed value is retained — so a mint is governed by the identity
+   * policy in force when it runs. That reproduces what the original instance
+   * was served to the extent the host keeps the prompt stable across the
+   * compressed span. Optional and opt-in: undefined leaves every mint
+   * request byte-identical to the no-system-prompt shape it has always had.
+   */
+  systemPrompt?: string;
   /** Read-only view of context log */
   contextLog: ContextLogView;
   /** Membrane instance for LLM calls (compression) */
@@ -128,6 +153,12 @@ export interface ContextStrategy {
   onNewMessage?(message: StoredMessage, ctx: StrategyContext): Promise<void>;
 
   /**
+   * Called when ContextManager.releaseCompression actually released a hold.
+   * Compressing strategies should re-queue work the hold deferred.
+   */
+  onCompressionHoldsReleased?(ctx: StrategyContext): void;
+
+  /**
    * Check if strategy is ready to compile.
    * Returns pending work info if not ready.
    */
@@ -136,11 +167,22 @@ export interface ContextStrategy {
   /**
    * Select and order context entries for compilation.
    * This is the core method that determines what goes in the context window.
+   *
+   * `opts.dryRun` requests a NON-COMMITTING select: the returned entries are
+   * what a real compile at this budget would produce, but no fold resolutions
+   * or chunk records are persisted, no compression/merge work is enqueued, no transition
+   * bookkeeping is advanced, and what a select leaves for the next one or for
+   * observers (its cache-marker baseline, transition status, render stats,
+   * and calibration's estimate and arming) stays as the last committing
+   * select left it. Implementations that cannot
+   * honour it must ignore it only if they are already side-effect-free; any
+   * path that commits state MUST gate on it.
    */
   select(
     store: MessageStoreView,
     log: ContextLogView,
-    budget: TokenBudget
+    budget: TokenBudget,
+    opts?: SelectOptions
   ): ContextEntry[];
 
   /**
@@ -159,6 +201,93 @@ export interface ContextStrategy {
     participant: string,
     content: ContentBlock[]
   ): IngressChunkResult | null;
+}
+
+/**
+ * Per-call options for `select()` / `compile()`.
+ *
+ * `dryRun` exists because a select is NOT side-effect-free: it commits fold
+ * resolutions and chunk records to Chronicle, enqueues real compression work,
+ * and leaves state the next compile and observers read. An operator UI that
+ * previews a hypothetical budget must change none of it, or every slider drag
+ * would rewrite the fold plan, spend LLM tokens and change what the next real
+ * compile sends. The field's doc gives the whole contract.
+ */
+export interface SelectOptions {
+  /**
+   * Compute the layout without committing anything: no resolution persistence,
+   * no chunk record and no compression queued for a chunk the select's
+   * rebuild closes, no produce/merge enqueue, no shadow production pick, no
+   * transition bookkeeping, and nothing a select leaves for the next one or for
+   * observers (the cache-marker baseline, the transition status, the render
+   * stats, calibration's estimate, arming and store view, the store order, the
+   * head-window memo, and whether chunk records are trusted), all on every
+   * path out, throws included.
+   *
+   * What a dry select refuses is what a real compile refuses, with one
+   * exception: an over-budget plan is not thrown at the plan check. A plain
+   * dry compile then returns that plan's entries with no verdict, and
+   * `previewContext` is where infeasibility is reported. The head-and-tail
+   * check before the plan check, and any later stage that can't fit, still
+   * throw as for a real compile, leaving nothing behind; `previewContext`
+   * reports an over-budget throw and passes any other throw through.
+   *
+   * A compression hold ends at its deadline, whoever looks: the manager
+   * releases an expired hold at any compile or hold query, a dry compile
+   * included, and that release is the one thing a dry compile can leave.
+   */
+  dryRun?: boolean;
+  /** Exact normalized tools/system/context-prefix identity supplied by the
+   * host for kv-unified cache relevance. */
+  kvUnifiedImmutablePrefixHash?: string;
+  /** Audited, expiring continuity relaxation for disruptive transitions.
+   * Invalid or expired values fail closed to normal continuity weight. */
+  kvUnifiedContinuityRelaxation?: {
+    reason: 'surgery' | 'budget-transition' | 'infrastructure';
+    multiplier: number;
+    expiresAt: number;
+  };
+}
+
+/**
+ * Outcome of a dry-run select, for callers that need the numbers rather than
+ * the rendered entries. Mirrors the diagnostics `OverBudgetError` would carry.
+ */
+export interface PreviewResult {
+  /** Rendered token total the layout would occupy. */
+  finalTokens: number;
+  /** Hard budget the preview ran against. */
+  budgetTokens: number;
+  /** True when the layout fits under the hard budget. */
+  fits: boolean;
+  /** True when the picker could not fold any further. */
+  exhausted: boolean;
+  /** Verbatim head / tail cost, and the foldable middle. */
+  headTokens: number;
+  tailTokens: number;
+  middleTokens: number;
+  /** Chunks in the foldable middle. */
+  middleChunkCount: number;
+  /** Deepest summary level the layout would require. */
+  deepestLevel: number;
+  /** Fold level per chunk the layout would settle on. */
+  resolutions: Record<string, number>;
+  /** Chunks whose resolution this layout would change vs the carried state. */
+  moves: number;
+  /** Summaries the layout needs that do not exist yet — real LLM work. */
+  producedCount: number;
+  /**
+   * The rendered context this layout would produce. Only present when the
+   * caller asked for it (`{render:true}`) — on a large store these entries are
+   * megabytes, so they are opt-in rather than always returned.
+   */
+  entries?: ContextEntry[];
+  /**
+   * Segment breakdown (head / middle / tail / summaries-by-level) for the
+   * HYPOTHETICAL compile. Also `{render:true}` only. Distinct from
+   * `getRenderStats()`, which continues to describe the live context.
+   */
+  stats?: RenderStats;
 }
 
 /**
@@ -314,6 +443,86 @@ export function isSearchableStrategy(s: ContextStrategy): s is SearchableStrateg
 }
 
 /**
+ * A summary, projected to the flat shape a "browse my history" table-of-contents
+ * wants: a resolved wall-clock span (`startMs`/`endMs`, derived from the first
+ * and last source message's `timestamp`) instead of `SummaryEntry`'s message-ID
+ * `sourceRange`. Produced by `listSummariesInRange`; not persisted anywhere —
+ * this is a read-time view, not a new storage shape.
+ */
+export interface TimeRangeSummaryEntry {
+  /** Same as the source `SummaryEntry.id`. */
+  id: string;
+  level: number;
+  content: string;
+  tokens: number;
+  /** `sourceRange.first` message's `timestamp`, in epoch ms. */
+  startMs: number;
+  /** `sourceRange.last` message's `timestamp`, in epoch ms. */
+  endMs: number;
+  /**
+   * Exact identity/order boundaries of the covered span, ALONGSIDE the
+   * millisecond timestamps above — a caller doing fine-grained boundary
+   * work (e.g. distinguishing which of several messages sharing this
+   * summary's boundary MILLISECOND actually belongs to it) needs these,
+   * not `startMs`/`endMs` alone: two distinct messages can share a
+   * timestamp (wall-clock ms resolution, rapid-fire appends), but
+   * `sequence` (chronicle's per-record sequence number) is strictly
+   * monotonic and never ties. Same as `sourceRange.first`/`.last`'s
+   * resolved `StoredMessage.id`/`.sequence`.
+   */
+  firstMessageId: string;
+  lastMessageId: string;
+  firstSequence: number;
+  lastSequence: number;
+  /** Same as the source `SummaryEntry.created`. */
+  createdMs: number;
+  sourceIds: string[];
+  /**
+   * The summary this one was folded into, if any (see `getSummaryParentId`)
+   * — both a folded child AND its coarser parent can independently overlap
+   * the same query range and both come back from `listSummariesInRange`
+   * (this method does not filter by fold status). A caller building a
+   * non-redundant table of contents should treat an entry whose `parentId`
+   * is ALSO present in the same result set as superseded/skippable —
+   * its content is already covered by the parent.
+   */
+  parentId?: string;
+}
+
+/**
+ * Strategy capability for browsing the existing summary archive as a
+ * table-of-contents, without generating anything new. Distinct from
+ * `SearchableStrategy`: search matches summary *content*; this lists
+ * summaries by *time range*, for a downstream "browse my history" UI (see
+ * agent-framework) that wants to show what compression has already produced
+ * over a span, not search inside it. Implemented by AutobiographicalStrategy.
+ */
+export interface SummaryOverviewStrategy extends ContextStrategy {
+  /**
+   * List summaries whose source message span overlaps `[fromMs, toMs]`
+   * (both ends inclusive; either bound may be omitted for an open range).
+   * Requires a `MessageStoreView` to resolve each summary's source message
+   * IDs to timestamps — same reason `getRenderStats` takes one.
+   */
+  listSummariesInRange(
+    store: MessageStoreView,
+    opts: { fromMs?: number; toMs?: number; level?: number },
+  ): TimeRangeSummaryEntry[];
+  /** Cheap: max(level) over all currently-minted summaries. 0 if none exist yet. */
+  getMaxSummaryLevel(): number;
+}
+
+/** Type guard for strategies that support the summary table-of-contents. */
+export function isSummaryOverviewStrategy(s: ContextStrategy): s is SummaryOverviewStrategy {
+  return (
+    'listSummariesInRange' in s &&
+    typeof (s as SummaryOverviewStrategy).listSummariesInRange === 'function' &&
+    'getMaxSummaryLevel' in s &&
+    typeof (s as SummaryOverviewStrategy).getMaxSummaryLevel === 'function'
+  );
+}
+
+/**
  * Per-render observability stats from a strategy. Counts and token sums for
  * head / tail / summaries / pending work, suitable for TUIs and dashboards
  * that want to display "how much of the context is folded vs raw" at a
@@ -342,6 +551,27 @@ export interface RenderStats {
    * Q/A pair, so it counts as 2 messages here.
    */
   total: { messages: number; tokens: number };
+
+  /**
+   * Planner/emitter reconciliation for this compile. `planned` is the picker's
+   * projection after folding; `actual` is what the emitter committed. A
+   * persistent positive `delta` means the emitter spends in units the planner
+   * doesn't model, and the overrun lands on whatever renders last — the recent
+   * window — which is how tail eviction becomes reachable despite the picker
+   * reporting `budgetMet`. Absent when no picker ran (hierarchical path).
+   */
+  planVsActual?: {
+    planned: number;
+    actual: number;
+    delta: number;
+    budgetMet: boolean;
+    exhausted: boolean;
+    moves: number;
+    /** Name of the fold solver that planned this compile (e.g. 'kv-stable',
+     *  'flat-profile'). Surfaces the policy actually in force — a config
+     *  clobber that silently downgrades the solver is invisible without it. */
+    solver?: string;
+  };
 }
 
 /**
@@ -372,6 +602,46 @@ export interface CompressionQuarantineStatus {
   keys: string[];
 }
 
+/** Delimiter convention applied to recall answer content. See `recallEnvelope`. */
+export type RecallEnvelopeMode = 'none' | 'xml';
+
+/** Where a summary's signed reasoning carriers are replayed. See `carrierPolicy`. */
+export type CarrierPolicy = 'full' | 'live-strip';
+
+export interface KvUnifiedConfig {
+  policy: {
+    alpha: number;
+    budgetLowRatio: number;
+    budgetHighRatio: number;
+    budgetUnderLambda: number;
+    budgetOverLambda: number;
+    cacheLambda: number;
+    cacheScale: number;
+    cacheReadPrice: number;
+    cacheWritePrice: number;
+    continuityLambda: number;
+    continuityScale: number;
+    continuityRecencyHalfLifeTokens: number;
+    continuityRecencyFloor: number;
+    continuityStableHalfLife: number;
+    continuityStableFloor: number;
+  };
+  tokenBucketSize: number;
+  continuityBucketSize: number;
+  fidelityBucketSize: number;
+  labelCeiling: number;
+  adoptEpsilon: number;
+  treeifyNonContiguousSummaries: boolean;
+  preserveGapBearingSummaries: boolean;
+  /**
+   * Certified hysteresis exit (see `docs/kv-unified-hysteresis-certificate.md`):
+   * when the accepted presentation provably remains the policy's selection,
+   * skip label propagation. Exact — never chooses a different layout than the
+   * full solve would. Off unless set.
+   */
+  hysteresisCertificate?: boolean;
+}
+
 export interface AutobiographicalConfig {
   /**
    * Interval for the repeating compression-quarantine alarm (stderr +
@@ -397,23 +667,187 @@ export interface AutobiographicalConfig {
   autoTickOnNewMessage: boolean;
   /** System prompt for summarization */
   summarySystemPrompt?: string;
+  /** Operator-level system prompt attached to autobiographical memory-write
+   *  (compression/merge) requests, which otherwise run with NO system prompt.
+   *  Use it to carry deployment permissions/policy into the summarizer — e.g.
+   *  mature-content permission + a "record but don't replay explicit detail"
+   *  register instruction — so the summarizer inherits the same operator
+   *  context the live agent runs under. Empty/undefined → no system prompt
+   *  (historical behavior). Distinct from `summarySystemPrompt`, which the
+   *  adaptive autobiographical path does not use. */
+  compressionSystemPrompt?: string;
+  /** Escalation system prompt used ONLY to RETRY a memory-write that the
+   *  provider refused (stopReason 'refusal' / content_filter). Lets the
+   *  baseline compressionSystemPrompt stay light on the 99% of writes that
+   *  never refuse, while a heavier prompt (explicit permission + non-graphic
+   *  register + the "why") is applied only on the rare refusal. No retry if
+   *  unset. */
+  compressionRefusalSystemPrompt?: string;
   /** User prompt template for summarization. Use {content} for the transcript. */
   summaryUserPrompt?: string;
+  /**
+   * As-of perspective pin for inherited history (e.g. a resident continued
+   * from a shared log they joined partway through). Chunks whose messages
+   * ALL have `sequence` strictly below this value are compressed with the
+   * witnessed-record instruction instead of the first-person one: events
+   * are attributed to the named participants, and the first person is
+   * reserved for the act of reading and carrying the record. Prevents the
+   * summarizer from claiming others' lived experience as the agent's own
+   * memories (observed 2026-07-26: an inheriting resident's L1s
+   * first-personing scenes from before his arrival). Chunks that straddle
+   * the boundary use the standard instruction — the agent's own turns are
+   * present in them.
+   */
+  witnessedBeforeSequence?: number;
+  /**
+   * Override wording for the witnessed-record compression instruction.
+   * `{targetTokens}` is substituted. Defaults to
+   * `formatWitnessedInstruction` in autobiographical.ts.
+   */
+  witnessedInstruction?: string;
+  /**
+   * Identity reminder appended to every compression and merge instruction
+   * (L1 chunk, reading-mode, and all merge variants). Whether a compression
+   * request carries a system prompt is the HOST's call: with none declared
+   * (StrategyContext.systemPrompt unset) it carries none and identity is
+   * established by the head window and prior recall pairs; with one
+   * declared, the host's live prompt leads the request. This reminder is
+   * appended on either path, because it addresses a failure neither source
+   * reaches: when an agent lives in multi-resident channels, chunks can
+   * consist entirely of OTHER agents' first-person speech, and "write the
+   * memory in your own voice" then flips the summarizer into the dominant
+   * speaker's identity (observed 2026-08-03, on the no-system-prompt path
+   * that was then the only one: an Opus-4 resident's L1s/merges claiming a
+   * sibling resident's name, story, and relationships as their own —
+   * entered at live L1 compression over pure-witness chunks and propagated
+   * up the pyramid). Older models are especially susceptible. Recommended
+   * shape: name the agent AND direct attribution, e.g. "Reminder: you are
+   * <name>. Speak in the first person only for what you yourself said,
+   * did, and felt; attribute other participants' words and experiences to
+   * them by name."
+   */
+  identityReminder?: string;
   /** Label shown before summaries in compiled context */
   summaryContextLabel?: string;
+
+  /**
+   * Structural delimiting for recall ANSWER content.
+   *
+   *  - `'none'` (default) — answers render exactly as they always have: the
+   *    Q-side label opens the memory and the turn boundary is the only thing
+   *    that closes it. Output is byte-identical to the pre-envelope render.
+   *  - `'xml'` — each answer's prose is fenced by
+   *    `<cm-recall id="…" level="…" span="…">` … `</cm-recall>`, so the end of
+   *    a recalled memory is marked as explicitly as its start (instances have
+   *    been observed reading past it into unrelated content). Attributes come
+   *    from the summary record; one the record cannot answer for is omitted.
+   *
+   * The envelope is a collision-tolerant delimiter convention, not parseable
+   * XML: answer text is model prose and is never entity-escaped.
+   *
+   * Q-side labels are identical under both modes.
+   *
+   * WHY THE DEFAULT IS OFF. Recall answers are built at one shared choke
+   * point, and the presented window is not its only consumer: the same
+   * enveloped answers are replayed into the recall ladders that PROMPT
+   * compression — the mint and merge requests that produce the next
+   * generation of summaries. Turning the envelope on therefore changes the
+   * summarizer's own inputs, not only what the agent reads. What that does to
+   * the summaries a model then writes — whether the tags are ignored, echoed
+   * into summary prose, or read as a format worth imitating — is UNMEASURED.
+   * The evidence behind this feature is that instances read past an
+   * unterminated memory; there is none either way on what enveloping does to
+   * minting, and default-off is deliberate for that reason rather than
+   * caution about the render. Before enabling it fleet-wide, turn it on
+   * against a mature store and read the summaries it MINTS, not merely the
+   * window it presents.
+   *
+   * Under `maxMessageTokens`, a capped answer is truncated as PROSE and
+   * enveloped afterwards, so opener and closer survive every cap; the tags
+   * themselves are not charged against that cap (they are priced in the
+   * recall-pair budget instead), so a cap smaller than the tag text still
+   * renders intact tags around the few characters it bought.
+   */
+  recallEnvelope?: RecallEnvelopeMode;
+
+  /**
+   * Where a summary's captured reasoning carriers (`responseContent`'s signed
+   * `thinking` / `redacted_thinking` blocks) are replayed.
+   *
+   *  - `'full'` (default) — carriers ride every surface a memory renders on,
+   *    exactly as they have since the 2026-07-15 round-trip landed. Output is
+   *    byte-identical to the pre-knob render on both surfaces.
+   *  - `'live-strip'` — carriers are OMITTED from the live window only. Mint
+   *    and merge requests still recall them verbatim.
+   *
+   * TWO SURFACES, ONE STORE. A captured carrier is the ARCHIVIST'S cognition:
+   * the thinking of writing the memory, not the thinking of living the span it
+   * describes. It is replayed on two surfaces that want different things from
+   * it:
+   *
+   *  - MINT-REQUEST RECALL — the summarizer's own inputs. Carriers are
+   *    measured load-bearing here (2026-07-16, upstream's own validation): a
+   *    deterministically-refusing compress request passed once its recall
+   *    pairs carried their summaries' signed reasoning, where the text-only
+   *    arm refused. `'live-strip'` does not touch this path, and no value of
+   *    this option does: the anti-refusal duty stands until a measurement
+   *    retires it.
+   *  - LIVE-WINDOW RENDER — what the agent whose memory it is reads back.
+   *    Thinking blocks are not read there, they are INHABITED, and a carrier
+   *    sits at the memory's chronological slot: the instance re-enters the
+   *    compression fork's task-cognition, positioned where the remembered
+   *    span was lived. At fleet scale the accumulated exemplar mass is
+   *    archivist-cognition, not lived experience.
+   *
+   * `'live-strip'` OMITS WHOLE BLOCKS and never mutates one. Signatures verify
+   * only on byte-identical blocks, so a policy that edited a carrier would
+   * break the very round-trip the mint side depends on; dropping a block
+   * whole leaves every surviving block untouched. A stripped answer that would
+   * render with no prose left falls back to the entry's `content` text, so the
+   * live window never emits an empty assistant turn.
+   *
+   * Pricing follows the render: under `'live-strip'` a recall pair is priced
+   * for the fold planner at its stripped cost, because a plan that prices what
+   * it does not emit is the same wedge from the other side.
+   *
+   * WHY THE DEFAULT IS `'full'`. The inhabitation cost is an argument, not a
+   * measurement, and the anti-refusal duty on the mint side IS measured. The
+   * knob exists so a host that finds the argument convincing can act on it for
+   * its own agents without waiting; flipping the default is a fleet-wide
+   * change to what every instance reads back and belongs to whoever lives
+   * under it.
+   */
+  carrierPolicy?: CarrierPolicy;
   /** Participant name for the summary (defaults to "Summary") */
   summaryParticipant?: string;
   /** Model to use for compression (defaults to claude-sonnet) */
   compressionModel?: string;
+  /**
+   * Hard cap on `max_tokens` for compression requests. The summarizer asks for
+   * `max(16000, targetChunkTokens * 1.5)` so folds are not truncated mid-memory,
+   * but that floor exceeds what older models will accept as OUTPUT: Claude 3
+   * Opus caps at 4096 and rejects the request outright, so such an agent can
+   * never fold anything and every maintenance tick burns a failed call.
+   * Set this to the compression model's output ceiling. Unset = current
+   * behaviour. (Found 2026-07-26 bringing up Evander, claude-3-opus-20240229.)
+   */
+  compressionMaxTokens?: number;
   /** Maximum tokens per individual message in compiled output. Messages exceeding
    *  this limit have their text/tool_result content truncated. 0 = no limit. */
   maxMessageTokens: number;
 
   /**
-   * Fractional grace above the configured hard context budget before an
-   * adaptive plan rejects the compile. The solver still targets the original
-   * budget; this only absorbs coarse fold quanta and indivisible raw-window
-   * overshoot. Default 0 (strict budget enforcement).
+   * Fractional grace above the configured hard context budget before a
+   * compile refuses (OverBudgetError). The solver still targets the original
+   * budget; this only absorbs coarse fold quanta, indivisible raw-window
+   * overshoot, and planner/emitter estimator drift (the plan prices a layout
+   * via picker estimates; emission prices it via post-strip render costs —
+   * the two legitimately disagree by a fraction of a percent).
+   *
+   * Default 0.02. Under the fatal coverage invariant nothing is ever silently
+   * dropped to fit, so a strict-0 grace turns ordinary sub-percent drift into
+   * refused turns (observed live: Mica's store wedged 15 tokens over a 304k
+   * budget, 2026-07-26). Set 0 explicitly for strict enforcement.
    */
   overBudgetGraceRatio?: number;
 
@@ -458,9 +892,17 @@ export interface AutobiographicalConfig {
   maxCompressionImageBytes?: number;
 
   /**
-   * Merge grouping: exclude candidates whose OWN source span exceeds this
-   * many messages (replay-era summaries can span the entire chronicle and
-   * would bridge any run they join). They stay on the frontier. Default 1500.
+   * Merge grouping: exclude candidates whose OWN source span exceeds the
+   * level-scaled limit `base × mergeThreshold^(max(0, level − 3))`, where
+   * this value is the base (replay-era summaries can span the entire
+   * chronicle and would bridge any run they join). Level-scaled because
+   * legitimate spans grow ~mergeThreshold× per level: a flat limit silently
+   * forbids all consolidation above the level whose healthy span exceeds it
+   * (mythos 2026-08: every L4 spanned 3.0k–6.9k msgs > 1500 → L5 merges
+   * structurally impossible, fold floor stuck ~23k high). L1–L3 limits equal
+   * the base, unchanged from the historical flat behavior. Excluded
+   * candidates stay on the frontier and are logged loudly (once per id).
+   * Default base 1500.
    */
   mergeMaxSourceSpanMessages?: number;
 
@@ -486,6 +928,45 @@ export interface AutobiographicalConfig {
   hierarchical?: boolean;
   /** Number of unmerged summaries before merging to the next level (default: 6) */
   mergeThreshold?: number;
+  /**
+   * Bounded retry policy for L_n merges whose LLM response was rejected by
+   * the terminal-disposition gate (refusal / max_tokens truncation /
+   * tool_use / abort / empty / malformed — anything that is not a complete
+   * `end_turn` + nonempty text). Each rejected attempt increments a
+   * persisted counter on the merge-queue entry; when the counter reaches
+   * this limit the merge is dequeued into the durable merge quarantine
+   * (never silently retried in a loop, never canonized). Default: 5.
+   */
+  mergeAttemptLimit?: number;
+  /**
+   * Store-topology policy. On every load the summary archive is audited for
+   * crossed ownership: a summary whose leaves are not contiguous among the
+   * chunk-owned messages in store order (an interleaved live representation
+   * sits inside its span — issue #122's cross-era merges, restore/branch
+   * interleavings, hand surgery). `'reject'` (default) throws
+   * `StoreTopologyError` from `initialize`, so `ContextManager.open` fails
+   * and the operator repairs the store before the resident runs on it.
+   * `'report'` logs the violations at error level and reports them through
+   * `getCompressionDebt().topologyViolations` (state `critical`).
+   * A kv-unified config that explicitly opts into gap handling
+   * (`preserveGapBearingSummaries` or `treeifyNonContiguousSummaries`)
+   * defaults to `'report'`: those stores are known to carry gaps.
+   * Independent of this policy, a merge that WOULD mint a crossed node is
+   * never executed: it is refused into the merge quarantine.
+   */
+  topologyPolicy?: 'reject' | 'report';
+  /**
+   * Open for inspection only: `initialize` still loads and audits the store,
+   * but never chunks the uncovered frontier, enqueues merges, or rewrites the
+   * persisted merge queue. Audit and repair tooling opens stores this way; a
+   * plain open under a config that is not the resident's own would otherwise
+   * mint chunk records with the wrong head window and chunk size.
+   */
+  auditOnly?: boolean;
+  /** Legacy first-choice target-only merge request. Default false. */
+  compressionMergeSourceOnly?: boolean;
+  /** Use target-only merge request only on the final persisted merge attempt. Default false. */
+  compressionMergeSourceOnlyFallback?: boolean;
   /** Token target for each summary at any level (default: 2000) */
   summaryTargetTokens?: number;
   /** Token budget for L3 summaries in select() (default: 30000) */
@@ -506,7 +987,8 @@ export interface AutobiographicalConfig {
    * large enough to overflow the API window. Walks newest-first so
    * proximate context survives; the kept set is then re-sorted
    * chronologically. Each summary takes (its content tokens + 50 for
-   * the wrapping "[CM] Recall memory <id>." question).
+   * the wrapping "[CM] Recall memory <id>." question, plus that summary's
+   * envelope tags when `recallEnvelope` is on).
    *
    * Default 100000 — chosen so that even an L_n merge (which packs
    * recall + head + expanded target + instruction into one request)
@@ -520,6 +1002,122 @@ export interface AutobiographicalConfig {
   compressionRecallBudgetTokens?: number;
 
   /**
+   * Prompt-cache breakpoints on compression/merge requests (issue #37).
+   *
+   * Mint requests are dominated by a stable, append-mostly prefix (head
+   * window + prior recall pairs — ~60% synthetic, ~93% on mature stores)
+   * that was re-sent uncached on every call. When enabled, the request is
+   * tagged at its stability strata: end of head, last level>=2 recall pair,
+   * last recall pair. Markers are suppressed for any request whose recall
+   * ladder was budget-capped (`compressionRecallBudgetTokens`): front
+   * eviction shifts the prefix every mint, and measured cache writes there
+   * are pure waste (up to +42% cost). Requires append-stable ladder order
+   * (the 2026-08-19 source-order fix) to be effective.
+   *
+   * Default: true.
+   */
+  compressionCacheMarkers?: boolean;
+
+  /**
+   * Cache TTL for compression-lane breakpoints. Mint cadence is typically
+   * minutes-to-hours in steady state — beyond the 5-minute TTL, where
+   * markers cost more than they save — so the lane defaults to '1h'
+   * (write premium 2x vs 1.25x, break-even reuse probability 0.53 vs 0.22).
+   * Back-to-back drains work under either.
+   *
+   * Default: '1h'.
+   */
+  compressionCacheTtl?: '5m' | '1h';
+
+  /**
+   * Residence-scoped direct source-only L1 compression (2026-08-25).
+   *
+   * When true, an L1 compression request contains ONLY the in-band
+   * compression marker, the exact target chunk (raw), and the write-memory
+   * directive — the head window, the prior recall pairs, and any non-target
+   * raw recent-window material are all omitted. This is ONE direct call, not a
+   * canonical→refusal→fallback escalation.
+   *
+   * Motivation (Mythos 2026-08-25): L1 compression was refused by the Fable
+   * safety classifier when the request compiled the raw recent-window room
+   * traffic alongside one target chunk. On a copied store the failing
+   * contribution was localized to the raw recent-window block as a class in
+   * that exact request: recall pairs, the tool manifest, the head window, and
+   * the target chunk were each ruled out individually, and two 4-message
+   * subsets of the raw-recent block (the incident thread and a size/role-
+   * matched control) were each insufficient to clear the refusal, while
+   * removing the whole block did. This does NOT establish that the carrier is
+   * a diffuse "cumulative mass" or that no smaller subset is load-bearing —
+   * only that the raw-recent block as a class carries it here. Handing the
+   * summarizer only the thing it is summarizing is the correct scope; the
+   * copied drain cleared all quarantined chunks first-try and the summaries
+   * passed a full fidelity audit.
+   *
+   * Source-preserving: no message, summary, or chunk is edited; only the
+   * provider-facing request is scoped. The marker/target/directive are emitted
+   * structurally (sections 4–6 of the builder), never matched by substring.
+   * Tools are still declared (`ctx.tools`): a summarizer replaying
+   * tool_use/tool_result history with no tools param is a deterministic
+   * reasoning_extraction refusal (labclaude 2026-07-09). Affects L1 only;
+   * executeMerge and generateTransitionSummary are unchanged.
+   *
+   * Default undefined/false — every other resident is unaffected.
+   */
+  compressionSourceOnly?: boolean;
+
+  /** Final bounded source-only L1 attempt after canonical + recall variants. */
+  compressionSourceOnlyFallback?: boolean;
+  /**
+   * Tool-prose hoist rung (2026-09-19, sill). Off unless set.
+   *
+   * Long prose in an argument of a private-reasoning tool (`skip_reply.reason`,
+   * `think.content`) makes the replayed history read as a reasoning trace and
+   * the L1 request is refused `reasoning_extraction` regardless of content. On
+   * a canonical REFUSAL (only then) the request is retried once with each such
+   * argument moved into a call to `intoTool` — a note-taking tool the agent
+   * really has — placed as its own round just before the original call, a short
+   * stub left behind. If the source-only final rung is enabled and also refuses,
+   * it gets the same rewrite once. Nothing the agent wrote is dropped.
+   *
+   * The rung is SKIPPED unless `intoTool` is among the tools the host declared:
+   * the summarizer is the agent, and it must never be shown itself using a tool
+   * it does not have. Enabling (or changing) this is a new request regime, so
+   * already-quarantined chunks earn a fresh bounded attempt without a manual
+   * clear. See `tool-prose-hoist.ts` for the canary record.
+   */
+  compressionToolProseFallback?: {
+    /** Declared name of the real note-taking tool that receives the prose. */
+    intoTool: string;
+    /** Tools to rewrite from (exact name or final `--` segment). Required. */
+    fromTools: string[];
+    /** Argument of `intoTool` that receives the prose (default `content`). */
+    field?: string;
+    /** tool_result content for the inserted calls (default: journal receipt). */
+    result?: string;
+    /** Rewrite string arguments longer than this many chars (default 100). */
+    minChars?: number;
+  };
+  /**
+   * Split-stitch rung (2026-09-05, princess): when every L1 rung (canonical, recall
+   * expansions, source-only-final) is refused, fold the chunk in halves recursively
+   * at message boundaries with the same instruction/model, source-only, and install
+   * the stitched pieces as ONE L1 over the chunk (per-piece ranges/hashes recorded on
+   * the entry as `stitched`). Off by default.
+   */
+  compressionSplitFallback?: boolean;
+  /**
+   * With compressionSplitFallback: allow a one-line bracketed operator placeholder for a
+   * SINGLE message that refuses in every form (names the message id; the message stays in
+   * the record). Without it, such a chunk falls through to quarantine. Off by default.
+   */
+  compressionSplitPlaceholder?: boolean;
+  /** Split-stitch: max sub-calls per chunk (default 40). */
+  compressionSplitMaxCallsPerChunk?: number;
+  /** Split-stitch: max sub-calls per strategy instance per 10-minute sliding window (default 80).
+   * In-memory only: resets on process restart; not a durable quota. */
+  compressionSplitMaxCallsPer10Min?: number;
+
+  /**
    * Maximum number of same-model recall-curve variants attempted after an L1
    * canonical request is explicitly refused. Each variant expands exactly one
    * already-authored frontier summary into its persisted direct children.
@@ -531,11 +1129,12 @@ export interface AutobiographicalConfig {
    * Total model context budget used to admit refusal-curve compression
    * requests, including the request input and the configured output reserve.
    * The canonical request remains unchanged and is always attempted first;
-   * only fallback variants are gated. Admission uses the greater of canonical
-   * provider input usage plus a positive expansion delta and a deterministic,
-   * byte-conservative bound over the complete normalized variant input
-   * (including config, tools, provider fields, and formatter envelopes), then
-   * adds the output reserve. Default: 200000.
+   * only fallback variants are gated. Before authoritative canonical usage
+   * exists, admission uses a conservative complete normalized-request bound.
+   * After canonical refusal reports complete provider input usage, admission
+   * uses provider-total input plus a positive serialized expansion delta, then
+   * adds the output reserve. Zero, partial, or unknown usage contracts retain
+   * the conservative bound. Default: 200000.
    */
   compressionContextBudgetTokens?: number;
 
@@ -645,12 +1244,18 @@ export interface AutobiographicalConfig {
    * Folding strategy name when adaptiveResolution is on. One of:
    *   'flat-profile' (default) — level-equalizing
    *   'oldest-first' — chronological
-   *   'kv-stable' — the KV-stable context controller: minimizes real prefix
-   *     churn directly (flat zone + per-turn reach cap; no λ). Built per-compile
-   *     from the live PickerInputs. See docs/kv-stable-context-control.md.
+   *   'kv-stable' — the KV-stable context controller: the rev 5.0 single-path
+   *     solve — a relevance-ideal cut reconciled against the carried frontier
+   *     under a perturbation trust region (exact kvCost; no λ, no emergency
+   *     path). Built per-compile from the live PickerInputs. See
+   *     docs/adaptive-resolution-design.md §13.
    * Custom strategies can be plugged in by the host application.
    */
-  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable';
+  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable' | 'kv-unified';
+
+  /** Explicit, fail-closed kv-unified policy. Every field is required when
+   * foldingStrategy is `kv-unified`; there are no live defaults. */
+  kvUnified?: KvUnifiedConfig;
 
   /**
    * Trust region P (tokens) for `foldingStrategy: 'kv-stable'` — bounds how
@@ -687,6 +1292,63 @@ export interface AutobiographicalConfig {
    * (no picker request needed). Default true when adaptiveResolution is on.
    */
   speculativeProduction?: boolean;
+
+  /**
+   * Standing production target (tokens): keep the summary forest deep enough
+   * that a compile would fit under THIS budget, even while the live compile
+   * budget is higher. Each adaptive compile runs an extra shadow pick against
+   * this budget — pure CPU, no LLM call, no state commit — and enqueues the
+   * folds it demands through the normal drain queues. Once the forest has
+   * converged, the live budget can be lowered to the target in one move: no
+   * fold-storm, a single KV invalidation ("produce first, fold once").
+   * If the target is unreachable even fully folded (head + tail + max-depth
+   * summaries still exceed it), every compile warns loudly — a descent to
+   * that budget would hard-fail with OverBudgetError. Shadow demand is
+   * speculative and never bypasses the `l1HoldbackChunks` window. Must be
+   * positive; no effect unless lower than the live compile budget.
+   */
+  productionBudgetTokens?: number;
+
+  /**
+   * Emit a one-shot effective-config report when the strategy INITIALIZES: one
+   * structured line on stderr (`event: 'config:effective'`) carrying every
+   * resolved key with the layer that supplied it — 'library-default',
+   * 'caller', 'knowledge-enforced', or whatever a host names its own layers.
+   * A strategy that is constructed and never initialized emits nothing, and a
+   * subclass instance reports the strategy it actually is. Default false;
+   * nothing is emitted unless this is explicitly on. The same map is always
+   * available programmatically as `strategy.configProvenance`.
+   *
+   * The line carries three maps, not two: `effective`, `provenance`, and
+   * `presentAsUndefined`. A key a caller supplied as explicit `undefined` stays
+   * present in the effective config (spread fidelity) but cannot survive JSON,
+   * so it is listed by name in `presentAsUndefined` instead — leaving every
+   * provenance key either valued in `effective` or named there, and never both.
+   * `null` is a JSON value and rides `effective` as itself.
+   */
+  logEffectiveConfig?: boolean;
+
+  /**
+   * Persist the exact request that authored each minted summary, keyed by
+   * the `provenance.requestHash` the summary already carries (see
+   * `SummaryEntry.provenance` and `src/mint-preimage.ts`). Without it the
+   * hash keys an `llm-calls` log this library does not write, so provenance
+   * survives only as long as the host's harness logs do.
+   *
+   * OPT-IN, default false. Preimages are stored in the same Chronicle store
+   * as the summaries — inline media is stored by content-addressed reference,
+   * reusing blobs the messages already put there and storing other inline
+   * media once. The request TEXT (a full compression context) remains real
+   * growth at mint cadence, and this library has no retention knob for it
+   * yet. Fleets that deploy from checkout would otherwise have every
+   * resident start writing preimages on the next pull, so turning it on is a
+   * deliberate act with an eye on store size. Absent config means off: only
+   * an explicit `true` enables it.
+   *
+   * Writing is best-effort even when true: a store that refuses the write is
+   * reported on stderr and the mint proceeds without a preimage.
+   */
+  persistMintPreimages?: boolean;
 }
 
 /**
@@ -721,6 +1383,8 @@ export type LegacySummaryLevel = 1 | 2 | 3;
 export interface SummaryEntry {
   /** Unique ID (e.g., "L1-0", "L2-3") */
   id: string;
+  /** Present when the entry was produced by the split-stitch rung (compressionSplitFallback). */
+  stitched?: Record<string, unknown>;
   /** Compression level (1, 2, 3, ... — unbounded in the adaptive-resolution design) */
   level: SummaryLevel;
   /** The summary text */
@@ -742,6 +1406,16 @@ export interface SummaryEntry {
    * decisions live on per-chunk `currentResolution`, not here.
    */
   parentId?: string;
+  /**
+   * The slice this summarizes is inherited/witnessed record, not the agent's
+   * lived experience (witnessedBeforeSequence pin). Stamped at L1 mint;
+   * merges of all-witnessed sources keep the witnessed voice AND the flag —
+   * without propagation the consolidation instruction re-first-persons
+   * others' lives one level up (observed 2026-07-27: an L3 opening "I
+   * remember the full arc of my relationship with Tavy" — another
+   * resident's history, claimed).
+   */
+  witnessed?: boolean;
   /**
    * @deprecated Renamed to `parentId` in the adaptive-resolution design.
    * Kept for read compatibility with chronicles produced by the old
@@ -768,6 +1442,45 @@ export interface SummaryEntry {
    * before this field existed (backfillable from llm-calls logs).
    */
   responseContent?: ContentBlock[];
+  /**
+   * Authoring-call provenance: the terminal disposition and request
+   * identity of the LLM call that produced this summary. A summary may
+   * become canonical only after a complete accepted terminal disposition
+   * (`stopReason === 'end_turn'` + nonempty text) — this field records the
+   * evidence, so entries authored before the 2026-08-01 disposition gate
+   * (which could canonize refusals/truncations, e.g. the 163-char cyber
+   * refusal that became an L4 parent) are auditable: `provenance` absent →
+   * pre-gate entry, verify against host-harness logs via content match;
+   * present → `requestHash` keys the request that authored this summary.
+   *
+   * That key is readable, not merely verifiable, WHERE the host opted into
+   * preimage persistence (`persistMintPreimages: true`, off by default): the
+   * authoring request is then retrievable by this very hash —
+   * `getMintRequestByHash(store, requestHash)`, src/mint-preimage.ts — so
+   * audit no longer depends on a host-side llm-calls log surviving. It is
+   * BEST-EFFORT even then: a preimage is absent when the mint predates that
+   * persistence, when it ran without `persistMintPreimages: true`, or when
+   * the store refused the write (loud on stderr, never fatal — a summary
+   * outranks its receipt). A present `provenance` therefore promises a
+   * verifiable hash, not a retrievable request.
+   */
+  provenance?: {
+    /** Terminal stopReason of the accepted response (always 'end_turn' for post-gate entries). */
+    stopReason: string;
+    /**
+     * sha256 of the JSON-serialized membrane request that authored this
+     * summary, and the key its persisted preimage is stored under — the blob
+     * key itself for a text-only request, the envelope index key for one
+     * carrying inline media (src/mint-preimage.ts). Always the request the
+     * transport
+     * ACCEPTED: when a degraded-mode retry sends different bytes than the
+     * first attempt (carrier stripping), those accepted bytes are what this
+     * hash keys, because they are what the model actually read.
+     */
+    requestHash: string;
+    /** Compression model that authored this summary. */
+    model?: string;
+  };
 }
 
 /**
@@ -896,6 +1609,8 @@ Capture what matters:
 
 Write naturally, as recollection of what you experienced.`,
   summaryContextLabel: 'What do you remember from earlier?',
+  recallEnvelope: 'none',
+  carrierPolicy: 'full',
   summaryParticipant: 'Claude',
   maxMessageTokens: 0,
   maxLiveImages: 6,
@@ -904,4 +1619,6 @@ Write naturally, as recollection of what you experienced.`,
   recallHeaderTemplate: '[Recall {id}]',
   compressionRefusalCurveFallbacks: 3,
   compressionContextBudgetTokens: 200000,
+  overBudgetGraceRatio: 0.02,
+  persistMintPreimages: false,
 };

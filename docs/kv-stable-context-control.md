@@ -143,6 +143,13 @@ only the optimum when costs are uniform and there are no pins.
 
 ## Prototype (this repo)
 
+> **Historical (rev 5.1, 2026-08-05):** the bullets below describe the
+> **retired** §12-era controller (hysteresis band + reach cap + escalation).
+> `kv-control.ts` now implements the rev 5.0 single-path solve — see
+> `adaptive-resolution-design.md` §13, and §13.6 for the robustness machinery
+> (boundary-cut/overlap tolerance, fold→project fixpoint) it has since grown.
+> The measurement harness described further down is unchanged and current.
+
 `src/adaptive/kv-control.ts` implements a tractable first cut:
 
 - **Bidirectional, within a hysteresis band [expandAt, foldAt]** — the frontier
@@ -155,9 +162,12 @@ only the optimum when costs are uniform and there are no pins.
   - in the **dead band** `[expandAt, foldAt]` → do nothing (pure append, zero
     perturbation). This is the fix for the fold-only ratchet, which left budget
     headroom unused and kept resumed conversations needlessly compressed.
-- **Group-consistent, leveled** moves (L1↔L2↔L3 whole groups) so the picker can
-  walk to the target via raise/lower; each fold bounded by the log-age saliency
-  cap; flat zone and pins never touched.
+- **Group-consistent, leveled** moves (L1↔L2↔L3 whole groups) inside the solve;
+  each fold bounded by the log-age saliency cap; flat zone and pins never
+  touched. (The picker applies the solved frontier directly — the former
+  raise/lower op walk was removed 2026-07-26; see adaptive-resolution-design.md
+  §3.5 history note. Leveled pins legitimately cut through groups, which group
+  ops could not express.)
 - **W hard wall + escalation** when even full folding can't fit under W. W is
   the *only* hard constraint: when folding within reach + saliency caps still
   exceeds W, the emergency lifts **both** the reach cap **and** the depth cap

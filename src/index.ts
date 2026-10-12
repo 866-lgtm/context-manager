@@ -1,24 +1,45 @@
 // Main class
-export { ContextManager } from './context-manager.js';
+export { ContextManager, InitializationSupersededError } from './context-manager.js';
 export type { ContextManagerConfig } from './context-manager.js';
 
 // Phase channel (liveness-watchdog observability hook)
 export { phaseChannel, enterPhase, withPhase, withPhaseAsync } from './phase-channel.js';
 
 // Storage
-export { MessageStore } from './message-store.js';
+export { MessageStore, defaultTokenEstimator, jsonTokenEstimator } from './message-store.js';
 export type { MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 export { concatBodyGroups } from './adaptive/render.js';
+export { continuesBody, bodyStart, bodyEnd, bodyBounds, bodyBoundsIn, type BodyShard } from './body-runs.js';
 export { ContextLog } from './context-log.js';
-export { BlobManager } from './blob-manager.js';
+export { BlobManager, blockAsStored } from './blob-manager.js';
+export {
+  persistMintRequestPreimage,
+  getMintRequestPreimageBytes,
+  getMintRequestByHash,
+  MintPreimageMaterializationError,
+} from './mint-preimage.js';
 
 // Strategies
 export { PassthroughStrategy } from './strategies/passthrough.js';
+export { WindowedPassthroughStrategy } from './strategies/windowed-passthrough.js';
+export type { WindowedPassthroughOptions } from './strategies/windowed-passthrough.js';
+export { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
 export { AutobiographicalStrategy, type AutobiographicalProgressSnapshot, type Chunk } from './strategies/autobiographical.js';
 export { KnowledgeStrategy } from './strategies/knowledge.js';
 
 // Utilities
 export { splitMixedToolMessages, stripUnpairedToolBlocks } from './normalize-tool-messages.js';
+export { resolveEffectiveConfig } from './config-provenance.js';
+export type { ConfigLayer, ConfigResolutionSemantics, EffectiveConfigReport } from './config-provenance.js';
+
+// Errors — cross-package behavioral surface. agent-framework gates its
+// OverBudget drain breaker on these errors (AF PR #58, framework.ts
+// classifyInferenceError); exporting them from the root gives consumers a
+// real `instanceof` instead of stringly-typed `err.name` matching.
+export { OverBudgetError, UncoveredDropError } from './adaptive/picker.js';
+export { StoreTopologyError, type TopologyViolation } from './strategies/autobiographical.js';
+export { planTopologyRepair, type RepairPlan, type RepairInputs, type RepairOptions } from './repair/topology.js';
+export type { OverBudgetDiagnostics } from './adaptive/picker.js';
 
 // Types
 export type {
@@ -32,6 +53,14 @@ export type {
   StoredContentBlock,
   MessageQuery,
   MessageQueryResult,
+  TimeRangeQueryOptions,
+  ChannelQueryOptions,
+  TimeAndChannelQueryOptions,
+  IndexedMessageQueryResult,
+  ChannelCount,
+  ChannelTokenBreakdown,
+  ChannelTokenStats,
+  ChannelTokenStatsOptions,
   // Context types
   SourceRelation,
   ContextEntry,
@@ -52,16 +81,24 @@ export type {
   HotConfigurableStrategy,
   AutobiographicalConfig,
   AutobiographicalOptions,
+  RecallEnvelopeMode,
+  CarrierPolicy,
   SummaryLevel,
   SummaryEntry,
   PhaseType,
   KnowledgeConfig,
   KnowledgeOptions,
   ResettableStrategy,
+  TimeRangeSummaryEntry,
+  SummaryOverviewStrategy,
+  AddMessageOptions,
+  CompressionHoldOptions,
+  CompressionHoldInfo,
 } from './types/index.js';
 
 export {
   DEFAULT_AUTOBIOGRAPHICAL_CONFIG,
   isResettableStrategy,
+  isSummaryOverviewStrategy,
   isHotConfigurableStrategy,
 } from './types/index.js';

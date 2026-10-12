@@ -1,0 +1,644 @@
+# Changelog
+
+Notable changes to `@animalabs/context-manager`, loosely following
+[Keep a Changelog](https://keepachangelog.com/). Entries land with the change
+that causes them, as fragment files in [`changelog.d/`](changelog.d/) that are
+folded into a version section at release time — see
+[CONTRIBUTING.md](CONTRIBUTING.md#changelog).
+
+Releases up to and including 0.6.2 predate this file; for their contents see
+`git log` and the
+[releases page](https://github.com/anima-research/context-manager/releases).
+
+## Unreleased
+
+## 0.13.0 — 2026-10-03
+
+### Added
+
+- Optional compression-hold timeouts: `holdCompression(ids, { timeoutMs })`
+  and `addMessage(..., { holdCompression: { timeoutMs } })`. A timed hold is
+  released automatically once expired — checked lazily on `tick()`,
+  `compile()` and hold queries (no timers) — through the same path as
+  `releaseCompression` (strategy notified), with a warning naming the ids
+  and how long they were held. Re-holding an id replaces its hold (timeout
+  restarts; re-holding without `timeoutMs` makes it indefinite).
+  `getCompressionHoldDetails()` reports `heldAt`/`expiresAt` per hold; the
+  manager clock is injectable via `ContextManager.open({ now })`. Holds
+  without a timeout behave exactly as before.
+  Deadlines are per message id; one call or one sharded `addMessage` reads
+  the clock once, so its ids share a deadline, and expiry releases only the
+  ids past their own deadline (never the rest of a shard group). Expiry is
+  also checked on `addMessage`.
+
+### Fixed
+
+- Key MessageStore message-ID indexes and materialized caches by native Chronicle branch ID, so deleting and recreating a branch under the same name cannot return stale content or edit/remove the wrong message.
+
+- Budget refusals report the configured window, response reserve, and input budget alongside the effective hard limit. Diagnostics label adaptive picker-chunk counts, hierarchical selection-item/raw-message counts, and planned versus attempted depth explicitly; preflight refusals report that no fold plan was computed and count pre-head history after a reset. Available summary inventory remains separate, and KV escalation logs include planned and available depths.
+
+- Recognize Bedrock-prefixed Fable/Mythos summarizer model IDs when deferring compression until the host supplies tool definitions.
+
+- Apply tool pairing repair before result pruning in both adaptive and hierarchical rendering. Generated missing-result placeholders no longer consume last-N retention slots, while genuine output with identical text still counts. Displaced or duplicate results are counted only after repair.
+
+- Coverage-repair warnings report the skipped summary counts and possible budget or interrupted-merge causes without diagnosing healthy stores as corrupt. Empty entries left by tool-result relocation now say the result moved during context repair.
+
+## 0.12.0 — 2026-10-03
+
+### Added
+
+- Compression holds: `ContextManager.holdCompression(ids)` /
+  `releaseCompression(ids)` / `getCompressionHolds()`, and
+  `addMessage(..., { holdCompression: true })` to place the hold before the
+  strategy sees the message. Autobiographical (and Knowledge) treat the
+  earliest held message as the start of the protected recent window: it,
+  everything after it, and the tool_use it answers stay raw and out of every
+  chunk; a chunk that closed before a late hold waits for release. Intended
+  for provisional content later replaced with `editMessage` (agent-framework's
+  tool-result guard stages a placeholder tool_result) — edits never reach
+  summaries, so edit while held, then release. Holds are in-memory only; a
+  reopened manager starts with none. With no holds, chunking, compression
+  requests and compiled context are unchanged.
+  Held content is also kept out of compression, merge and transition-summary
+  prompts' head context (a reset head window can sit past the hold), and
+  hold checks cost nothing when no hold exists (one timeline scan per pass
+  otherwise).
+  Releasing a hold notifies the strategy (`onCompressionHoldsReleased`), which
+  re-queues deferred chunks so `tick()` resumes without a new message. An L1
+  or merge whose span gains a hold mid-request is discarded and retried after
+  release; queued merges reaching a hold wait. A held tool_result keeps a
+  sharded (adaptive-resolution) tool_use message's whole body group with it.
+  Range removals drop holds on removed messages.
+  Removing a held message also resumes deferred compression, and a release
+  during branch (re)initialization never throws into the caller — the
+  strategy is notified once initialization completes.
+
+- `compressionToolProseFallback: { intoTool, fromTools, field?, result?, minChars? }`
+  — an opt-in L1 compression fallback rung. Long prose kept in an argument of a
+  private-reasoning tool (`skip_reply.reason`, `think.content`) makes replayed
+  history read as a reasoning trace, and the memory-write is refused
+  `reasoning_extraction` regardless of content. On a canonical **refusal** the
+  request is retried once with each such argument moved into a call to
+  `intoTool` — a note-taking tool the agent really has (agent-framework's
+  `journal`) — placed as its own round just before the original call, with a
+  short stub left behind; if the source-only final rung is enabled and also
+  refuses, it gets the same rewrite once. Nothing the agent wrote is dropped.
+  The rung is skipped unless `intoTool` is among the declared tools and at least
+  one argument qualifies. Enabling or changing it is a new request regime, so
+  already-quarantined chunks earn a fresh bounded attempt without a manual
+  clear. Off by default: with the option unset, canonical requests, request
+  hashes and quarantine identity are byte-identical.
+
+- Store topology fails loudly. Every load audits the summary archive for
+  crossed ownership (a summary whose leaves are not contiguous among
+  chunk-owned messages in store order — issue #122's cross-era merges,
+  restore/branch interleavings, hand surgery). `topologyPolicy: 'reject'`
+  (default) throws `StoreTopologyError` from `initialize`, so
+  `ContextManager.open` refuses the store until it is repaired;
+  `'report'` logs the violations at error level and reports them through
+  `getCompressionDebt().topologyViolations` (state `critical`). A kv-unified
+  config that opts into gap handling (`preserveGapBearingSummaries` or
+  `treeifyNonContiguousSummaries`) defaults to `'report'`.
+  `scripts/audit-topology.ts` runs the same audit read-only on a store path.
+- Merge adjacency is judged in store order, not chunk-record order, so a chunk
+  minted late over an early message can no longer join the frontier's merge run
+  (the second half of #122). Demand-path merges (`enqueueMergeForRange`, #95)
+  are split into strictly adjacent runs like the threshold path. `executeMerge`
+  refuses any group that is not one level below the target and strictly adjacent
+  in store order: no model call, the entry moves into the merge quarantine with
+  outcome `topology_violation`, and `getCompressionDebt().topologyRefusals` /
+  state `critical` say so. A crossed node is never minted.
+
+- `repair-topology --rebuild-since <messageId|ISO date>`: in rebuild mode,
+  only crossed summaries whose span starts at or after that message are
+  dissolved for the ladder to re-fold; older ones get the compact treatment,
+  so regions that were repaired by hand are never re-summarized. The plan
+  reports where the cutoff landed and how the crossed set split.
+- compact mode adopts hole owners downward: a root of any lower level that
+  owns a hole is taken into the descendant one level above it whose span is
+  adjacent, so a small hole deep inside a tall tower closes where it is and
+  nothing above unravels.
+
+- `planTopologyRepair` (`src/repair/topology.ts`) and `scripts/repair-topology.ts`:
+  a general, regeneration-free repair for crossed summary ownership (the
+  stores `topologyPolicy: 'reject'` refuses). A crossed summary keeps the run
+  of children carrying the most leaves and detaches the rest as roots; a
+  crossed L1 keeps its largest run and releases the stray messages from its
+  chunk record; single-source parents dissolve; touched ancestors get their
+  `sourceRange` recomputed; kv-stable resolutions are clamped to the leaf's
+  remaining chain. `--release-head` removes detached opening L1s (and
+  uncompressed prefix records) so the head window takes those messages back
+  verbatim. Dry-run by default; `--apply` writes and re-opens the store under
+  `'reject'` to verify. `scripts/audit-topology.ts` now prints summary,
+  chunk and chunk→L1 link counts and warns when it has nothing to audit.
+- `auditOnly` strategy config: `initialize` loads and audits the store but
+  never chunks the uncovered frontier, enqueues merges, or rewrites the
+  persisted merge queue. The audit and repair scripts open stores this way;
+  a plain open under a config that is not the resident's own mints chunk
+  records with the wrong head window and chunk size, which the resident then
+  compresses at its next boot. `--release-head=all` (with
+  `--release-head-limit <n>`) also releases pre-existing prefix L1s.
+- `--mode rebuild`: dissolves each crossed summary and its ancestors (plus,
+  for a child run left without an unparented same-level neighbour, the
+  tower over the smaller adjacent neighbour) back to roots, so the merge
+  ladder re-folds the affected regions bottom-up with real summaries —
+  faithful and compact, at the price of summarizer calls. Reports
+  `dissolvedForRebuild` (≈ merges to regenerate) and `exposedL1Leaves`;
+  re-fold offline with `drain-autobiographical` before restarting.
+
+### Changed
+
+- `kvUnified.hysteresisCertificate` is now a strategy config key (passed
+  through by the adapter like the other `kvUnified` fields), so the certified
+  hysteresis exit can be switched on from a recipe. The certificate also no
+  longer declines when an appended leaf has a fold option (a freshly minted
+  L1 over new messages): it enumerates every cut that keeps each accepted
+  leaf at its accepted level (capped at 256, else it declines as before),
+  scores them exactly, and certifies the best one — which is what the full
+  solve's hysteresis rule selects. On a copy of Sill's store, 24 of 25
+  unchanged turns certified at ~0.4 s instead of a 4–6 s solve.
+
+- Compile overhead on large stores: `mergeAdjacentBodyGroupRaw` no longer
+  fetches every raw entry's message from chronicle (with blob resolution) to
+  read two shard fields; it indexes the caller's message listing once (~0.7 s
+  saved per compile on a 75k-message store).
+
+### Fixed
+
+- `scripts/drain-autobiographical.ts` now passes the four split-fallback keys
+  (`compressionSplitFallback`, `compressionSplitPlaceholder`,
+  `compressionSplitMaxCallsPerChunk`, `compressionSplitMaxCallsPer10Min`)
+  through from the recipe, so an offline drain honours them; previously they
+  were silently dropped and a drain ran without the split-stitch rung even when
+  the resident had it on. (`compressionToolProseFallback` is passed through too.)
+
+- The head window no longer ratchets down under calibration drift (#122).
+  When a calibration rise moved the token-derived head boundary onto
+  messages no chunk owned, those messages were minted into small, late L1s
+  that merged with the open frontier: summaries mixing the chronicle's
+  opening with much later material, rendered at the opening's position. The
+  boundary now extends over that uncovered run to the first owned message
+  (bounded at 2× `headWindowTokens`). Stores with no coverage after the
+  boundary, and heads that grew over owned messages, keep the stock boundary.
+
+- Post-strip token estimates now subtract a stripped image at the store's
+  calibrated price. `MessageStore.estimateTokens` prices every block as
+  `round(raw × calibration)`, but `postStripEstimates` took the uncalibrated
+  `tokenEstimate ?? 1600` (minus the placeholder) back off. With the
+  calibration multiplier below ~0.995, an image-only message whose image had
+  aged out of the live window came out NEGATIVE (e.g. 0.925: 1480 − 1591 =
+  −111), and kv-unified's canonical-forest check rejected every compile with
+  `chunk <id> has invalid raw cost -…` — a hard-down that could not heal,
+  since calibration only updates after a successful call. Above 1.0 the same
+  mismatch over-counted each stripped image (≈ 450 tokens at 1.28). Each
+  per-message estimate is also clamped at zero.
+
+- kv-unified latent demand keeps no ranking state between compiles: it is ranked on every compile, so appended messages, policy changes and branch switches always reach it. It has no candidates, and costs nothing, while fewer than `mergeThreshold` same-level summaries line up.
+
+- kv-unified leaf engine: token buckets no longer let it drop a label with a different token count while reporting a zero error bound (#109). Reached only through an explicit `engine: 'leaf'`; the default route is unchanged. Such callers may need a larger `labelCeiling`, since the leaf engine now keeps more labels.
+- kv-unified latent demand: `approximate` is now true only when the solve reports a nonzero score error bound, instead of whenever a bucket size is configured.
+
+- kv-unified cache model: the raw tail now renders as one unit per message
+  (keyed by chunk id, the same identity a message keeps after it slides into
+  the middle) instead of one opaque `tail` unit. With the opaque unit every
+  append shifted the tail's position — the messages leaving the tail became
+  new raw units in front of it — so the end-of-tail marker fell outside the
+  identical prefix and an unchanged layout was priced as the whole tail
+  (~100k tokens on Sill) recomputed on every turn, although the wire bytes
+  were identical. Selection was unaffected (the false churn was the same for
+  every candidate and cancelled in the floor normalization), but reported
+  churn and `cacheFloor` were wrong and the opt-in hysteresis certificate's
+  zero-churn precondition could never hold in steady state. Applies to
+  `renderLayout`, both solver storages and the terminal evaluator; cache
+  markers on tail messages now map to that message's unit. Tail tokens not
+  attributed to any tail chunk (synthetic inputs only) keep the opaque block,
+  so token totals are unchanged. The first solve after upgrading sees the
+  persisted opaque-tail layout diverge once; subsequent receipts are per-message.
+
+- The L1 mint builder's compression-image byte cap now applies to the
+  post-split wire messages instead of the pre-split `llmMessages` list.
+  `splitMixedToolMessages`/collapse rebuild message objects, so the cap was
+  logging its strips against copies the request never shipped — a mixed tool
+  round carrying an image kept its image on the wire under ANY
+  `maxCompressionImageBytes` (field repro 2026-09-21: "replaced 1 older
+  image ... kept 0MB" logged while the same mint failed with the provider's
+  image-input 400). The merge builder has always capped its post-split list;
+  the L1 builder now matches it.
+
+## 0.11.0 — 2026-09-25
+
+### Changed
+
+- Use reusable packed label records and bucket tables in the kv-unified DAG
+  solver. Preserve the object implementation as a diagnostic reference.
+- Select terminal candidates with conservative rounding bounds and exact cache
+  accounting, refining all possible winners, ties, and normalization-floor
+  witnesses. Keep the selected result exact and defer remaining diagnostic
+  candidate-list evaluations until requested, without changing policy or grids.
+
+### Fixed
+
+- kv-unified: a relevant provider cache no longer multiplies the Pareto label
+  set. A label's state key kept the unit at which it diverged from the cached
+  layout after the divergence, though nothing prices that value, so labels
+  that diverged at different units never competed and every compile from the
+  second turn on grew with the forest. The key now carries it only while the
+  cache is intact; the warm-prefix length a diverged label keeps, which the
+  cache term prices, stays in the key. Bucketed representative ties now break
+  on the frontier signature, as terminal selection does, instead of on that
+  unit. Exact-mode selected scores are unchanged (an equal-score tie can
+  resolve to a different cut, as it already could with no cache); bucketed
+  selections stay within the reported bound. On a production store
+  (≈270 chunks, 260k tokens) turns 2–4 select bit-identical scores in
+  1.7–1.9 s and under 2 GB, down from 20–21 s and 12–23 GB (7.2M → 0.57M
+  labels per compile). (#105)
+
+- Reduce kv-unified solve time and memory for existing presentations and forced
+  transitions by using linear bucket selection, equivalent broken-cache-prefix
+  states, precomputed action costs, and lazy frontier materialization. Preserve
+  the configured welfare policy, hard token wall, continuity pricing, and grids;
+  no solve deadline is introduced.
+- Handle internal protected holes in the automatic DAG solver and preserve
+  chronological cache emissions across nested ownership gaps.
+- Add an optional certified hysteresis exit for provable unchanged selections
+  and phase diagnostics for offline solver profiling.
+
+- Signed `thinking` blocks are priced by signature length (`MessageStore.SIGNATURE_CHARS_PER_TOKEN`, measured on Opus 4.8 via `count_tokens`) or the larger visible text, never by the flat 600-token default. On keep-all models (Opus ≥ 4.5, Sonnet ≥ 4.6, Fable/Mythos) prior thinking is replayed and billed as input at the full hidden chain of thought; the flat default under-priced long agentic histories ~10×, which pinned the calibration multiplier at its ceiling and left the compiled request far over budget. A per-block `tokenEstimate` stamped at creation still wins.
+- Estimator calibration also accepts a sample whose implied raw multiplier is inside the clamp range, so a multiplier pinned at 1.8 by a wrong per-class rate can come back down once the rate is fixed (on the ratio alone every honest sample read 0.56 and was rejected forever).
+
+- The autobiographical strategy prices rendered bodies (recall pairs, envelopes, merged entries, `maxMessageTokens` truncation) with the store's calibrated estimator instead of a strategy-local flat chars/4. Under `carrierPolicy: 'live-strip'`, where the exact mint `tokens` no longer floors the recall-pair price, the local rule under-priced dense summary prose by ~28% against `count_tokens` (526k planned vs 728k real on a 500-summary window); with parity the plan prices what it emits (real/est 1.02). The recall-pair price memo is also keyed by the calibration multiplier. `defaultTokenEstimator` / `jsonTokenEstimator` are now exported.
+
+## 0.10.1 — 2026-09-21
+
+### Fixed
+
+- kv-unified: a stale presentation receipt no longer makes the Pareto label
+  count superlinear in the DAG engine. Extension tokens (rendered tokens not
+  covered by the accepted presentation) are no longer a state-key dimension;
+  they are a dominance dimension while a provider cache is relevant (the
+  cache term prices them) and a cover-envelope term reported in the
+  a-posteriori error bound (`approximationCacheErrorBound`). The leaf engine
+  (auto-selected when a pin or lock leaves a protected hole inside a summary)
+  is fixed only while no provider cache is relevant; with one it has no
+  representative cap and is barely improved (#107). Separately, the first
+  successful non-dry-run adaptive presentation by a non-kv-unified folding
+  strategy supersedes a persisted `kvunified:presentation-receipt`, so a
+  switch back to kv-unified starts from an empty chain instead of measuring
+  against a days-old baseline. Loading, a `dryRun` compile and a failed
+  compile leave the receipt untouched; a host preview that runs a
+  non-dry-run compile counts as a presentation, and
+  `adaptiveResolution: false` never supersedes. A kv-stable → kv-unified
+  switch on a production store went from "exceeded ceiling 100000 at 125796"
+  (and >5 GB at a 1M ceiling) to a 332 ms / 436 MB solve under the same
+  ceiling, measured with no relevant provider cache; with one, the same
+  solve is dominated by #105, which this change does not address. (#97)
+
+## 0.10.0 — 2026-09-18
+
+### Added
+
+- `ContextManager.getSummariesInRange`/`getMaxSummaryLevel` list existing
+  compression summaries whose source span overlaps a time range — a
+  read-only "browse my history" primitive, no generation, for a downstream
+  agent-facing table-of-contents tool (see agent-framework's `HistoryModule`
+  `overview` tool).
+
+- `TimeRangeSummaryEntry` (from `getSummariesInRange`) now also exposes
+  `firstMessageId`/`lastMessageId`/`firstSequence`/`lastSequence` — exact,
+  tie-free identity/order boundaries for the covered span, alongside the
+  existing millisecond `startMs`/`endMs`. Wall-clock timestamps aren't
+  unique (two distinct messages can share a millisecond under rapid-fire
+  appends); chronicle's per-record `sequence` is strictly monotonic and
+  never ties, so a consumer doing fine-grained boundary work (e.g. a
+  downstream "overview" tool distinguishing which of several
+  same-millisecond messages actually belongs to a given summary) has an
+  exact way to do it.
+
+## 0.9.2 — 2026-09-17
+
+### Fixed
+
+- `getChannelCounts()` now reports the true unique message count per
+  channel instead of summing the two channel-id metadata schemas'
+  native index counts. A message that legitimately carries both
+  `metadata.channelId` and `metadata.external.channelId` (a real shape
+  produced by agent-framework's MCPL ingestion, which preserves an
+  incoming `metadata.external` while also adding its own top-level
+  `metadata.channelId`) was being counted twice.
+
+## 0.9.1 — 2026-09-17
+
+### Fixed
+
+- `queryByChannel`/`queryByTimeAndChannel`/`getChannelCounts`/
+  `getChannelTokenStats` now index and merge BOTH channel-id metadata
+  shapes: `metadata.channelId` (what agent-framework's real MCPL
+  ingestion actually writes) and `metadata.external.channelId` (the
+  pre-existing convention). 0.9.0 only indexed the latter, so these
+  methods silently found nothing for real framework-ingested history.
+
+## 0.9.0 — 2026-09-17
+
+### Added
+
+- `MessageStore`/`ContextManager` gain `queryByTime`/`queryByChannel`/
+  `queryByTimeAndChannel`/`getChannelCounts`/`getChannelTokenStats`
+  (`queryMessagesBy*`/`getChannelMessageCounts`/`getChannelTokenStats` on
+  `ContextManager`), backed by chronicle's new native `/timestamp` and
+  `/metadata/external/channelId` secondary field indexes (#99). O(log n + k)
+  against the index, not a full-store scan; requires chronicle >= the
+  version that ships `registerStateFieldIndex` — degrades to a clear error
+  on an older chronicle build rather than a silent full scan.
+
+### Changed
+
+- `compile()` now tags synthesized context messages with participant
+  `system_context:{namespace}` instead of `injection:{namespace}`. The old
+  name leaked verbatim into the rendered prompt (membrane formats messages
+  as `{participant}: {text}`), and a speaker literally named "injection"
+  tripped models' prompt-injection wariness on benign ambient context.
+  Nothing keys off the prefix programmatically; transcripts and UI filters
+  that grep for `injection:` should switch to `system_context:`.
+
+### Fixed
+
+- kv-unified: a new provider submission now supersedes an earlier flight that was never settled (a provider call that died before its usage event, then a retry) instead of throwing `kv-unified submission … is still in flight` and failing the retry as well. The superseded id is logged and later callbacks for it are no-ops.
+
+## 0.8.0 — 2026-09-07
+
+### Added
+
+- **Strategy-view composition** (groundwork for tune-out,
+  anima-research/agent-framework#77; all three inert until configured):
+  `ContextManagerConfig.viewFilter` — strategy-facing exclusion applied at the
+  single view choke point, so chunking, selection, emission, and the coverage
+  invariants all see the same excluded-free world while the store and direct
+  accessors keep everything (documented as non-retroactive over persisted
+  summaries and not a confidentiality boundary — excise by branching);
+  `ContextManagerConfig.auxiliaryMessageViews` — additional message slots
+  merged read-only into the strategy view, interleaved by branch-global
+  chronicle sequence (writes still target only the manager's own slot; an
+  entry naming the manager's own slot is refused, repeats merge once);
+  standalone compositors `filterMessageStoreView` / `mergeMessageStoreViews`
+  (#54).
+- **`WindowedPassthroughStrategy`** — passthrough over a sequence-anchored
+  window with coarse re-anchoring (jump to ~`reAnchorFraction` of budget on
+  overflow, byte-stable prefix + appends between jumps, unlike a naively
+  sliding front). The anchor persists in a `{ns}/windowed:anchor` snapshot
+  slot, follows branches, and is re-derived whenever the store's branch is
+  observed to change (host undo/redo included); `setAnchor()` is the external
+  policy hook. Places ≤ 2 message-level cache markers (measured stable prefix
+  + end) under the shared ≤ 3 first-claim contract. Applies `maxMessageTokens`
+  truncation and the autobiographical live-image policy (`maxLiveImages`,
+  `imageStripDepthTokens`, `maxLiveImageBytes`) itself, and refuses with
+  `OverBudgetError` when the newest message alone exceeds the usable budget
+  (#54).
+
+- `compressionSplitFallback` (default off): a final L1 rung that, after every
+  existing rung is refused, folds the chunk in halves at message boundaries
+  (tool rounds indivisible) in source-only shape and installs the stitched
+  pieces as one L1 over the chunk, with per-piece request/response/content
+  hashes, aggregate usage, and per-chunk / sliding-window call caps; provider
+  errors abort it. `compressionSplitPlaceholder` (default off) allows an
+  operator-authored, structurally marked placeholder for a single message that
+  refuses alone. Cap knobs: `compressionSplitMaxCallsPerChunk`,
+  `compressionSplitMaxCallsPer10Min`.
+
+- `carrierPolicy: 'full' | 'live-strip'` (default `'full'`) chooses where a
+  summary's captured reasoning carriers replay. `'live-strip'` omits the
+  signed `thinking` / `redacted_thinking` blocks from the LIVE WINDOW only —
+  the surface where an agent reads its own memory back and inhabits the
+  archivist's task-cognition at the remembered span's slot. Mint and merge
+  recall pairs keep their carriers unconditionally under either value, whole
+  and byte-verbatim, because that is where the anti-refusal duty is measured.
+  Stripping omits whole blocks and never rewrites one, so signatures still
+  verify on the mint side; a carrier-only entry falls back to its `content`
+  prose rather than rendering an empty turn; and the fold planner prices a
+  recall pair for the render the policy will actually emit.
+
+- Add the fail-closed `kv-unified` context solver with exact feasibility certificates, bounded Pareto welfare selection, accepted-presentation/cache receipts, expiring continuity relaxation, score-ranked latent summary demand, and token-weighted 33/66/100 history markers plus a tail marker.
+- Add aggregate-only Fable replay tooling and canonical ownership repair/prevention for stale, crossed, and non-contiguous summary ancestry.
+
+- Mint request preimages can now be persisted, so
+  `provenance.requestHash` is readable and not merely verifiable. With the
+  option on, every accepted L1 and merge mint stores its authoring request in
+  the same Chronicle store as the summary, retrievable by the hash the summary
+  already carries. Read it with `getMintRequestByHash(store, hash)` or
+  `getMintRequestPreimageBytes(store, hash)`. Refused and quarantined attempts
+  are not mints and are not stored.
+- New option: `persistMintPreimages`, **opt-in, default `false`**. Absent
+  config means off — only an explicit `true` enables it. Preimage text is real
+  growth at mint cadence, and this library ships no retention knob for it yet,
+  so a fleet that deploys from a checkout would otherwise have every resident
+  begin writing preimages on the next pull. Turning it on is a deliberate act,
+  taken with an eye on store size.
+- Inline media is stored by reference, not re-embedded. Media-bearing
+  preimages store the request JSON as an envelope of literal spans and
+  content-addressed media blob references. Media already extracted by
+  `MessageStore` reuses its existing blob; other inline media is stored once.
+  Reads restore the exact original base64 spelling and verify the materialized
+  bytes against `requestHash`. Text-only preimages remain plain request blobs,
+  and a damaged envelope raises `MintPreimageMaterializationError`.
+- Preimages are persisted best-effort: a store failure never blocks the mint
+  and leaves no preimage, so a reader gets null — alongside pre-feature mints
+  and persistence left off. The hash on the entry stays verifiable either way.
+
+### Fixed
+
+- Compression is now deferred until the host has pushed tool definitions
+  when the summarizer is a Fable/Mythos-family model, not only when the
+  chunk itself contains tool blocks. On those models a summarizer request
+  with the memory marker and directive but no `tools` param is a
+  deterministic `reasoning_extraction` input-block regardless of chunk
+  content, so a pure-chat seeded agent's first speculative L1 — fired
+  before the first `setToolDefinitions` — burned a doomed call and landed
+  its opening slice in compression quarantine (Linn, 2026-09-05). Opus-family
+  summarizers keep minting tools-less; deferred chunks are re-examined on the
+  next ingestion/activation as before.
+
+- Preserve explicitly allowed gap-bearing summary ownership without regenerating
+  historical prose, while retaining exact chronological cache accounting.
+- Price replayed signed-thinking summaries from their stored provider output
+  counts instead of replacing exact measurements with the legacy fallback.
+
+- `provenance.requestHash` now identifies the request the transport actually
+  ACCEPTED. In the carrier-transport degraded path both mint sites sent a
+  reasoning-stripped copy of the request but hashed and persisted the
+  original, so a summary authored by the stripped retry carried the hash of
+  bytes the model never read: `sha256(preimage) === requestHash` verified
+  green while the stored request was not the authoring one. L1 attempts and
+  merges now hash, map and persist the accepted bytes. A split-stitched L1
+  (`compressionSplitFallback`) records each fold part's accepted request hash
+  and, with `persistMintPreimages: true`, persists every leaf's preimage — its
+  own `requestHash` is a composite over the parts, not a request.
+
+## 0.7.0 — 2026-09-01
+
+### Added
+
+- Compression and merge requests now carry prompt-cache breakpoints at their
+  stability strata — end of head window, last level≥2 recall pair, last
+  recall pair — with a 1h cache TTL (#37). The mint lane previously sent its
+  entire recall prefix (~60–93% of input) uncached on every call. Markers are
+  suppressed when the recall ladder was budget-capped (front-eviction shifts
+  the prefix, making cache writes counterproductive), and stale block-level
+  `cache_control` riding replayed imported content is stripped so the seams
+  can never push a request past Anthropic's 4-breakpoint limit. New options:
+  `compressionCacheMarkers` (default `true`) and `compressionCacheTtl`
+  (default `'1h'`).
+
+- **`OverBudgetError`, `UncoveredDropError` (and `OverBudgetDiagnostics`) are
+  exported from the package root** (#41). Both errors are cross-package
+  behavioral surface — agent-framework gates its OverBudget drain breaker and
+  `context_refusal` classification on them (AF PR #58,
+  `classifyInferenceError`) but could only match `err.name` across the
+  boundary. Consumers now get a real `instanceof`; the constructors' message
+  wording stops being implicitly load-bearing. Additive, no behavior change.
+
+- Autobiographical L1 compression can opt into default-off `compressionSourceOnly` mode, which scopes the auxiliary mint request to the compression marker, exact target chunk, and write-memory directive while leaving primary and merge requests unchanged. The residence-scoped mode preserves source and stored memory, keeps tool definitions for tool-bearing history, and fails quiet with one quarantined call on refusal (#75).
+
+- Effective configuration is now readable, with the layer that supplied each
+  key: `resolveEffectiveConfig(layers, semantics)` collapses ordered named
+  layers into `{ effective, provenance }`, and `strategy.configProvenance`
+  exposes that map for an autobiographical or knowledge instance
+  (`'library-default'`, `'caller'`, `'knowledge-enforced'`, or whatever a host
+  names its own layers). Values previously coalesced through `??`-chains across
+  52 default sites, so the effective value of a key was recoverable only by
+  reconstructing the chain by hand and the layer that supplied it was not
+  recoverable at all. `semantics` is stated per call rather than assumed:
+  `'skip-nullish'` reads a layer's `undefined`/`null` as "not supplied" (the
+  `??` rule, and what a host stacking env/profile layers wants), while
+  `'spread-fidelity'` lets a layer's own keys win exactly as
+  `{ ...defaults, ...caller }` assigns them. The strategies resolve with
+  spread fidelity, which is what their constructors always did, so no caller's
+  effective config changed — including callers passing an explicit `undefined`
+  or `null`, where the two readings differ.
+- New option `logEffectiveConfig` (default `false`): one structured
+  `config:effective` line on stderr carrying every effective key with its
+  source, for operators who want the resolved picture in their logs rather than
+  through a debugger. It is emitted at strategy initialization rather than at
+  construction, so a subclass instance reports the strategy it actually is.
+  The line carries a third field, `presentAsUndefined`: keys a caller supplied
+  as explicit `undefined` stay present in the effective config but cannot
+  survive JSON, so they are named there instead — every provenance key is
+  either valued in `effective` or listed in `presentAsUndefined`, never both.
+
+- `ContextManager.setSystemPrompt(text)` threads the host's live system prompt
+  into memory-minting LLM requests — both L1 chunk compression and level
+  merges — as the request's `system` field, ahead of the identity head, the
+  same layout a live activation uses. On hosts whose identity and conduct live
+  in system voice, a summarizer that never sees that prompt is a different
+  agent from the one whose memory it writes: without it, memories were authored
+  by a system-promptless variant of the agent and merges re-summarized those
+  summaries upward. Note WHICH prompt a mint is served. The rest of the request
+  is built as-of the span being compressed — same head, same recall ladder, no
+  tail after the chunk — but the prompt is not: it lives in a single slot with
+  no per-message history, so a mint gets the identity policy in force AT MINT
+  TIME. That equals what the original instance was served exactly insofar as
+  the host keeps the prompt stable across the compressed span; where it has
+  changed, the memory is authored under the current policy and the older text
+  is not recoverable from here. The hook mirrors `setToolDefinitions`: hosts
+  push on every activation, an empty or `undefined` push never downgrades the
+  recorded value. Opt-in — with the setter never called, mint requests keep
+  their exact previous shape, carrying no `system` key at all, so canonical
+  request hashes and compression quarantine identities are unchanged. Hosts
+  that do set it also give a marker-less mint (first mint, capped ladder,
+  markers off) a cache breakpoint on the system block via membrane's existing
+  no-message-breakpoint fallback, which previously had nowhere to land on this
+  lane.
+
+- **`recallEnvelope` — opt-in structural delimiting for recall answers.**
+  A recall answer has never had an end delimiter: the Q-side label opens the
+  memory and the turn boundary is all that closes it, and instances have been
+  observed reading past the end of a recalled memory into unrelated content.
+  With `recallEnvelope: 'xml'` every recall answer's prose is fenced by
+  `<cm-recall id="…" level="…" span="…">` … `</cm-recall>`, on the presented
+  window (both select paths) and on the mint/merge recall ladders alike.
+  Attributes are sourced from the summary record and omitted when it cannot
+  answer for one; content is never entity-escaped (the envelope is a
+  collision-tolerant delimiter convention, not parseable XML); reasoning
+  carriers are left byte-identical; Q-side labels are unchanged in both modes,
+  so zero-recall surgery keys on exactly what it always did. The recall-pair
+  budget prices each summary's actual envelope string. Under
+  `maxMessageTokens` a capped answer is truncated as prose and enveloped
+  afterwards, so opener and closer survive every cap. Default `'none'`
+  renders byte-identically to before.
+
+### Changed
+
+- The cache-breakpoint slot contract with membrane is now stated explicitly
+  at `placeCacheMarkers` and enforced with a compile-time assertion: this
+  strategy holds first claim on up to 3 message-level markers of Anthropic's
+  4 `cache_control` slots; membrane is residual claimant on the remainder
+  (tools/system fallback when no message markers arrive, and its tool-loop
+  floating cache marker). The previous comment justified the 3-cap with a
+  membrane behavior — an unconditional system-block marker — that membrane
+  dropped some time ago, which left the fourth slot unclaimed and unnoticed
+  while tool-loop suffixes went uncached (the qa-ops 2026-08-20 incident).
+  No placement behavior changes; a future edit that emits a fourth marker
+  now fails loudly at compile time instead of surfacing as a hard 400 or as
+  membrane silently losing its float.
+
+- Changelog entries now land as per-change fragment files in `changelog.d/`
+  (`<slug>.<breaking|added|changed|fixed>.md`), folded into the version
+  section at release time — concurrent PRs no longer conflict in
+  `CHANGELOG.md`. Editing `## Unreleased` directly still works and is merged
+  at the same point.
+
+- Autobiographical L1 compression can opt into `compressionSourceOnlyFallback`, which preserves the ordinary canonical request and configured recall-curve attempts, then makes exactly one marker+target+directive source-only call only after every earlier bounded attempt fails. The legacy `compressionSourceOnly` first-choice switch remains compatible; source-only no longer has to become permanent default geometry when it is intended as an emergency last rung.
+- Merge compression can likewise opt into `compressionMergeSourceOnlyFallback`: ordinary persisted retry shapes run first, and the final permitted merge attempt uses the exact legacy target-only wire shape. Legacy `compressionMergeSourceOnly` first-choice behavior remains compatible.
+
+### Fixed
+
+- Compression-refusal fallback admission now uses provider-aware total input
+  usage after the canonical call (including disjoint Anthropic/Bedrock cache
+  counters without double-counting subset-style providers), fails closed on
+  zero/partial/unknown usage, and versions the durable accounting contract so
+  legacy byte-bound quarantines remain evidence without consuming the repaired
+  per-chunk shape allowance.
+- Append-only autobiographical compiles now preserve the previous request's
+  endpoint as an explicit cache breakpoint, avoiding recent-tail cache misses
+  when a tool-heavy turn appends more than the provider's 20-block lookback.
+- Compression recall pairs now follow canonical message-store order rather
+  than lexical source-ID order, preserving chronology and stable prompt-cache
+  prefixes when decimal message IDs cross a width boundary (for example,
+  `"99"` to `"100"`).
+
+- Rebuild the message ID-to-index lookup after a Chronicle branch switch, so
+  message mutations and `branchAt(messageId)` cannot use slot positions cached
+  from a differently shaped sibling branch.
+
+- `getCompressionDebt()` accepts `Date` message timestamps (the live
+  `StoredMessage` shape) when deriving `oldestPendingAgeMs`; the number-only
+  filter had made the degraded(>1h)/critical(>6h) staleness ladder
+  unreachable in production (#82).
+
+- Base64 raster images now derive PNG, JPEG, GIF, or WebP MIME from byte magic on ingress and again when resolving legacy blob references. Incorrect transport metadata can no longer persist into provider requests and hard-down a residence with repeatable image-type 400s; blob bytes and unknown media types remain unchanged.
+
+## 0.6.3 — 2026-08-03
+
+### Added
+
+- **`chunkBoundaryHint` — a subclass seam for semantic chunk boundaries.**
+  Strategies with domain knowledge about conversation structure (chat-topic
+  transitions, episode breaks) can close a chunk early at a semantic boundary
+  without forking `rebuildChunks` — hinted closes persist chunk records and
+  respect the minimum-size and tool_use-pairing guards exactly like size-based
+  closes. Motivation: connectome-host's FrontdeskStrategy forked the whole
+  chunker for topic-aware boundaries and silently bypassed chunk-record
+  persistence and the fail-closed orphan guard.
+- **Budget-saturation liveness gates** (`test/long-context-saturation.test.ts`)
+  — the regression net for the 2026-08-03 production outage class (hierarchical
+  renderer saturating its fixed budget into a terminal `UncoveredDropError`
+  refusal loop): the adaptive path must compile every turn of a workload whose
+  raw history is several times the budget, and under pathological pressure may
+  refuse only with the recoverable `OverBudgetError` class, never an uncovered
+  drop.
+
+### Changed
+
+- The adaptive path's tail-shortfall and newest-turn-retention refusals now
+  name their stage (`Tail emission dropped reserved recent-window messages`,
+  `Structural repair did not retain the newest turn`) instead of masquerading
+  as picker exhaustion with impossible arithmetic ("742 tokens still exceed
+  hard budget 11220").

@@ -8,6 +8,7 @@ import type {
   ContextLogView,
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
+import { MessageStore } from './message-store.js';
 
 const DEFAULT_CONTEXT_STATE_ID = 'context';
 
@@ -32,9 +33,7 @@ export class ContextLog {
       namespace?: string;
     } = {}
   ) {
-    this.stateId = options.namespace
-      ? `${options.namespace}/context`
-      : DEFAULT_CONTEXT_STATE_ID;
+    this.stateId = ContextLog.stateIdFor(options.namespace);
     this.blobManager = new BlobManager(store);
     this.tokenEstimator = options.estimator ?? defaultTokenEstimator;
     this.rebuildSourceIndex();
@@ -48,13 +47,18 @@ export class ContextLog {
    * @param namespace Optional namespace for multi-agent support
    */
   static register(store: JsStore, namespace?: string): void {
-    const stateId = namespace ? `${namespace}/context` : DEFAULT_CONTEXT_STATE_ID;
+    const stateId = ContextLog.stateIdFor(namespace);
     store.registerState({
       id: stateId,
       strategy: 'append_log',
       deltaSnapshotEvery: 50,
       fullSnapshotEvery: 10,
     });
+  }
+
+  /** The context log's slot id for a namespace. */
+  static stateIdFor(namespace?: string): string {
+    return namespace ? `${namespace}/context` : DEFAULT_CONTEXT_STATE_ID;
   }
 
   private rebuildSourceIndex(): void {
@@ -275,13 +279,29 @@ export class ContextLog {
     switch (block.type) {
       case 'text':
         return this.tokenEstimator(block.text);
-      case 'thinking':
-        // Signature-only blocks (display:'omitted') carry empty thinking text
-        return this.tokenEstimator(block.thinking ?? '');
-      case 'redacted_thinking':
+      case 'thinking': {
+        // Mirrors MessageStore.computeBlockTokensRaw: stamped price wins;
+        // a signed block is a full hidden chain of thought, priced by the
+        // larger of its visible text and its signature length.
+        const stamped = (block as { tokenEstimate?: number }).tokenEstimate;
+        if (typeof stamped === 'number') return stamped;
+        const signature = (block as { signature?: string }).signature;
+        const textTokens = this.tokenEstimator(block.thinking ?? '');
+        if (typeof signature === 'string' && signature.length > 0) {
+          return Math.max(textTokens, MessageStore.signedThinkingTokens(signature));
+        }
+        return textTokens;
+      }
+      case 'redacted_thinking': {
         // Encrypted reasoning payload, round-tripped verbatim — rough
         // estimate from the data length so budgeting isn't blind to it.
-        return this.tokenEstimator((block as { data?: string }).data ?? '');
+        const stamped = (block as { tokenEstimate?: number }).tokenEstimate;
+        if (typeof stamped === 'number') return stamped;
+        const data = (block as { data?: string }).data;
+        return typeof data === 'string' && data.length > 0
+          ? Math.round(data.length / MessageStore.ENCRYPTED_CARRIER_CHARS_PER_TOKEN)
+          : MessageStore.HIDDEN_THINKING_TOKENS_DEFAULT;
+      }
       case 'tool_use':
         return this.tokenEstimator(JSON.stringify(block.input)) + 20;
       case 'tool_result':
@@ -297,7 +317,10 @@ export class ContextLog {
       case 'video':
         return 1000;
       default:
-        return 0;
+        // Mirrors MessageStore.computeBlockTokensRaw: membrane's XML-history
+        // carriers (tool_attempt, tool_notice) are priced as the markup they
+        // replay as; any other unknown block stays at 0.
+        return MessageStore.xmlHistoryCarrierTokens(block);
     }
   }
 

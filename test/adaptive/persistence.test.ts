@@ -28,6 +28,7 @@ function makeMockMembrane() {
     complete: async () => {
       callCount++;
       return {
+        stopReason: 'end_turn',
         content: [{ type: 'text', text: `[mock summary #${callCount}]` }],
       };
     },
@@ -46,7 +47,7 @@ describe('AutobiographicalStrategy — adaptive state persistence', () => {
     // Phase 1: open, ingest, compile under pressure, capture resolutions
     const mock1 = makeMockMembrane();
     const strategy1 = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 100,
       recentWindowTokens: 200,
     });
@@ -75,7 +76,7 @@ describe('AutobiographicalStrategy — adaptive state persistence', () => {
     // Phase 2: reopen with a fresh strategy instance, verify resolutions restored
     const mock2 = makeMockMembrane();
     const strategy2 = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 100,
       recentWindowTokens: 200,
     });
@@ -104,7 +105,7 @@ describe('AutobiographicalStrategy — adaptive state persistence', () => {
   it('locks survive close + reopen', async () => {
     const mock1 = makeMockMembrane();
     const strategy1 = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 100,
       recentWindowTokens: 200,
     });
@@ -125,7 +126,7 @@ describe('AutobiographicalStrategy — adaptive state persistence', () => {
     // Reopen
     const mock2 = makeMockMembrane();
     const strategy2 = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 100,
       recentWindowTokens: 200,
     });
@@ -144,7 +145,7 @@ describe('AutobiographicalStrategy — adaptive state persistence', () => {
   it('unlocking persists too', async () => {
     const mock1 = makeMockMembrane();
     const strategy1 = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
     });
     const manager1 = await ContextManager.open({
       path: TEST_STORE_PATH,
@@ -156,7 +157,10 @@ describe('AutobiographicalStrategy — adaptive state persistence', () => {
     strategy1.unlockChunk(id);
     manager1.close();
 
-    const strategy2 = new AutobiographicalStrategy({ adaptiveResolution: true });
+    const strategy2 = new AutobiographicalStrategy({
+      compressionModel: 'mock',
+      adaptiveResolution: true,
+    });
     const manager2 = await ContextManager.open({
       path: TEST_STORE_PATH,
       strategy: strategy2,
@@ -171,7 +175,7 @@ describe('AutobiographicalStrategy — adaptive state persistence', () => {
     // Phase 1: drive compression and folding
     const mock1 = makeMockMembrane();
     const strategy1 = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 100,
       recentWindowTokens: 200,
     });
@@ -193,7 +197,7 @@ describe('AutobiographicalStrategy — adaptive state persistence', () => {
     // Phase 2: reopen, compile with same budget
     const mock2 = makeMockMembrane();
     const strategy2 = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 100,
       recentWindowTokens: 200,
     });

@@ -4,6 +4,8 @@
 
 ## Changelog
 
+- **rev 5.1 (2026-08-05)**: Doc-truth reconciliation against the shipped solver (audited `fa8f938..ec34f2b`). §13.2 corrected: the shipped solve is a **lexicographic branch cascade**, not the drafted `+ λ·perturbation` minimization (no λ exists in `src/`); `relevance_loss` documented as what it is — a salience-weighted *misallocation comparator*, not a minimand; the enforced rejection wall documented as `W × (1 + overBudgetGraceRatio)` at the strategy layer. §13.4 pseudocode regenerated from `planControlledFrontier` (adds `strictReach`/`blocked`, the `madeProgress` guard, the exact bootstrap predicate). §13.5's "budget-driven depth by construction" claim corrected (phase B is W-gated; the shape prior still bounds depth in the [target, W] band). New **§13.6** documents the robustness machinery the solve grew in production (boundary-cut tolerance `de3d293`, overlap tolerance + fold→project fixpoint `b99fcc3`/`204431b`, deepest-first projection, phase-C overshoot acceptance, the `TokenLedger` invariant, memoization contracts). New **§13.7** documents prepared-window transitions (`goalTotalTokens`/`strictReach`/hot-context API). §12 marked historical; its phantom `best-fit` strategy bullet removed (deleted in `ea198a1`).
+
 - **rev 5.0 (2026-07-12)**: The kv-stable controller is redesigned as a **single-path solve** — the emergency path, the reach *eligibility gate*, and the fold/expand pass pair are removed. One algorithm per turn: build the salience-weighted **ideal cut** (relevance only, W the sole hard wall), then reconcile it against the carried frontier under a **perturbation trust region** (P, the re-priced `reachTokens`) via suffix adoption, with a **quality-gap override** allowed to exceed P. Salience becomes a per-chunk *coefficient on information loss* (fold-cheap content: externalized code / tool output / images) rather than an eligibility rule. Motivated by the 2026-07-12 production incident (mythos): the emergency path + a reach-gated from-scratch pick manufactured an **inverted resolution profile** (oldest history at L1, the most recent days at L3) which the reach gate then made permanently unrepairable. See **section 13**, which supersedes 12.2 / 12.4 where they conflict.
 
 - **rev 4.0 (2026-06-22)**: Reconciliation against the post-PR #19 solver evolution (shipped on `main`, `context-manager` >= 0.5.3). Three changes reshaped the picker and are documented in the new **section 12**, which is the current source of truth where it conflicts with sections 3.5/3.7/3.9/5: (a) a `best-fit` sequence-DP strategy was added and the earlier **half-life / value-minus-lambda-KVcost solver was removed** (`ea198a1`) -- flat-profile is the baseline, not a lambda solve; (b) a **`kv-stable`** controller (`kv-control.ts`) landed as the production default -- a receding-horizon policy under a constraint hierarchy that **replaces cache-as-a-cost-term with cache-as-a-structural-constraint** (the reach cap); (c) kv-stable is **bidirectional** (it un-folds to use budget headroom), so the "V1 ships only monotonic strategies" claim in section 3.9 no longer holds. A production limitation surfaced (opus4): the `foldDepthCap` saliency geometry is a hard per-chunk ceiling that mis-scales to the token wall -- see section 12.4.
@@ -142,27 +144,15 @@ exists so a chronicle written by the pre-adaptive code path continues to
 load and read correctly, with the picker treating it as a from-scratch
 fresh chronicle for resolution purposes (see §6.1).
 
-### 3.5 Pluggable folding strategy
+### 3.5 Pluggable folding solver
 
-The picker is a generic orchestrator. Decisions are delegated to a `FoldingStrategy`:
+The picker is a thin validator/applier. Policy is delegated to a `FoldingSolver`,
+which returns the COMPLETE target frontier in one call:
 
 ```typescript
-type FoldOp =
-  | { kind: 'raise'; groupRoot: SummaryId }       // group-fold up one level
-  | { kind: 'lower'; groupRoot: SummaryId }       // refold down (non-monotonic)
-  | { kind: 'produce'; level: number; range: ChunkRange };  // lazy production
-
-interface FoldingState {
-  /** All chunks in source order (oldest first). */
-  chunks(): readonly ChunkView[];
-  /** Foldable chunks — middle of the chronicle, not pinned, not locked. */
-  foldableMiddle(): readonly ChunkView[];
-  /** Archive lookup by summary id. */
-  getSummary(id: SummaryId): SummaryEntry | null;
-  /** All leaf chunks under a given summary (recursive walk). */
-  leavesUnder(groupRoot: SummaryId): readonly ChunkView[];
-  /** Total tokens that would render under the current per-chunk resolutions. */
-  tokenCount(): number;
+interface ProduceRequest {
+  level: number;        // summary level to produce (e.g., 2 for L2)
+  range: ChunkRange;    // chunks the produced summary should cover
 }
 
 interface FoldingBudget {
@@ -171,43 +161,43 @@ interface FoldingBudget {
   slack: number;
 }
 
-interface FoldingStrategy {
+interface FoldingSolution {
+  /** Target resolution per chunk (0 = raw, k = L_k). Must be REALIZABLE:
+   *  every targeted level's ancestor summary exists. The picker verifies
+   *  this and treats a violation as a loud solver bug. */
+  frontier: ReadonlyMap<ChunkId, number>;
+  /** Summaries the solver wanted but that don't exist yet. */
+  produced: ProduceRequest[];
+}
+
+interface FoldingSolver {
   readonly name: string;
-  /** Return the next fold operation, or null if no more folds needed. */
-  selectNextFold(state: FoldingState, budget: FoldingBudget): FoldOp | null;
+  solve(inputs: PickerInputs, budget: FoldingBudget): FoldingSolution;
 }
 ```
 
-`FoldingState` is methods-not-fields: head/tail/pinned/locked filtering is
-internalized in `foldableMiddle()` so strategies don't need to re-derive
-the eligibility set. The picker's `MutableFoldingState` is the
-implementation; strategies see a read-only view.
-
-The picker's loop, simplified:
-
-```
-applied = []; produced = []
-loop:
-  op = strategy.selectNextFold(state, budget)
-  if not op: break
-  if op.kind in {'raise','lower'}: apply(op); applied.push(op); continue
-  if op.kind == 'produce':         produced.push(op); break   // defer to caller
-return { finalResolutions, applied, produced, exhausted, ... }
-```
+> **History — the op walk (removed 2026-07-26).** Through 2026-07 this was an
+> op protocol: `selectNextFold(state, budget)` returned one group-atomic
+> `raise`/`lower`/`produce` op per call, and the picker looped, applying ops
+> until convergence under an iteration bound. Group-atomic ops cannot express
+> a frontier that cuts through a summary group — which V2 leveled pins
+> (`ProtectedRange.level`) produce by design — so the walk oscillated on such
+> targets (the 2026-07-25 Mythos outage; the `raise:L4-936` wedge), and its
+> "nearest realizable" degradation silently diverged from the solve while
+> plan-vs-actual metrics, anchored on the walked state, reported zero drift.
+> The walk was removed deliberately and durably: solvers own the frontier;
+> the picker owns validation, application, and accounting. Greedy policies
+> iterate INSIDE their solve (`src/adaptive/greedy-fold.ts`) — the iteration
+> is an implementation detail, never a protocol.
 
 `produced` is returned to the caller (the strategy) rather than acted on
 inside the picker — see §3.8 and §5.
 
-Strategies shipped in V1:
+Solvers shipped:
 
-- **`FlatProfileStrategy`** (default). Aims for roughly-equal counts of *visible items* at each non-trivial level. Monotonic (only emits `raise`). See §3.7.
-- **`OldestFirstStrategy`**. The behavior originally proposed in this doc's rev 1. Monotonic. Kept for comparison and as a fallback during early rollout.
-
-Strategies envisioned for later (not V1 scope, but the interface accommodates them):
-
-- `AgentDirectedStrategy` (V2) — honors `unfold`/`refold` operations from the agent; emits compensation `raise`/`lower` ops to keep within budget.
-- `ContentImportanceStrategy` — uses content scoring (embeddings, heuristics) to prefer folding low-importance regions.
-- `TopicCoherentStrategy` — folds contiguous regions of related content together.
+- **`KvStableStrategy`** (`foldingStrategy: 'kv-stable'`, the fleet default in practice). Closed-form bidirectional solve via `planControlledFrontier` — see §13.
+- **`FlatProfileStrategy`** (default when no `foldingStrategy` is configured). Aims for roughly-equal counts of *visible items* at each non-trivial level. Greedy, monotonic. See §3.7.
+- **`OldestFirstStrategy`**. The behavior originally proposed in this doc's rev 1. Greedy, monotonic. Kept for comparison.
 
 ### 3.6 Sub-message chunking via `bodyGroupId`
 
@@ -305,6 +295,11 @@ raiseGroup(groupRoot):
 
 **Locked chunks block group-fold partially.** If chunk C is `lockedByAgent: true` and the picker raises C's level-k ancestor group, every chunk in the group *except* C flips to level k. C stays at its current resolution. The rendered output then has a hole inside what was a contiguous group — strategy must handle this in its eligibility check (only consider a group raisable if at least one chunk inside is unlocked, ideally most).
 
+> *(rev 5.1)* The kv-stable solve generalized this from locked chunks to **all**
+> hard-protected leaves (raw zone, pins, locked): a protected leaf inside a
+> foldable group is excluded from the fold rather than vetoing it — boundary-cut
+> tolerance, §13.6. Group atomicity means "every participating leaf".
+
 **Producing missing summaries.** If `raiseGroup(groupRoot)` requires
 L_{k+1} and no L_{k+1} exists yet, the strategy emits a `produce` op
 instead of a `raise`. The picker collects produce ops in
@@ -359,6 +354,15 @@ This case should be rare in practice with unbounded L_n: the picker can almost a
 - Hard budget set lower than the minimum-renderable head+tail size.
 
 `OverBudgetError` carries diagnostic info: `{ budget, actual, diagnostics: { headTokens, tailTokens, middleTokens, middleChunkCount, deepestLevel } }`.
+
+> *(rev 5.1 qualifications)* Two shipped behaviors refine "throw-only":
+> **(a)** the enforced wall is the *grace-inflated* budget —
+> `maxTokens × (1 + overBudgetGraceRatio)`, default ×1.02 — so a marginal
+> overshoot from projection repairs (§13.6) doesn't refuse a turn (§13.2);
+> **(b)** the recent-window emitter *can* evict tail messages under extreme
+> pressure, but any such eviction that would silently lose content instead
+> **refuses the turn** (`UncoveredDropError`) — pressure never ships silent
+> loss. The philosophy stands: surface the overage, let the host decide.
 
 ### 3.11 Recent-window slide
 
@@ -425,7 +429,7 @@ Walk chunks in source order. For each chunk:
 - If `currentResolution == 0`: emit raw content.
 - If `currentResolution == k > 0`: emit the L_k recall pair for the chunk's L_k ancestor. (Adjacent chunks sharing the same L_k ancestor emit the recall pair once.)
 
-After this walk, group consecutive entries with the same `bodyGroupId` and concatenate their bodies into a single API message. Pinned chunks (`pins` slot) always render at L0 regardless of `currentResolution`.
+After this walk, join each body's consecutive entries and concatenate their bodies into a single API message. A body is one ingestion: in store order, an entry continues the body before it only when it carries the same `bodyGroupId` at a higher `shardIndex` (`src/body-runs.ts`), so two copies of one text are two bodies. Pinned chunks (`pins` slot) always render at L0 regardless of `currentResolution`.
 
 The positioned-recall-pair logic from PR #15 survives: pins are interleaved with non-pinned regions in chronological order. The grouping is now driven by `currentResolution` + `bodyGroupId` instead of `mergedInto`.
 
@@ -436,32 +440,37 @@ Given:
 
 - `totalBudget` = `TokenBudget.maxTokens - reserveForResponse - headTokens`
 - `slack` = `compressionSlackRatio` (default 0.1)
-- `strategy` = configured `FoldingStrategy` instance
+- `solver` = configured `FoldingSolver` instance
 - Chunk store, summary tree, head/tail sets
 
 ```
 [picker.run]
-1. Build MutableFoldingState (mutable internal view over chunks + summaries).
-2. op = strategy.selectNextFold(state, budget)
-3. While op AND iterations < bound:
-   - if op.kind == 'raise':   applyRaise; applied.push(op); continue
-   - if op.kind == 'lower':   (V2) applyLower; applied.push(op); continue
-   - if op.kind == 'produce': produced.push(op); break
-4. Return { finalResolutions, applied, produced, finalTokens,
-            budgetMet, exhausted, iterations }.
+1. { frontier, produced } = solver.solve(inputs, budget)
+2. APPLY: per live chunk, final[id] = frontier[id] ?? 0 (clamped ≥ 0).
+   Frontier entries for ids with no live chunk (store-surgery residue) are
+   dropped and counted (deadFrontierIds) — never persisted.
+3. ACCOUNT + VALIDATE: rendered-token total via the renderer's unit model
+   (accountFrontier). A chunk targeting a level whose ancestor summary does
+   not exist is a SOLVER BUG: accounted as raw, counted (unrealizable), and
+   reported loudly ([picker-unrealizable]) — never silently skipped.
+4. Return { finalResolutions, produced, finalTokens,
+            budgetMet, exhausted, moves, deadFrontierIds, unrealizable }.
 
 [selectAdaptive — strategy side, after picker.run]
 5. Commit finalResolutions to strategy state; persist if changed.
 6. If produced.length > 0: handleProducedOps to route into compression
    queue / merge queue (§3.8).
-7. If exhausted AND finalTokens > totalBudget: throw OverBudgetError.
+7. If finalTokens > rejectionBudget — the hard budget × (1 +
+   overBudgetGraceRatio), default ×1.02 — and this is not a dry-run
+   preview: throw OverBudgetError. (Rev 5.1: the throw no longer
+   consults `exhausted`, which is solver-owned telemetry — see §13.2.)
 8. Walk middle messages and emit context entries, grouping bodyGroup
    shards via the rendering algorithm in §3.6.1.
 ```
 
-The iteration bound is `max(1000, chunks.length * 10)` — scales with
-chronicle size so non-convergence detection doesn't trip on large stores
-that legitimately need more ops than a fixed ceiling allows.
+`moves` is the number of chunks whose resolution changed vs the carried
+state (it replaced the op walk's `iterations` in `PlanVsActual` and the
+preview surfaces when the walk was retired — see §3.5 history note).
 
 Token counting: each chunk's `rawTokens` is computed at picker-input
 construction time (delegated to `MessageStoreView.estimateTokens`); each
@@ -542,6 +551,10 @@ These were debated during the rev-2 revision and are now locked unless implement
 
 ## 9. Implementation scope
 
+> *(rev 5.1)* This table is a PR #19 artifact, kept for the historical record.
+> The integration surface has kept growing since — `autobiographical.ts` alone
+> is now ~9,100 lines.
+
 Implemented breakdown vs original estimate (PR #19; `git diff main..feat/adaptive-resolution --stat`):
 
 | Component | Estimated | Actual |
@@ -587,7 +600,7 @@ Implemented in PR #19 (`feat/adaptive-resolution`, anima-research/context-manage
 2. **Recall pair format consistency** — promoted to a design property in §3.9 (monotonic memory fading by construction).
 3. **Pins interaction** — pins always render raw; picker's `foldableMiddle()` excludes pinned chunks. If a pin pushes total over the hard budget, `OverBudgetError` fires (§3.10).
 4. **Branching semantics** — chunk state lives in branch-scoped Chronicle state slots (`autobio:resolutions`, `autobio:locks`); branching inherits the slots via Chronicle's copy-on-write. Verified by `test/adaptive/branching.test.ts`.
-5. **Telemetry** — `getStats()` exposes per-level summary counts and compression count; the picker returns `iterations`, `applied`, `produced`, `finalTokens`, `budgetMet`, `exhausted` for observability at the call site. A formal `RenderStats` extension is still pending.
+5. **Telemetry** — `getStats()` exposes per-level summary counts and compression count; the picker returns `finalResolutions`, `produced`, `finalTokens`, `budgetMet`, `exhausted`, `moves`, `deadFrontierIds`, `unrealizable` for observability at the call site *(rev 5.1: `iterations`/`applied` died with the op walk — `moves` replaced them; see §5)*. A formal `RenderStats` extension is still pending.
 
 **Note (rev 4.0):** the as-shipped solver has since evolved well past this PR #19 snapshot -- `best-fit` and `kv-stable` strategies, cache-as-reach-cap, bidirectional folding. See **section 12** for the current controller and its open calibration question.
 
@@ -598,16 +611,29 @@ Out of scope for V1, still pending for follow-up:
 - V2 agent-driven unfold/refold tools (§4.3) and `AgentDirectedStrategy`.
 
 
-## 12. Post-PR #19: the kv-stable controller (current default)
+## 12. Post-PR #19: the kv-stable controller — **HISTORICAL (superseded by §13)**
 
-Rev 3.0 documented the PR #19 picker with `FlatProfileStrategy` as the only shipped strategy. Three changes since (all on `main`) reshaped the solver. **Where this section conflicts with sections 3.5 / 3.7 / 3.9 / 5, this section is current.**
+> **Historical (rev 5.1).** §12.2–§12.4 describe the two-path controller
+> (polite fold-within-reach + emergency) that ran between rev 4.0 and rev 5.0
+> and **no longer exists** — `foldWithinReach` / `shedToTarget` have no
+> occurrences in `src/`. They are kept as the record of *why* rev 5.0 exists.
+> Only two things in this section remain live: the strategy lineup (§12.1,
+> corrected below) and the `foldDepthCap` formula (§12.3), which survives as
+> the *soft shape prior* inside the §13 solve — no longer a hard ceiling.
+
+Rev 3.0 documented the PR #19 picker with `FlatProfileStrategy` as the only shipped strategy. Three changes since (all on `main`) reshaped the solver. **Where this section conflicts with sections 3.5 / 3.7 / 3.9 / 5, this section is current** — and §13 supersedes this section in turn.
 
 ### 12.1 Strategy lineup (`config.foldingStrategy`)
 
-- **`flat-profile`** -- the baseline. Level-equalizing: when over the soft target, raise the most-populous level, oldest-first, and exit as soon as the budget is met. Monotonic (raises only). No per-chunk depth ceiling, so it descends to whatever level fits the budget -- which is why it stays feasible where kv-stable currently floors out (section 12.4).
+- **`flat-profile`** -- the library default. Level-equalizing: when over the soft target, raise the most-populous level, oldest-first, and exit as soon as the budget is met. Monotonic (raises only). No per-chunk depth ceiling, so it descends to whatever level fits the budget.
 - **`oldest-first`** -- chronological variant of the same shedder.
-- **`best-fit`** -- sequence-DP solver producing a contiguous resolution gradient that maximizes a concave fidelity value under the budget. (The earlier half-life / value-minus-lambda-KVcost best-fit solver was **removed** in `ea198a1`; this is the DP reimplementation.)
-- **`kv-stable`** -- the production controller the deployed agents run. Described below.
+- **`kv-stable`** -- the production controller the deployed agents run (connectome-host recipes select it). Described in §13.
+
+The config union is exactly `'flat-profile' | 'oldest-first' | 'kv-stable'`
+(`types/strategy.ts`). *(rev 5.1: an earlier revision of this list advertised a
+`best-fit` sequence-DP strategy as shipped; that solver was built on a branch
+and deleted in `ea198a1` — it never joined the union. See
+`docs/best-fit-frontier-resolution.md` for what survived of it.)*
 
 ### 12.2 kv-stable: a constraint hierarchy, not a cost solve
 
@@ -697,22 +723,50 @@ One solve, every turn. One hard constraint. Cache is a *priced quantity*, never
 an eligibility rule.
 
 ```
-minimize    relevance_loss(F) + λ·perturbation(F, F_prev)
-subject to  render(F) ≤ W                 -- the only physics
+build       ideal = relevanceCut(tree, target, W)   -- pure relevance, no P anywhere
+reconcile   hold F_prev | adopt ideal | adopt a suffix of ideal | override
+subject to  render(F) ≤ W·(1+grace)   -- the enforced wall (see below)
             perturbation(F, F_prev) ≤ P   -- trust region: soft, default-on,
                                           -- overridable with cause
 ```
 
-- `relevance_loss(F) = Σ_chunks salience(c, t) · infoLoss(level_F(c))` — see 13.3.
+**There is no scalar objective.** Rev 5.0 was drafted as
+`minimize relevance_loss + λ·perturbation`; what shipped is deliberately
+λ-free — a **lexicographic branch cascade** (§13.4): feasibility first,
+perturbation bounded by P second, with relevance quality used only as a
+*comparator* to reject certifiably bad plans. Information and perturbation are
+never traded through an exchange rate — a made-up λ was a named failure mode
+of the pre-rev-5 solver (`kv-stable-context-control.md`, "Why this exists"),
+and re-introducing one via the objective notation would repeat it.
+
+- `relevance_loss(F)` — salience-weighted **misallocation**, not absolute
+  information loss: `Σ salience(c) · max(0, level_F(c) − shapeCap(c))` over
+  foldable chunks — the excess fold depth beyond what the log-age shape prior
+  would assign. Zero for any cut that folds nothing past its prior; positive
+  exactly where fidelity is spent in the wrong place; recency-aware by
+  construction (the cap grows with age), so an inverted profile scores high
+  even when a naive Σ level would tie it with the correct gradient. Meaningful
+  only for comparing cuts of the same tree — it feeds the quality-gap tests
+  and nothing else. The ideal cut is *constructed* (greedy, priority-ordered),
+  not obtained by minimizing this function.
 - `perturbation(F, F_prev)` — exact, not modeled: rendered tokens from the
   earliest position where `F`'s layout diverges from `F_prev`'s to the end
   (`kvCost` in `render-offsets.ts`) — precisely what the provider will re-read.
 - `P` (`reachTokens`, re-priced) — a **trust region on per-turn divergence**,
   not a spatial eligibility gate. It bounds how much perturbation an ordinary
   turn may take; it never determines *which* chunks may move.
-- `W` — unchanged: the physical wall. Infeasibility at max fold is a loud
-  failure (`OverBudgetError`), correctly pointing at summary *production*, not
-  allocation.
+- `W` — the physical wall, with two qualifications the original rev 5.0 text
+  lacked:
+  - the ideal-cut construction is **best-effort**: on a damaged (non-nested)
+    tree it can return an over-W frontier with `escalated` set rather than
+    throwing — the fold→project fixpoint is round-capped (§13.6);
+  - the **enforced** rejection wall lives in the strategy layer, one grace
+    band above W: `rejectionBudget = floor(maxTokens · (1 +
+    overBudgetGraceRatio))`, default ratio 0.02 → ×1.02
+    (`autobiographical.ts`). `OverBudgetError` fires on
+    `finalTokens > rejectionBudget` — regardless of the solver's `exhausted`
+    flag, which is now solver-owned telemetry (`446c28c`) — correctly
+    pointing at summary *production*, not allocation.
 
 **Override rule (what replaces the emergency).** The trust region may be
 exceeded, same algorithm, same code path, when either:
@@ -720,17 +774,40 @@ exceeded, same algorithm, same code path, when either:
 1. **Infeasible within P** — no frontier within P of `F_prev` fits under W.
    Mandatory and automatic: feasibility beats continuity, always.
 2. **Quality gap** — the best frontier within P is certifiably bad:
-   `relevance_loss(best_within_P) − relevance_loss(ideal)` exceeds a
-   configured fraction of `relevance_loss(ideal)`. The solver takes the ideal
-   and pays the perturbation. This is the self-healing property: a stuck
-   misallocated profile *is* a persistent quality gap, so it repairs itself
-   instead of fossilizing.
-3. **Bootstrap** — `F_prev` is empty (reset, first run): perturbation is
-   undefined, P never enters; pure relevance solve.
+   `relevance_loss(best_within_P) − relevance_loss(ideal)` exceeds
+   `qualityGapRatio · max(1, relevance_loss(ideal))` (default ratio 0.35).
+   The solver takes the ideal and pays the perturbation. This is the
+   self-healing property: a stuck misallocated profile *is* a persistent
+   quality gap, so it repairs itself instead of fossilizing. Disabled under
+   `strictReach` (§13.7).
+3. **Bootstrap** — nothing carried: no persisted frontier exists (`previous`
+   is literally empty) and the carried frontier is all-raw. Perturbation is
+   undefined, P never enters; pure relevance solve. (A *non-empty* all-zeros
+   `previous` — a store that has genuinely never folded — does **not**
+   bootstrap; it holds or folds normally.)
 
 Every override is loud: the plan reports `override: 'infeasible' | 'quality-gap'
 | 'bootstrap'` plus the exact perturbation, and the strategy layer logs a
 `[kv-escalation]` line. Silence was half of the incident.
+
+**Demand-side production under escalation (issue #56, 2026-08-06).** The
+solver never *speculatively* pre-produces — deeper folding than has been
+produced stays the pre-producer's job — but when the plan **escalates**
+(even full folding exceeds W) while foldable chunks have no L1 coverage at
+all, `KvStableStrategy.solve` emits level-1 `ProduceRequest`s over the
+contiguous uncovered runs (skipping the flat zone, pins, and locked chunks).
+This is the only route into the strategy layer's demand path
+(`handleProducedOps` → `enqueueL1ForRange` → `_demandedL1Chunks`), which is
+what overrides the `l1HoldbackChunks` window. Without it, tight operating
+points — where the budget wall lands while the only uncompressed material is
+the unclosed trailing span plus the held-back newest closed chunk — wedged
+permanently: empty speculative queue, no way to raise demand, every compile
+re-escalating infeasible (the L1-holdback deadlock; external repro at
+budgets 14–26k). A produce op still never authorizes an inference — the
+escalated compile hard-fails as before — but recovery now needs only the
+production drain, not config surgery. A range whose tail ends in the
+unclosed trailing span (not yet a chunk) resolves "through the newest closed
+chunk" at the consumer, so the whole backlog is demanded in one compile.
 
 ### 13.3 Salience as a coefficient (not a cap)
 
@@ -742,16 +819,20 @@ weight on that chunk's information loss:
   externalized folds cheap: code that lives on disk/git, tool_results
   (re-derivable), logs, URL link-drops, images (the file/CDN retains them).
   Conversation exists nowhere but the chronicle — folding it destroys the only
-  copy — so it stays expensive. Computable at chunk creation from composition
-  (fraction of tool blocks / code fences / images / bare links).
-- **Dynamic modulation (v2)** — a multiplier over the static prior: chunks
+  copy — so it stays expensive. Computed from composition (fraction of tool
+  blocks / code fences / images / bare links). *(rev 5.1, as-shipped: computed
+  per compile at picker-input construction, memoized in a `WeakMap` keyed on
+  the stored message (`eb7d794`) — there is no persisted salience field.
+  The strategy clamps its prior to `[0.2, 1]`; the solver re-clamps to
+  `[0, 1]` and defaults missing values to 1.)*
+- **Dynamic modulation (v2 — unimplemented)** — a multiplier over the static prior: chunks
   coupled to the *current* activity (same files, same locus, same task; recent
   recall hits) are boosted above their prior; the boost decays when the
   activity closes. "While coding, recent code is hot; once done, it folds
   soon" — implemented as decay plus the λ term (a refold happens when the
   relevance gain covers its perturbation bill), not as a state machine.
-- **v2 source upgrade**: the summarizer already reads every chunk at
-  compression time — it can emit a salience annotation and "payload
+- **v2 source upgrade (unimplemented)**: the summarizer already reads every
+  chunk at compression time — it can emit a salience annotation and "payload
   externalized to <path>" flags as metadata, riding a call we already pay for.
 - The image-strip post-pass (`imageStripDepthTokens` / `maxLiveImages`) is a
   hardcoded special case of this coefficient (images = maximal static
@@ -763,33 +844,71 @@ Hard protections are unchanged and are the only remaining eligibility rules:
 flat zone / head / tail raw, pins (classic, pin-at-level-k, pin-max-level),
 locked chunks. Salience never overrides a pin.
 
+*(rev 5.1 amendment — boundary-cut tolerance, `de3d293`.)* A hard protection
+protects its **leaf**, no longer its whole group: a protected leaf inside a
+foldable group is *excluded from the fold* rather than vetoing it, and renders
+raw beside the group's recall (the renderer's "ownership wins" semantics).
+Without this, a head/tail boundary cutting two messages into a 742-leaf L3
+group made the entire group permanently unfoldable and OverBudget-wedged the
+agent with its own L3 sitting unused. Details and the related unanimity
+exemptions in §13.6.
+
 ### 13.4 The per-turn algorithm
+
+As shipped (`planControlledFrontier`, `kv-control.ts` — regenerated rev 5.1):
 
 ```
 solve(tree, F_prev, W, P):
   ideal = relevanceCut(tree, target, W)
       -- from scratch, no P anywhere:
-      -- fold in salience-then-age priority order, level-by-level, respecting
-      --   the shape prior; continue past the prior (never past hard
-      --   protections) if still over W; then pack youngest-first back toward
-      --   the target; project to a valid group-consistent cut
-      -- floor > W → infeasible → OverBudgetError (loud)
+      -- phase A: fold in salience-then-age priority order, level-by-level,
+      --   under the shape prior, toward the target;
+      -- phase B: if still over W, keep folding past the prior (never past
+      --   hard protections);
+      -- phase C: pack — un-fold youngest-first back toward the target,
+      --   accepting an un-fold that overshoots the target when it lands
+      --   CLOSER to it and stays under W (§13.6);
+      -- project to a valid group-consistent cut and iterate fold→project
+      --   to a fixpoint (§13.6). BEST-EFFORT: on a damaged tree this can
+      --   return over-W with `escalated` set — it does not throw.
 
-  if F_prev empty → ideal                          (bootstrap)
+  gapCeiling = qualityGapRatio · max(1, loss(ideal))      -- ∞ under strictReach
 
-  Δ = perturbation(ideal, F_prev)                  (exact, kvCost)
-  in dead band and quality gap small → F_prev      (quiet turn, zero cost)
-  Δ ≤ P → ideal                                    (ordinary turn)
+  F_prev empty (no persisted frontier) → ideal            (bootstrap)
+
+  carried in [expandAt, foldAt], carried ≤ W,
+    loss(carried) − loss(ideal) ≤ gapCeiling → F_prev     (hold, zero cost;
+      a LARGE gap falls through — a stuck misallocated profile self-heals)
+
+  Δ = perturbation(ideal, F_prev)                         (exact, kvCost)
+  Δ ≤ P → ideal                                           (ordinary turn)
 
   partial = suffixAdopt(ideal, F_prev, P)
       -- adopt ideal's changes newest-first only: keep F_prev before boundary
-      -- B, take ideal after it; slide B oldest-ward until P is spent.
-      -- Perturbation is prefix-based, so partial adoption is exactly a
-      -- suffix cut — no combinatorial search.
-  partial fits W and gap(partial, ideal) ≤ threshold → partial
-      -- receding-horizon repair: the next turns keep adopting, P at a time
+      -- B, take ideal after it; binary-search B oldest-ward until P is
+      -- spent. Perturbation is prefix-based, so partial adoption is exactly
+      -- a suffix cut — no combinatorial search. Each candidate is projected
+      -- to a valid cut before costing.
+  partial ≤ W, gap(partial, ideal) ≤ gapCeiling,
+    and madeProgress → partial
+      -- receding-horizon repair: the next turns keep adopting, P at a time.
+      -- madeProgress guard: when a shed is REQUIRED (carried > foldAt), a
+      -- partial plan must reach the band or at least move (perturbation
+      -- > 0). An under-folded profile scores ZERO misallocation loss, so
+      -- the quality gap alone cannot reject "do nothing forever"; a P below
+      -- the physical floor (the tail any fold must invalidate) lands here
+      -- and falls through to an override.
+
+  strictReach and carried ≤ W → F_prev, blocked='reach-floor'
+      -- paced transitions never pay a big perturbation for quality (§13.7)
 
   otherwise → ideal, override recorded             (infeasible / quality-gap)
+      -- under strictReach, an adopted ideal still above the goal band
+      -- additionally reports blocked='target-floor'
+
+[strategy layer, after picker.run:]
+  finalTokens > W·(1 + overBudgetGraceRatio) and not a dry-run preview
+      → OverBudgetError (loud)
 ```
 
 Properties: on a quiet turn `ideal ≈ F_prev` + a tail fold, Δ is naturally
@@ -811,9 +930,122 @@ whose cache is already cold (restart, config change, model swap — visible as
 - Reach as "how far back a fold may edit" — reach (`reachTokens`) is now P,
   a perturbation trust region in tokens re-read, direction-free.
 - The §12.4 "Option (a) budget-driven steepness" calibration question is
-  absorbed: the ideal cut folds by priority until the target is met, so the
-  gradient's depth is budget-driven by construction and `mergeThreshold`
-  no longer bounds the achievable depth.
+  **narrowed, not absorbed** *(corrected rev 5.1)*. `mergeThreshold` no longer
+  bounds *feasibility*: phase B folds past the shape prior whenever W demands,
+  and depth is bounded by the deepest *produced* level
+  (`maxAvailableLevel(tree)`), not a constant. But phase B is **W-gated** —
+  when "fold to shape" cannot reach the soft target yet the result fits under
+  W, the solve rests in the [target, W] band at prior-bounded depth, so the
+  log-age banding (base `k = mergeThreshold`) still shapes achievable depth
+  there. What survives of §12.4 is a fidelity-allocation question in that
+  band, no longer a crash or feasibility question.
 - The fold/expand watermark pair remains only as the dead-band boundary of
   the trust-region logic (`foldAtTokens` / `expandAtTokens` keep their config
   meaning).
+
+### 13.6 Solving on imperfect trees (2026-07-27 → 2026-08-03)
+
+§13.4's construction assumes a cleanly nested summary tree whose group
+boundaries respect protection boundaries. Production stores violate both —
+store surgery, calibration drift, and repair history leave trees where the
+clean algorithm wedges or lies. Four mechanisms make the solve total over real
+stores; all are load-bearing and none appeared in the original rev 5.0 text.
+
+**Boundary-cut tolerance** (`de3d293`). A hard-protected leaf (−1 sentinel:
+raw zone / pins / locked) inside a foldable group is *excluded from the fold*
+rather than vetoing it, and is exempt from group unanimity in the validity
+projection. The renderer already draws protected messages raw beside their
+chunk's recall ("ownership wins"), so a boundary cutting through a group must
+not make the group permanently unfoldable. Trigger: calibration drift moved
+the token-derived head boundary two messages into an L3's first chunk — the
+2-leaf overlap vetoed the whole 742-leaf group in every phase, and the agent
+OverBudget-wedged with its own L3 unused. Consequence for §3.8: group
+atomicity now means "every *participating* leaf", not "every leaf".
+
+**Overlap tolerance** (`b99fcc3`, `204431b`). After surgery a summary "tree"
+can be **non-nested**: a group's `leafChunkIds` may include leaves whose own
+lineage tops out below the group's level or climbs through a different family.
+Folding such a leaf plants an unrenderable mark; the projection then
+monotone-lowers the whole group around it — observed: one disagreeing leaf
+un-folded a 200-leaf group, 615 leaves cascaded (+24k tokens), and the solve
+returned an over-W frontier while a produced L4/L5 layer sat unused (opus4).
+Now leaves whose lineage disagrees are skipped by folds and exempted from
+unanimity: they render raw beside the covering recall. **This is a degraded
+mode, not a feature** — every exempted leaf means messages are semantically
+*double-represented* in the window (rendered raw or via their own chain while
+a covering recall also renders). The solve proceeding is the mitigation; the
+topology is the disease. `[kv-overlap]` warns on **every** affected compile
+until the store gets nesting repair.
+
+**Fold→project fixpoint** (`b99fcc3`). The validity projection can only lower
+levels; on a non-nested tree its repairs *add* tokens after the phases stopped
+at target — and a single projection pass used to be final, returning an over-W
+frontier ("W is the only physics", violated by its own solver). The phases now
+iterate on the projected frontier — the `TokenLedger` rebuilt each round —
+until the render fits under W, a round makes no progress, or the round cap
+(two extra rounds) is reached. Hence "best-effort" in §13.2/§13.4.
+
+**Deepest-first projection** (`1074ec6`). Within each projection pass, deeper
+disagreeing leaves are lowered toward their shallower group-mates before the
+shallow ones are judged. Shallowest-first overshot: a leaf un-folded to its
+pin cap (L1) among still-deeper siblings (L2) was pushed past the cap to raw
+in pass 1, before the siblings descended to meet it — the group converged at
+raw instead of at the cap. Still monotone (only lowers) → terminates.
+
+**Phase C accepts overshoot toward the target.** Merge groups are coarse
+quanta (8–15k tokens on production trees); accept-only-if-under-target strands
+real headroom un-spent whenever every remaining quantum overshoots (mythos:
+134k rendered of a 183.6k hard budget). An un-fold that lands past the target
+is accepted when it gets *closer* to it and stays under W. The target stays
+the attractor; W stays the only wall.
+
+**The ledger invariant.** All phase arithmetic runs on an incremental
+`TokenLedger` — O(group) per move instead of O(n) re-renders (the mythos
+0.5s→16s compile leak, `incremental-compile-problem.md` §9.3). Its
+correctness contract: `ledger.tokens` equals `renderLayout(...).totalTokens`
+for the same frontier — both share the missing-ancestor→raw fallback and the
+unit identity (siblings share one recall unit). Phase C therefore records
+*exact prior levels* for honest reverts: with boundary-cut tolerance a group
+may hold members below the fold level, and a hardcoded from/to drifts the
+ledger off the render — after which every later accept decision runs on
+corrupt arithmetic (observed: phase C walked an L3 fold all the way back to
+carried while its ledger believed it sat on target). Anyone editing the
+phases is editing against this invariant.
+
+**Memoization contracts** (`1c4c436`, `7f2d5e1`). Three memos are
+correctness-relevant, not just performance: group *eligibility* is memoized
+per (node, level, phase) — valid because the verdict is a pure function of
+static caps shared by every member; projection *unanimity* per (node, level)
+per pass — valid because a pass only lowers, which cannot make a group
+unanimous at that level; and phase C's `attempted` set short-circuits
+re-tries but is **cleared on every accepted un-fold**, so the accept sequence
+is exactly the naive one. Breaking any of these validity arguments either
+reintroduces the O(groupSize²) compile leak or silently changes the solve.
+
+### 13.7 Prepared windows and paced transitions
+
+The solver's parameter surface supports walking an agent toward a *different*
+window size without a KV catastrophe — preparing a smaller frontier ahead of
+a model swap or budget cut while compiles continue against the current window:
+
+- **Goal watermarks** — `KvStableOptions.goalTotalTokens` /
+  `goalTargetTokens` re-aim `foldAtTokens` / `targetTokens` at the future
+  window while `windowTokens` stays the current hard budget. The solve treats
+  the goal as its attractor while remaining feasible against today's wall.
+- **`strictReach`** — turns P from a soft trust region into a hard transition
+  *pace*: the quality-gap override is disabled (`gapCeiling = ∞`), and when no
+  realizable change fits within P the solver **holds** the carried frontier
+  and reports `blocked: 'reach-floor'` instead of paying a large
+  perturbation. An adopted ideal that still exceeds the goal band reports
+  `blocked: 'target-floor'` (the goal is not yet reachable).
+- **Strategy surface** — `blocked` maps to
+  `transitionBlocked: 'transition-pace-floor' | 'prepared-window-floor'`
+  (`autobiographical.ts`), and the whole loop is driven through the
+  hot-reloadable settings API: `HotContextSettings` /
+  `getHotContextSettings()` / `updateHotContextSettings()`
+  (`types/strategy.ts`), with `preparedWindowTokens` (the future usable
+  window), `transitionPaceTokens` (the per-compile re-read allowance), and a
+  `prepared: true` status once the selected frontier fits the prepared
+  window. A dry-run preview path reports infeasibility of an aggressive goal
+  via `_lastPreview.fits` — without taking the outage that learning it live
+  would cost.

@@ -22,6 +22,13 @@ export interface ContextEntry {
   index: number;
   /** Source message ID (if derived from message store) */
   sourceMessageId?: MessageId;
+  /**
+   * FULL provenance when this entry stands for more than one message — e.g. a
+   * composite produced by merging adjacent body-group shards. `sourceMessageId`
+   * names only the first, which made merged shards look unrepresented to the
+   * coverage invariant. Populate this wherever N entries collapse into one.
+   */
+  sourceMessageIds?: MessageId[];
   /** How this entry relates to its source */
   sourceRelation?: SourceRelation;
   /** Participant name */
@@ -30,6 +37,9 @@ export interface ContextEntry {
   content: ContentBlock[];
   /** For prompt caching (future) */
   cacheMarker?: boolean;
+  /** Internal cache-layout identity when this entry ends one atomic rendered
+   * unit. Used to reconcile message markers with accepted solver receipts. */
+  cacheLayoutKey?: string;
 }
 
 /**
@@ -42,15 +52,16 @@ export interface ContextEntryInternal {
   participant: string;
   content: StoredContentBlock[];
   cacheMarker?: boolean;
+  cacheLayoutKey?: string;
 }
 
 /**
  * Token budget for context compilation.
  */
 export interface TokenBudget {
-  /** Maximum tokens for the context window */
+  /** Total token window, including reserveForResponse. Strategies target maxTokens - reserveForResponse input tokens. */
   maxTokens: number;
-  /** Reserve this many tokens for model response */
+  /** Response tokens withheld from maxTokens before fitting the input context. */
   reserveForResponse: number;
 }
 
@@ -88,6 +99,21 @@ export interface ContextInjection {
  * Result of context compilation.
  * Separates system-position injections from message-level content.
  */
+/** Planner/emitter reconciliation for one compile (see rsEnd). */
+export interface PlanVsActual {
+  /** Picker's projected total after folding. */
+  planned: number;
+  /** Tokens the emitter actually committed. */
+  actual: number;
+  /** actual - planned; positive means the emitter overran the plan. */
+  delta: number;
+  budgetMet: boolean;
+  exhausted: boolean;
+  /** Chunks whose resolution the applied frontier changed vs the carried
+   *  state. (Replaced the op-walk's `iterations` when the walk was retired.) */
+  moves: number;
+}
+
 export interface CompileResult {
   /** Compiled messages (includes beforeUser/afterUser injections merged in) */
   messages: NormalizedMessage[];

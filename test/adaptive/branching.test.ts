@@ -37,6 +37,7 @@ function makeMockMembrane() {
     complete: async () => {
       callCount++;
       return {
+        stopReason: 'end_turn',
         content: [{ type: 'text', text: `[mock summary #${callCount}]` }],
       };
     },
@@ -54,7 +55,7 @@ describe('AutobiographicalStrategy — branching semantics', () => {
   it('fork inherits resolutions at fork point; divergence does not leak back', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 100,
       recentWindowTokens: 200,
     });
@@ -122,7 +123,7 @@ describe('AutobiographicalStrategy — branching semantics', () => {
   it('locks on fork do not affect parent', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 100,
     });
     const manager = await ContextManager.open({
@@ -160,7 +161,7 @@ describe('AutobiographicalStrategy — branching semantics', () => {
   it('summaries on fork do not affect parent', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 80,
       mergeThreshold: 3,
       recentWindowTokens: 50,

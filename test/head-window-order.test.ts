@@ -44,6 +44,7 @@ function createCapturingMembrane() {
         .join('').length;
       const summary = `[mock summary] ` + 'x '.repeat(Math.max(30, Math.floor(inputChars / 10)));
       return {
+        stopReason: 'end_turn',
         content: [{ type: 'text', text: summary }],
         usage: { input_tokens: Math.ceil(inputChars / 4), output_tokens: Math.ceil(summary.length / 4) },
       };
@@ -117,6 +118,53 @@ describe('Compression prompt ordering (confabulation regression)', () => {
       }
     }
     assert.ok(checked >= 1, 'expected at least one call with recall pairs to verify ordering against');
+    await manager.close();
+  });
+
+  it('keeps prior recalls in Chronicle order when decimal message IDs cross 99', async () => {
+    cleanup();
+    const { membrane, calls } = createCapturingMembrane();
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: TEST_COMPRESSION_MODEL,
+      targetChunkTokens: 80,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      hierarchical: true,
+      mergeThreshold: 1000,
+    });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+      membrane: membrane as any,
+    });
+
+    const filler = (i: number) => `event ${i} ` + 'chronological substantive history '.repeat(8);
+    for (let i = 0; i < 150; i++) {
+      manager.addMessage(i % 2 === 0 ? 'user' : 'agent', [t(filler(i))]);
+    }
+
+    await drain(manager);
+    let crossedThreeDigits = false;
+    for (const call of calls) {
+      const recallIds = call.messages.flatMap((message) =>
+        message.content.flatMap((block) => {
+          const match = /^\[CM\] Recall memory (.+)\.$/.exec((block as { text?: string }).text ?? '');
+          return match ? [match[1]] : [];
+        }),
+      );
+      const sourceStarts = recallIds.map((id) => {
+        const summary = manager.getSummary(id);
+        assert.ok(summary, `recalled summary ${id} must exist`);
+        return Number(summary.sourceRange.first);
+      });
+      if (sourceStarts.some((id) => id >= 100)) crossedThreeDigits = true;
+      assert.deepStrictEqual(
+        sourceStarts,
+        [...sourceStarts].sort((a, b) => a - b),
+        `recall pairs must follow Chronicle order, got ${sourceStarts.join(', ')}`,
+      );
+    }
+    assert.ok(crossedThreeDigits, 'fixture must exercise the decimal-ID width transition');
     await manager.close();
   });
 

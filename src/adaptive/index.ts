@@ -3,10 +3,10 @@
  *
  * See `docs/adaptive-resolution-design.md` for the architectural overview.
  *
- * Status: V1 implementation, not yet wired into `AutobiographicalStrategy`.
- * Modules in this directory are exercised via the test harness in
- * `test/adaptive/` and will be integrated into the strategy in a follow-up
- * once the design is validated against real workloads.
+ * Status: wired into `AutobiographicalStrategy` (`selectAdaptive`) and in
+ * production — deployed agents run the kv-stable solver from this directory
+ * (design §13). Also exercised standalone via `test/adaptive/` and the
+ * replay harness (`kv-replay`).
  */
 
 // Chunker
@@ -18,13 +18,12 @@ export {
   type ShardingResult,
 } from './chunker.js';
 
-// Folding strategy interface
+// Folding solver interface
 export type {
-  FoldingStrategy,
-  FoldingState,
+  FoldingSolver,
+  FoldingSolution,
   FoldingBudget,
-  FoldOp,
-  ChunkView,
+  ProduceRequest,
   ChunkId,
   ChunkRange,
   SummaryId,
@@ -34,6 +33,7 @@ export type {
 export { FlatProfileStrategy } from './strategies/flat-profile.js';
 export { OldestFirstStrategy } from './strategies/oldest-first.js';
 export { KvStableStrategy, type KvStableOptions } from './strategies/kv-stable.js';
+export { KvUnifiedStrategy, type KvUnifiedOptions } from './strategies/kv-unified.js';
 
 // Summary tree + rendered-unit accounting (shared substrate)
 export {
@@ -43,6 +43,65 @@ export {
   type LeafNode,
   type SummaryNode,
 } from './summary-tree.js';
+export {
+  CanonicalSummaryForest,
+  CanonicalForestError,
+  type CanonicalConstraintKind,
+  type CanonicalLeafConstraint,
+  type CanonicalForestOptions,
+  type CanonicalForestIssueCode,
+  type CanonicalForestIssue,
+  type CanonicalLeaf,
+  type CanonicalSummary,
+  type CanonicalRoot,
+  type ConstraintConflict,
+  type MinimumTokenCertificate,
+  type MinimumTokenResult,
+  type CanonicalSelectAction,
+  type CanonicalDecisionNode,
+  type CanonicalDecisionDag,
+  type ExactCutCandidate,
+  type ExactCutEnumerationStats,
+  type ExactCutEnumeration,
+  ExactEnumerationLimitError,
+  SparseLabelCeilingError,
+  type SparseLabelStats,
+  type SparseLabelResult,
+} from './kv-unified.js';
+export {
+  ExactKvUnifiedPolicySolver,
+  KvUnifiedPolicyError,
+  DEFAULT_KV_UNIFIED_WELFARE_POLICY,
+  type PresentedLeaf,
+  type AcceptedPresentationReference,
+  type ProviderCacheReference,
+  type KvUnifiedWelfarePolicy,
+  type ExactPolicySolveOptions,
+  type ExactPolicyCandidate,
+  type ExactPolicySolveResult,
+} from './kv-unified-policy.js';
+export {
+  ParetoKvUnifiedPolicySolver,
+  type ParetoPropagationStats,
+  type ParetoPolicySolveResult,
+} from './kv-unified-pareto.js';
+export {
+  KvUnifiedReceiptChain,
+  type PendingPresentationSubmission,
+  type PresentationDelta,
+  type PresentationReceipt,
+  type ReceiptChainSnapshot,
+  type SerializedReceiptChain,
+  type SerializedReceiptChainV1,
+  type SerializedReceiptChainV2,
+  type SerializedReceiptHead,
+  type LeafRun,
+  type RawLeafRun,
+  MAX_DECODED_LEAVES,
+  encodeLeafRuns,
+  decodeLeafRuns,
+  type ObservedCacheWireReceipt,
+} from './kv-unified-receipts.js';
 export {
   renderLayout,
   kvCost,
@@ -86,6 +145,9 @@ export {
 export {
   Picker,
   OverBudgetError,
+  UncoveredDropError,
+  accountFrontier,
+  type OverBudgetDiagnostics,
   type PickerInputs,
   type PickerResult,
   type PickerChunk,

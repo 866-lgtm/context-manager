@@ -1,32 +1,46 @@
 /**
- * KvStableStrategy — the KV-stable context controller plugged into the existing
- * picker (see `docs/kv-stable-context-control.md`).
+ * KvStableStrategy — the KV-stable context controller as a folding SOLVER
+ * (the rev 5.0 single-path solve; see `docs/adaptive-resolution-design.md`
+ * §13. `docs/kv-stable-context-control.md` is the historical "why" and the
+ * measurement harness).
  *
- * Same "solve-once-then-walk" bridge as `BestFitStrategy`: on the first
- * `selectNextFold` it computes a target frontier with `planControlledFrontier`
- * (the *same* policy the replay harness measures), memoizes it, then emits one
- * `raise`/`lower` op per call to walk the live state toward it, returning `null`
- * once reached. The picker already applies raise/lower — no picker change.
+ * One `solve` call computes the complete target frontier with
+ * `planControlledFrontier` (the *same* policy the replay harness measures)
+ * and returns it for the picker to apply directly.
  *
- * Unlike `BestFitStrategy` (which maximizes value − λ·KVcost over a half-life
- * recency model), this minimizes real prefix churn directly: it holds the flat
- * zone (head/tail/pinned) raw, never folds locked chunks, and sheds the foldable
- * middle oldest-first/leveled under a per-turn divergence **reach cap** (the
- * perturbation cap P), bounded by per-chunk log-age saliency caps, yielding the
- * reach cap only as far as needed to stay under the hard wall (`totalBudget`).
- * No λ, no recency half-life.
+ * It minimizes real prefix churn: it holds the flat zone (head/tail/pinned)
+ * raw, never folds locked chunks, honors V2 leveled pins (`pinLevel` /
+ * `pinMaxLevel`) as fixed levels / hard fold-depth caps, and reconciles a
+ * from-scratch relevance-ideal cut against the carried frontier under a
+ * perturbation TRUST REGION P (exact kvCost, not a spatial gate) — adopting
+ * the ideal within P, amortizing bigger repairs via suffix adoption, and
+ * exceeding P only with a recorded override. There is no emergency path.
  *
- * Like `BestFitStrategy`, it does not emit `produce` ops — deeper folding than
- * has been produced is the speculative pre-producer's job; the controller only
- * targets levels whose summaries already exist. Deterministic.
+ * It does not SPECULATIVELY emit produce requests — deeper folding than has
+ * been produced is the speculative pre-producer's job; the controller only
+ * targets levels whose summaries already exist. The one exception is DEMAND
+ * under escalation (issue #56): when even full folding exceeds the hard wall
+ * W while foldable chunks have no L1 coverage at all, production is the only
+ * remaining lever, and the caller's demand path (`handleProducedOps` →
+ * `enqueueL1ForRange` → the L1-holdback exemption) is reachable only through
+ * produce ops — so the solve emits L1 requests for the uncovered ranges.
+ * Deterministic.
+ *
+ * History: this used to walk the plan into the picker one group-atomic
+ * raise/lower op at a time. Group ops cannot express a frontier that cuts
+ * through a group — which leveled pins legitimately require — so the walk
+ * oscillated (the 2026-07-25 Mythos outage; the `raise:L4-936` wedge) and
+ * silently rendered "nearest realizable" frontiers that diverged from the
+ * plan while plan-vs-actual reported zero drift. The walk is gone; the plan
+ * IS the frontier.
  */
 
 import type {
-  FoldingStrategy,
-  FoldingState,
+  FoldingSolver,
+  FoldingSolution,
   FoldingBudget,
-  FoldOp,
   ChunkId,
+  ProduceRequest,
 } from '../folding-strategy.js';
 import type { PickerInputs } from '../picker.js';
 import { SummaryTree } from '../summary-tree.js';
@@ -50,43 +64,35 @@ export interface KvStableOptions {
   strictReach?: boolean;
 }
 
-export class KvStableStrategy implements FoldingStrategy {
+export class KvStableStrategy implements FoldingSolver {
   readonly name = 'kv-stable';
 
-  private readonly inputs: PickerInputs;
   private readonly opts: KvStableOptions;
-  private readonly fPrev: Map<ChunkId, number>;
-  private target: Map<ChunkId, number> | null = null;
   private _lastPlan: ControlPlan | null = null;
+  private _lastTarget: Map<ChunkId, number> | null = null;
 
-  constructor(inputs: PickerInputs, opts: KvStableOptions = {}) {
-    this.inputs = inputs;
+  constructor(opts: KvStableOptions = {}) {
     this.opts = opts;
-    this.fPrev = new Map(inputs.chunks.map((c) => [c.id, c.currentResolution]));
   }
 
-  selectNextFold(state: FoldingState, budget: FoldingBudget): FoldOp | null {
-    if (!this.target) this.target = this.solve(budget);
-    return this.nextOp(state);
-  }
-
-  /** Target frontier this run is walking toward (null before the first call). */
+  /** Target frontier of the most recent solve (null before the first). */
   targetFrontier(): ReadonlyMap<ChunkId, number> | null {
-    return this.target;
+    return this._lastTarget;
   }
 
   /** The full control plan behind the target (perturbation, override) — for
    *  observability at the call site (`[kv-escalation]` logging). Null before
-   *  the first `selectNextFold`. */
+   *  the first `solve`. */
   lastPlan(): ControlPlan | null {
     return this._lastPlan;
   }
 
-  private solve(budget: FoldingBudget): Map<ChunkId, number> {
-    const tree = new SummaryTree(this.inputs);
+  solve(inputs: PickerInputs, budget: FoldingBudget): FoldingSolution {
+    const tree = new SummaryTree(inputs);
+    const fPrev = new Map(inputs.chunks.map((c) => [c.id, c.currentResolution]));
 
     // Flat zone (forced raw, never folded): head, tail, classic pins. Frozen
-    // (kept at their carried resolution, never folded): locked. V2 dynamic pins
+    // (kept at their carried resolution, never touched): locked. V2 dynamic pins
     // (`pinLevel` / `pinMaxLevel`) are honored as a fixed level or a hard fold-
     // depth cap — see `planControlledFrontier`.
     const rawZone = new Set<ChunkId>();
@@ -95,9 +101,9 @@ export class KvStableStrategy implements FoldingStrategy {
     const pinCaps = new Map<ChunkId, number>();
     const fixedPins: Array<{ id: ChunkId; level: number }> = [];
     let now = 0;
-    for (const c of this.inputs.chunks) {
+    for (const c of inputs.chunks) {
       if (c.sequence > now) now = c.sequence;
-      if (this.inputs.headChunkIds.has(c.id) || this.inputs.tailChunkIds.has(c.id) || c.pinned) {
+      if (inputs.headChunkIds.has(c.id) || inputs.tailChunkIds.has(c.id) || c.pinned) {
         rawZone.add(c.id);
       } else if (c.pinLevel !== undefined) {
         // Pin-at-level-k: fix exactly at k (0 = raw). k=0 is equivalent to a
@@ -118,10 +124,10 @@ export class KvStableStrategy implements FoldingStrategy {
     // Group-consistency for pin-at-level-k: an L_k recall pair is atomic over
     // its whole covered range, so "cut through the L_k node" (design §7) fixes
     // EVERY leaf under that node at k — not just the addressed chunk. Fixing a
-    // single sub-chunk while its siblings render raw is an unrenderable (and
-    // non-converging) frontier. Clamp k to the deepest produced level for the
-    // chunk; if none exists, fall back to fixing just the chunk (the controller
-    // clamps it further). Skip leaves already forced raw (head/tail/classic pin).
+    // single sub-chunk while its siblings render raw is an unrenderable
+    // frontier. Clamp k to the deepest produced level for the chunk; if none
+    // exists, fall back to fixing just the chunk (the controller clamps it
+    // further). Skip leaves already forced raw (head/tail/classic pin).
     for (const { id, level } of fixedPins) {
       const eff = Math.min(level, tree.maxLevel(id));
       if (eff <= 0) { rawZone.add(id); continue; }
@@ -135,8 +141,8 @@ export class KvStableStrategy implements FoldingStrategy {
       }
     }
 
-    const plan = planControlledFrontier(this.inputs, tree, {
-      previous: this.fPrev,
+    const plan = planControlledFrontier(inputs, tree, {
+      previous: fPrev,
       // Single-path solve (design §13.4): the [targetBudget, totalBudget] band
       // is the quiet dead band; the trust region and overrides do the rest.
       foldAtTokens: this.opts.goalTotalTokens ?? budget.totalBudget,
@@ -154,27 +160,51 @@ export class KvStableStrategy implements FoldingStrategy {
       mergeThreshold: this.opts.mergeThreshold,
     });
     this._lastPlan = plan;
-    return plan.resolutions;
-  }
+    this._lastTarget = plan.resolutions;
 
-  /** Emit one op moving the live state toward the target frontier. */
-  private nextOp(state: FoldingState): FoldOp | null {
-    const target = this.target!;
-    for (const c of state.chunks()) {
-      if (c.inHead || c.inTail || c.pinned || c.lockedByAgent) continue;
-      const cur = c.currentResolution;
-      const tgt = target.get(c.id) ?? 0;
-      if (cur === tgt) continue;
-
-      if (cur < tgt) {
-        const summary = c.ancestorAt(tgt);
-        if (!summary) continue; // unrealizable target (summary not produced) — skip
-        return { kind: 'raise', groupRoot: summary.id };
+    // DEMAND-SIDE PRODUCTION (issue #56). Speculative pre-production stays the
+    // pre-producer's job — but when even full folding exceeds the hard wall W
+    // (plan.escalated) while foldable chunks have no L1 at all, producing
+    // those L1s is the only lever left, and the caller's demand path
+    // (`handleProducedOps` → `enqueueL1ForRange` → `_demandedL1Chunks`) fires
+    // only on produce ops. Emitting none wedged tight operating points
+    // PERMANENTLY: the L1 holdback filter kept the newest closed chunk(s) out
+    // of the speculative queue, demand could never be raised to override the
+    // holdback, and every compile re-escalated infeasible (the L1-holdback
+    // deadlock — external repro at budgets 14–26k). Contiguous uncovered runs
+    // coalesce into one request each; the consumer maps message ranges back
+    // onto closed chunks and dedupes against its queue, so re-emission on
+    // subsequent escalated compiles is convergent, and a range covering only
+    // the unclosed trailing span (not yet a chunk) is skipped harmlessly.
+    const produced: ProduceRequest[] = [];
+    if (plan.escalated) {
+      const bySequence = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence);
+      let run: { first: ChunkId; last: ChunkId } | null = null;
+      const flush = (): void => {
+        if (run) produced.push({ level: 1, range: { firstChunkId: run.first, lastChunkId: run.last } });
+        run = null;
+      };
+      for (const c of bySequence) {
+        // Uncovered AND foldable: no L1 lineage, not force-raw (head/tail/
+        // pins — incl. pin-at-k clamped to raw for lack of summaries, which
+        // lands in rawZone above), not frozen (locked keeps its resolution,
+        // so a produced L1 could never be rendered anyway).
+        const uncovered = !c.l1Id && !rawZone.has(c.id) && !frozen.has(c.id);
+        if (!uncovered) { flush(); continue; }
+        if (run) run.last = c.id;
+        else run = { first: c.id, last: c.id };
       }
-      const summary = c.ancestorAt(cur);
-      if (!summary) continue;
-      return { kind: 'lower', groupRoot: summary.id };
+      flush();
     }
-    return null;
+
+    return {
+      frontier: plan.resolutions,
+      produced,
+      // Kv-stable exhaustion is the ESCALATED state only: even full folding
+      // exceeds the hard wall W. A dead-band hold above the soft target is
+      // the designed steady state, not exhaustion — see
+      // FoldingSolution.exhausted for why the semantics are solver-owned.
+      exhausted: plan.escalated,
+    };
   }
 }

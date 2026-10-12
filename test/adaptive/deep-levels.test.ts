@@ -27,6 +27,7 @@ function makeMockMembrane() {
     complete: async () => {
       callCount++;
       return {
+        stopReason: 'end_turn',
         content: [{ type: 'text', text: `[mock summary #${callCount}] short summary content here.` }],
       };
     },
@@ -52,7 +53,7 @@ describe('AutobiographicalStrategy — deep-level pre-production', () => {
   it('speculativeProduction off: only L1/L2/L3 (legacy behavior)', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: false,
+      compressionModel: 'mock',      adaptiveResolution: false,
       targetChunkTokens: 100,
       mergeThreshold: 3, // small so we get to deep levels quickly
       recentWindowTokens: 50,
@@ -78,7 +79,7 @@ describe('AutobiographicalStrategy — deep-level pre-production', () => {
   it('speculativeProduction on: produces L4+ when source counts warrant it', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true, // turns on speculativeProduction
+      compressionModel: 'mock',      adaptiveResolution: true, // turns on speculativeProduction
       targetChunkTokens: 80,
       mergeThreshold: 2, // smallest possible — forces the chain to climb fast
       recentWindowTokens: 50,
@@ -115,7 +116,7 @@ describe('AutobiographicalStrategy — deep-level pre-production', () => {
   it('parentId set correctly across deep levels', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 80,
       mergeThreshold: 2,
       recentWindowTokens: 50,
@@ -158,7 +159,7 @@ describe('AutobiographicalStrategy — deep-level pre-production', () => {
   it('picker uses L4+ summaries when budget pressure requires it', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
-      adaptiveResolution: true,
+      compressionModel: 'mock',      adaptiveResolution: true,
       targetChunkTokens: 80,
       mergeThreshold: 2,
       recentWindowTokens: 50,

@@ -66,6 +66,10 @@ type AttemptHandler =
       stop: 'refusal' | 'end_turn' | 'max_tokens';
       text?: string;
       inputTokens?: number;
+      topLevelInputTokens?: number;
+      cacheCreationTokens?: number;
+      cacheReadTokens?: number;
+      provider?: string;
       omitUsage?: boolean;
     }
   | { raw: unknown }
@@ -83,7 +87,26 @@ function flexibleMembrane(handlers: AttemptHandler[]) {
         if ('raw' in handler) return handler.raw;
         const result = response(handler.stop, handler.text ?? '');
         if (handler.inputTokens !== undefined) result.usage.inputTokens = handler.inputTokens;
-        if (handler.omitUsage) delete (result as { usage?: unknown }).usage;
+        if (handler.topLevelInputTokens !== undefined) result.usage.inputTokens = handler.topLevelInputTokens;
+        if (handler.cacheCreationTokens !== undefined || handler.cacheReadTokens !== undefined || handler.provider) {
+          (result as unknown as { details: { usage: Record<string, number>; model: { provider: string } } }).details = {
+            usage: {
+              inputTokens: handler.inputTokens ?? result.usage.inputTokens,
+              outputTokens: result.usage.outputTokens,
+              ...(handler.cacheCreationTokens !== undefined
+                ? { cacheCreationTokens: handler.cacheCreationTokens }
+                : {}),
+              ...(handler.cacheReadTokens !== undefined
+                ? { cacheReadTokens: handler.cacheReadTokens }
+                : {}),
+            },
+            model: { provider: handler.provider ?? 'anthropic' },
+          };
+        }
+        if (handler.omitUsage) {
+          delete (result as { usage?: unknown }).usage;
+          delete (result as { details?: unknown }).details;
+        }
         return result;
       },
     } as never,
@@ -350,6 +373,42 @@ describe('compression refusal recall curves', () => {
     assert.equal(fx.strategy.summariesView().filter((entry) => entry.level === 1).length, 5);
     assert.equal(fx.target.compressed, true);
     assert.equal(quarantineEvents(fx.manager).length, 0, 'normal success appends no quarantine events');
+    fx.manager.close();
+  });
+
+  it('canonical tool_use gets ONE no-tools retry before the curve plan burns (lena 2026-08-06)', async () => {
+    // Curve variants vary the recall frontier, not the response mode — a
+    // think-first model fails every variant identically. The retry must be
+    // the canonical request plus exactly one sentence.
+    const mock = flexibleMembrane([
+      {
+        raw: {
+          stopReason: 'tool_use',
+          content: [{ type: 'tool_use', id: 'tu-1', name: 'think', input: { content: 'draft…' } }],
+          usage: { inputTokens: 100, outputTokens: 50 },
+        },
+      },
+      { stop: 'end_turn', text: 'a memory written as prose after the no-tools retry' },
+    ]);
+    const fx = await fixture(mock.membrane);
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+
+    assert.equal(mock.calls.length, 2, 'one retry, zero curve-fallback calls');
+    assert.ok(
+      !JSON.stringify(mock.calls[0]!.request).includes('do not call any tools'),
+      'first attempt stays byte-identical to the canonical prompt',
+    );
+    const retry = mock.calls[1]!.request;
+    const lastMessage = retry.messages[retry.messages.length - 1]!;
+    const lastText = lastMessage.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('');
+    assert.ok(
+      lastText.includes('do not call any tools for this'),
+      'retry carries the no-tools line on the final instruction message',
+    );
+    assert.equal(fx.target.compressed, true, 'retry output persists as the L1');
+    assert.equal(quarantineEvents(fx.manager).length, 0, 'a healed tool_use leaves no quarantine debt');
     fx.manager.close();
   });
 
@@ -779,12 +838,141 @@ describe('compression refusal recall curves', () => {
     const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
       .record as Record<string, unknown>;
     assert.equal(record.canonicalProviderInputTokens, 90_000);
-    assert.match(String(record.accountingSource), /canonical_provider_input/);
+    assert.match(String(record.accountingSource), /provider_total_input/);
     const plan = record.plan as Array<Record<string, unknown>>;
     assert.ok(plan.length > 0);
     assert.ok(plan.every((item) => item.disposition === 'admission_rejected'));
     assert.ok(plan.every((item) => item.accountingSource === 'canonical_provider_usage_plus_expansion'));
     assert.ok(plan.every((item) => Number(item.boundedInputTokens) > 90_000));
+    fx.manager.close();
+  });
+
+  it('provider usage replaces the invariant UTF-8 floor after canonical refusal', async () => {
+    const mock = flexibleMembrane([
+      { stop: 'refusal', inputTokens: 120_000, cacheCreationTokens: 40_000, cacheReadTokens: 20_000, provider: 'anthropic' },
+      { stop: 'end_turn', text: 'provider-counted fallback succeeded', inputTokens: 190_000 },
+    ]);
+    const fx = await fixture(mock.membrane, {
+      compressionContextBudgetTokens: 350_000,
+      compressionRefusalCurveFallbacks: 1,
+      headWindowTokens: 100_000,
+    });
+    fx.manager.setToolDefinitions([{
+      name: 'huge_invariant_tool_catalog',
+      description: 'schema inventory '.repeat(30_000),
+      inputSchema: {
+        type: 'object',
+        properties: { payload: { type: 'string', description: 'large field '.repeat(30_000) } },
+      },
+    }]);
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2, 'observed canonical usage admits one fallback');
+    assert.equal(fx.target.compressed, true);
+    const requests = mock.calls.map((call) => Buffer.byteLength(JSON.stringify(call.request), 'utf8'));
+    assert.ok(requests[0]! > 350_000, 'invariant serialized request exceeds the token budget numerically');
+    const exhausted = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted');
+    assert.equal(exhausted, undefined, 'successful fallback leaves no quarantine');
+    fx.manager.close();
+  });
+
+  it('canonical provider accounting includes cache-write and cache-read tokens', async () => {
+    const mock = flexibleMembrane([
+      { stop: 'refusal', inputTokens: 2, cacheCreationTokens: 210_000, cacheReadTokens: 130_000, provider: 'anthropic' },
+      { stop: 'end_turn', text: 'must never be called' },
+    ]);
+    const fx = await fixture(mock.membrane, {
+      compressionContextBudgetTokens: 350_000,
+      compressionRefusalCurveFallbacks: 3,
+    });
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 1, 'full cached canonical usage plus output reserve blocks fallbacks');
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+      .record as Record<string, unknown>;
+    assert.equal(record.canonicalProviderInputTokens, 340_002);
+    const plan = record.plan as Array<Record<string, unknown>>;
+    assert.ok(plan.length > 0);
+    assert.ok(plan.every((item) => item.accountingSource === 'canonical_provider_usage_plus_expansion'));
+    assert.ok(plan.every((item) => item.disposition === 'admission_rejected'));
+    fx.manager.close();
+  });
+
+  it('Bedrock cache counters use the same disjoint accounting contract', async () => {
+    const mock = flexibleMembrane([
+      { stop: 'refusal', inputTokens: 2, cacheCreationTokens: 210_000, cacheReadTokens: 130_000, provider: 'bedrock' },
+    ]);
+    const fx = await fixture(mock.membrane, {
+      compressionContextBudgetTokens: 350_000,
+      compressionRefusalCurveFallbacks: 1,
+    });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 1);
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+      .record as Record<string, unknown>;
+    assert.equal(record.canonicalProviderInputTokens, 340_002);
+    fx.manager.close();
+  });
+
+  it('prefers detailed provider usage over the top-level basic usage mirror', async () => {
+    const mock = flexibleMembrane([
+      {
+        stop: 'refusal',
+        inputTokens: 100_000,
+        topLevelInputTokens: 1,
+        cacheCreationTokens: 120_000,
+        cacheReadTokens: 80_000,
+        provider: 'anthropic',
+      },
+    ]);
+    const fx = await fixture(mock.membrane, {
+      compressionContextBudgetTokens: 310_000,
+      compressionRefusalCurveFallbacks: 1,
+    });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 1, 'detailed total plus output reserve blocks the fallback');
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+      .record as Record<string, unknown>;
+    assert.equal(record.canonicalProviderInputTokens, 300_000);
+    fx.manager.close();
+  });
+
+  it('does not double-count provider cache fields that are subsets of total input', async () => {
+    const mock = flexibleMembrane([
+      { stop: 'refusal', inputTokens: 200_000, cacheReadTokens: 150_000, provider: 'openai-responses-api' },
+      { stop: 'end_turn', text: 'subset-accounted fallback succeeded', inputTokens: 220_000 },
+    ]);
+    const fx = await fixture(mock.membrane, {
+      compressionContextBudgetTokens: 350_000,
+      compressionRefusalCurveFallbacks: 1,
+    });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2, 'OpenAI cached input is not added twice');
+    assert.equal(fx.target.compressed, true);
+    fx.manager.close();
+  });
+
+  it('zero or partial non-Anthropic usage falls back to the complete request bound', async () => {
+    const mock = flexibleMembrane([
+      { stop: 'refusal', inputTokens: 0, cacheReadTokens: 5, provider: 'openai-responses-api' },
+    ]);
+    const fx = await fixture(mock.membrane, {
+      compressionContextBudgetTokens: 60_000,
+      compressionRefusalCurveFallbacks: 1,
+    });
+    fx.manager.setToolDefinitions([{
+      name: 'large_zero_usage_tool',
+      description: 'schema inventory '.repeat(20_000),
+      inputSchema: { type: 'object', properties: {} },
+    }]);
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 1, 'degenerate usage cannot bypass the deterministic floor');
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+      .record as Record<string, unknown>;
+    assert.equal(record.canonicalProviderInputTokens, undefined);
+    assert.ok((record.plan as Array<Record<string, unknown>>).every(
+      (item) => item.accountingSource === 'complete_normalized_request_bound',
+    ));
     fx.manager.close();
   });
 
@@ -851,13 +1039,13 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
-  it('continues across empty output and provider error, then accepts persistable max_tokens text', async () => {
+  it('continues across empty output and provider error, then accepts persistable end_turn text', async () => {
     const providerError = Object.assign(new Error('synthetic variant failure'), { type: 'invalid_request' });
     const mock = flexibleMembrane([
       { stop: 'refusal' },
       { stop: 'end_turn', text: '' },
       { error: providerError },
-      { stop: 'max_tokens', text: 'persistable truncated memory' },
+      { stop: 'end_turn', text: 'persistable recovered memory' },
     ]);
     const fx = await fixture(mock.membrane);
     const extraChildren = [
@@ -883,7 +1071,7 @@ describe('compression refusal recall curves', () => {
     const produced = fx.strategy.summariesView().find(
       (entry) => entry.sourceIds.join(':') === fx.target.messages.map((message) => message.id).join(':'),
     );
-    assert.equal(produced?.content, 'persistable truncated memory');
+    assert.equal(produced?.content, 'persistable recovered memory');
     assert.equal(quarantineEvents(fx.manager).filter((event) => event.kind === 'exhausted').length, 0);
     fx.manager.close();
   });
@@ -945,11 +1133,11 @@ describe('compression refusal recall curves', () => {
     }
   });
 
-  it('continues after a malformed fallback and persists later max_tokens text', async () => {
+  it('continues after a malformed fallback and persists later end_turn text', async () => {
     const mock = flexibleMembrane([
       { stop: 'refusal' },
       { raw: { stopReason: 'end_turn', content: [null] } },
-      { stop: 'max_tokens', text: 'later bounded memory' },
+      { stop: 'end_turn', text: 'later bounded memory' },
     ]);
     const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 2 });
     await fx.strategy.run(fx.target, managerContext(fx.manager));
@@ -959,13 +1147,22 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
-  it('preserves canonical non-refusal empty, max_tokens, and error behavior', async () => {
+  it('preserves canonical empty/error behavior; canonical max_tokens is never canonized', async () => {
     {
+      // cm #55 (2026-08-06): an empty generation is no longer a silent
+      // skip — after the plain-prose retry also comes back empty, the
+      // chunk exhausts into durable quarantine (bounded accounting for
+      // every non-success outcome; previously this re-attempted on every
+      // maintenance pass forever).
       const mock = flexibleMembrane([{ stop: 'end_turn', text: '' }]);
       const fx = await fixture(mock.membrane);
       await fx.strategy.run(fx.target, managerContext(fx.manager));
       assert.equal(fx.target.compressed, false);
-      assert.equal(quarantineEvents(fx.manager).filter((event) => event.kind === 'exhausted').length, 0);
+      const exhausted = quarantineEvents(fx.manager).filter((event) => event.kind === 'exhausted');
+      assert.equal(exhausted.length, 1, 'empty generations exhaust durably now');
+      const outcomes = exhausted[0]!.outcomes as Array<{ outcome: string; curveLabel: string }>;
+      assert.ok(outcomes.every((o) => o.outcome === 'unusable_empty'));
+      assert.ok(outcomes.some((o) => o.curveLabel === 'canonical-plain-prose'), 'prose retry was attempted first');
       fx.manager.close();
     }
     for (const malformed of [
@@ -981,10 +1178,24 @@ describe('compression refusal recall curves', () => {
       fx.manager.close();
     }
     {
+      // Terminal-disposition gate (2026-08-01): a truncated canonical
+      // generation must NOT become a permanent memory, however plausible its
+      // text. It rides the bounded fallback machinery ('incomplete') and,
+      // with every attempt truncated, exhausts into quarantine.
       const mock = flexibleMembrane([{ stop: 'max_tokens', text: 'canonical partial memory' }]);
-      const fx = await fixture(mock.membrane);
+      const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 2 });
       await fx.strategy.run(fx.target, managerContext(fx.manager));
-      assert.equal(fx.target.compressed, true);
+      assert.equal(fx.target.compressed, false, 'truncated memory must never be canonized');
+      const produced = fx.strategy.summariesView().find(
+        (entry) => entry.content === 'canonical partial memory',
+      );
+      assert.equal(produced, undefined);
+      const exhausted = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted');
+      assert.ok(exhausted, 'exhaustion is receipted durably');
+      const outcomes = (exhausted!.outcomes as Array<{ outcome: string; stopReason?: string }>);
+      assert.equal(outcomes[0]!.outcome, 'incomplete');
+      assert.equal(outcomes[0]!.stopReason, 'max_tokens');
+      assert.ok(outcomes.every((outcome) => outcome.outcome === 'incomplete'));
       fx.manager.close();
     }
     {
@@ -1092,6 +1303,61 @@ describe('compression refusal recall curves', () => {
     manager.close();
   });
 
+  it('a new accounting version is not blocked by the old per-chunk shape cap', async () => {
+    const path = freshPath();
+    const firstMock = scriptedMembrane(['refusal']);
+    const first = await fixture(firstMock.membrane, { compressionRefusalCurveFallbacks: 0 }, path);
+    const targetIds = first.target.messages.map((message) => message.id);
+    await first.strategy.run(first.target, managerContext(first.manager));
+    const exhausted = quarantineEvents(first.manager).find((event) => event.kind === 'exhausted')!;
+    const current = exhausted.record as Record<string, unknown>;
+    await first.strategy.clearCompressionRefusalQuarantine(String(current.key));
+    for (let i = 0; i < 3; i++) {
+      const legacyConfig = { ...(current.normalizedConfig as Record<string, unknown>) };
+      delete legacyConfig.accountingVersion;
+      const legacy: Record<string, unknown> = {
+        ...structuredClone(current),
+        key: `legacy-key-${i}`,
+        familyKey: `legacy-family-${i}`,
+        accountingSource: 'legacy-byte-wall',
+        normalizedConfig: legacyConfig,
+      };
+      if (i === 0) delete legacy.normalizedConfig;
+      first.manager.getStore().appendToStateJsonWithIdentity(
+        'default/autobio:compression-refusal-quarantine-events',
+        { kind: 'exhausted', key: legacy.key, record: legacy, created: Date.now() + i },
+        'eventId',
+        'sequence',
+      );
+    }
+    first.manager.close();
+
+    const retryMock = scriptedMembrane(['end_turn']);
+    const retried = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+    });
+    const manager = await ContextManager.open({ path, strategy: retried, membrane: retryMock.membrane });
+    const ctx = managerContext(manager);
+    const chunk: Chunk = {
+      index: 999,
+      startIndex: 10,
+      endIndex: 12,
+      messages: targetIds.map((id) => ctx.messageStore.get(id)!).filter(Boolean),
+      tokens: 100,
+      compressed: false,
+    };
+    await retried.run(chunk, ctx);
+    assert.equal(retryMock.calls.length, 1, 'v2 accounting earns one fresh canonical attempt');
+    assert.equal(chunk.compressed, true);
+    manager.close();
+  });
+
   it('restart with fallback limit 1→3 invalidates the exhausted plan key', async () => {
     const path = freshPath();
     const firstMock = scriptedMembrane(['refusal']);
@@ -1131,7 +1397,7 @@ describe('compression refusal recall curves', () => {
 
   it('restart with a changed admission budget invalidates the exact plan key', async () => {
     const path = freshPath();
-    const firstMock = scriptedMembrane(['refusal']);
+    const firstMock = flexibleMembrane([{ stop: 'refusal', inputTokens: 20_000 }]);
     const first = await fixture(firstMock.membrane, {
       compressionRefusalCurveFallbacks: 3,
       compressionContextBudgetTokens: 19_000,
@@ -1964,7 +2230,7 @@ describe('compression refusal recall curves', () => {
       assert.deepEqual(derived(fx.strategy), emptyDerived, 'stale mirrors are cleared');
       await assert.rejects(
         fx.manager.tick(),
-        /requires reinitialization for the current branch generation/,
+        /requires successful strategy initialization/,
       );
       const currentCtx = managerContext(fx.manager);
       await assert.rejects(
@@ -1973,7 +2239,7 @@ describe('compression refusal recall curves', () => {
       );
       await assert.rejects(
         fx.manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }),
-        /requires reinitialization for the current branch generation/,
+        /requires successful strategy initialization/,
       );
       assert.deepEqual(snapshot(), expectedState, 'stale entrypoints write no durable state');
       assert.deepEqual(derived(fx.strategy), emptyDerived, 'stale entrypoints rebuild no mirrors');
