@@ -1497,8 +1497,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   static readonly COMPRESSION_PERSISTENT_FAILURES = 8;
   /**
    * How long failures may go on with nothing landing before the lane alerts
-   * once (see compressionStallStateId). An hour with no observed activity is
-   * idle (compressionStallIdle), and the next failure starts the clock again.
+   * once (see compressionStallStateId). A lane idle for 61 minutes after its
+   * recorded heartbeat (compressionStallIdle) ends its stretch, and the next
+   * failure starts the clock again.
    */
   static readonly COMPRESSION_STALL_ALERT_MS = 60 * 60_000;
   /**
@@ -4648,19 +4649,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Whether the lane has been idle at `at`: an hour with no observed
-   * activity, meaning no failure, no attempt starting, and no tick that found
-   * it waiting on a pause with work pending. The recorded heartbeat
-   * (activeAt) trails the last activity by less than
-   * COMPRESSION_STALL_HEARTBEAT_MS, so the test allows that much more, and
-   * any run of ticks less than an hour apart keeps the stretch. A pause counts
-   * only through those ticks, which is the host's side: a host should tick a
-   * lane that isn't ready regularly, well inside the hour (once a minute
-   * serves), which agent-framework's maintenance pass does except while its
-   * own provider gate skips the agent. Where no tick comes for an hour, the
-   * stretch ends: there is no alert until the next failure starts another,
-   * and ticks resuming during the same hold start none. Never a false one.
-   * The process being down counts as idle.
+   * Whether the lane has been idle at `at`: 61 minutes after the recorded
+   * heartbeat (activeAt) with no observed activity, meaning no failure, no
+   * attempt starting, and no tick that found it waiting on a pause with work
+   * pending. That is an hour, plus the minute by which the heartbeat, written
+   * at most once a minute (COMPRESSION_STALL_HEARTBEAT_MS), can trail the
+   * last activity. So ticks less than an hour apart always keep a stretch,
+   * and an idle gap of between 60 and 61 minutes may keep one too: the
+   * alert's timing is good to about a minute. A pause counts only through
+   * those ticks, which is the host's side: a host should tick a lane that
+   * isn't ready regularly, well inside the hour (once a minute serves), which
+   * agent-framework's maintenance pass does except while its own provider
+   * gate skips the agent. When the stretch ends, there is no alert until the
+   * next failure starts another, and ticks resuming during the same hold
+   * start none. Apart from that minute, a missed hour costs a later alert, or
+   * none until the next failure, rather than a false one. The process being
+   * down counts as idle.
    */
   private compressionStallIdle(clock: CompressionStallClock, at: number): boolean {
     return clock.activeAt === null ||

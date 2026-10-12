@@ -2012,7 +2012,7 @@ describe("the stall clock's idle rule: failures, attempts and the waits they cau
     fx.manager.close();
   });
 
-  it('with no tick for an hour, a long wait reads as idle: the next failure starts a new stretch (the stated cost)', async () => {
+  it('with no tick for two hours, a long wait reads as idle: the next failure starts a new stretch (the stated cost)', async () => {
     const fx = await queued(scripted([
       { throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 2 * HOUR }) },
       { throw: failure('server', { httpStatus: 503 }) },

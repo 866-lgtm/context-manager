@@ -132,17 +132,20 @@ export interface ReadinessState {
    * answering, the subject may be failing on its own and needs inspecting.
    * Read from the branch's durable stall clock, shared by the strategies on
    * its store and namespace: a restart keeps it, and a landing by any of
-   * those strategies, through any membrane or model, clears it. An hour with
-   * no observed activity (no failure, no attempt starting, and no tick that
-   * found the lane paused with work pending; the process down included) is
-   * idle: the next attempt or paused tick then ends the old stretch, with no
-   * landing, and the next failure starts the clock again. A pause counts only
-   * through the ticks that see it: ticks less than an hour apart keep the
-   * stretch, so a host should tick a lane that isn't ready regularly, well
-   * inside the hour (once a minute serves). agent-framework's maintenance pass
-   * does, except while its own provider gate skips the agent. Where no tick
-   * comes for an hour, there is no alert until the next failure starts
-   * another stretch; never a false one.
+   * those strategies, through any membrane or model, clears it. Idle is 61
+   * minutes after the recorded heartbeat with no observed activity (no
+   * failure, no attempt starting, and no tick that found the lane paused with
+   * work pending; the process down included): an hour, plus the minute by
+   * which the heartbeat, written at most once a minute, can trail the last
+   * activity. The next attempt or paused tick then ends the old stretch, with
+   * no landing, and the next failure starts the clock again. A pause counts
+   * only through the ticks that see it: ticks less than an hour apart always
+   * keep a stretch, and an idle gap of between 60 and 61 minutes may keep one
+   * too, so the alert's timing is good to about a minute. A host should tick
+   * a lane that isn't ready regularly, well inside the hour (once a minute
+   * serves); agent-framework's maintenance pass does, except while its own
+   * provider gate skips the agent. Apart from that minute, a missed hour costs
+   * a later alert, or none until the next failure, rather than a false one.
    */
   compressionStall?: { since: string; subject: string; failureClass: string };
 }
