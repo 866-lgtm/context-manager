@@ -166,8 +166,9 @@ function compressionDomain(membrane: object, model: string | undefined): string 
  * The strategies of this process on each store and namespace. A pause lives
  * only in process, on its strategy, and binds its route on every branch, so
  * the stall clock's idle test reads the pauses of all of them
- * (compressionLaneWaitEnd). A strategy joins at initialize, and one
- * collected counts no pause.
+ * (compressionLaneWaitEnd). A strategy joins at initialize and leaves at
+ * detach, when its manager closes or replaces it; one collected counts no
+ * pause either.
  */
 const compressionLanePeers = new WeakMap<object, Map<string, Set<WeakRef<AutobiographicalStrategy>>>>();
 
@@ -4692,6 +4693,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       end = Math.max(end, pause.backoffUntil, stated);
     }
     return end;
+  }
+
+  /**
+   * The manager closed or replaced this strategy: it leaves its compression
+   * lane, so its pause, which nothing will lift now, no longer keeps the
+   * lane's stall clock from reading idle time.
+   */
+  detach(): void {
+    const joined = this.compressionLaneJoined;
+    if (!joined) return;
+    compressionLanePeers.get(joined.store)?.get(joined.namespace)?.delete(joined.ref);
+    this.compressionLaneJoined = undefined;
   }
 
   /** Join this process's strategies on `store` and `namespace` (compressionLanePeers). */

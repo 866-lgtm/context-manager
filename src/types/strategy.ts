@@ -161,6 +161,15 @@ export interface ContextStrategy {
   initialize?(ctx: StrategyContext): Promise<void>;
 
   /**
+   * The manager is done with this strategy: it closed, or setStrategy()
+   * replaced it. The strategy lets go of what it holds in the process
+   * (AutobiographicalStrategy leaves its compression lane, so its pause no
+   * longer counts for the lane's stall clock). A later setStrategy() of the
+   * same instance initializes it again.
+   */
+  detach?(): void;
+
+  /**
    * Periodic background maintenance.
    * Called by application to trigger compression, indexing, etc.
    */

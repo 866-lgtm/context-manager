@@ -2059,6 +2059,22 @@ describe("the stall clock's idle rule: failures, attempts and the waits they cau
     fx.manager.close();
   });
 
+  it("a strategy its manager replaced or closed leaves the lane: its hold, which nothing will lift, stops counting (Basil-1007)", async () => {
+    const hold = failure('rate_limit', { httpStatus: 429, retryAfterMs: Number.POSITIVE_INFINITY });
+    const a = await queued(scripted([OK('unused')]).membrane);
+    const b = await queued(scripted([OK('unused')]).membrane, { store: a.manager.getStore() });
+    b.strategy.notePause(hold, managerContext(b.manager));
+    assert.equal(a.strategy.laneWaitEnd(), Number.POSITIVE_INFINITY, "the sibling's hold counts for the lane");
+    b.manager.close(); // b doesn't own the store, which stays open
+    assert.equal(a.strategy.laneWaitEnd(), Number.NEGATIVE_INFINITY, 'a closed manager\'s strategy left the lane');
+
+    a.strategy.notePause(hold, managerContext(a.manager));
+    const replacement = new ProbeStrategy({ compressionModel: 'same-model', autoTickOnNewMessage: false } as never);
+    await a.manager.setStrategy(replacement);
+    assert.equal(replacement.laneWaitEnd(), Number.NEGATIVE_INFINITY, 'a replaced strategy left the lane');
+    a.manager.close();
+  });
+
   it("a wait released on another branch is released here too: the pause is the authority (Andrew-2310's release-on-fork case)", async () => {
     const fx = await queued(scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 3 * HOUR }) }]).membrane);
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
