@@ -867,6 +867,24 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     await fx.manager.close();
   });
 
+  it("a stored merge run that isn't well formed is read as none (cm138-r5 I13)", async () => {
+    const path = freshPath();
+    const fx = await fixture({ complete: async () => { throw network(); } } as never, {}, path);
+    await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
+    const stored = fx.manager.getStore().getStateJson('default/autobio:mergeQueue') as Array<{ failureStreak?: { failures: unknown } }>;
+    assert.equal(stored[0]?.failureStreak?.failures, 1);
+    stored[0]!.failureStreak!.failures = '7';
+    fx.manager.getStore().setStateJson('default/autobio:mergeQueue', stored);
+    fx.manager.getStore().sync();
+    await fx.manager.close();
+    const strategy = new Probe({ compressionModel: MODEL, hierarchical: true, targetChunkTokens: 100_000, recentWindowTokens: 0, headWindowTokens: 0, autoTickOnNewMessage: false, mergeThreshold: 99, quarantineAlarmIntervalMs: 0 });
+    const manager = await ContextManager.open({ path, strategy, membrane: { complete: async () => { throw network(); } } as never });
+    const queue = (strategy as unknown as { mergeQueue: Array<{ failureStreak?: unknown }> }).mergeQueue;
+    assert.equal(queue.length, 1, 'the entry is kept');
+    assert.equal(queue[0]!.failureStreak, undefined, "a count of '7' isn't counted on");
+    await manager.close();
+  });
+
   it('a merge written as the branch switches is still a landing in its domain (cm138-r4 I6)', async () => {
     const membrane = {
       complete: async (request: unknown) => {
@@ -892,14 +910,17 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     const fork = store.createBranchAt('zz-fork', main, store.currentSequence()).name;
     const probe = fx.strategy as unknown as { executeMerge(level: number, sourceIds: string[], c: StrategyContext): Promise<boolean> };
     const original = probe.executeMerge.bind(fx.strategy);
+    let switched = false;
     probe.executeMerge = async (level, sourceIds, c) => {
       const wrote = await original(level, sourceIds, c);
       // The branch switches after the merge is written, before the tick resumes.
       await fx.manager.switchBranch(fork);
+      switched = wrote;
       return wrote;
     };
     await fx.strategy.tick(ctx(fx.manager));
     probe.executeMerge = original;
+    assert.equal(switched, true, 'the merge was written, then the branch switched before the tick went on');
     await fx.manager.switchBranch(main);
     let counted: number | undefined;
     for (let i = 0; i < 3 && counted === undefined; i++) {

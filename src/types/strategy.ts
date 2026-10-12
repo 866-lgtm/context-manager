@@ -132,10 +132,11 @@ export interface ReadinessState {
    * answering, the subject may be failing on its own and needs inspecting.
    * Read from the branch's durable stall clock, shared by the strategies on
    * its store and namespace: a restart keeps it, and a landing by any of
-   * those strategies, through any membrane or model, clears it. After the
-   * process was down for an hour or more, which is idle time, the next
-   * attempt or paused tick ends the old stretch, and the next failure starts
-   * the clock again.
+   * those strategies, through any membrane or model, clears it. An hour in
+   * which the lane was neither failing, nor running an attempt, nor waiting
+   * on a pause (nothing pending, or the process down) is idle: the next
+   * attempt or paused tick then ends the old stretch, with no landing, and
+   * the next failure starts the clock again.
    */
   compressionStall?: { since: string; subject: string; failureClass: string };
 }

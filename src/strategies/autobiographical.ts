@@ -163,12 +163,13 @@ function compressionDomain(membrane: object, model: string | undefined): string 
 }
 
 /**
- * A route's key among the stall clock's waits: its comparison domain, which
- * names this process, with a space for the NUL (the store's JSON refuses one).
+ * The strategies of this process on each store and namespace. A pause lives
+ * only in process, on its strategy, and binds its route on every branch, so
+ * the stall clock's idle test reads the pauses of all of them
+ * (compressionLaneWaitEnd). A strategy joins at initialize, and one
+ * collected counts no pause.
  */
-function stallWaitRoute(membrane: object, model: string | undefined): string {
-  return compressionDomain(membrane, model).replace('\u0000', ' ');
-}
+const compressionLanePeers = new WeakMap<object, Map<string, Set<WeakRef<AutobiographicalStrategy>>>>();
 
 function domainLanded(membrane: object, model: string | undefined): number {
   return domainLandings.get(membrane)?.get(model ?? '') ?? 0;
@@ -216,6 +217,21 @@ interface CompressionFailureStreak {
    * whose run another content's ladder never takes, ends or replaces.
    */
   subject?: string;
+}
+
+/**
+ * Whether a stored run can be counted on. A damaged one (a non-numeric count
+ * would decide its rung at once, and a null one has no fields) is read as no
+ * run, by every reader of runs.
+ */
+function isWellFormedRun(run: unknown): run is CompressionFailureStreak {
+  if (run === null || typeof run !== 'object') return false;
+  const candidate = run as Partial<CompressionFailureStreak>;
+  return typeof candidate.key === 'string' && typeof candidate.failureClass === 'string' &&
+    Number.isSafeInteger(candidate.failures) && candidate.failures! >= 1 &&
+    Number.isFinite(candidate.atLanded) && Number.isFinite(candidate.firstFailedAt) &&
+    (candidate.domain === undefined || typeof candidate.domain === 'string') &&
+    (candidate.subject === undefined || typeof candidate.subject === 'string');
 }
 
 /**
@@ -781,19 +797,12 @@ const MAX_DATE_MS = 8.64e15;
 interface CompressionStallClock {
   /** The first failure since the last landing, or since its stretch ended after an idle hour. */
   failingSince: number | null;
-  /** When the lane was last seen failing, starting an attempt, or waiting on a pause with work pending. */
-  activeAt: number | null;
   /**
-   * The pauses failures of this stretch installed, by route
-   * (stallWaitRoute, which names this process), with when each
-   * ends: MAX_DATE_MS for an explicit hold, which has no end. While one
-   * binds, the lane is waiting, not idle, even with no tick to see it, and
-   * strategies sharing the namespace through other routes keep their own.
-   * A pause lifted early (an answer, a release, a change of route) leaves
-   * or shortens its entry, and one recorded by another process ended with
-   * that process.
+   * When the lane was last seen failing, starting an attempt, or waiting on a
+   * pause with work pending. The pauses themselves are in process
+   * (compressionLaneWaitEnd), so a restart's down time is idle.
    */
-  waits: Record<string, number>;
+  activeAt: number | null;
   /** The latest failure: what failed, its class, and its lane. */
   last: { subject: string; failureClass: string; lane: 'l1' | 'merge' } | null;
   /** The stall alert, once raised for this stretch. */
@@ -802,7 +811,7 @@ interface CompressionStallClock {
 
 /** A stall clock with no failure stretch: after a landing, or a stretch that ended idle. */
 const emptyStallClock = (): CompressionStallClock =>
-  ({ failingSince: null, activeAt: null, waits: {}, last: null, stall: null });
+  ({ failingSince: null, activeAt: null, last: null, stall: null });
 
 /** When the lane may call again: the later of its two constraints. */
 const pauseUntil = (pause: CompressionLanePause): number => Math.max(pause.backoffUntil, pause.statedUntil ?? 0);
@@ -1552,6 +1561,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected store: JsStore | null = null;
   /** Namespace for state-id scoping. Set in `initialize()`. */
   protected ns: string = '';
+  /** Where this strategy joined compressionLanePeers. */
+  private compressionLaneJoined?: { store: object; namespace: string; ref: WeakRef<AutobiographicalStrategy> };
   protected get summariesStateId(): string { return `${this.ns}/autobio:summaries`; }
   protected get chunksStateId(): string { return `${this.ns}/autobio:chunks`; }
   /** Memories are identity-bearing: a substitute model writing summaries in
@@ -2132,6 +2143,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Bind to the chronicle store + namespace for persistent strategy state.
     this.store = ctx.store;
     this.ns = ctx.namespace;
+    this.joinCompressionLane(ctx.store, ctx.namespace);
     observeStoreBranch(ctx.store);
     const sourceBranch = this.captureCompressionBranch();
     this.initializingBranchIdentity = {
@@ -2530,9 +2542,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.summaryIdCounter = typeof counter === 'number' ? counter : 0;
 
     const queue = this.store.getStateJson(this.mergeQueueStateId);
-    this.mergeQueue = Array.isArray(queue)
+    this.mergeQueue = (Array.isArray(queue)
       ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; failureStreak?: CompressionFailureStreak }>)
-      : [];
+      : []
+    ).map((merge) => {
+      // A damaged run is read as none (isWellFormedRun), as for L1.
+      if (!merge || merge.failureStreak === undefined || isWellFormedRun(merge.failureStreak)) return merge;
+      const { failureStreak: _damaged, ...rest } = merge;
+      return rest;
+    });
     const mergeQuarantine = this.store.getStateJson(this.mergeQuarantineStateId);
     this.mergeQuarantine = new Map(
       (Array.isArray(mergeQuarantine) ? (mergeQuarantine as MergeQuarantineRecord[]) : [])
@@ -4176,18 +4194,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         typeof candidate.chunkSourceHash === 'string' &&
         Array.isArray(candidate.outcomes)
       ) {
-        // A run that isn't well formed can't be counted on (a non-numeric
-        // count would decide its rung at once): the family keeps its
-        // answers, without the run.
-        const run = candidate.failureStreak as Partial<CompressionFailureStreak> | undefined;
-        const wellFormed = run === undefined || (
-          typeof run.key === 'string' && typeof run.failureClass === 'string' &&
-          Number.isSafeInteger(run.failures) && run.failures! >= 1 &&
-          Number.isFinite(run.atLanded) && Number.isFinite(run.firstFailedAt) &&
-          (run.domain === undefined || typeof run.domain === 'string') &&
-          (run.subject === undefined || typeof run.subject === 'string')
-        );
-        if (wellFormed) {
+        // A run that isn't well formed can't be counted on
+        // (isWellFormedRun): the family keeps its answers, without the run.
+        if (candidate.failureStreak === undefined || isWellFormedRun(candidate.failureStreak)) {
           progress.set(candidate.familyKey, candidate as CompressionFamilyProgress);
         } else {
           const { failureStreak: _malformed, ...rest } = candidate as CompressionFamilyProgress;
@@ -4330,7 +4339,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!pause) return null;
     if (pause.membrane !== ctx.membrane || pause.model !== this.config.compressionModel) {
       this.compressionPause = null;
-      this.noteCompressionWaitLifted(stallWaitRoute(pause.membrane as object, pause.model));
       return null;
     }
     return Date.now() < pauseUntil(pause) ? pause : null;
@@ -4355,7 +4363,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     pause.statedBy = null;
     // A hold that continues after the release is news: it warns again.
     delete pause.admissionDeadline;
-    this.noteCompressionWaitLifted(stallWaitRoute(pause.membrane as object, pause.model), pause.backoffUntil);
     // A release is the caller's word on the wait, not an answer from the
     // provider: the failure count stays, so a failure after it keeps doubling
     // the backoff from the genuine count (only an answer resets it).
@@ -4486,7 +4493,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       reason,
     };
     this.compressionPause = pause;
-    this.noteCompressionFailureForStall(lane, subject, error, stallWaitRoute(ctx.membrane as object, model), pauseUntil(pause));
+    this.noteCompressionFailureForStall(lane, subject, error);
     const sourceLabel = pauseSource(pause);
     console.warn(
       `[autobiographical] compression paused ${pauseUntilText(pause)} after a ${lane === 'l1' ? 'chunk' : 'merge'} failure ` +
@@ -4584,7 +4591,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!pause || pause.membrane !== membrane || pause.model !== model) return;
     console.warn(`[autobiographical] compression resumed after ${pause.failures} paused failure(s)`);
     this.compressionPause = null;
-    this.noteCompressionWaitLifted(stallWaitRoute(membrane, model));
   }
 
   /** The model a compression request names, as a pause records it (see pauseCompressionLane). */
@@ -4602,10 +4608,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return {
       failingSince: time(stored?.failingSince),
       activeAt: time(stored?.activeAt),
-      waits: Object.fromEntries(
-        Object.entries(stored?.waits && typeof stored.waits === 'object' ? stored.waits : {})
-          .filter((entry): entry is [string, number] => time(entry[1]) !== null),
-      ),
       last: last && typeof last.subject === 'string' && typeof last.failureClass === 'string' &&
           (last.lane === 'l1' || last.lane === 'merge')
         ? { subject: last.subject, failureClass: last.failureClass, lane: last.lane }
@@ -4654,34 +4656,56 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Whether the lane has been idle for COMPRESSION_STALL_ALERT_MS at `at`:
    * neither failing, nor starting an attempt, nor waiting on a pause with
-   * work pending, nor inside a pause a failure of the stretch installed in
-   * this process that still binds (waits), an explicit hold included. A hold
-   * by the caller's admission is seen only through the ticks that find the
-   * lane paused. The process being down counts as idle.
+   * work pending, nor inside a pause a failure installed that still binds
+   * (compressionLaneWaitEnd), an explicit hold included. A hold by the
+   * caller's admission is seen only through the ticks that find the lane
+   * paused. The process being down counts as idle.
    */
   private compressionStallIdle(clock: CompressionStallClock, at: number): boolean {
     if (clock.activeAt === null) return true;
-    let lastActive = clock.activeAt;
-    const thisProcess = `${COMPRESSION_DOMAIN_PROCESS}:`;
-    for (const [route, until] of Object.entries(clock.waits)) {
-      if (route.startsWith(thisProcess) && until > lastActive) lastActive = until;
-    }
+    const lastActive = Math.max(clock.activeAt, this.compressionLaneWaitEnd());
     return at - lastActive >= AutobiographicalStrategy.COMPRESSION_STALL_ALERT_MS;
   }
 
   /**
-   * A route's pause was lifted early: an answer ended it (`until` absent),
-   * or a release left only its backoff (`until`, its new end). The wait the
-   * stall clock records for that route ends with it.
+   * When the pauses failures installed on this lane end, as this process
+   * knows them: those of every strategy of the process on this store and
+   * namespace, on whatever branch, since a pause binds its route on every
+   * branch. The pause is the authority: an answer, a release or a change of
+   * route that ends one early ends its wait, and an explicit hold has no end.
+   * Only a failure's own parts count, its backoff and the provider's stated
+   * wait: a hold by the caller's admission is rechecked at ticks, and those
+   * ticks see it.
    */
-  private noteCompressionWaitLifted(route: string, until?: number): void {
-    if (!this.store) return;
-    const clock = this.readStallClock();
-    const recorded = clock.waits[route];
-    if (recorded === undefined || (until !== undefined && until >= recorded)) return;
-    if (until === undefined) delete clock.waits[route];
-    else clock.waits[route] = until;
-    this.writeStallClock(clock);
+  private compressionLaneWaitEnd(): number {
+    let end = Number.NEGATIVE_INFINITY;
+    const peers = this.store ? compressionLanePeers.get(this.store)?.get(this.ns) : undefined;
+    for (const ref of peers ?? []) {
+      const peer = ref.deref();
+      if (!peer) {
+        peers!.delete(ref);
+        continue;
+      }
+      const pause = peer.compressionPause;
+      if (!pause) continue;
+      const stated = pause.statedBy === 'provider' && pause.statedUntil !== null ? pause.statedUntil : Number.NEGATIVE_INFINITY;
+      end = Math.max(end, pause.backoffUntil, stated);
+    }
+    return end;
+  }
+
+  /** Join this process's strategies on `store` and `namespace` (compressionLanePeers). */
+  private joinCompressionLane(store: object, namespace: string): void {
+    const joined = this.compressionLaneJoined;
+    if (joined?.store === store && joined.namespace === namespace) return;
+    if (joined) compressionLanePeers.get(joined.store)?.get(joined.namespace)?.delete(joined.ref);
+    let byNamespace = compressionLanePeers.get(store);
+    if (!byNamespace) compressionLanePeers.set(store, byNamespace = new Map());
+    let peers = byNamespace.get(namespace);
+    if (!peers) byNamespace.set(namespace, peers = new Set());
+    const ref = new WeakRef<AutobiographicalStrategy>(this);
+    peers.add(ref);
+    this.compressionLaneJoined = { store, namespace, ref };
   }
 
   /**
@@ -4726,19 +4750,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * is counted no further than its first failure and backs off
    * indefinitely; this is how an operator hears of it.
    */
-  private noteCompressionFailureForStall(
-    lane: 'l1' | 'merge', subject: string, error: unknown, route: string, pausedUntil: number,
-  ): void {
+  private noteCompressionFailureForStall(lane: 'l1' | 'merge', subject: string, error: unknown): void {
     if (!this.store) return;
     const now = Date.now();
     const clock = this.readStallClock();
     const continues = clock.failingSince !== null;
-    const waits = continues ? { ...clock.waits } : {};
-    waits[route] = Number.isFinite(pausedUntil) ? pausedUntil : MAX_DATE_MS;
     const next: CompressionStallClock = {
       failingSince: continues ? clock.failingSince : now,
       activeAt: now,
-      waits,
       last: { subject, failureClass: compressionFailureClass(error), lane },
       stall: continues ? clock.stall : null,
     };
@@ -6177,7 +6196,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       compressionQueue: this.compressionQueue,
       compressionQueueGeneration: this.compressionQueueGeneration,
       // The dry rebuild orders its queue (orderCompressionQueue), which drops
-      // the orders and waits of chunks its own cut doesn't have.
+      // the orders and waits of chunks its own cut doesn't have, and the
+      // orders of merges not queued now: a dry select changes none of them.
       compressionFailureOrder: new Map(this.compressionFailureOrder),
       compressionNotBefore: new Map(this.compressionNotBefore),
       mergeFailureOrder: new Map(this.mergeFailureOrder),
