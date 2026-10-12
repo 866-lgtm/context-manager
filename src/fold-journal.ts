@@ -29,12 +29,15 @@
  *   reverse, so a crash or a failed append between the two cannot duplicate
  *   or lose a receipt. Diffs read only the persisted layout, never the live
  *   message view. A layout persists as its members (gap-coded sequences) and
- *   its units (forms with counts). A delta's size follows what changed. A
- *   snapshot holds the whole layout, the history behind the window as its
- *   members; it is written only once the records since the last one would
- *   outweigh it, so snapshots cost about as much again as the deltas between
- *   them. On average, then, the bytes stored per acceptance don't grow with
- *   the session, though each snapshot holds the whole view's members.
+ *   its units (forms with counts). A delta holds the members that changed
+ *   and the units from the first that changed to the last, so changes far
+ *   apart re-send the units between them. A snapshot holds the whole layout,
+ *   the history behind the window as its members; it is written only once
+ *   the records since the last one would outweigh it, so snapshots cost
+ *   about as much again as the deltas between them. On average, then, an
+ *   acceptance stores at most about twice an average delta's bytes, which
+ *   doesn't grow with the session while the deltas don't, though each
+ *   snapshot holds the whole view's members.
  *
  * Typed records are enumerable from any branch, but each one takes the next
  * sequence of the branch selected when it is written, as any record does:
@@ -61,6 +64,7 @@
 import { randomUUID } from 'node:crypto';
 import type { JsStore } from '@animalabs/chronicle';
 import type { BranchRef, CompileProvenance, JournalMark, LayoutUnit, RenderedLayout } from './types/index.js';
+import { describeThrown } from './describe-thrown.js';
 
 export const STORE_IDENTITY_RECORD = 'context-manager/store-identity';
 export const ACCEPTED_LAYOUT_RECORD = 'context-manager/accepted-layout';
@@ -599,7 +603,7 @@ export class FoldJournal {
     } catch (err) {
       if (!markFailures.has(this.store)) {
         markFailures.add(this.store);
-        console.error(`[fold-journal] can't tell where the journal stands (${err instanceof Error ? err.message : String(err)}); compiles carry no mark until it can`);
+        console.error(`[fold-journal] can't tell where the journal stands (${describeThrown(err)}); compiles carry no mark until it can`);
       }
       return null;
     }
@@ -1060,7 +1064,7 @@ export class FoldJournal {
       if (!isLayoutRecord(record)) throw new Error('it no longer reads as one');
       layout = this.reconstruct(record);
     } catch (err) {
-      warnUnreadable(index, id, `its layout doesn't rebuild: ${(err as Error).message}; branch ${branch.ref.name} is treated as unrecorded`);
+      warnUnreadable(index, id, `its layout doesn't rebuild: ${describeThrown(err)}; branch ${branch.ref.name} is treated as unrecorded`);
       return null;
     }
     const latest: LatestLayout = {
@@ -1078,10 +1082,14 @@ export class FoldJournal {
   /** A record's layout, from its snapshot and the deltas since. Throws when the chain doesn't rebuild. */
   private reconstruct(record: AcceptedLayoutRecord): StoredLayout {
     const chain: AcceptedLayoutRecord[] = [];
+    const linked = new Set<string>();
     let current: AcceptedLayoutRecord | null = record;
     while (current && current.kind === 'delta') {
       chain.push(current);
       if (!current.prev) throw new Error(`delta ${current.compileId} names no record before it`);
+      // A link back into the chain would keep this walk going forever.
+      if (linked.has(current.prev)) throw new Error(`record ${current.prev} comes twice in its chain`);
+      linked.add(current.prev);
       const older: AcceptedLayoutRecord | null = readRecord<AcceptedLayoutRecord>(this.store, current.prev);
       if (!isLayoutRecord(older)) throw new Error(`record ${current.prev} in its chain can't be read`);
       if (older.ns !== record.ns || branchKey(older.branch) !== branchKey(record.branch)) {
@@ -1440,7 +1448,9 @@ export interface LayoutDelta {
  * inserted, the rest of `prev` kept, then `app` appended. Arrivals become
  * added members and appended units; a fold in the middle becomes a small
  * drop/ins; a change to `prev`'s last unit replaces everything after the
- * common prefix. Every pair of layouts has one. Empty parts are left out.
+ * common prefix. Two changes far apart re-send every unit between them,
+ * since only the common prefix and suffix are kept. Every pair of layouts
+ * has one. Empty parts are left out.
  */
 export function layoutDelta(prev: StoredLayout, next: StoredLayout): LayoutDelta {
   const units = unitsDelta(prev.units, next.units);

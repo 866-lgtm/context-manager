@@ -508,6 +508,39 @@ describe('sharded writes declare their group size', () => {
     });
   });
 
+  it('a rollback whose removal throws a value String() cannot print still raises the write\'s error, and reports it', async () => {
+    await withManager('./test-shard-count-recovery-unprintable', async (open) => {
+      const cm = await open();
+      const store = (cm as unknown as { messageStore: { append: (...args: unknown[]) => unknown; removeBodyGroup: (id: string) => void } }).messageStore;
+      const append = store.append.bind(store);
+      const removeBodyGroup = store.removeBodyGroup.bind(store);
+      let calls = 0;
+      store.append = (...args: unknown[]) => {
+        calls += 1;
+        if (calls === 2) throw new Error('injected failure before the second shard');
+        return append(...args);
+      };
+      // An object with no prototype has no toString, so String() throws on it.
+      store.removeBodyGroup = () => { throw Object.create(null); };
+      const error = console.error;
+      const logged: string[] = [];
+      const printable = (arg: unknown): string => { try { return String(arg); } catch { return '(unprintable)'; } };
+      console.error = (...args: unknown[]) => { logged.push(args.map(printable).join(' ')); };
+      try {
+        assert.throws(() => cm.addMessage('alice', [text('[header]'), text('the body')]), /injected failure before the second shard/);
+      } finally {
+        console.error = error;
+        store.append = append;
+        store.removeBodyGroup = removeBodyGroup;
+      }
+      assert.ok(
+        logged.some((l) => l.includes('removing what it wrote threw') && l.includes('[object Object]')),
+        `the failed removal is reported: ${logged.join('\n')}`,
+      );
+      cm.close();
+    });
+  });
+
   it('a view filter that hides shard 0 leaves the body its identity, all its shards in rawBodies, and no whole-delivery claim', async () => {
     const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
     const { rmSync } = await import('node:fs');
