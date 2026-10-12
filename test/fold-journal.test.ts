@@ -11,6 +11,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { inspect } from 'node:util';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy } from '../src/index.js';
@@ -1451,6 +1452,29 @@ describe('fold journal durability and index', () => {
       console.error = error;
       cm.close();
     }
+  });
+
+  it('a receipt listener throwing a value console.error cannot format leaves the acceptance standing, and is reported', async () => {
+    const { cm } = await open();
+    add(cm, 3);
+    const provenance = (await cm.compile(BUDGET)).provenance!;
+    const journal = new FoldJournal(cm.getStore(), 'agents/tester');
+    // The real console formats an object through its inspect hook, which can throw.
+    const unprintable = { [inspect.custom]() { throw new Error('custom inspect failed'); } };
+    journal.onReceipt(() => { throw unprintable; });
+    const write = process.stderr.write;
+    const written: string[] = [];
+    let receipt: FoldReceipt | null;
+    process.stderr.write = ((chunk: string | Uint8Array) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;
+    try {
+      receipt = journal.accept(provenance, Date.now(), undefined);
+    } finally {
+      process.stderr.write = write;
+    }
+    assert.equal(receipt?.kind, 'baseline', 'the acceptance stands');
+    assert.equal(layoutRecords(cm.getStore()).length, 1);
+    assert.ok(written.some((w) => w.includes('receipt listener failed: [object Object]')), `reported: ${written.join('')}`);
+    cm.close();
   });
 
   it('a compile stands when the journal\'s store throws a value String() cannot print', async () => {

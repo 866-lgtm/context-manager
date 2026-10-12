@@ -33,10 +33,9 @@
  *   and the units from the first that changed to the last, so changes far
  *   apart re-send the units between them. A snapshot holds the whole layout,
  *   the history behind the window as its members; it is written only once
- *   the records since the last one would outweigh it, so snapshots cost
- *   about as much again as the deltas between them. On average, then, an
- *   acceptance stores at most about twice an average delta's bytes, which
- *   doesn't grow with the session while the deltas don't, though each
+ *   the records since the last one would outweigh it, so snapshots are
+ *   amortized against the deltas between them, and on average the bytes
+ *   stored per acceptance stay bounded while the deltas do, though each
  *   snapshot holds the whole view's members.
  *
  * Typed records are enumerable from any branch, but each one takes the next
@@ -64,7 +63,7 @@
 import { randomUUID } from 'node:crypto';
 import type { JsStore } from '@animalabs/chronicle';
 import type { BranchRef, CompileProvenance, JournalMark, LayoutUnit, RenderedLayout } from './types/index.js';
-import { describeThrown } from './describe-thrown.js';
+import { describeThrown, logThrown } from './describe-thrown.js';
 
 export const STORE_IDENTITY_RECORD = 'context-manager/store-identity';
 export const ACCEPTED_LAYOUT_RECORD = 'context-manager/accepted-layout';
@@ -763,7 +762,7 @@ export class FoldJournal {
       try {
         listener(receipt);
       } catch (err) {
-        console.error('[fold-journal] receipt listener failed:', err);
+        logThrown('[fold-journal] receipt listener failed:', err);
       }
     }
   }

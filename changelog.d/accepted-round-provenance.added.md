@@ -56,11 +56,10 @@
     delta on the branch's previous record, holding the members that changed
     and the units from the first that changed to the last, or a snapshot of
     the whole layout once the records since the last snapshot would outweigh
-    it, each counted whole, receipt included. So snapshots cost about as
-    much again as the deltas between them, and on average an acceptance
-    stores at most about twice an average delta's bytes. That doesn't grow
-    with the history while the deltas don't, as when messages arrive and a
-    fold changes one stretch of the view. Changes far apart re-send the
+    it, each counted whole, receipt included. So snapshots are amortized
+    against the deltas between them, and on average the bytes stored per
+    acceptance stay bounded while the deltas do, as when messages arrive
+    and a fold changes one stretch of the view. Changes far apart re-send the
     units between them, so a change at each end of a long view re-sends all
     of it. Each snapshot holds the whole view's members, and rebuilding a
     layout reads at most about two snapshots' worth.

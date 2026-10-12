@@ -17,3 +17,17 @@ export function describeThrown(value: unknown): string {
     }
   }
 }
+
+/**
+ * Log `message` with the thrown value as console.error formats it, keeping
+ * an Error's stack, without letting the formatting fail in its turn: Node
+ * formats an object through its [util.inspect.custom] hook, which can throw.
+ * Then the value is described by describeThrown instead.
+ */
+export function logThrown(message: string, value: unknown): void {
+  try {
+    console.error(message, value);
+  } catch {
+    console.error(`${message} ${describeThrown(value)}`);
+  }
+}

@@ -56,7 +56,7 @@ import type { StoreBranchGeneration } from './branch-generation.js';
 import { randomUUID } from 'node:crypto';
 import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
 import { FoldJournal, branchRefOf } from './fold-journal.js';
-import { describeThrown } from './describe-thrown.js';
+import { describeThrown, logThrown } from './describe-thrown.js';
 import type { FoldQuery, FoldQueryResult, FoldReceipt, Presentation, ReceiptSource, RoundUsage } from './fold-journal.js';
 import type {
   BranchRef,
@@ -859,7 +859,7 @@ export class ContextManager {
       try {
         listener(event);
       } catch (err) {
-        console.error(`[context-manager] an onMessage listener threw on a '${event.type}' event for ${describeStoreEvent(event)}; the write stands:`, err);
+        logThrown(`[context-manager] an onMessage listener threw on a '${event.type}' event for ${describeStoreEvent(event)}; the write stands:`, err);
       }
     });
   }
