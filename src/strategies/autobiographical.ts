@@ -4604,8 +4604,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Whether the lane has been idle for COMPRESSION_STALL_ALERT_MS at `at`:
    * neither failing, nor starting an attempt, nor waiting on a pause with
-   * work pending, nor inside a pause its latest failure installed. The
-   * process being down counts as idle.
+   * work pending, nor inside the longest pause a failure of the stretch
+   * installed (waitingUntil). The process being down counts as idle.
    */
   private compressionStallIdle(clock: CompressionStallClock, at: number): boolean {
     if (clock.activeAt === null) return true;
