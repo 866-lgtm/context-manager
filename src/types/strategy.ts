@@ -120,15 +120,17 @@ export interface ReadinessState {
   /** Description of pending work */
   description?: string;
   /**
-   * Set while the compression lane is stalled: failures have gone on for an
-   * hour with nothing landing (AutobiographicalStrategy). `since` is when the
-   * failures began (ISO time), `subject` the work that kept failing, and
-   * `failureClass` its failure (membrane's error type and HTTP status). A
-   * failure counts against its request only once other compression has
-   * landed, so while nothing lands the request backs off indefinitely and is
+   * Set while the compression lane is stalled: failures, and the waits they
+   * caused, have gone on for an hour with nothing landing
+   * (AutobiographicalStrategy). `since` is when the failures began (ISO
+   * time), `subject` the work that failed latest, and `failureClass` its
+   * failure (membrane's error type and HTTP status). A failure counts against
+   * its subject only once other compression has landed on its route and
+   * model, so while nothing lands the subject backs off indefinitely and is
    * never decided. In an outage that is the intent; if the provider is
-   * answering, the request may be failing on its own and needs inspecting.
-   * Cleared when a compression lands.
+   * answering, the subject may be failing on its own and needs inspecting.
+   * Read from the branch's durable stall clock, so a restart keeps it and a
+   * landing by any strategy on the store clears it.
    */
   compressionStall?: { since: string; subject: string; failureClass: string };
 }

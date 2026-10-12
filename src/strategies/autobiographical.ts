@@ -787,9 +787,9 @@ const pauseUntilText = (pause: CompressionLanePause): string => {
 const dispatchedCompressionModel = new WeakMap<object, string>();
 /**
  * The hash of the request each failed L1 call actually dispatched, keyed by
- * its error. A rung's outcome keeps the rung's identity, but a server-error
- * streak counts failures of one request: after a carrier rejection the rung
- * dispatches its stripped request, whose failures are its own.
+ * its error. A rung's outcome keeps the rung's identity, but after a carrier
+ * rejection the rung dispatches its stripped request, whose failures are a
+ * run of their own (chunkRunKey).
  */
 const dispatchedRequestHash = new WeakMap<object, string>();
 function noteDispatchedModel(error: unknown, request: NormalizedRequest): void {
@@ -5849,8 +5849,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // It is evidence about the merge only by the company it keeps
         // (nextFailureStreak): a persistent fault on one payload (rhys
         // 2026-08-06: 514 consecutive merge 500s across a week-long episode)
-        // fails while other compression lands, and at
-        // COMPRESSION_PERSISTENT_FAILURES of one class it goes through the
+        // fails while other compression lands on its route and model, and at
+        // COMPRESSION_PERSISTENT_FAILURES it goes through the
         // bounded rejection policy, whose retries shrink the recall budget,
         // giving the provider a genuinely different request. In an outage
         // nothing lands, so nothing is counted. A deferral by the caller's
@@ -7678,13 +7678,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       /**
        * A failure that is not a rejection says nothing about the request by its
        * kind: keep what the ladder has learned and rethrow (the outer catch
-       * pauses the lane, and the tick puts the chunk at the back of the queue).
-       * The next eligible tick resumes at this rung. It is evidence about the
-       * request only by the company it keeps (nextFailureStreak): at
-       * COMPRESSION_PERSISTENT_FAILURES failures of one class, each after other
-       * compression landed, the request is failing on its own, and that
-       * becomes this rung's deterministic outcome. A no-call deferral by the
-       * caller's provider admission is no failure and changes nothing.
+       * pauses the lane, and the tick puts the chunk behind the work that
+       * hasn't failed). The next eligible tick resumes at this rung. It is
+       * evidence about the chunk's rung only by the company it keeps
+       * (nextFailureStreak): at COMPRESSION_PERSISTENT_FAILURES, the first and
+       * the rest each after other compression landed on the same route and
+       * model, the rung is failing on its own, and that becomes its
+       * deterministic outcome. A no-call deferral (the caller's provider
+       * admission, or the split rung's window) is no failure and changes
+       * nothing.
        */
       const interrupt = (
         error: unknown,
