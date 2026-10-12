@@ -1894,6 +1894,14 @@ describe("a run's evidence belongs to the chunk's sources, and one family holds 
     await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, "a count of '7' doesn't decide it");
     assert.deepEqual(runsOf(fx.manager), [1]);
+    // A count at or past the deciding failure can't be stored by a run either (cm138-r6 I14).
+    const again = progressSlot(fx.manager) as Array<{ failureStreak?: { failures: unknown } }>;
+    again[0]!.failureStreak!.failures = 9;
+    fx.manager.getStore().setStateJson(PROGRESS_SLOT, again);
+    fx.strategy.land(mock.membrane);
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'a count of 9 is read as no run');
+    assert.deepEqual(runsOf(fx.manager), [1]);
     fx.manager.close();
   });
 
