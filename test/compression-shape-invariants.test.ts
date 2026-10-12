@@ -124,8 +124,9 @@ function createValidatingMembrane(compressionRatio = 5, resultId: ResultIdReader
 }
 
 /**
- * Membrane's formatters convert a block to its wire form before the tool-pair
- * normalizer runs: a tool_result names its call as `tool_use_id`.
+ * A tool_result naming its call as the wire does, `tool_use_id`: Membrane's
+ * formatters write that before the tool-pair normalizer runs. (They also map
+ * `isError` and sanitize content, which this validator doesn't read.)
  */
 function toWireBlock(block: ContentBlock): ContentBlock {
   if (block.type !== 'tool_result') return block;
@@ -134,16 +135,19 @@ function toWireBlock(block: ContentBlock): ContentBlock {
 }
 
 /**
- * Normalizer repairs that stand in for half a tool cycle: a result invented
- * for a tool_use that had none, or a result turned to text because its call
- * was gone (`stray_` from membrane#54 on, `orphan_` before). The API accepts
- * the repaired request, but it no longer says what happened, so here each
- * means context-manager lost half of a cycle it was given whole. The list
- * mirrors membrane's own set of repairs that rewrite content rather than
- * placement (PREFIX_REWRITING_NORMALIZE_EVENT_KINDS, which its package
- * doesn't export): a new kind belongs here when membrane adds it there.
+ * Normalizer repairs that stand in for a missing or duplicated half of a
+ * tool cycle, which context-manager should have sent whole and once:
+ * - `synthetic_pending_result`: a result invented for a call whose result
+ *   is missing;
+ * - `orphan_tool_result_textified`: a result turned to text because its
+ *   call is missing;
+ * - `stray_tool_result_textified` (from membrane#54 on): a duplicate result
+ *   turned to text.
+ * The API accepts the repaired request, but it no longer says what happened.
+ * A new normalizer kind belongs here when it stands in for a missing or
+ * extra call or result. Repairs that only move blocks don't.
  */
-const LOST_HALF_CYCLE_REPAIRS = new Set([
+const STAND_IN_REPAIRS = new Set([
   'synthetic_pending_result',
   'orphan_tool_result_textified',
   'stray_tool_result_textified',
@@ -179,11 +183,11 @@ function createWireValidatingMembrane(compressionRatio = 5) {
       const repairs: string[] = [];
       const normalized = normalizeToolPairs(provider, {
         onEvent: (event: { kind: string }) => {
-          if (LOST_HALF_CYCLE_REPAIRS.has(event.kind)) repairs.push(event.kind);
+          if (STAND_IN_REPAIRS.has(event.kind)) repairs.push(event.kind);
         },
       });
       if (repairs.length > 0) {
-        throw new Error(`the normalizer stood in for lost halves of tool cycles: ${repairs.join(', ')}`);
+        throw new Error(`the normalizer stood in for halves of tool cycles: ${repairs.join(', ')}`);
       }
       const asApiShape = normalized.messages.map((m) => ({
         participant: m.role,
@@ -483,10 +487,12 @@ describe('Compression pipeline: API shape invariants', () => {
 
     await drain(manager);
     assert.ok(calls.length > 0, 'expected at least one compression call to land');
-    // validateApiShape throwing inside the mock membrane is the failure
-    // mode — no throw means every request shipped was API-valid, i.e. the
-    // bundled cycles were split before reaching the membrane, and that the
-    // normalizer didn't have to stand in for half of any of them.
+    // A throw inside the mock fails the drain: the shape validator's, or the
+    // mock's own when the normalizer stood in for half of a cycle. So no
+    // throw means every request shipped was API-valid after Membrane's
+    // normalizer, which stood in for nothing. It doesn't show context-manager
+    // split the bundled cycles itself: the normalizer re-roles a whole
+    // bundled cycle too, as the mock's own cases below pin.
     await manager.close();
   });
 
@@ -563,14 +569,35 @@ describe('Compression pipeline: API shape invariants', () => {
 
 describe('the wire-validating mock', () => {
   // The postmortem case relies on this mock to tell a whole composition from
-  // one the normalizer had to patch; pin both directions here.
+  // one the normalizer had to patch; pin both directions here, and the
+  // spelling each side's validator reads.
   const send = (messages: ApiMessage[]) =>
     createWireValidatingMembrane().membrane.complete({ messages });
+
+  it('reads one spelling of a result\'s call on each side: toolUseId in context-manager, tool_use_id on the wire', () => {
+    const cycle = (result: ContentBlock): ApiMessage[] => [
+      { participant: 'assistant', content: [u('S1')] },
+      { participant: 'user', content: [result] },
+    ];
+    const wire = { type: 'tool_result', tool_use_id: 'S1', content: 'ok' } as unknown as ContentBlock;
+    validateApiShape(cycle(r('S1')), membraneResultId);
+    validateApiShape(cycle(wire), wireResultId);
+    assert.throws(() => validateApiShape(cycle(wire), membraneResultId), /not followed by a matching tool_result/);
+    assert.throws(() => validateApiShape(cycle(r('S1')), wireResultId), /not followed by a matching tool_result/);
+  });
 
   it('accepts whole tool cycles bundled into one user-roled message (the normalizer re-roles them)', async () => {
     await send([
       { participant: 'user', content: [t('look'), u('W1'), r('W1'), t('done')] },
       { participant: 'agent', content: [t('ok')] },
+    ]);
+  });
+
+  it('accepts a whole cycle whose result sits in a later message (the normalizer moves what lies between)', async () => {
+    await send([
+      { participant: 'user', content: [t('look'), u('W4')] },
+      { participant: 'user', content: [t('meanwhile')] },
+      { participant: 'user', content: [r('W4'), t('done')] },
     ]);
   });
 
@@ -588,7 +615,7 @@ describe('the wire-validating mock', () => {
         { participant: 'agent', content: [t('ok')] },
         { participant: 'user', content: [r('W3'), t('more')] },
       ]),
-      /tool_result_textified/,
+      /orphan_tool_result_textified/,
     );
   });
 });
