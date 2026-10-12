@@ -9055,21 +9055,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // re-read. `[plan-vs-actual]` only counts moves. Computed from the picker
     // inputs' carried resolutions (the frontier the previous request was
     // rendered from), never from `this.resolutions`, which may already hold
-    // staged-but-uncommitted changes. Quiet compiles cost nothing here.
+    // staged-but-uncommitted changes. STAGED here and LOGGED only at the
+    // commit point below: a plan that later fails the budget, coverage or
+    // emission checks is not a fold the resident experienced, and a retry
+    // would otherwise log the same moves twice (PR #157 review). Quiet
+    // compiles cost nothing here.
     this._lastFoldDiff = null;
+    let stagedFoldDiff: FoldDiff | null = null;
     if (!dryRun && result.moves > 0) {
       try {
         const carried = new Map<ChunkId, number>(
           pickerChunks.map((c) => [c.id, c.currentResolution]),
         );
-        const diff = describeFoldDiff(
+        stagedFoldDiff = describeFoldDiff(
           pickerInputs,
           new SummaryTree(pickerInputs),
           carried,
           result.finalResolutions,
         );
-        this._lastFoldDiff = diff;
-        console.error(formatFoldDiff(diff));
       } catch (err) {
         // Observability must never fail a compile.
         console.warn('[fold-diff] unavailable for this compile:', err);
@@ -9523,6 +9526,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (pendingResolutionChanges.length > 0 && !dryRun) {
       for (const [id, level] of pendingResolutionChanges) this.resolutions.set(id, level);
       this.persistResolutions();
+    }
+    // The fold is now real: log it once, attach it to this compile's stats.
+    if (stagedFoldDiff) {
+      this._lastFoldDiff = stagedFoldDiff;
+      console.error(formatFoldDiff(stagedFoldDiff));
     }
     // Same commit point for the receipt left behind by kv-unified: a real
     // presentation by a non-kv-unified strategy has now succeeded, so that

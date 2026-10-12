@@ -126,3 +126,42 @@ test('fold-diff: raised chunks are counted and formatted; run listing is capped'
   assert.match(line, /raised=18/);
   assert.match(line, /\+14 more runs/);
 });
+
+test('fold-diff: a folded chunk is positioned by the ancestor the CARRIED frontier chose, not by any recall covering it', () => {
+  // 36 chunks: L1 per 6, one L2 over all 36. Carried: chunks 0..29 at L2 (one
+  // L2 pair rendered first), chunks 30..35 held at L1 (their own L1 pair
+  // rendered after it) — the lock shape. Next: 30..35 go raw.
+  const ch = buildChronicleWithChain({ chunkCount: 36, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
+  const inputs = inputsOf(ch);
+  const tree = new SummaryTree(inputs);
+  const prev = new Map<ChunkId, number>();
+  for (const id of ids(ch, 0, 30)) prev.set(id, 2);
+  for (const id of ids(ch, 30, 36)) prev.set(id, 1);
+  const next = new Map<ChunkId, number>(prev);
+  for (const id of ids(ch, 30, 36)) next.set(id, 0);
+  const d = describeFoldDiff(inputs, tree, prev, next);
+  assert.equal(d.runs.length, 1);
+  assert.equal(d.runs[0].from, 1);
+  // The L1 pair sits AFTER the L2 pair (200 tokens), not at offset 0.
+  assert.equal(d.runs[0].offsetBefore, 200);
+  assert.equal(d.divergenceOffset, 200);
+});
+
+test('fold-diff: a new layout that is a strict prefix of the carried one is reported as changed, with nothing re-read', () => {
+  const ch = buildChronicleWithChain({ chunkCount: 36, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
+  const inputs = inputsOf(ch);
+  const tree = new SummaryTree(inputs);
+  // Carried: 0..29 at L2 (pair A), 30..35 at L1 (pair B). Next: 30..35 join
+  // the already-rendered L2 → the layout is [A] — a strict prefix of [A, B].
+  const prev = new Map<ChunkId, number>();
+  for (const id of ids(ch, 0, 30)) prev.set(id, 2);
+  for (const id of ids(ch, 30, 36)) prev.set(id, 1);
+  const next = new Map<ChunkId, number>(ids(ch, 0, 36).map((id) => [id, 2]));
+  const d = describeFoldDiff(inputs, tree, prev, next);
+  assert.equal(d.moves, 6);
+  assert.equal(d.nextTokens, 200);
+  assert.equal(d.divergenceOffset, 200, 'diverges at the end of the new layout, not null');
+  assert.equal(d.suffixTokens, 0);
+  assert.match(formatFoldDiff(d), /divergence@0k suffix=0k/);
+  assert.doesNotMatch(formatFoldDiff(d), /layout unchanged/);
+});

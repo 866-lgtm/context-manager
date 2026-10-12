@@ -18,7 +18,7 @@
  */
 
 import type { ChunkId } from './folding-strategy.js';
-import type { PickerInputs } from './picker.js';
+import type { PickerInputs, PickerChunk } from './picker.js';
 import type { SummaryTree } from './summary-tree.js';
 import { renderLayout, earliestDivergenceIndex, type Frontier } from './render-offsets.js';
 
@@ -55,7 +55,9 @@ export interface FoldDiff {
   /**
    * Offset in the NEW layout of the first rendered unit that differs from the
    * carried layout (`kvCost` semantics): a prompt-cache prefix can survive up
-   * to here. `null` when the layouts are identical.
+   * to here. Equals `nextTokens` when the new layout is a strict prefix of the
+   * carried one (units dropped at the end, nothing re-read). `null` only when
+   * the layouts are identical.
    */
   divergenceOffset: number | null;
   /** Tokens of the new layout from the divergence to the end — what the
@@ -77,19 +79,22 @@ export function describeFoldDiff(
   const prevLayout = renderLayout(inputs, tree, previous);
   const nextLayout = renderLayout(inputs, tree, next);
 
-  // Offset of each chunk's own unit in the carried layout: raw units are
-  // keyed by chunk id; a recall unit is keyed by summary id and covers every
-  // leaf under it, so attribute it to all of them.
-  const offsetBefore = new Map<ChunkId, number>();
+  // Offset of each chunk's own unit in the carried layout: a raw chunk's unit
+  // is keyed by its id; a folded chunk renders through the ancestor the
+  // CARRIED frontier selected for it (keyed by summary id). Attribute by that
+  // ancestor, not by every recall unit covering the leaf — with locks a
+  // chunk can sit at L1 while its siblings' L2 also covers it, and the L2's
+  // earlier offset would otherwise be reported for the L1's leaves (PR #157
+  // review).
+  const unitOffset = new Map<string, number>();
   for (const unit of prevLayout.units) {
-    if (unit.kind === 'raw') {
-      offsetBefore.set(unit.key, unit.offset);
-    } else if (unit.kind === 'recall') {
-      for (const leaf of tree.leavesUnder(unit.key)) {
-        if (!offsetBefore.has(leaf)) offsetBefore.set(leaf, unit.offset);
-      }
-    }
+    if (unit.kind === 'raw' || unit.kind === 'recall') unitOffset.set(unit.key, unit.offset);
   }
+  const offsetBefore = (c: PickerChunk): number | null => {
+    const level = c.pinned ? 0 : previous.get(c.id) ?? 0;
+    const key = level === 0 ? c.id : tree.ancestorAt(c.id, level)?.id ?? c.id;
+    return unitOffset.get(key) ?? null;
+  };
 
   const ordered = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence);
   const runs: FoldDiffRun[] = [];
@@ -122,14 +127,22 @@ export function describeFoldDiff(
       count: 1,
       firstChunkId: c.id,
       lastChunkId: c.id,
-      offsetBefore: offsetBefore.get(c.id) ?? null,
+      offsetBefore: offsetBefore(c),
     };
     runs.push(current);
   }
 
+  // `null` means byte-identical. A new layout that is a strict PREFIX of the
+  // carried one (units removed at the end, nothing after them) diverges at
+  // its own end: the provider re-reads nothing (`suffixTokens` 0) but the
+  // layout did change, and hosts must be able to tell that from unchanged.
   const d = earliestDivergenceIndex(prevLayout.units, nextLayout.units);
   const divergenceOffset =
-    d === -1 || d >= nextLayout.units.length ? null : nextLayout.units[d].offset;
+    d === -1
+      ? null
+      : d >= nextLayout.units.length
+        ? nextLayout.totalTokens
+        : nextLayout.units[d].offset;
   const suffixTokens = divergenceOffset === null ? 0 : nextLayout.totalTokens - divergenceOffset;
 
   return {
