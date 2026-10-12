@@ -484,10 +484,11 @@ function serializeHead(head: PresentationReceipt): SerializedReceiptHead {
   return { ...rest, changeRuns: encodeLeafRuns(changes.map((c) => [c.leafId, c.value] as const)) };
 }
 
-/** A pre-#148 writer persists the head it loaded verbatim. After a rollback,
- * that writer loaded a format-2 chain it does not know, so it carries the
- * format-2 head (`changeRuns`, no `changes`) back in its legacy shape; the
- * next upgrade then failed in `serializeHead` on `changes.map`. Decode that
+/** After a rollback, a pre-#148 build reads a format-2 chain's leaf table as
+ * empty and keeps its head as loaded. Until one of its acceptances advances
+ * the presentation (a keepalive or an unchanged layout does not), it persists
+ * that format-2 head (`changeRuns`, no `changes`) in the legacy shape; the next
+ * upgrade then failed in `serializeHead` on `changes.map` (#164). Decode that
  * head; any other head without a `changes` array is malformed. */
 function legacyHead(head: unknown): PresentationReceipt {
   if (isRecord(head) && Array.isArray(head.changes)) return head as unknown as PresentationReceipt;

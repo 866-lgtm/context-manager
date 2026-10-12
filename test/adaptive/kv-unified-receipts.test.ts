@@ -358,11 +358,12 @@ test('a legacy chain carrying a format-2 head (rollback, then upgrade) loads and
   chain.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'l1', leaves: leaves('raw:a') });
   chain.accept('s1', 100, null);
   const v2 = JSON.parse(JSON.stringify(chain.serialize()));
-  // What a pre-#148 build writes after loading v2: the head object verbatim,
-  // its own leaf table (it read v2's as empty) in the legacy array shape.
-  const rolledBack: SerializedReceiptChainV1 = {
+  // A pre-#148 build reads v2's leaf table as empty and keeps the head as
+  // loaded. An acceptance that does not advance the presentation (a keepalive,
+  // an unchanged layout) persists exactly that: the format-2 head, no leaves.
+  const rolledBack = {
     head: v2.head,
-    leaves: [['a', { repHash: 'raw:a', level: 0, lastChangedSeq: 1 }]],
+    leaves: [],
     cache: null,
     wireReceipt: null,
     settledSubmissionIds: ['s1'],
@@ -370,10 +371,26 @@ test('a legacy chain carrying a format-2 head (rollback, then upgrade) loads and
   const restored = KvUnifiedReceiptChain.deserialize(JSON.parse(JSON.stringify(rolledBack)));
   assert.deepEqual(restored.head?.changes, chain.head?.changes);
   assert.equal(restored.head?.receiptHash, chain.head?.receiptHash);
+  assert.equal(restored.leaves.size, 0, 'the lost baseline stays lost; the chain only loads again');
   assert.doesNotThrow(() => restored.serialize());
   restored.begin({ submissionId: 's2', requestHash: 'r2', layoutHash: 'l2', leaves: leaves('summary:L1') });
   assert.equal(restored.accept('s2', 200, null).presentationAdvanced, true);
+  assert.equal(restored.head?.parentReceiptHash, chain.head?.receiptHash);
   assert.doesNotThrow(() => JSON.stringify(restored.serialize()));
+
+  // Once the old build advances the presentation, it writes its own legacy
+  // head (with `changes`) and leaf table; that shape loaded before this fix too.
+  const advanced = {
+    head: { ...v2.head, changeRuns: undefined, changes: [{ leafId: 'a', value: { repHash: 'summary:L1', level: 1, lastChangedSeq: 2 } }] },
+    leaves: [['a', { repHash: 'summary:L1', level: 1, lastChangedSeq: 2 }]],
+    cache: null,
+    wireReceipt: null,
+    settledSubmissionIds: ['s1', 's2'],
+  } as unknown as SerializedReceiptChainV1;
+  const reloaded = KvUnifiedReceiptChain.deserialize(JSON.parse(JSON.stringify(advanced)));
+  assert.equal(reloaded.leaves.get('a')?.repHash, 'summary:L1');
+  assert.doesNotThrow(() => reloaded.serialize());
+
   // A legacy head with neither shape is refused, not carried.
   const broken = { ...rolledBack, head: { ...v2.head, changeRuns: undefined } };
   assert.throws(() => KvUnifiedReceiptChain.deserialize(JSON.parse(JSON.stringify(broken))), /malformed head receipt/);
