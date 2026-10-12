@@ -352,3 +352,29 @@ test('kv-unified settled submission ids are bounded in memory as they are on dis
   assert.deepEqual(chain.accept('s299', 1, null), { presentationAdvanced: false, duplicate: true }, 'recent ids stay settled');
   assert.throws(() => chain.accept('s0', 1, null), /does not match the in-flight submission/, 'an evicted id is simply unknown');
 });
+
+test('a legacy chain carrying a format-2 head (rollback, then upgrade) loads and persists again', () => {
+  const chain = new KvUnifiedReceiptChain();
+  chain.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'l1', leaves: leaves('raw:a') });
+  chain.accept('s1', 100, null);
+  const v2 = JSON.parse(JSON.stringify(chain.serialize()));
+  // What a pre-#148 build writes after loading v2: the head object verbatim,
+  // its own leaf table (it read v2's as empty) in the legacy array shape.
+  const rolledBack: SerializedReceiptChainV1 = {
+    head: v2.head,
+    leaves: [['a', { repHash: 'raw:a', level: 0, lastChangedSeq: 1 }]],
+    cache: null,
+    wireReceipt: null,
+    settledSubmissionIds: ['s1'],
+  } as unknown as SerializedReceiptChainV1;
+  const restored = KvUnifiedReceiptChain.deserialize(JSON.parse(JSON.stringify(rolledBack)));
+  assert.deepEqual(restored.head?.changes, chain.head?.changes);
+  assert.equal(restored.head?.receiptHash, chain.head?.receiptHash);
+  assert.doesNotThrow(() => restored.serialize());
+  restored.begin({ submissionId: 's2', requestHash: 'r2', layoutHash: 'l2', leaves: leaves('summary:L1') });
+  assert.equal(restored.accept('s2', 200, null).presentationAdvanced, true);
+  assert.doesNotThrow(() => JSON.stringify(restored.serialize()));
+  // A legacy head with neither shape is refused, not carried.
+  const broken = { ...rolledBack, head: { ...v2.head, changeRuns: undefined } };
+  assert.throws(() => KvUnifiedReceiptChain.deserialize(JSON.parse(JSON.stringify(broken))), /malformed head receipt/);
+});

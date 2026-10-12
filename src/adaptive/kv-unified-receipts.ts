@@ -144,7 +144,7 @@ export class KvUnifiedReceiptChain {
     } else if (Array.isArray((value as SerializedReceiptChainV1).leaves)) {
       const legacy = value as SerializedReceiptChainV1;
       chain = new KvUnifiedReceiptChain({
-        head: legacy.head ?? null,
+        head: legacy.head == null ? null : legacyHead(legacy.head),
         leaves: new Map(legacy.leaves),
         cache: legacy.cache ?? null,
         wireReceipt: legacy.wireReceipt ?? null,
@@ -482,6 +482,17 @@ function decodeLeafTable(runs: readonly LeafRun[]): Map<ChunkId, PresentedLeaf> 
 function serializeHead(head: PresentationReceipt): SerializedReceiptHead {
   const { changes, ...rest } = head;
   return { ...rest, changeRuns: encodeLeafRuns(changes.map((c) => [c.leafId, c.value] as const)) };
+}
+
+/** A pre-#148 writer persists the head it loaded verbatim. After a rollback,
+ * that writer loaded a format-2 chain it does not know, so it carries the
+ * format-2 head (`changeRuns`, no `changes`) back in its legacy shape; the
+ * next upgrade then failed in `serializeHead` on `changes.map`. Decode that
+ * head; any other head without a `changes` array is malformed. */
+function legacyHead(head: unknown): PresentationReceipt {
+  if (isRecord(head) && Array.isArray(head.changes)) return head as unknown as PresentationReceipt;
+  if (isRecord(head) && Array.isArray(head.changeRuns)) return deserializeHead(head as unknown as SerializedReceiptHead);
+  throw new Error('kv-unified receipt: malformed head receipt');
 }
 
 function deserializeHead(head: SerializedReceiptHead): PresentationReceipt {
