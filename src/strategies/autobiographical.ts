@@ -4653,18 +4653,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * heartbeat (activeAt) with no observed activity, meaning no failure, no
    * attempt starting, and no tick that found it waiting on a pause with work
    * pending. That is an hour, plus the minute by which the heartbeat, written
-   * at most once a minute (COMPRESSION_STALL_HEARTBEAT_MS), can trail the
-   * last activity. So ticks less than an hour apart always keep a stretch,
-   * and an idle gap of between 60 and 61 minutes may keep one too: the
-   * alert's timing is good to about a minute. A pause counts only through
-   * those ticks, which is the host's side: a host should tick a lane that
-   * isn't ready regularly, well inside the hour (once a minute serves), which
-   * agent-framework's maintenance pass does except while its own provider
-   * gate skips the agent. When the stretch ends, there is no alert until the
-   * next failure starts another, and ticks resuming during the same hold
-   * start none. Apart from that minute, a missed hour costs a later alert, or
-   * none until the next failure, rather than a false one. The process being
-   * down counts as idle.
+   * at most once a minute (COMPRESSION_STALL_HEARTBEAT_MS), can trail the last
+   * activity. So ticks less than an hour apart always keep a stretch, and an
+   * idle gap of between 60 and 61 minutes may keep one too: the idle
+   * classification has about one-minute resolution. A pause counts only through
+   * those ticks, which is the host's side: a host should tick a lane that isn't
+   * ready regularly, well inside the hour (once a minute serves), which
+   * agent-framework's maintenance pass does except while its own provider gate
+   * skips the agent. When the stretch ends, there is no alert until the next
+   * failure starts another, and ticks resuming during the same hold start none.
+   * Apart from that minute, a missed hour costs a later alert, or none until
+   * the next failure, rather than a false one. The process being down counts as
+   * idle.
    */
   private compressionStallIdle(clock: CompressionStallClock, at: number): boolean {
     return clock.activeAt === null ||
