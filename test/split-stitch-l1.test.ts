@@ -252,7 +252,9 @@ describe('split-stitch L1 fallback', () => {
     const fx = await build(membrane, { split: true, placeholder: true, windowCap: 2, n: 2 });
     const window = fx.strategy as unknown as { splitCallTimes: number[] };
     window.splitCallTimes = [Date.now() - 1_000]; // another chunk's split call, a second ago
-    await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /split-stitch waits for its call window/);
+    const wait = await fx.strategy.run(fx.target, managerContext(fx.manager)).then(() => null, (error: unknown) => error as Error & { waitMs?: number });
+    assert.match(wait?.message ?? '', /split-stitch waits for its call window/);
+    assert.ok(wait!.waitMs! > 598_000 && wait!.waitMs! <= 599_000, `until that call ages out of the 10-minute window (${wait!.waitMs} ms)`);
     const pieces = () => calls.filter((c) => texts(c).filter((t) => /^raw-\d+ /.test(t)).length === 1);
     assert.equal(pieces().length, 0, 'no piece is sent while the window lacks room for a whole attempt');
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'not exhausted');
@@ -261,6 +263,36 @@ describe('split-stitch L1 fallback', () => {
     await fx.strategy.run(fx.target, managerContext(fx.manager));
     assert.equal(pieces().length, 2, 'the rung runs whole');
     assert.equal(fx.strategy.entries().length, 1, 'and installs its one L1');
+  });
+
+  it("a piece's call that the caller's provider admission defers takes no window slot and counts as no call (sheet I14)", async () => {
+    const deferred = Object.assign(new Error('Provider wait: same-model is held; no call was made'), { type: 'rate_limit', retryable: true, providerAdmission: 'deferred' });
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        const targets = texts(request).filter((t) => /^raw-\d+ /.test(t));
+        if (targets.length >= 2) return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'bio' } } } };
+        throw deferred;
+      },
+    } as never;
+    const fx = await build(membrane, { split: true, n: 2 });
+    await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /Provider wait/);
+    assert.deepEqual((fx.strategy as unknown as { splitCallTimes: number[] }).splitCallTimes, [], 'no slot taken');
+    assert.equal(fx.strategy.attempted()!.calls, 0, 'and no call counted');
+  });
+
+  it("a piece whose answer is classified as a provider error ends the rung with that error's type (sheet I20)", async () => {
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        const targets = texts(request).filter((t) => /^raw-\d+ /.test(t));
+        if (targets.length >= 2) return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'bio' } } } };
+        return { content: [text('a piece')], stopReason: 'zz-unknown-stop', usage: { inputTokens: 100, outputTokens: 20 }, raw: { response: {} } };
+      },
+    } as never;
+    const fx = await build(membrane, { split: true, n: 2 });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const projection = (fx.strategy as unknown as { readCompressionQuarantineProjection(): Map<string, { outcomes: Array<{ curveLabel: string; outcome: string; errorType?: string }> }> }).readCompressionQuarantineProjection();
+    const split = [...projection.values()][0]?.outcomes.find((outcome) => outcome.curveLabel === 'split-stitch');
+    assert.deepEqual([split?.outcome, split?.errorType], ['provider_error', 'provider-error:malformed_response']);
   });
 
   it('an attempt that alone needs more calls than the window allows ends the rung: under these caps it cannot finish', async () => {

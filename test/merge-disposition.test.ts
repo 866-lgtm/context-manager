@@ -699,7 +699,7 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
   const network = () => Object.assign(new Error('zz network down'), { type: 'network', retryable: true });
   const lane = (fx: Fixture) => fx.strategy as unknown as {
     compressionPause: { backoffUntil: number; statedUntil: number | null; failures: number } | null;
-    mergeQueue: Array<{ failureStreak?: { failures: number } }>;
+    mergeQueue: Array<{ level: number; sourceIds: string[]; failureStreak?: { failures: number } }>;
   };
   const answer = { stopReason: 'end_turn', content: [t('a merged parent')], usage: { inputTokens: 100, outputTokens: 20 } };
 
@@ -747,8 +747,12 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
       'the run is synced with its own write, before the pause starts the stall clock');
     lane(fx).compressionPause!.backoffUntil = 0;
     (fx.strategy as unknown as { noteCompressionLanded(membrane: unknown, model: string): void }).noteCompressionLanded(ctx(fx.manager).membrane, MODEL);
+    const beforeRefusal = synced.length;
     await fx.strategy.tick(ctx(fx.manager)); // a refusal: an answer
     assert.equal(lane(fx).mergeQueue[0]?.failureStreak, undefined, 'the answer ended the run');
+    const refusalSyncs = synced.slice(beforeRefusal).map((at) => (at.queue as Array<{ attempts?: number; failureStreak?: unknown }> | null)?.[0]);
+    assert.ok(refusalSyncs.some((entry) => entry?.attempts === 1 && entry.failureStreak === undefined),
+      "the refusal's write is synced: its attempt counted and its run ended (sheet I2)");
     await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
     assert.equal(lane(fx).mergeQueue[0]?.failureStreak?.failures, 1, 'a new run, though work landed before the refusal');
     await fx.manager.close();
@@ -762,6 +766,47 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     await fx.strategy.tick(ctx(fx.manager));
     assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1, 'recorded through the bounded policy');
     assert.equal(lane(fx).compressionPause, null, 'a rejection pauses nothing');
+    await fx.manager.close();
+  });
+
+  it("an answer ends the entry's run even when the queue changed during the call (sheet I24)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const calls: unknown[] = [];
+    const membrane = {
+      complete: async (request: unknown) => {
+        calls.push(request);
+        if (calls.length === 1) throw network();
+        await gate;
+        return { stopReason: 'refusal', content: [], usage: { inputTokens: 100, outputTokens: 0 } };
+      },
+    } as never;
+    const fx = await fixture(membrane);
+    await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
+    assert.equal(lane(fx).mergeQueue.length, 1);
+    const entry = lane(fx).mergeQueue[0]!;
+    assert.equal(entry.failureStreak?.failures, 1, 'a run');
+    lane(fx).compressionPause!.backoffUntil = 0;
+    const tick = fx.strategy.tick(ctx(fx.manager));
+    await calledAtLeast(calls, 2);
+    // Another entry takes the head while the call is out.
+    lane(fx).mergeQueue.unshift({ level: entry.level, sourceIds: ['zz-other-a', 'zz-other-b'] } as never);
+    release();
+    await tick;
+    assert.equal(entry.failureStreak, undefined, 'the answer ended its run');
+    const stored = fx.manager.getStore().getStateJson('default/autobio:mergeQueue') as Array<{ sourceIds: string[]; failureStreak?: unknown }>;
+    const kept = stored.find((queued) => queued.sourceIds.join() === entry.sourceIds.join());
+    assert.ok(kept, 'the entry is still queued');
+    assert.equal(kept!.failureStreak, undefined, 'and its run ended durably');
+    await fx.manager.close();
+  });
+
+  it('a merge no longer queued leaves the failure order (sheet I26)', async () => {
+    const fx = await fixture(scripted([{ stop: 'end_turn', text: 'unused' }]).membrane);
+    const order = (fx.strategy as unknown as { mergeFailureOrder: Map<string, number> }).mergeFailureOrder;
+    order.set('zz-a merge that left the queue', 1);
+    (fx.strategy as unknown as { orderCompressionQueue(): void }).orderCompressionQueue();
+    assert.equal(order.has('zz-a merge that left the queue'), false);
     await fx.manager.close();
   });
 
