@@ -9,4 +9,5 @@
   inherited material in it. The protection is opt-in. With only
   `identityReminder` set, the library appends it, current name included,
   to wholly inherited targets too, so an inherited-history migration
-  should set `witnessedIdentityReminder`. Unset, requests are unchanged.
+  should set `witnessedIdentityReminder`. The offline drain script passes
+  it from the recipe. Unset, requests are unchanged.
