@@ -10096,12 +10096,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const historyEnd = firstTail - 1; // last non-tail entry
 
     // The deep band: the leading run of recall pairs, right after the head,
-    // rendered at the deepest level this compile emitted. Nothing can ARRIVE
-    // to change it — a new max-level summary lands after the run, a merge one
+    // rendered at the deepest level this compile emitted. Nothing ARRIVES to
+    // change it — a new max-level summary lands after the run; a merge one
     // level up is the rare exception (one event per mergeThreshold landings
-    // at that level), and the solver never re-cuts below the deepest level
-    // it already chose. It is the cheapest stable prefix after system+tools
-    // and the one the head marker was standing in for: on Fable (2026-10-06)
+    // at that level). The solver can still LOWER it: kv-stable's ideal cut
+    // may raise the band's youngest group when the budget no longer needs it
+    // (see #156), and `Picker.run` applies whatever the solver returns — so
+    // this is the cheapest stable prefix after system+tools, not an
+    // immutable one, and when it does move the measured marker below still
+    // covers what survived. It is what the head marker was standing in for:
+    // on Fable (2026-10-06)
     // the head marker cached 244 tokens of bootstrap messages while 14
     // complete L3 pairs (~73k) sat unmarked behind it, and 24 of 51 large
     // rewrites in a week re-read exactly the system+tools prefix.
