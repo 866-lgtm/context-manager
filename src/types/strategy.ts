@@ -682,19 +682,18 @@ export interface AutobiographicalConfig {
   summarySystemPrompt?: string;
   /** Operator-level system prompt attached to autobiographical memory-write
    *  (compression/merge) requests, which otherwise run with NO system prompt.
-   *  Use it to carry deployment permissions/policy into the summarizer — e.g.
-   *  mature-content permission + a "record but don't replay explicit detail"
-   *  register instruction — so the summarizer inherits the same operator
-   *  context the live agent runs under. Empty/undefined → no system prompt
-   *  (historical behavior). Distinct from `summarySystemPrompt`, which the
-   *  adaptive autobiographical path does not use. */
+   *  Use it for deployment-specific memory-write instructions, so the
+   *  summarizer inherits the same operator context the live agent runs
+   *  under. Empty/undefined → no system prompt (historical behavior).
+   *  Distinct from `summarySystemPrompt`, which the adaptive
+   *  autobiographical path does not use. */
   compressionSystemPrompt?: string;
   /** Escalation system prompt used ONLY to RETRY a memory-write that the
-   *  provider refused (stopReason 'refusal' / content_filter). Lets the
-   *  baseline compressionSystemPrompt stay light on the 99% of writes that
-   *  never refuse, while a heavier prompt (explicit permission + non-graphic
-   *  register + the "why") is applied only on the rare refusal. No retry if
-   *  unset. */
+   *  provider refused (stopReason 'refusal' / content_filter): a stronger
+   *  operator prompt for retries after a refusal. Lets the baseline
+   *  compressionSystemPrompt stay light on the writes that never refuse,
+   *  while the fuller prompt is applied only on the rare refusal. No retry
+   *  if unset. */
   compressionRefusalSystemPrompt?: string;
   /** User prompt template for summarization. Use {content} for the transcript. */
   summaryUserPrompt?: string;
