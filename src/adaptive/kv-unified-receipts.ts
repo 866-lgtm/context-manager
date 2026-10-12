@@ -144,7 +144,7 @@ export class KvUnifiedReceiptChain {
     } else if (Array.isArray((value as SerializedReceiptChainV1).leaves)) {
       const legacy = value as SerializedReceiptChainV1;
       chain = new KvUnifiedReceiptChain({
-        head: legacy.head ?? null,
+        head: legacy.head == null ? null : legacyHead(legacy.head),
         leaves: new Map(legacy.leaves),
         cache: legacy.cache ?? null,
         wireReceipt: legacy.wireReceipt ?? null,
@@ -488,6 +488,18 @@ function decodeLeafTable(runs: readonly LeafRun[]): Map<ChunkId, PresentedLeaf> 
 function serializeHead(head: PresentationReceipt): SerializedReceiptHead {
   const { changes, ...rest } = head;
   return { ...rest, changeRuns: encodeLeafRuns(changes.map((c) => [c.leafId, c.value] as const)) };
+}
+
+/** After a rollback, a pre-#148 build reads a format-2 chain's leaf table as
+ * empty and keeps its head as loaded. Until one of its acceptances advances
+ * the presentation (a keepalive or an unchanged layout does not), it persists
+ * that format-2 head (`changeRuns`, no `changes`) in the legacy shape; the next
+ * upgrade then failed in `serializeHead` on `changes.map` (#164). Decode that
+ * head; any other head without a `changes` array is malformed. */
+function legacyHead(head: unknown): PresentationReceipt {
+  if (isRecord(head) && Array.isArray(head.changes)) return head as unknown as PresentationReceipt;
+  if (isRecord(head) && Array.isArray(head.changeRuns)) return deserializeHead(head as unknown as SerializedReceiptHead);
+  throw new Error('kv-unified receipt: malformed head receipt');
 }
 
 function deserializeHead(head: SerializedReceiptHead): PresentationReceipt {
