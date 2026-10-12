@@ -1784,6 +1784,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._storeView = null;
     this._calibrationArmed = false;
     this._calibration = 1;
+    this._calibrationEma = null;
     this._calibrationLoaded = false;
     this._lastKvStable = null;
     this._storeOrder = new Map();
@@ -9173,14 +9174,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     const alpha = 0.2; // slow EMA: one wild request shouldn't yank the ruler
-    const next = current + alpha * (observed - current);
+    const ema = this._calibrationEma ?? current;
+    const next = ema + alpha * (observed - ema);
     const clamped = Math.min(1.8, Math.max(0.6, next));
-    if (Math.abs(clamped - current) / current > 0.02) {
-      console.error(
-        `[estimator-calibration] real/est=${ratio.toFixed(2)} ` +
-          `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)} (est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k)`,
-      );
-    }
+    this._calibrationEma = clamped;
+    // DEAD BAND. The multiplier is applied only once the EMA has moved more
+    // than 2% from the applied value. Every applied change reprices every
+    // message and summary, so each structure kept across compiles (kv-unified
+    // forest, summary tree, certificate graph, token memos) is rebuilt; a
+    // sample per compile moved it by a fraction of a percent every wake and
+    // made every compile a cold one.
+    // ponytail: fixed 2% band, so estimates may lag the EMA by up to 2%;
+    // make it a config value if a host needs a tighter ruler.
+    if (Math.abs(clamped - current) / current <= 0.02) return;
+    console.error(
+      `[estimator-calibration] real/est=${ratio.toFixed(2)} ` +
+        `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)} (est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k)`,
+    );
     this._calibration = clamped;
     this.applyCalibration();
     try {
@@ -9287,6 +9297,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _calibrationArmed = false;
 
   private _calibration = 1;
+  /** The EMA itself; `_calibration` is its last applied value (see the dead band). */
+  private _calibrationEma: number | null = null;
   private _calibrationLoaded = false;
 
   protected applyCalibration(): void {
