@@ -1810,6 +1810,14 @@ describe('compression refusal recall curves', () => {
       (message) => secondCtx.messageStore.get(message.id),
     ).filter(Boolean) as StoredMessage[];
     const secondChunk = { ...first.target, messages: secondMessages, compressed: false };
+    // The waiter's reloads, to show its compression took the coalesced path.
+    const reloads: unknown[] = [];
+    const probe = second as unknown as { loadPersistedState(options?: unknown): void };
+    const reload = probe.loadPersistedState.bind(second);
+    probe.loadPersistedState = (options?: unknown) => {
+      reloads.push(options);
+      reload(options);
+    };
     // The first instance's compression is the producer: the second starts only
     // once the first is in its provider call, so it finds the family in flight.
     const producer = first.strategy.run(first.target, managerContext(first.manager));
@@ -1822,6 +1830,7 @@ describe('compression refusal recall curves', () => {
     release();
     await Promise.all([producer, waiter]);
     assert.equal(calls, 1, 'the second compression waited on the first');
+    assert.deepEqual(reloads, [{ keepKvUnifiedPresentation: true }], 'it took the coalesced path, reloading once');
     assert.equal(secondChunk.compressed, true, 'the waiter took up the durable L1');
     assert.ok(second.pinsView().some((pin) => pin.id === pinId), "the waiter took up the other instance's pin");
     const chain = (second as unknown as {
