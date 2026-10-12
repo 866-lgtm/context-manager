@@ -15,6 +15,7 @@ import {
 } from '../kv-unified-pareto.js';
 import { normalizeContinuityMultiplier, normalizePolicy, policyScore } from '../kv-unified-policy.js';
 
+import type { KvUnifiedReuse } from '../kv-unified-reuse.js';
 export type { KvUnifiedReuse } from '../kv-unified-reuse.js';
 
 export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> {
@@ -155,12 +156,17 @@ export class KvUnifiedStrategy implements FoldingSolver {
     budget: FoldingBudget,
   ): ProduceRequest[] {
     const config = this.options.latentDemand!;
+    // Holders of candidates this compile does not score are dropped: their
+    // merge exists now, or is no longer producible.
+    const live = this.options.reuse;
+    const whatIf: WhatIfReuse = { base: forest, live, carried: live?.whatIf, kept: live ? new Map() : undefined };
+    if (live) live.whatIf = whatIf.kept;
     const candidates = latentHigherLevelCandidates(inputs, forest, config)
       .slice(0, Math.max(0, Math.floor(config.maxCandidates)));
     // Pass 1: one conservative (p80 recall-cost) what-if solve per candidate.
     const solved = candidates.flatMap((candidate) => {
       const conservative = solveWithLatentCandidate(
-        inputs, candidate, candidate.conservativeRecallTokens, this.options, budget.totalBudget,
+        inputs, whatIf, candidate, candidate.conservativeRecallTokens, this.options, budget.totalBudget,
       );
       this.demandSolves++;
       return conservative.feasible ? [{ candidate, conservative }] : [];
@@ -215,7 +221,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
       if (undecided.length > 0) {
         for (const entry of undecided) {
           const full = solveWithLatentCandidate(
-            inputs, entry.candidate, entry.candidate.conservativeRecallTokens,
+            inputs, whatIf, entry.candidate, entry.candidate.conservativeRecallTokens,
             { ...this.options, hysteresisCertificate: false }, budget.totalBudget,
           );
           this.demandSolves++;
@@ -240,7 +246,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
             candidate.expectedRecallTokens !== candidate.conservativeRecallTokens) {
           const tied = passing.some((other) => other !== entry && gain(other) === conservativeImprovement);
           const expected = solveWithLatentCandidate(
-            inputs, candidate, candidate.expectedRecallTokens,
+            inputs, whatIf, candidate, candidate.expectedRecallTokens,
             tied ? { ...this.options, hysteresisCertificate: false } : this.options, budget.totalBudget,
           );
           this.demandSolves++;
@@ -373,8 +379,18 @@ function latentHigherLevelCandidates(
     );
 }
 
+/** What a what-if solve may reuse: the live forest it extends, the holders
+ * last compile's what-ifs left (`carried`) and the ones this compile keeps. */
+interface WhatIfReuse {
+  readonly base: CanonicalSummaryForest;
+  readonly live?: KvUnifiedReuse;
+  readonly carried?: ReadonlyMap<string, KvUnifiedReuse>;
+  readonly kept?: Map<string, KvUnifiedReuse>;
+}
+
 function solveWithLatentCandidate(
   inputs: PickerInputs,
+  whatIf: WhatIfReuse,
   candidate: LatentCandidate,
   recallTokens: number,
   options: KvUnifiedOptions,
@@ -401,10 +417,25 @@ function solveWithLatentCandidate(
   const recallPairTokens = new Map(inputs.recallPairTokens ?? []);
   recallPairTokens.set(candidate.id, recallTokens);
   const candidateInputs: PickerInputs = { ...inputs, summaries, recallPairTokens };
-  const forest = new CanonicalSummaryForest(candidateInputs, {
+  // The what-if forest is the base forest plus one parent over existing
+  // summaries, which is what a merge arriving between compiles looks like:
+  // derive it the same way instead of building every leaf again.
+  const forestOptions = {
     treeifyNonContiguousSummaries: options.treeifyNonContiguousSummaries,
     preserveGapBearingSummaries: options.preserveGapBearingSummaries,
-  });
+  };
+  // The same candidate comes back on every compile until its merge exists,
+  // so its forest and certificate graph are kept like the live ones: derived
+  // from last compile's what-if when only leaves were appended since. The
+  // first what-if borrows unchanged nodes from the live certificate graph.
+  const key = `${candidate.id}\0${recallTokens}`;
+  const holder: KvUnifiedReuse = whatIf.kept?.get(key) ?? whatIf.carried?.get(key) ??
+    { certificate: whatIf.live?.certificate };
+  whatIf.kept?.set(key, holder);
+  const forest = (holder.forest ? CanonicalSummaryForest.derive(holder.forest, candidateInputs, forestOptions) : null) ??
+    CanonicalSummaryForest.derive(whatIf.base, candidateInputs, forestOptions) ??
+    new CanonicalSummaryForest(candidateInputs, forestOptions);
+  holder.forest = forest;
   // The certificate stays on for what-ifs: a certified solve answers in
   // ~0.4 s instead of a full solve. Its pool is the carried layout and its
   // extensions, which the certificate allows to score up to
@@ -415,7 +446,7 @@ function solveWithLatentCandidate(
   return new ParetoKvUnifiedPolicySolver(candidateInputs, forest).solve({
     ...options,
     maxTokens,
-    reuse: undefined,
+    reuse: whatIf.kept ? holder : undefined,
   });
 }
 

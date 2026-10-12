@@ -12,7 +12,7 @@ import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import { renderLayout } from '../../src/adaptive/render-offsets.js';
 import { ParetoKvUnifiedPolicySolver } from '../../src/adaptive/kv-unified-pareto.js';
 import { CanonicalSummaryForest } from '../../src/adaptive/kv-unified.js';
-import { KvUnifiedStrategy } from '../../src/adaptive/strategies/kv-unified.js';
+import { KvUnifiedStrategy, type KvUnifiedReuse } from '../../src/adaptive/strategies/kv-unified.js';
 import { Picker } from '../../src/adaptive/picker.js';
 import { buildChronicleWithChain, MockChronicle } from './harness.js';
 
@@ -1483,12 +1483,15 @@ test('latent demand decides a certified what-if solve against its unrestricted s
 function certifiedWhatIfFixture(o: {
   raw: number[]; salience: number[]; pairTokens: number; seenL2: number[]; covered: number;
   budget: number; adoptEpsilon: number; hysteresisCertificate: boolean;
+  /** Cross-compile holder, and ownerless raw leaves appended after the eight. */
+  reuse?: KvUnifiedReuse; appended?: number;
 }) {
   const chronicle = new MockChronicle({ recallPairTokens: o.pairTokens });
   for (let i = 0; i < 8; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: o.raw[i] });
   chronicle.chunks.forEach((chunk, i) => { chunk.salience = o.salience[i]; });
   const l1s: Array<{ id: string }> = [];
   for (let i = 0; i < 8; i += 2) l1s.push(chronicle.produceL1([`c${i}`, `c${i + 1}`]));
+  for (let i = 0; i < (o.appended ?? 0); i++) chronicle.addChunk({ id: `n${i}`, rawTokens: 40 });
   for (const [k, tokens] of o.seenL2.entries()) {
     const id = `L2-seen-${k}`;
     chronicle.summaries.set(id, {
@@ -1512,6 +1515,7 @@ function certifiedWhatIfFixture(o: {
     adoptEpsilon: o.adoptEpsilon, hysteresisCertificate: o.hysteresisCertificate,
     latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 8 },
     presentation: { currentSeq: 1, leaves },
+    ...(o.reuse ? { reuse: o.reuse } : {}),
   });
   const result = strategy.solve(inputs, { totalBudget: o.budget, targetBudget: o.budget, slack: 0 });
   return { strategy, result };
@@ -1548,4 +1552,35 @@ test('latent demand runs each expected-cost solve once when a certified what-if 
   assert.equal(result.produced.length, 2);
   // Two conservative what-ifs, the unrestricted c4..c7 one, one p50 each.
   assert.equal(strategy.lastTimings?.demandSolves, 5);
+});
+
+test('latent demand what-if solves reuse their own forests across compiles without changing the ranking', () => {
+  const base = {
+    raw: [50, 50, 200, 100, 100, 200, 50, 200], salience: [0.2, 0.5, 1, 1, 0.5, 1, 0.5, 1],
+    pairTokens: 150, seenL2: [10, 20, 30, 40], covered: 2, budget: 800, adoptEpsilon: 200, hysteresisCertificate: true,
+  };
+  const describe = (r: ReturnType<typeof certifiedWhatIfFixture>) => ({
+    produced: r.result.produced,
+    evaluations: r.strategy.lastDemandEvaluations.map((e) => [e.request, e.conservativeImprovement, e.expectedImprovement]),
+    frontier: [...r.result.frontier],
+  });
+  const reuse: KvUnifiedReuse = {};
+  // Each compile builds its own inputs, as the host does; only `reuse` lives on.
+  for (const appended of [0, 0, 1, 2]) {
+    const before = new Map(reuse.whatIf ?? []);
+    const held = certifiedWhatIfFixture({ ...base, appended, reuse });
+    assert.deepEqual(describe(held), describe(certifiedWhatIfFixture({ ...base, appended })), `appended=${appended}`);
+    assert.ok(reuse.whatIf && reuse.whatIf.size > 0, 'what-if holders are kept for the next compile');
+    // A candidate scored again keeps its holder, and with it the forest to derive from.
+    if (before.size > 0) {
+      const carried = [...reuse.whatIf.entries()].filter(([key, holder]) => before.get(key) === holder);
+      assert.ok(carried.length > 0, `appended=${appended}`);
+      for (const [, holder] of carried) assert.equal(holder.forest?.derived, true, `appended=${appended}`);
+    }
+    // The live entries belong to the live solve alone.
+    for (const holder of reuse.whatIf.values()) {
+      assert.notEqual(holder.forest, reuse.forest);
+      assert.ok(holder.certificate === undefined || holder.certificate !== reuse.certificate);
+    }
+  }
 });
