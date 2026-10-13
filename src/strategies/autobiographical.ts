@@ -725,6 +725,24 @@ function sha256Json(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
 }
 
+/** Sources as readers iterate them: a non-empty list of ids. */
+function isIdList(ids: unknown): ids is string[] {
+  return Array.isArray(ids) && ids.length > 0 && ids.every((id) => typeof id === 'string' && id.length > 0);
+}
+
+/** A range as readers dereference it: its first and last message ids. */
+function isReadableRange(range: unknown): range is { first: string; last: string } {
+  const ends = range as { first?: unknown; last?: unknown } | null | undefined;
+  const first = ends?.first;
+  const last = ends?.last;
+  return typeof first === 'string' && first.length > 0 && typeof last === 'string' && last.length > 0;
+}
+
+/** Text a recall or a merge can carry. */
+function hasSummaryText(summary: SummaryEntry): boolean {
+  return typeof summary.content === 'string' && summary.content.trim().length > 0;
+}
+
 /**
  * Chronicle state mutation is synchronous but not transactional across a
  * read/project/append sequence. Serialize those short sequences for strategy
@@ -1997,103 +2015,113 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const summaries = this.store.getStateJson(this.summariesStateId);
     const loaded = Array.isArray(summaries) ? (summaries as SummaryEntry[]) : [];
-    // Empty text cannot be recalled or merged. Source lists must also be
-    // readable: the adaptive picker's L1 index iterates them, and the local
-    // exact-L1 index joins them. Null sources poison every adaptive compile;
-    // other malformed lists can misidentify a summary's message coverage.
-    const hasContent = (summary: SummaryEntry) =>
-      typeof summary.content === 'string' && summary.content.trim().length > 0;
-    const hasIds = (ids: unknown): ids is string[] =>
-      Array.isArray(ids) && ids.length > 0 &&
-      ids.every(id => typeof id === 'string' && id.length > 0);
-    const nonEmpty = loaded.filter(summary => summary && hasContent(summary));
-    const droppedEmpty = loaded.length - nonEmpty.length; // Includes null entries.
-
-    // Preserve main's duplicate selection: the merged copy owns the parent's
-    // coverage. Validate sources only after choosing it, so an unreadable
-    // merged copy can borrow provenance without exposing a plain copy beside
-    // the parent. Keep the position of the first occurrence.
-    const byId = new Map<string, SummaryEntry>();
-    const sourceDonors = new Map<string, SummaryEntry>();
-    for (const summary of nonEmpty) {
-      const previous = byId.get(summary.id);
-      if (!previous || (!previous.mergedInto && summary.mergedInto)) {
-        byId.set(summary.id, summary);
-      }
-      if (hasIds(summary.sourceIds) && !sourceDonors.has(summary.id)) {
-        sourceDonors.set(summary.id, summary);
-      }
+    // Readers need a summary's text, its sources as a list of ids, and its
+    // range as two ids: the adaptive picker's L1 index iterates every L1's
+    // sources, recall dereferences the range's ends, and empty text can't be
+    // recalled or merged. One null `sourceIds` threw on every compile.
+    //
+    // Copies of one id are one summary. Before setMergedInto resolved its
+    // log slot by id, a merge could be written over a neighbour's slot,
+    // leaving duplicates whose merge state diverged. The summary keeps the
+    // text of a non-empty copy, a merged one if there is one, and the parent
+    // pointer of any copy that has one: its parent covers it, so left
+    // unmerged it would render twice. It keeps its first copy's position.
+    const copiesById = new Map<string, SummaryEntry[]>();
+    let malformed = 0;
+    for (const summary of loaded) {
+      if (!summary || typeof summary !== 'object') { malformed++; continue; }
+      const copies = copiesById.get(summary.id);
+      if (copies) copies.push(summary);
+      else copiesById.set(summary.id, [summary]);
     }
-    const dupes = nonEmpty.length - byId.size;
+    const dupes = loaded.length - malformed - copiesById.size;
 
-    // A compressed chunk owns the exact, ordered message ids of its L1.
-    // Rebuild from that durable provenance instead of discarding good text
-    // and scheduling another compression. Uncompressed records are not proof
-    // that this summary was produced from their sources.
-    const chunksBySummary = new Map<string, ChunkRecord>();
+    // A compressed chunk record names its L1 and holds the ordered message
+    // ids that L1 was written from, the ids compression reads. An
+    // uncompressed record proves nothing about a summary.
+    const chunkSources = new Map<string, string[]>();
     for (const record of this.chunkRecords) {
-      if (record.compressed && record.summaryId && hasIds(record.sourceIds) &&
-          !chunksBySummary.has(record.summaryId)) {
-        chunksBySummary.set(record.summaryId, record);
+      if (record.compressed && record.summaryId && isIdList(record.sourceIds) &&
+          !chunkSources.has(record.summaryId)) {
+        chunkSources.set(record.summaryId, record.sourceIds);
       }
     }
-    const rebuiltIds: string[] = [];
+    const byId = new Map<string, SummaryEntry>();
+    const emptyIds: string[] = [];
     const unreadableIds: string[] = [];
-    for (const [id, summary] of byId) {
-      if (hasIds(summary.sourceIds)) continue;
-      const donor = sourceDonors.get(id);
-      const chunk = summary.level === 1 ? chunksBySummary.get(id) : undefined;
-      if (donor) {
-        byId.set(id, { ...summary, sourceIds: [...donor.sourceIds], sourceRange: { ...donor.sourceRange } });
-        rebuiltIds.push(id);
-      } else if (chunk) {
-        byId.set(id, {
-          ...summary,
-          sourceIds: [...chunk.sourceIds],
-          sourceRange: { first: chunk.sourceIds[0], last: chunk.sourceIds[chunk.sourceIds.length - 1] },
-        });
-        rebuiltIds.push(id);
-      } else {
-        byId.delete(id);
-        unreadableIds.push(id);
+    const rebuiltIds: string[] = [];
+    const hasParent = (summary: SummaryEntry) => typeof getSummaryParentId(summary) === 'string';
+    for (const [id, copies] of copiesById) {
+      const withText = copies.filter(hasSummaryText);
+      const chosen = withText.find(hasParent) ?? withText[0];
+      if (!chosen) { emptyIds.push(id); continue; }
+      let summary = chosen;
+      const merged = hasParent(summary) ? undefined : copies.find(hasParent);
+      if (merged) {
+        summary = { ...summary };
+        if (typeof merged.parentId === 'string') summary.parentId = merged.parentId;
+        if (typeof merged.mergedInto === 'string') summary.mergedInto = merged.mergedInto;
       }
+      if (summary.level === 1) {
+        // An L1's own sources, else its compressed chunk record's, else a
+        // copy's. Its range is their ends whenever they're adopted or it
+        // can't be read.
+        const ids = [summary.sourceIds, chunkSources.get(id), ...copies.map((copy) => copy.sourceIds)].find(isIdList);
+        if (!ids) { unreadableIds.push(id); continue; }
+        if (ids !== summary.sourceIds || !isReadableRange(summary.sourceRange)) {
+          summary = { ...summary, sourceIds: [...ids], sourceRange: { first: ids[0]!, last: ids[ids.length - 1]! } };
+          rebuiltIds.push(id);
+        }
+      } else if (!(isIdList(summary.sourceIds) && isReadableRange(summary.sourceRange))) {
+        // Above L1 a range's ends are message ids that the sources don't
+        // name, so sources and range come together from one copy.
+        const donor = copies.find((copy) => isIdList(copy.sourceIds) && isReadableRange(copy.sourceRange));
+        if (!donor) { unreadableIds.push(id); continue; }
+        summary = { ...summary, sourceIds: [...donor.sourceIds], sourceRange: { ...donor.sourceRange } };
+        rebuiltIds.push(id);
+      }
+      byId.set(id, summary);
     }
 
-    // A kept parent must not still cover a dropped summary while that
-    // summary's children return to the frontier. Drop ancestors to a fixed
-    // point, including ancestors of empty-content summaries. Descendants are
-    // unmerged below, and the surviving sources can build replacement merges.
-    // A rejected duplicate does not remove an id that has a surviving copy.
-    const removedIds = new Set(loaded.filter(summary => summary && !byId.has(summary.id)).map(summary => summary.id));
+    // A summary above L1 is kept only while every summary it names is kept,
+    // whatever removed one and whenever: earlier versions dropped empty
+    // summaries without their parents. A parent naming a missing summary
+    // covers messages that are rendered, or compressed again, without it.
+    // Repeat to a fixed point. Dropping costs the ancestors' text; their
+    // surviving sources merge again.
     const ancestorIds: string[] = [];
-    let changed: boolean;
-    do {
+    for (let changed = true; changed;) {
       changed = false;
       for (const [id, summary] of byId) {
-        if (!summary.sourceIds.some(sourceId => removedIds.has(sourceId))) continue;
+        if (!(summary.level > 1) || summary.sourceIds.every((sourceId) => byId.has(sourceId))) continue;
         byId.delete(id);
-        removedIds.add(id);
         ancestorIds.push(id);
         changed = true;
       }
-    } while (changed);
+    }
 
+    // A parent pointer to a summary that is gone is cleared, so its child
+    // renders and merges again. Readers take `parentId` before the older
+    // `mergedInto`, so each is checked.
     let danglingParents = 0;
+    const dangling = (parent: string | undefined) => parent !== undefined && !byId.has(parent);
     this.summaries = [...byId.values()].map((summary) => {
-      if (!summary.mergedInto || byId.has(summary.mergedInto)) return summary;
+      if (!dangling(summary.parentId) && !dangling(summary.mergedInto)) return summary;
       danglingParents++;
-      const { mergedInto: _dropped, ...repaired } = summary;
-      return repaired as SummaryEntry;
+      const repaired = { ...summary };
+      if (dangling(repaired.parentId)) delete repaired.parentId;
+      if (dangling(repaired.mergedInto)) delete repaired.mergedInto;
+      return repaired;
     });
-    if (droppedEmpty > 0 || unreadableIds.length > 0 || rebuiltIds.length > 0 ||
-        ancestorIds.length > 0 || dupes > 0 || danglingParents > 0) {
+    const droppedIds = [...copiesById.keys()].filter((id) => !byId.has(id));
+    if (malformed > 0 || dupes > 0 || droppedIds.length > 0 || rebuiltIds.length > 0 || danglingParents > 0) {
       this.store.setStateJson(this.summariesStateId, this.summaries);
       console.warn(
-        '[autobiographical] repaired summary state: removed ' + droppedEmpty + ' empty/malformed entries, ' +
-          unreadableIds.length + ' without readable sourceIds and ' + ancestorIds.length + ' ancestors; ' +
-          'rebuilt ' + rebuiltIds.length + ' [' + rebuiltIds.join(', ') + ']; ' +
-          'dropped ids [' + [...removedIds].join(', ') + ']; ' +
-          'deduped ' + dupes + ', cleared ' + danglingParents + ' dangling parent pointer(s)',
+        `[autobiographical] repaired summary state: removed ${malformed} malformed entr(ies); dropped ` +
+          `${emptyIds.length} empty, ${unreadableIds.length} with unreadable sources or range, and ` +
+          `${ancestorIds.length} naming a missing summary [${droppedIds.join(', ')}]; rebuilt the sources of ` +
+          `${rebuiltIds.length} [${rebuiltIds.join(', ')}]; deduped ${dupes}; cleared ${danglingParents} ` +
+          `dangling parent pointer(s)`,
       );
     }
 
@@ -2132,8 +2160,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .filter((r) => r && typeof r.key === 'string' && Array.isArray(r.sourceIds))
         .map((r) => [r.key, r]),
     );
+    // A queued merge is kept only while it is an entry whose sources are kept
+    // summaries, as for a summary above L1.
     const validMergeQueue = this.mergeQueue.filter(
-      merge => merge && hasIds(merge.sourceIds) && !merge.sourceIds.some(id => removedIds.has(id)),
+      merge => merge && isIdList(merge.sourceIds) && merge.sourceIds.every((sourceId) => byId.has(sourceId)),
     );
     if (validMergeQueue.length !== this.mergeQueue.length) {
       const removed = this.mergeQueue.length - validMergeQueue.length;
@@ -2588,8 +2618,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (local) return local;
     const persisted = this.store?.getStateJson(this.summariesStateId);
     if (!Array.isArray(persisted)) return undefined;
+    // Another instance may have appended it since this one loaded. Adopt it
+    // only as the loader would keep it: text, a list of ids and a range.
     const found = (persisted as SummaryEntry[]).find(
-      (summary) => summary?.level === 1 && Array.isArray(summary.sourceIds) && summary.sourceIds.join(':') === chunkIdKey,
+      (summary) => summary?.level === 1 && isIdList(summary.sourceIds) && summary.sourceIds.join(':') === chunkIdKey &&
+        hasSummaryText(summary) && isReadableRange(summary.sourceRange),
     );
     if (found && !this.summaries.some((summary) => summary.id === found.id)) {
       this.summaries.push(found);

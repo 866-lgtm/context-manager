@@ -332,12 +332,14 @@ describe('AutobiographicalStrategy — persistence', () => {
     ['adaptive, kv-stable', { adaptiveResolution: true, foldingStrategy: 'kv-stable' }],
   ] as const) {
     it(`compiles a store that held an L1 with null sourceIds, after a reopen (${label})`, async () => {
+      let parentId = '';
       {
         const strategy = new TestableStrategy({ targetChunkTokens: 300, ...options });
         const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
         const ids = ['one', 'two', 'three', 'four'].map((text, i) => manager.addMessage(i % 2 === 0 ? 'User' : 'Claude', textBlock(text)));
         const good = strategy.seedL1('summary of one and two', ids.slice(0, 2));
         const parent = strategy.seedL2([good.id], 'parent of the good one');
+        parentId = parent.id;
         strategy.persistRawSummaries([
           ...strategy.getSummariesView(),
           // A superseded L1 that no chunk record points at, whose parent doesn't list it.
@@ -353,12 +355,16 @@ describe('AutobiographicalStrategy — persistence', () => {
         const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
         assert.ok(compiled.messages.length > 0);
         assert.ok(strategy.getSummariesView().some(summary => summary.id === 'L1-0' && summary.content === 'summary of one and two'), 'the readable L1 survives');
+        assert.ok(strategy.getSummariesView().some(summary => summary.id === parentId), 'so does its parent');
         const dry = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }, undefined, { dryRun: true });
         assert.ok(dry.messages.length > 0);
         for (const context of [compiled, dry]) {
           const texts = context.messages.flatMap(message => message.content).map(block => (block as { text?: string }).text);
           for (const text of ['one', 'two', 'three', 'four']) assert.equal(texts.filter(value => value === text).length, 1, JSON.stringify(texts));
-          if (!('adaptiveResolution' in options)) assert.equal(texts.filter(value => value === 'parent of the good one').length, 1);
+          const parents = texts.filter(value => value === 'parent of the good one').length;
+          // Adaptive resolution may render the parent's L1 in its place.
+          if ('adaptiveResolution' in options) assert.ok(parents <= 1, JSON.stringify(texts));
+          else assert.equal(parents, 1);
         }
         assert.ok(!strategy.getSummariesView().some((s) => s.id === 'L1-lost'), 'the record is dropped on load');
         assert.ok(!strategy.readPersistedSummaries().some((s) => s.id === 'L1-lost'), 'and the drop is persisted, with nothing else to repair');
@@ -376,24 +382,30 @@ describe('AutobiographicalStrategy — persistence', () => {
       const warnings: string[] = [];
       t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
       let sourceIds: string[] = [];
+      let parentId = '';
       {
         const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
         const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
         sourceIds = ['chunk-first', 'chunk-last'].map(text => manager.addMessage('User', textBlock(text)));
         const l1 = strategy.seedL1('KEEP THIS CONTENT', sourceIds);
+        const parent = strategy.seedL2([l1.id], 'its parent');
+        parentId = parent.id;
         strategy.persistRawChunks([{ id: 'c-0', sourceIds, compressed: true, summaryId: l1.id }]);
-        strategy.persistRawSummaries([{ ...l1, sourceIds: shape, sourceRange: { first: 'lost', last: 'lost' } }]);
+        strategy.persistRawSummaries([{ ...l1, sourceIds: shape, sourceRange: { first: 'lost', last: 'lost' } }, parent]);
         manager.sync();
         manager.close();
       }
       const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
       const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
       try {
-        const [l1] = strategy.getSummariesView();
+        const [l1, parent] = strategy.getSummariesView();
         assert.ok(l1, 'recoverable content survives');
         assert.equal(l1.content, 'KEEP THIS CONTENT');
         assert.deepEqual(l1.sourceIds, sourceIds);
         assert.deepEqual(l1.sourceRange, { first: sourceIds[0], last: sourceIds[1] });
+        assert.equal(l1.level, 1);
+        assert.equal(l1.mergedInto, parentId, 'the rebuilt L1 stays merged into its parent');
+        assert.equal(parent?.id, parentId, 'and the parent is kept');
         assert.deepEqual(strategy.readPersistedSummaries(), strategy.getSummariesView());
         assert.ok(strategy.readPersistedChunks().some(record => record.summaryId === l1.id && record.compressed));
         assert.ok(warnings.some(line => /rebuilt/.test(line) && line.includes(l1.id)), warnings.join('\n'));
@@ -451,6 +463,137 @@ describe('AutobiographicalStrategy — persistence', () => {
     } finally { manager.close(); }
   });
 
+  it('keeps the parent pointer of an empty merged copy, so its plain copy renders only through its parent', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    let childId = '';
+    let parentId = '';
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, recentWindowTokens: 1, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const id = manager.addMessage('User', textBlock('DUP-A'));
+      const child = strategy.seedL1('DUP-A', [id]);
+      const plain = { ...child };
+      const parent = strategy.seedL2([child.id], 'DUP-A');
+      childId = child.id;
+      parentId = parent.id;
+      strategy.persistRawSummaries([plain, { ...child, content: '' }, parent]);
+      manager.sync();
+      manager.close();
+    }
+    const strategy = new TestableStrategy({ targetChunkTokens: 300, recentWindowTokens: 1, auditOnly: true });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      const child = strategy.getSummariesView().find(summary => summary.id === childId)!;
+      assert.equal(child.content, 'DUP-A');
+      assert.equal(child.mergedInto, parentId);
+      assert.ok(strategy.getSummariesView().some(summary => summary.id === parentId));
+      assert.deepEqual(strategy.readPersistedSummaries(), strategy.getSummariesView());
+      for (const dryRun of [false, true]) {
+        const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }, undefined, { dryRun });
+        const rendered = JSON.stringify(compiled.messages.map(message => message.content));
+        assert.equal(rendered.split('DUP-A').length - 1, 1, rendered);
+      }
+    } finally { manager.close(); }
+  });
+
+  it('derives an L1 range from its sources, and drops a summary above L1 whose range no copy can supply', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    let ids: string[] = [];
+    let summaryIds: string[] = [];
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      ids = ['range-a', 'range-b', 'range-c'].map(text => manager.addMessage('User', textBlock(text)));
+      const [a, b, c] = ids.map((id, i) => strategy.seedL1('summary ' + i, [id]));
+      const parent = strategy.seedL2([c.id], 'parent without a range');
+      summaryIds = [a.id, b.id, c.id, parent.id];
+      strategy.persistRawSummaries([
+        { ...a, sourceIds: null, sourceRange: { first: 'lost', last: 'lost' } },
+        { ...a, sourceRange: undefined },
+        { ...b, sourceRange: {} },
+        c,
+        { ...parent, sourceRange: undefined },
+      ]);
+      manager.sync();
+      manager.close();
+    }
+    const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      const [a, b, c, parentId] = summaryIds;
+      const kept = new Map(strategy.getSummariesView().map(summary => [summary.id, summary]));
+      assert.deepEqual([...kept.keys()], [a, b, c], 'the parent with no readable range is dropped');
+      assert.deepEqual(kept.get(a)!.sourceIds, [ids[0]], 'sources from the copy that has them');
+      assert.deepEqual(kept.get(a)!.sourceRange, { first: ids[0], last: ids[0] }, 'range from those sources');
+      assert.deepEqual(kept.get(b)!.sourceRange, { first: ids[1], last: ids[1] });
+      assert.equal(kept.get(c)!.mergedInto, undefined, `its child no longer points at ${parentId}`);
+      assert.deepEqual(strategy.readPersistedSummaries(), strategy.getSummariesView());
+    } finally { manager.close(); }
+  });
+
+  it('takes an L1 sources from its compressed chunk record before a copy of the L1', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    let ids: string[] = [];
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      ids = ['record-first', 'record-last'].map(text => manager.addMessage('User', textBlock(text)));
+      const l1 = strategy.seedL1('recorded summary', ids);
+      strategy.persistRawChunks([{ id: 'c-0', sourceIds: ids, compressed: true, summaryId: l1.id }]);
+      strategy.persistRawSummaries([{ ...l1, sourceIds: null }, { ...l1, sourceIds: [ids[1]] }]);
+      manager.sync();
+      manager.close();
+    }
+    const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      const [l1] = strategy.getSummariesView();
+      assert.deepEqual(l1.sourceIds, ids);
+      assert.deepEqual(l1.sourceRange, { first: ids[0], last: ids[1] });
+    } finally { manager.close(); }
+  });
+
+  it('drops a summary that names one an earlier open removed, with what is queued on it, once', async (t) => {
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
+    let survivorId = '';
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, recentWindowTokens: 1, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const ids = ['GONE-A', 'GONE-B'].map(text => manager.addMessage('User', textBlock(text)));
+      const [lost, survivor] = ids.map((id, i) => strategy.seedL1(['GONE-A', 'GONE-B'][i], [id]));
+      const parent = strategy.seedL2([lost.id, survivor.id], 'GONE-A GONE-B');
+      const grandparent = strategy.seedParent(3, [parent.id], 'GONE-A GONE-B');
+      survivorId = survivor.id;
+      // As an earlier version leaves a store after dropping an empty L1. The
+      // survivor also carries the newer parent pointer, which readers take first.
+      strategy.persistRawSummaries(strategy.getSummariesView()
+        .filter(summary => summary.id !== lost.id)
+        .map(summary => summary.id === survivor.id ? { ...summary, parentId: parent.id } : summary));
+      // One merge names the grandparent, which only the cascade drops; the
+      // other names the L1 that was already gone.
+      strategy.persistRawMergeQueue([{ level: 4, sourceIds: [grandparent.id] }, { level: 2, sourceIds: [lost.id, survivor.id] }]);
+      manager.sync();
+      manager.close();
+    }
+    for (let open = 0; open < 2; open++) {
+      warnings.length = 0;
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, recentWindowTokens: 1, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      try {
+        assert.deepEqual(strategy.getSummariesView().map(summary => summary.id), [survivorId]);
+        assert.equal(strategy.getSummariesView()[0].mergedInto, undefined);
+        assert.equal(strategy.getSummariesView()[0].parentId, undefined);
+        assert.deepEqual(strategy.readPersistedSummaries(), strategy.getSummariesView());
+        assert.deepEqual(strategy.readPersistedMergeQueue(), []);
+        if (open === 1) assert.ok(!warnings.some(line => line.includes('repaired summary state')), warnings.join('\n'));
+        const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+        const rendered = JSON.stringify(compiled.messages.map(message => message.content));
+        for (const marker of ['GONE-A', 'GONE-B']) assert.equal(rendered.split(marker).length - 1, 1, rendered);
+      } finally { manager.close(); }
+    }
+  });
+
   for (const defect of ['null-parent', 'empty-parent', 'empty-child'] as const) {
     it('cascades ' + defect + ' drops upward, repairs descendants and renders each source once', async (t) => {
       const markers = ['CASCADE-A', 'CASCADE-B', 'CASCADE-C'];
@@ -468,6 +611,8 @@ describe('AutobiographicalStrategy — persistence', () => {
         safeParentId = safeParent.id;
         const grandparent = strategy.seedParent(3, [parent.id, safeParent.id], markers.join(' '));
         strategy.seedParent(4, [grandparent.id], markers.join(' '));
+        // Only the cascade drops the grandparent, in every case.
+        strategy.persistRawMergeQueue([{ level: 4, sourceIds: [grandparent.id] }]);
         strategy.persistRawChunks(children.map((child, i) => ({ id: 'c-' + i, sourceIds: [ids[i]], compressed: true, summaryId: child.id })));
         const brokenId = defect === 'empty-child' ? childIds[0] : parent.id;
         const records = strategy.getSummariesView().map(summary => summary.id !== brokenId ? summary
@@ -487,6 +632,7 @@ describe('AutobiographicalStrategy — persistence', () => {
           assert.equal(summary.mergedInto, summary.id === childIds[2] ? safeParentId : undefined);
         }
         assert.deepEqual(strategy.readPersistedSummaries(), strategy.getSummariesView());
+        assert.deepEqual(strategy.readPersistedMergeQueue(), [], 'the merge queued on a dropped ancestor is removed');
         if (defect === 'empty-child') {
           const reopened = strategy.readPersistedChunks().find(record => record.id === 'c-0')!;
           assert.equal(reopened.compressed, false);
@@ -547,7 +693,7 @@ describe('AutobiographicalStrategy — persistence', () => {
     }
   });
 
-  it('skips live-appended non-array sources during exact L1 lookup', async () => {
+  it('adopts a live-appended L1 only as the loader would keep it', async () => {
     const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
     const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
     try {
@@ -557,6 +703,8 @@ describe('AutobiographicalStrategy — persistence', () => {
         { ...base, id: 'L1-string', sourceIds: id },
         { ...base, id: 'L1-number', sourceIds: 1 },
         { ...base, id: 'L1-null', sourceIds: null },
+        { ...base, id: 'L1-empty', sourceIds: [id], content: ' ' },
+        { ...base, id: 'L1-no-range', sourceIds: [id], sourceRange: undefined },
         { ...base, sourceIds: [id] },
       ]);
       assert.equal(strategy.exactL1([id])?.id, 'L1-live');
