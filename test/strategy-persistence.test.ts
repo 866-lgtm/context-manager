@@ -112,6 +112,10 @@ class TestableStrategy extends AutobiographicalStrategy {
     this.store?.setStateJson(this.locksStateId, locked);
   }
 
+  persistRawCounter(value: number): void {
+    this.store?.setStateJson(this.counterStateId, value);
+  }
+
   readPersistedResolutions(): Record<string, number> {
     return (this.store?.getStateJson(this.resolutionsStateId) as Record<string, number> | null) ?? {};
   }
@@ -669,6 +673,7 @@ describe('AutobiographicalStrategy — persistence', () => {
     t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
     const config = { targetChunkTokens: 300, recentWindowTokens: 40 };
     let l1Id = '';
+    let lowerId = '';
     {
       const strategy = new TestableStrategy(config);
       const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
@@ -677,6 +682,7 @@ describe('AutobiographicalStrategy — persistence', () => {
       const l1 = strategy.seedL1('L1-TEXT', ids);
       const lower = strategy.seedL2([l1.id], 'LOWER');
       l1Id = l1.id;
+      lowerId = lower.id;
       // Two summaries at one level that list each other and point at each other.
       strategy.persistRawSummaries([
         { ...l1, mergedInto: lower.id },
@@ -694,7 +700,8 @@ describe('AutobiographicalStrategy — persistence', () => {
       assert.deepEqual(stored.map((s) => s.id), [l1Id], 'a summary listing one at its own level is dropped, and so is the other');
       assert.equal(stored[0]!.mergedInto, undefined, 'and the L1 under them has no parent left');
       const line = warnings.find((w) => w.includes('repaired summary state')) ?? '';
-      assert.match(line, /naming one not below it \[[^\]]+\]/, line);
+      assert.deepEqual(line.match(/naming one not below it \[([^\]]*)\]/)?.[1]?.split(', ').sort(), [lowerId, 'L2-same'].sort(), line);
+      assert.match(line, /naming a missing summary \[\]/, 'whichever the pass reaches first: ' + line);
       const dry = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }, undefined, { dryRun: true });
       const live = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
       for (const context of [dry, live]) {
@@ -702,6 +709,36 @@ describe('AutobiographicalStrategy — persistence', () => {
         assert.equal(texts.filter((text) => text === 'L1-TEXT').length, 1, JSON.stringify(texts));
         assert.ok(!texts.some((text) => text === 'LOWER' || text === 'SAME' || text.startsWith('MSG')), JSON.stringify(texts));
       }
+    } finally { manager.close(); }
+  });
+
+  it('drops a summary that lists one above it, as naming one not below it', async (t) => {
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
+    let upId = '';
+    let bId = '';
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const [a, b] = ['a', 'b'].map((text) => strategy.seedL1(text, [manager.addMessage('User', textBlock(text))]));
+      const mid = strategy.seedL2([a!.id], 'mid');
+      const top = strategy.seedParent(3, [mid.id], 'top');
+      const up = strategy.seedL2([b!.id], 'up');
+      upId = up.id;
+      bId = b!.id;
+      // An L2 that lists the L3 above it beside its own L1.
+      strategy.persistRawSummaries(strategy.getSummariesView().map((s) => (s.id === up.id ? { ...s, sourceIds: [b!.id, top.id] } : s)));
+      manager.sync();
+      manager.close();
+    }
+    const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      const stored = new Map(strategy.readPersistedSummaries().map((s) => [s.id, s]));
+      assert.ok(!stored.has(upId), 'the summary listing one above it is dropped');
+      assert.equal(stored.get(bId)?.mergedInto, undefined, 'and its L1 has no parent left');
+      const line = warnings.find((w) => w.includes('repaired summary state')) ?? '';
+      assert.equal(line.match(/naming one not below it \[([^\]]*)\]/)?.[1], upId, line);
     } finally { manager.close(); }
   });
 
@@ -749,18 +786,25 @@ describe('AutobiographicalStrategy — persistence', () => {
     } finally { manager.close(); }
   });
 
-  it('gives a summary no pointer names the one summary a level up that lists it, and no parent when two do', async (t) => {
+  it('gives a summary no pointer names the one summary a level up that lists it, no parent when two do, and the one another copy names', async (t) => {
     t.mock.method(console, 'warn', () => {});
     let xId = '';
     let wId = '';
     let wParentId = '';
+    let uId = '';
+    let uParentId = '';
     {
       const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
       const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
-      const [x, y, z, w, v] = ['x', 'y', 'z', 'w', 'v'].map((text) => strategy.seedL1(text, [manager.addMessage('User', textBlock(text))]));
-      // x is listed by two L2s. w is listed by one L2, and directly by an L3 above it.
+      const [x, y, z, w, v, u, s1, s2] = ['x', 'y', 'z', 'w', 'v', 'u', 's1', 's2'].map((text) => strategy.seedL1(text, [manager.addMessage('User', textBlock(text))]));
+      // x and u are each listed by two L2s; only u has a copy whose pointer
+      // names one of them. w is listed by one L2, and directly by an L3 above it.
       const first = strategy.seedL2([x!.id, y!.id], 'first');
       const second = strategy.seedL2([x!.id, z!.id], 'second');
+      const third = strategy.seedL2([u!.id, s1!.id], 'third');
+      const fourth = strategy.seedL2([u!.id, s2!.id], 'fourth');
+      uId = u!.id;
+      uParentId = fourth.id;
       const wParent = strategy.seedL2([w!.id, v!.id], 'w parent');
       const skipping = strategy.seedParent(3, [wParent.id, w!.id], 'skips a level');
       xId = x!.id;
@@ -774,7 +818,9 @@ describe('AutobiographicalStrategy — persistence', () => {
       const view = new Map(strategy.getSummariesView().map((s) => [s.id, s]));
       strategy.persistRawSummaries([
         unpointed(view.get(x!.id)!), view.get(y!.id)!, view.get(z!.id)!, unpointed(view.get(w!.id)!), view.get(v!.id)!,
-        view.get(first.id)!, view.get(second.id)!, view.get(wParent.id)!, view.get(skipping.id)!,
+        unpointed(view.get(u!.id)!), { ...unpointed(view.get(u!.id)!), content: '', mergedInto: fourth.id },
+        view.get(s1!.id)!, view.get(s2!.id)!,
+        view.get(first.id)!, view.get(second.id)!, view.get(third.id)!, view.get(fourth.id)!, view.get(wParent.id)!, view.get(skipping.id)!,
       ]);
       manager.sync();
       manager.close();
@@ -785,6 +831,70 @@ describe('AutobiographicalStrategy — persistence', () => {
       const stored = new Map(strategy.readPersistedSummaries().map((s) => [s.id, s]));
       assert.equal(stored.get(xId)?.mergedInto, undefined, 'with two parents listing it, neither is chosen');
       assert.equal(stored.get(wId)?.mergedInto, wParentId, 'the summary listing it a level up is its parent; the one two levels up is not');
+      assert.equal(stored.get(uId)?.mergedInto, uParentId, 'of two listing it, the one another copy names is its parent');
+    } finally { manager.close(); }
+  });
+
+  it('takes parentId before mergedInto, counts once a summary listing a child twice, and takes no parent at the child\'s level', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    const ids: Record<string, string> = {};
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const l1 = (text: string) => strategy.seedL1(text, [manager.addMessage('User', textBlock(text))]);
+      const [tc, a1, b1, rc, c1, kc] = ['tc', 'a1', 'b1', 'rc', 'c1', 'kc'].map(l1);
+      const pa = strategy.seedL2([tc!.id, a1!.id], 'pa');
+      const pb = strategy.seedL2([tc!.id, b1!.id], 'pb');
+      const rr = strategy.seedL2([rc!.id, c1!.id], 'rr');
+      Object.assign(ids, { tc: tc!.id, pa: pa.id, rc: rc!.id, rr: rr.id, kc: kc!.id });
+      const view = new Map(strategy.getSummariesView().map((s) => [s.id, s]));
+      const plain = (id: string) => {
+        const copy = { ...view.get(id)! };
+        delete (copy as { mergedInto?: string }).mergedInto;
+        return copy;
+      };
+      strategy.persistRawSummaries([
+        // tc's parentId and mergedInto name two kept summaries that both list it.
+        { ...plain(tc!.id), parentId: pa.id, mergedInto: pb.id },
+        view.get(a1!.id)!, view.get(b1!.id)!,
+        // rc has no pointer, and one summary lists it twice.
+        plain(rc!.id), view.get(c1!.id)!,
+        // kc points at an L1 that lists it.
+        { ...plain(kc!.id), mergedInto: 'L1-kk' },
+        { ...plain(kc!.id), id: 'L1-kk', content: 'kk', sourceIds: [kc!.id] },
+        view.get(pa.id)!, view.get(pb.id)!,
+        { ...view.get(rr.id)!, sourceIds: [rc!.id, rc!.id, c1!.id] },
+      ]);
+      manager.sync();
+      manager.close();
+    }
+    const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      const stored = new Map(strategy.readPersistedSummaries().map((s) => [s.id, s]));
+      assert.equal(stored.get(ids.tc!)?.parentId, ids.pa, 'parentId is read first');
+      assert.equal(stored.get(ids.tc!)?.mergedInto, ids.pa, 'and mergedInto is set to the same parent');
+      assert.equal(stored.get(ids.rc!)?.mergedInto, ids.rr, 'a summary listing it twice is one parent');
+      assert.equal(stored.get(ids.kc!)?.mergedInto, undefined, 'a summary at its own level is no parent, though it lists it');
+    } finally { manager.close(); }
+  });
+
+  it('keeps the summary-id counter past every id the store holds, whatever counter it stored', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      for (const text of ['one', 'two']) strategy.seedL1(text, [manager.addMessage('User', textBlock(text))]);
+      // Another instance on the store wrote the counter it held, an older one.
+      strategy.persistRawCounter(0);
+      manager.sync();
+      manager.close();
+    }
+    const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      assert.deepEqual(strategy.getSummariesView().map((s) => s.id), ['L1-0', 'L1-1']);
+      assert.equal(strategy.getCounter(), 2, 'the next id repeats none in the store');
     } finally { manager.close(); }
   });
 
@@ -792,12 +902,15 @@ describe('AutobiographicalStrategy — persistence', () => {
     t.mock.method(console, 'warn', () => {});
     let id = '';
     let parentId = '';
+    let secondId = '';
     {
       const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
       const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
-      const [l1, other, third] = ['copy one', 'copy two', 'copy three'].map((text) => strategy.seedL1(text, [manager.addMessage('User', textBlock(text))]));
-      const parent = strategy.seedL2([l1!.id, other!.id], 'parent');
+      // The parent's three L1s come first, so its leaves are contiguous.
+      const [l1, other, byParentId, third] = ['copy one', 'copy two', 'copy four', 'copy three'].map((text) => strategy.seedL1(text, [manager.addMessage('User', textBlock(text))]));
+      const parent = strategy.seedL2([l1!.id, other!.id, byParentId!.id], 'parent');
       const side = strategy.seedL2([third!.id], 'side');
+      secondId = byParentId!.id;
       id = l1!.id;
       parentId = parent.id;
       const view = new Map(strategy.getSummariesView().map((s) => [s.id, s]));
@@ -808,6 +921,9 @@ describe('AutobiographicalStrategy — persistence', () => {
         { ...plain, content: 'STALE, DANGLING POINTER', mergedInto: 'L2-gone' },
         { ...plain, content: 'STALE, POINTER TO A SUMMARY THAT DOES NOT LIST IT', mergedInto: side.id },
         { ...plain, content: 'FRESH', mergedInto: parent.id },
+        // The second summary's fresh copy names its parent through parentId.
+        { ...view.get(byParentId!.id)!, mergedInto: undefined, content: 'STALE, NO POINTER' },
+        { ...view.get(byParentId!.id)!, mergedInto: undefined, content: 'FRESH BY PARENTID', parentId: parent.id },
         view.get(other!.id)!,
         view.get(third!.id)!,
         view.get(parent.id)!,
@@ -822,6 +938,9 @@ describe('AutobiographicalStrategy — persistence', () => {
       const kept = strategy.readPersistedSummaries().find((s) => s.id === id)!;
       assert.equal(kept.content, 'FRESH');
       assert.equal(kept.mergedInto, parentId);
+      const second = strategy.readPersistedSummaries().find((s) => s.id === secondId)!;
+      assert.equal(second.content, 'FRESH BY PARENTID');
+      assert.equal(second.mergedInto, parentId);
     } finally { manager.close(); }
   });
 
@@ -1159,7 +1278,13 @@ describe('AutobiographicalStrategy — persistence', () => {
         { ...base, sourceIds: key, sourceRange: undefined, mergedInto: 'L2-other-instance' },
         { id: 'L2-other-instance', level: 2, content: 'above both', tokens: 1, sourceLevel: 1, sourceIds: ['L1-live', 'L1-other-chunk'], sourceRange: { first: ids[0], last: ids[2] }, created: 0 },
       ]);
+      const latches = strategy as unknown as { chunkRecordsOrphaned: boolean; _overlapBlocked: Set<string> };
+      latches.chunkRecordsOrphaned = true;
+      latches._overlapBlocked.add('refused-chunk');
       const found = strategy.exactL1(key);
+      assert.equal(latches.chunkRecordsOrphaned, true, 'the reload leaves the latches rebuildChunks owns');
+      assert.ok(latches._overlapBlocked.has('refused-chunk'));
+      latches.chunkRecordsOrphaned = false;
       assert.equal(found?.id, 'L1-live');
       assert.deepEqual(found?.sourceRange, { first: ids[0], last: ids[1] }, 'its range is derived from its sources, as the loader derives it');
       assert.equal(found?.mergedInto, 'L2-other-instance');

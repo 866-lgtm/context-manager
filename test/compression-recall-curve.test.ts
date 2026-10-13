@@ -2090,6 +2090,104 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
+  const kvUnifiedOptions = {
+    recentWindowTokens: 100,
+    adaptiveResolution: true,
+    foldingStrategy: 'kv-unified',
+    kvUnified: {
+      policy: {
+        alpha: 0.7, budgetLowRatio: 0.5, budgetHighRatio: 0.9, budgetUnderLambda: 10, budgetOverLambda: 10,
+        cacheLambda: 1, cacheScale: 1000, cacheReadPrice: 0.1, cacheWritePrice: 1.25,
+        continuityLambda: 1, continuityScale: 1000, continuityRecencyHalfLifeTokens: 1000, continuityRecencyFloor: 0.2,
+        continuityStableHalfLife: 10, continuityStableFloor: 0.25,
+      },
+      tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100, labelCeiling: 10_000, adoptEpsilon: 0,
+      treeifyNonContiguousSummaries: false, preserveGapBearingSummaries: false,
+    },
+  } as never;
+
+  /** Another instance on the same store, which compresses the target and merges its L1. */
+  async function otherInstance(fx: Fixture, membrane: unknown) {
+    const other = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+    });
+    const manager = await ContextManager.open({ store: fx.manager.getStore(), strategy: other, membrane: membrane as never });
+    const ids = fx.target.messages.map((message) => message.id);
+    const write = () => {
+      const l1 = summary('L1-900', 1, ids, ids[0]!, ids.at(-1)!, 20, "the other instance's L1");
+      other.seed(l1);
+      other.seed(summary('L2-901', 2, [l1.id], ids[0]!, ids.at(-1)!, 20, "the other instance's L2"));
+      other.linkChild(l1, 'L2-901');
+    };
+    return { manager, ids, write };
+  }
+
+  it("a compression adopts an L1 another instance wrote before it started, with the summary above it, and calls no provider", async () => {
+    let calls = 0;
+    const membrane = { complete: async () => { calls++; return response('end_turn', 'not needed'); } };
+    const fx = await fixture(membrane, { compressionRefusalCurveFallbacks: 0 });
+    const other = await otherInstance(fx, membrane);
+    other.write();
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(calls, 0, 'no provider call');
+    assert.equal(fx.target.compressed, true);
+    assert.equal(fx.target.summaryId, 'L1-900');
+    const held = new Map(fx.strategy.summariesView().map((entry) => [entry.id, entry]));
+    assert.equal(held.get('L1-900')?.mergedInto, 'L2-901', 'it holds the L1 with the summary above it');
+    assert.ok(held.has('L2-901'));
+    other.manager.close();
+    fx.manager.close();
+  });
+
+  it("a compression whose L1 another instance writes during the provider call adopts it, keeping its own kv-unified submission in flight", async () => {
+    let calls = 0;
+    let other!: Awaited<ReturnType<typeof otherInstance>>;
+    const membrane = {
+      complete: async () => {
+        calls++;
+        other.write();
+        return response('end_turn', 'a paid result the other instance made redundant');
+      },
+    };
+    const fx = await fixture(membrane, { compressionRefusalCurveFallbacks: 0, ...(kvUnifiedOptions as object) });
+    other = await otherInstance(fx, membrane);
+    await fx.manager.compile({ maxTokens: 10_000, reserveForResponse: 0 }, undefined, { kvUnifiedImmutablePrefixHash: 'immutable-v1' });
+    fx.strategy.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+    const presentation = fx.strategy as unknown as {
+      kvUnifiedDraft: unknown;
+      kvUnifiedPendingLayout: unknown;
+      kvUnifiedReceipts: { inFlightSubmissionId: string | null };
+    };
+    const draft = presentation.kvUnifiedDraft;
+    const submittedLayout = presentation.kvUnifiedPendingLayout;
+    assert.ok(draft && submittedLayout, 'compiled and submitted');
+    const reloads: unknown[] = [];
+    const probe = fx.strategy as unknown as { loadPersistedState(options?: unknown): void };
+    const reload = probe.loadPersistedState.bind(fx.strategy);
+    probe.loadPersistedState = (options?: unknown) => {
+      reloads.push(options);
+      reload(options);
+    };
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(calls, 1, 'the compression made its call');
+    assert.equal(fx.target.summaryId, 'L1-900', 'then adopted the L1 the other instance wrote meanwhile');
+    const overTarget = fx.strategy.summariesView().filter((entry) => entry.level === 1 && entry.sourceIds.join(':') === other.ids.join(':'));
+    assert.deepEqual(overTarget.map((entry) => entry.id), ['L1-900'], 'and stored no second L1 over the same messages');
+    assert.ok(fx.strategy.summariesView().some((entry) => entry.id === 'L2-901'), 'it holds the summary above it');
+    assert.deepEqual(reloads, [{ keepKvUnifiedPresentation: true }], 'the lookup reloaded once, keeping the presentation');
+    assert.equal(presentation.kvUnifiedReceipts.inFlightSubmissionId, 's1', 'the submission is still in flight');
+    assert.equal(presentation.kvUnifiedDraft, draft, 'the draft is kept');
+    assert.equal(presentation.kvUnifiedPendingLayout, submittedLayout, 'the submitted layout is kept');
+    other.manager.close();
+    fx.manager.close();
+  });
+
   it('reloads branch-scoped quarantine projection on every branch switch', async () => {
     const mock = scriptedMembrane(['refusal']);
     const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });

@@ -753,16 +753,15 @@ function hasSummaryText(summary: SummaryEntry): boolean {
  * failed.
  */
 function reachableLevel(saved: number, l1Id: SummaryId | undefined, summariesById: ReadonlyMap<SummaryId, SummaryEntry>): number {
+  // Every parent sits above its summary: the load repair keeps no other, a
+  // merge names the summary it wrote a level up, and the live lookup reloads
+  // rather than adopt stored pointers. So the walk climbs and ends.
   let level = 0;
   let current = l1Id === undefined ? undefined : summariesById.get(l1Id);
   while (current && current.level <= saved) {
     level = current.level;
     const parentId = getSummaryParentId(current);
-    const parent = parentId ? summariesById.get(parentId) : undefined;
-    // The load repair keeps only parents a level up, but the live lookup
-    // adopts an appended L1's pointers as stored; stopping at a parent that
-    // isn't higher keeps this walk finite.
-    current = parent && parent.level > current.level ? parent : undefined;
+    current = parentId ? summariesById.get(parentId) : undefined;
   }
   return level;
 }
@@ -1741,6 +1740,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (abortIfStale()) return;
       this.registerStates();
       if (abortIfStale()) return;
+      // An open starts afresh the latches that rebuildChunks owns. A reload
+      // during a compression (loadPersistedState's other callers) leaves them
+      // for rebuildChunks to recompute.
+      this.chunkRecordsOrphaned = false;
+      this._orphanWarned = false;
+      this._overlapBlocked.clear();
       this.loadPersistedState();
       if (abortIfStale()) return;
       await this.deliverPendingCompressionQuarantineAlerts(sourceBranch);
@@ -2045,9 +2050,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const n = Number(r.id.replace(/^c-/, ''));
         return Number.isFinite(n) && n >= max ? n + 1 : max;
       }, 0);
-      this.chunkRecordsOrphaned = false;
-      this._orphanWarned = false;
-      this._overlapBlocked.clear();
     }
     const summaries = this.store.getStateJson(this.summariesStateId);
     const loaded = Array.isArray(summaries) ? (summaries as SummaryEntry[]) : [];
@@ -2125,25 +2127,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // it, and two such summaries can list each other, each covering the
     // other's messages. Repeat to a fixed point. Dropping costs the
     // ancestors' text; their surviving sources merge again.
+    // A drop's reason comes from its sources' levels as loaded, so it doesn't
+    // depend on which summary the pass reaches first.
     const ancestorIds: string[] = [];
     const misplacedIds: string[] = [];
+    const loadedLevel = new Map([...byId].map(([id, summary]) => [id, summary.level]));
+    const notBelow = (summary: SummaryEntry) =>
+      summary.sourceIds.some((sourceId) => (loadedLevel.get(sourceId) ?? 0) >= summary.level);
     for (let changed = true; changed;) {
       changed = false;
       for (const [id, summary] of byId) {
-        if (!(summary.level > 1)) continue;
-        const sources = summary.sourceIds.map((sourceId) => byId.get(sourceId));
-        if (sources.every((source) => source !== undefined && source.level < summary.level)) continue;
+        if (!(summary.level > 1) || (!notBelow(summary) && summary.sourceIds.every((sourceId) => byId.has(sourceId)))) continue;
         byId.delete(id);
-        (sources.includes(undefined) ? ancestorIds : misplacedIds).push(id);
+        (notBelow(summary) ? misplacedIds : ancestorIds).push(id);
         changed = true;
       }
     }
 
     // A summary has one parent: the first of its own pointers, then its other
     // copies' (`parentId` before the older `mergedInto` in each, as readers
-    // take them), that names a kept summary listing it among its sources,
-    // which sits above it, as every kept summary sits above what it lists.
-    // Without one, its parent is the kept summary one level up that lists
+    // take them), that names a kept summary above it listing it among its
+    // sources, so no two summaries can be each other's parent. Without one, its parent is the kept summary one level up that lists
     // it, when exactly one does: a pointer can name a summary further up,
     // such as a grandparent, or nothing, while the parent that covers the
     // summary lists it, and clearing the pointer would render the summary
@@ -2156,12 +2160,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const clearedIds: string[] = [];
     const covers = (pointer: unknown, summary: SummaryEntry): pointer is string => {
       const parent = typeof pointer === 'string' ? byId.get(pointer) : undefined;
-      return !!parent && parent.sourceIds.includes(summary.id);
+      return !!parent && parent.level > summary.level && parent.sourceIds.includes(summary.id);
     };
     const listedBy = new Map<string, SummaryEntry[]>();
     for (const summary of byId.values()) {
       if (summary.level === 1) continue;
-      for (const sourceId of summary.sourceIds) {
+      for (const sourceId of new Set(summary.sourceIds)) {
         const listers = listedBy.get(sourceId);
         if (listers) listers.push(summary);
         else listedBy.set(sourceId, [summary]);
@@ -2227,8 +2231,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
+    // The counter is shared by every instance on the store, and each writes
+    // its own, so the stored value can trail ids already written. A new id
+    // must repeat none of them.
     const counter = this.store.getStateJson(this.counterStateId);
-    this.summaryIdCounter = typeof counter === 'number' ? counter : 0;
+    const pastIds = [...copiesById.keys()].reduce((past, id) => {
+      const n = Number(/^L\d+-(\d+)$/.exec(id)?.[1]);
+      return Number.isFinite(n) && n >= past ? n + 1 : past;
+    }, 0);
+    this.summaryIdCounter = Math.max(typeof counter === 'number' ? counter : 0, pastIds);
 
     const queue = this.store.getStateJson(this.mergeQueueStateId);
     this.mergeQueue = Array.isArray(queue)
