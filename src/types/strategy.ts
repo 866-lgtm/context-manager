@@ -23,7 +23,14 @@ export interface MessageStoreView {
   length(): number;
   /** Estimate tokens for a message */
   estimateTokens(message: StoredMessage): number;
-  /** Closed-loop estimator calibration (optional — MessageStore provides it). */
+  /**
+   * Closed-loop estimator calibration (optional — MessageStore provides it).
+   * The strategy owns the factor (see MessageStore's tokenCalibration). A view
+   * supplies both of these or neither: a dry select reads the factor before
+   * its load changes it and puts it back afterwards, so it throws for a view
+   * with the setter alone rather than change a factor it can't restore. A
+   * view with neither is a fixed estimator.
+   */
   setTokenCalibration?(factor: number): void;
   getTokenCalibration?(): number;
   /**
@@ -524,6 +531,16 @@ export function isSummaryOverviewStrategy(s: ContextStrategy): s is SummaryOverv
   );
 }
 
+/** A calibration multiplier discarded on load (see `RenderStats.calibration`). */
+export interface CalibrationReset {
+  /** The multiplier that was discarded. */
+  discardedMultiplier: number;
+  /** The pricing epoch it was learned under (a record without a stamp counts as 1). */
+  fromEpoch: number;
+  /** When it was discarded (ms since epoch). */
+  at: number;
+}
+
 /**
  * Per-render observability stats from a strategy. Counts and token sums for
  * head / tail / summaries / pending work, suitable for TUIs and dashboards
@@ -553,6 +570,24 @@ export interface RenderStats {
    * Q/A pair, so it counts as 2 messages here.
    */
   total: { messages: number; tokens: number };
+
+  /**
+   * Estimator calibration in force for this compile: the multiplier applied
+   * to every token estimate and the pricing epoch it was learned under.
+   * `reset` is present once a multiplier from an older epoch (a record
+   * without a stamp counts as epoch 1) has been discarded on load. It is kept
+   * in the persisted calibration state, so it stays visible across restarts,
+   * learning and a later epoch's re-stamp until an operator re-stamps the
+   * record without it; a later discard replaces it, and an older binary
+   * after a rollback writes its own record, without it, over a newer one. A
+   * discard shrinks (or grows) the window by the old multiplier's ratio, so
+   * it should be seen, not only logged once.
+   */
+  calibration?: {
+    multiplier: number;
+    pricingEpoch: number;
+    reset?: CalibrationReset;
+  };
 
   /**
    * Planner/emitter reconciliation for this compile. `planned` is the picker's

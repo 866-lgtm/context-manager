@@ -482,6 +482,11 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
           self._lastRenderStats = null;
           self._lastCompileEstimate = 1;
           self._calibrationArmed = true;
+          self._calibrationLoaded = false;
+          self._calibration = 1.5;
+          self._calibrationReset = { discardedMultiplier: 9, fromEpoch: 0, at: 1 };
+          // The multiplier the store prices by, which the dry load applies.
+          (args[0] as { setTokenCalibration?(factor: number): void }).setTokenCalibration?.(3);
           self._storeView = {};
           self._storeOrder = new Map();
           self._cachedHeadStartIndex = { id: 'zz', msgCount: 1, result: 0 };
@@ -503,13 +508,18 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
     // Every field select() saves and restores, read by identity.
     const fields = [
       'chunks', 'compressionQueue', 'chunkRecordsOrphaned', '_orphanWarned', '_prevCacheKeys', 'lastFrontierTokens',
-      'transitionBlocked', '_lastRenderStats', '_lastCompileEstimate', '_calibrationArmed', '_storeView', '_storeOrder',
-      '_cachedHeadStartIndex',
+      'transitionBlocked', '_lastRenderStats', '_lastCompileEstimate', '_calibrationArmed', '_calibrationLoaded',
+      '_calibration', '_calibrationReset', '_storeView', '_storeOrder', '_cachedHeadStartIndex',
     ];
-    const raw = () => fields.map((f) => (strategy as unknown as Record<string, unknown>)[f]);
+    const storeCalibration = () =>
+      (manager as unknown as { messageStore: { getTokenCalibration(): number } }).messageStore.getTokenCalibration();
+    const raw = () => [
+      ...fields.map((f) => (strategy as unknown as Record<string, unknown>)[f]),
+      storeCalibration(),
+    ];
     const rawBefore = raw();
     const assertRestored = (when: string) => raw().forEach((value, i) =>
-      assert.strictEqual(value, rawBefore[i], `${fields[i]} is put back ${when}`));
+      assert.strictEqual(value, rawBefore[i], `${fields[i] ?? 'the store\'s token calibration'} is put back ${when}`));
     await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true });
     assert.strictEqual(before(), expected);
     assertRestored('after a dry compile');

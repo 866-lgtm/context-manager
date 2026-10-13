@@ -24,6 +24,7 @@ import type {
   SearchResult,
   TimeRangeSummaryEntry,
   RenderStats,
+  CalibrationReset,
   HotContextSettingsUpdate,
   HotContextSettingsStatus,
   SelectOptions,
@@ -72,6 +73,12 @@ import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms } from '../raw-forms.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
+
+/** A persisted reset record is trusted only if it has the expected shape. */
+function isCalibrationReset(v: unknown): v is CalibrationReset {
+  const r = v as CalibrationReset | null | undefined;
+  return !!r && Number.isFinite(r.discardedMultiplier) && Number.isFinite(r.fromEpoch) && Number.isFinite(r.at);
+}
 
 /**
  * Append a JSONL entry describing one compression LLM call to the path
@@ -1792,6 +1799,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibration = 1;
     this._calibrationEma = null;
     this._calibrationLoaded = false;
+    this._calibrationReset = null;
     this._imageWatermark = undefined;
     this._imageWatermarkLoaded = false;
     this._lastKvStable = null;
@@ -4856,11 +4864,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the next one and for observers: the cache-marker baseline the next
     // compile measures its stable prefix against, the transition status
     // (getHotContextSettings), the render stats (getRenderStats, with its
-    // plan-vs-actual), calibration's estimate, arming and store view, the
-    // store order and the head-window memo stay as the last committing select
-    // left them. They are put back here, on every path out, throws included;
-    // each select path gates its own persistence and enqueueing. The dry run's
-    // own render stats are its output, as its plan is (_lastPreview), and
+    // plan-vs-actual), calibration's estimate, arming, store view, load and
+    // multiplier, with the multiplier the store prices by (a dry select that
+    // loads the multiplier first leaves it unloaded, so the next committing
+    // select loads it again and persists what the load decides), the store
+    // order and the head-window memo stay as the last committing select left
+    // them. They are put back here, on every path out, throws included; each
+    // select path gates its own persistence and enqueueing. The dry run's own
+    // render stats are its output, as its plan is (_lastPreview), and
     // previewContext reads them from _lastPreviewStats.
     // Chunking runs dry too: a chunk the dry run closes gets no record, and
     // the chunks, the compression queue and whether chunk records are trusted
@@ -4885,6 +4896,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       lastRenderStats: this._lastRenderStats,
       lastCompileEstimate: this._lastCompileEstimate,
       calibrationArmed: this._calibrationArmed,
+      calibrationLoaded: this._calibrationLoaded,
+      calibration: this._calibration,
+      calibrationReset: this._calibrationReset,
+      storeCalibration: store.getTokenCalibration?.(),
       storeView: this._storeView,
       storeOrder: this._storeOrder,
       headStartMemo: this._cachedHeadStartIndex,
@@ -4914,6 +4929,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._lastRenderStats = saved.lastRenderStats;
       this._lastCompileEstimate = saved.lastCompileEstimate;
       this._calibrationArmed = saved.calibrationArmed;
+      this._calibrationLoaded = saved.calibrationLoaded;
+      this._calibration = saved.calibration;
+      this._calibrationReset = saved.calibrationReset;
+      if (saved.storeCalibration !== undefined) store.setTokenCalibration?.(saved.storeCalibration);
       this._storeView = saved.storeView;
       this._storeOrder = saved.storeOrder;
       this._cachedHeadStartIndex = saved.headStartMemo;
@@ -5503,6 +5522,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (loud) console.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
       else console.error(line);
     }
+    r.calibration = {
+      multiplier: this._calibration,
+      pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+      ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+    };
     this._lastRenderStats = r;
     this._rs = null;
   }
@@ -8335,7 +8359,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // estimate is taken this compile.
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     let _t = _diag ? Date.now() : 0;
-    this.loadCalibration(store);
+    this.loadCalibration(store, { dryRun });
     const messages = store.getAll();
     this.refreshStoreOrder(messages);
     if (_diag) { console.error(`[cm-cache] selectAdaptive: calibration+getAll ${Date.now() - _t}ms`); _t = Date.now(); }
@@ -9245,7 +9269,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibration = clamped;
     this.applyCalibration();
     try {
-      this.store?.setStateJson(this.calibrationStateId, { multiplier: this._calibration, at: Date.now() });
+      this.store?.setStateJson(this.calibrationStateId, {
+        multiplier: this._calibration,
+        at: Date.now(),
+        pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+        ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+      });
     } catch { /* persistence is best-effort */ }
   }
 
@@ -9351,22 +9380,164 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** The EMA itself; `_calibration` is its last applied value (see the dead band). */
   private _calibrationEma: number | null = null;
   private _calibrationLoaded = false;
+  /** Set when an older-epoch multiplier was discarded; persisted with the record. */
+  private _calibrationReset: CalibrationReset | null = null;
 
   protected applyCalibration(): void {
     this._storeView?.setTokenCalibration?.(this._calibration);
   }
 
-  /** Load the persisted multiplier once and push it into the store view. */
-  protected loadCalibration(store: MessageStoreView): void {
+  /**
+   * Version of the per-class token pricing the persisted calibration
+   * multiplier was learned against. The multiplier is a residual over those
+   * rates, so it means nothing once they change: a store that pinned 1.8
+   * under the flat-600 signed-thinking price (epoch 0) comes back after the
+   * signature-priced fix estimating ~1.8x its real size. If that inflated
+   * plan is over the hard budget, the very first compile throws
+   * OverBudgetError, so no inference runs, no sample is ever reported, and
+   * the band fix in reportRealInputTokens never gets a chance to decay it: a
+   * permanent startup wedge. Bump this whenever MessageStore/ContextLog
+   * pricing changes shape, and give the new epoch an entry in
+   * CALIBRATION_EPOCH_REPRICES.
+   *
+   *   0: signed thinking at a flat HIDDEN_THINKING_TOKENS_DEFAULT (before 0.11.0)
+   *   1: signed thinking priced by signature length (0.11.0 on)
+   *   2: membrane's XML-history carriers (tool_attempt, tool_notice) priced as
+   *      the markup they replay as, where they had estimated as 0
+   *
+   * A record without a stamp counts as epoch 1: the releases from 0.11.0 until
+   * this stamp shipped wrote their records without one, under epoch 1's
+   * pricing. A record last learned before 0.11.0 has no stamp either and can't
+   * be told apart from those; the changelog gives its one-time repair.
+   *
+   * A binary from before a bump still learns after a rollback, and its first
+   * applied sample overwrites the newer epoch's record with its own stamp
+   * (reportRealInputTokens); rolling forward again treats that as an older
+   * record.
+   */
+  static readonly CALIBRATION_PRICING_EPOCH = 2;
+
+  /**
+   * For each pricing epoch, the content it repriced: a predicate over the
+   * store that is true when the store holds any. A multiplier from an older
+   * epoch is discarded only if some epoch since then repriced content this
+   * store actually holds. Otherwise its residual still means what it meant
+   * (e.g. a store on another provider's tokenizer, which never carries
+   * signed thinking), and it is re-stamped instead. An epoch without an
+   * entry here counts as repricing everything (discard, as before).
+   */
+  static readonly CALIBRATION_EPOCH_REPRICES: Readonly<Record<number, (messages: readonly StoredMessage[]) => boolean>> = {
+    // 1: signed thinking priced by signature length, not a flat 600. A block
+    // with a numeric `tokenEstimate` is priced by that stamp in both epochs
+    // (MessageStore and ContextLog read it first), so it wasn't repriced.
+    1: (messages) => messages.some((m) => m.content.some((b) => {
+      const block = b as { type?: string; signature?: unknown; tokenEstimate?: unknown };
+      return block.type === 'thinking' && typeof block.signature === 'string' && block.signature.length > 0 &&
+        typeof block.tokenEstimate !== 'number';
+    })),
+    // 2: XML-history carriers, which estimated as 0 before (an unknown block)
+    // and are now priced by MessageStore.xmlHistoryCarrierTokens.
+    2: (messages) => messages.some((m) => m.content.some((b) => MessageStore.xmlHistoryCarrierTokens(b) > 0)),
+  };
+
+  /** Whether any epoch in (fromEpoch, CALIBRATION_PRICING_EPOCH] repriced content in this store. */
+  protected calibrationRepricedSince(fromEpoch: number, messages: readonly StoredMessage[]): boolean {
+    for (let e = fromEpoch + 1; e <= AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH; e++) {
+      const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[e];
+      if (!reprices || reprices(messages)) return true;
+    }
+    return false;
+  }
+
+  /** Load the persisted multiplier once and push it into the store view.
+   *  A multiplier from an older epoch is re-stamped if no content this store
+   *  holds was repriced since, and otherwise discarded (start at 1). One from
+   *  a newer epoch is not used.
+   *  A dry select's load decides the same way from the record and the store
+   *  as they are, and the rest of its select prices by that decision (its
+   *  chunking ran before the load, at the store's factor then, as a
+   *  committing select's does), but it writes and logs nothing. select()
+   *  then puts back everything the load changed, the multiplier the store
+   *  prices by included, so the first committing select loads again, from
+   *  the record and the store as they are by then, and logs and persists
+   *  what it decides. */
+  protected loadCalibration(store: MessageStoreView, opts: { dryRun: boolean }): void {
     this._storeView = store;
     if (!this._calibrationLoaded) {
       this._calibrationLoaded = true;
+      const commit = !opts.dryRun;
+      // A load decides from the record and the store alone: an earlier dry
+      // load of this branch may have left its own decision in these.
+      this._calibration = 1;
+      this._calibrationReset = null;
       try {
-        const saved = this.store?.getStateJson(this.calibrationStateId) as { multiplier?: number } | null;
+        const saved = this.store?.getStateJson(this.calibrationStateId) as
+          { multiplier?: number; pricing?: number; reset?: CalibrationReset } | null;
         if (saved && Number.isFinite(saved.multiplier)) {
-          this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+          // No stamp: written by a release from 0.11.0 until the stamp shipped
+          // (see CALIBRATION_PRICING_EPOCH).
+          const epoch = saved.pricing ?? 1;
+          const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+          if (epoch === current) {
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+          } else if (epoch < current && !this.calibrationRepricedSince(epoch, store.getAll())) {
+            // Nothing this store holds was repriced since that epoch, so the
+            // residual is still valid: keep it and re-stamp it. A reset it
+            // carries is this store's history and stays with it, as it does
+            // through the learner's writes.
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+            if (commit) {
+              console.warn(
+                `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from pricing epoch ${epoch} ` +
+                  `(current ${current}): this store holds no content repriced since then; re-stamped`,
+              );
+              try {
+                this.store?.setStateJson(this.calibrationStateId, {
+                  multiplier: this._calibration,
+                  at: Date.now(),
+                  pricing: current,
+                  ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+                });
+              } catch { /* persistence is best-effort */ }
+            }
+          } else if (epoch < current) {
+            const reset: CalibrationReset = { discardedMultiplier: saved.multiplier!, fromEpoch: epoch, at: Date.now() };
+            this._calibrationReset = reset;
+            if (commit) {
+              console.warn(
+                `[estimator-calibration] DISCARDED multiplier ${saved.multiplier!.toFixed(2)} learned under ` +
+                  `pricing epoch ${epoch} (current ${current}); restarting from 1.00. Every token estimate ` +
+                  `changes by ${(1 / saved.multiplier!).toFixed(2)}x, and the window refolds to match. If the ` +
+                  `old value is still accurate for this store (e.g. it mostly corrects for a non-Anthropic ` +
+                  `tokenizer), check it against provider-billed input tokens and re-stamp it: ` +
+                  `setStateJson('${this.calibrationStateId}', { multiplier, at, pricing: ${current} }). ` +
+                  `Shown as calibration.reset in render stats until then.`,
+              );
+              // Persist the reset, so a rollback to a binary that ignores the
+              // stamp can't reload the stale multiplier and re-arm the wedge,
+              // and the discard isn't re-logged on every restart.
+              try {
+                this.store?.setStateJson(this.calibrationStateId, { multiplier: 1, at: Date.now(), pricing: current, reset });
+              } catch { /* persistence is best-effort */ }
+            }
+          }
+          // A record from a NEWER epoch belongs to a later binary. The load
+          // leaves it on disk and doesn't use it, and logs nothing, since
+          // re-stamping it as the discard warning advises would destroy it.
+          // This binary's learner still writes its own record over it on its
+          // first applied sample (see CALIBRATION_PRICING_EPOCH).
         }
       } catch { /* absent slot is fine */ }
+    }
+    // A dry select changes the store's multiplier only where select() read it
+    // first and can put it back (see MessageStoreView).
+    if (opts.dryRun && store.setTokenCalibration && !store.getTokenCalibration) {
+      throw new Error(
+        'A dry select needs a store view that reads its token calibration (getTokenCalibration) ' +
+          'as well as setting it, so the multiplier it applies can be put back afterwards.',
+      );
     }
     this.applyCalibration();
   }
