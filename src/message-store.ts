@@ -18,6 +18,7 @@ import type {
   ChannelTokenStatsOptions,
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
+import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from './body-runs.js';
 
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
 
@@ -133,6 +134,22 @@ function bumpWriteVersion(store: object, stateId: string): number {
 
 function currentWriteVersion(store: object, stateId: string): number {
   return sharedWriteVersions.get(store)?.get(stateId) ?? 0;
+}
+
+/** Bumped by every mutation except append. An append leaves every earlier
+ *  record untouched, so caches of per-message facts can survive it; an edit
+ *  or removal cannot be told apart from an append by the write version. */
+const sharedEditVersions = new WeakMap<object, Map<string, number>>();
+function bumpEditVersion(store: object, stateId: string): void {
+  let m = sharedEditVersions.get(store);
+  if (!m) {
+    m = new Map();
+    sharedEditVersions.set(store, m);
+  }
+  m.set(stateId, (m.get(stateId) ?? 0) + 1);
+}
+function currentEditVersion(store: object, stateId: string): number {
+  return sharedEditVersions.get(store)?.get(stateId) ?? 0;
 }
 
 /** CM_CACHE_DIAG=1: log every materialization-cache miss with its REASON and
@@ -312,7 +329,7 @@ export class MessageStore {
 
 
   private indexWriteVersion = -1;
-  private indexBranch = '';
+  private indexBranchId = '';
 
   /**
    * Id→index lookup that survives both sibling-instance writes and Chronicle
@@ -320,14 +337,16 @@ export class MessageStore {
    * stamp indexWriteVersion at their bump; a version the stamp hasn't seen
    * means a SIBLING MessageStore on this JsStore wrote. Branches can expose
    * different append-log shapes without changing that process-local version,
-   * so branch name is an independent freshness key. Rebuild once, then
+   * so native branch ID is an independent freshness key. Names can be reused
+   * after deletion, including through direct Chronicle calls with no observed
+   * intermediate switch (issue #92). Rebuild once, then
    * resolve. O(1) on every same-instance, same-branch path (2026-07-25 review
    * class: a stale index previously threw "Message not found" or, after
    * shifts, would have mutated or branched from the wrong item).
    */
   private lookupIndex(messageId: MessageId): number | undefined {
     if (
-      this.indexBranch !== this.store.currentBranch().name ||
+      this.indexBranchId !== this.store.currentBranch().id ||
       this.indexWriteVersion !== currentWriteVersion(this.store, this.stateId)
     ) {
       this.rebuildIndex();
@@ -335,8 +354,17 @@ export class MessageStore {
     return this.idToIndex.get(messageId);
   }
 
+  /** Whether the materialized cache reflects every write to the slot so far, through any instance. */
+  private cacheIsCurrent(): boolean {
+    return (
+      this.allCache !== null &&
+      this.allCache.branchId === this.store.currentBranch().id &&
+      this.allCache.writeVersion === currentWriteVersion(this.store, this.stateId)
+    );
+  }
+
   private rebuildIndex(): void {
-    this.indexBranch = this.store.currentBranch().name;
+    this.indexBranchId = this.store.currentBranch().id;
     this.indexWriteVersion = currentWriteVersion(this.store, this.stateId);
     this.idToIndex.clear();
     const messages = this.getAllInternal();
@@ -357,7 +385,7 @@ export class MessageStore {
    * continuously: on a 19.5k-message store, perf showed the agent pinning
    * a full core in serde_json between LLM calls.
    *
-   * Freshness tokens: (branch, head sequence) — with a cheap same-slot
+   * Freshness tokens: (native branch ID, head sequence) — with a cheap same-slot
    * revalidation for foreign-state writes — PLUS the process-wide
    * per-(store, stateId) write version (sharedWriteVersions above), which
    * makes edits/removals through SIBLING MessageStore instances visible:
@@ -372,7 +400,7 @@ export class MessageStore {
    * spreads; image cap/strip replace blocks rather than mutating).
    */
   private allCache: {
-    branch: string;
+    branchId: string;
     sequence: number;
     internals: StoredMessageInternal[];
     writeVersion: number;
@@ -421,7 +449,20 @@ export class MessageStore {
     // writes one record. The reconstructed state sees a fully-populated
     // StoredMessageInternal, and `branchAt(messageId)` forks at this
     // message's own sequence — exactly the post-fork-visible point.
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    // Whether this instance's id index and materialized cache reflected
+    // every write to the slot BEFORE this append — including writes made
+    // through a sibling MessageStore on the same store. A local write may
+    // re-certify only state that was current going in; a stale index or
+    // cache stays stale and is rebuilt on the next lookup. Previously the
+    // append stamped both as current regardless: after a sibling removed
+    // an earlier message, a lookup by id here returned the wrong message
+    // under the right id (Astra's reproducer, 2026-10-07).
+    const branchId = this.store.currentBranch().id;
+    const indexWasCurrent =
+      this.indexBranchId === branchId &&
+      this.indexWriteVersion === currentWriteVersion(this.store, this.stateId);
+    const cacheWasCurrent = this.cacheIsCurrent();
+    const version = bumpWriteVersion(this.store, this.stateId);
     const record = this.store.appendToStateJsonWithIdentity(
       this.stateId,
       partialInternal,
@@ -460,8 +501,9 @@ export class MessageStore {
     const canonical = canPointLookup ? this.getInternal(index) : null;
     if (
       canonical &&
+      cacheWasCurrent &&
       this.allCache &&
-      this.allCache.branch === this.store.currentBranch().name &&
+      this.allCache.branchId === this.store.currentBranch().id &&
       this.allCache.internals.length === index
     ) {
       this.allCache.internals.push(canonical);
@@ -474,13 +516,18 @@ export class MessageStore {
     } else {
       if (this.allCache) {
         cacheDiag(
-          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : this.allCache.branch !== this.store.currentBranch().name ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
+          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : !cacheWasCurrent ? 'cache was stale before the append' : this.allCache.branchId !== this.store.currentBranch().id ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
         );
       }
       this.allCache = null;
     }
 
-    this.idToIndex.set(message.id, index);
+    if (indexWasCurrent) {
+      // This instance made the write and its index reflects it.
+      this.idToIndex.set(message.id, index);
+      this.indexWriteVersion = version;
+    }
+    // Else: left stale on purpose; lookupIndex rebuilds it from the slot.
     this.emit({ type: 'add', message });
     return message;
   }
@@ -520,7 +567,9 @@ export class MessageStore {
       content: storedContent,
     };
 
+    const cacheWasCurrent = this.cacheIsCurrent();
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    bumpEditVersion(this.store, this.stateId);
     this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
 
     // Write-through the materialized cache (see append — the cached entry
@@ -532,11 +581,17 @@ export class MessageStore {
     if (
       canonicalEdit &&
       this.allCache &&
-      this.allCache.branch === this.store.currentBranch().name &&
+      this.allCache.branchId === this.store.currentBranch().id &&
       this.allCache.internals[index]
     ) {
       this.allCache.internals[index] = canonicalEdit;
       this.allCache.sequence = this.store.currentSequence();
+      // This instance made the write and the cache now reflects it: stamp
+      // the version, as append does, so the next read is a hit rather than
+      // a whole-slot reload — but only if the cache was current before the
+      // write, so a sibling's earlier edit still forces the rebuild it is
+      // owed.
+      if (cacheWasCurrent) this.allCache.writeVersion = this.indexWriteVersion;
     } else {
       this.allCache = null;
     }
@@ -566,17 +621,21 @@ export class MessageStore {
       );
     }
 
+    const cacheWasCurrent = this.cacheIsCurrent();
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
     // Write-through the materialized cache (see append); fall back to
     // invalidation if the cache wasn't current.
     if (
       this.allCache &&
-      this.allCache.branch === this.store.currentBranch().name &&
+      this.allCache.branchId === this.store.currentBranch().id &&
       this.allCache.internals.length === this.length() + 1
     ) {
       this.allCache.internals.splice(index, 1);
       this.allCache.sequence = this.store.currentSequence();
+      // See edit(): stamp our own write so it does not cost a full reload.
+      if (cacheWasCurrent) this.allCache.writeVersion = this.indexWriteVersion;
     } else {
       this.allCache = null;
     }
@@ -586,9 +645,10 @@ export class MessageStore {
   }
 
   /**
-   * Remove every shard of the bodyGroup containing `messageId`. If the
-   * message is not part of a bodyGroup, falls back to single-message
-   * remove. Atomic from the caller's perspective.
+   * Remove every shard of the body containing `messageId`: one ingestion,
+   * so another copy of the same text, under the same group id, stays (see
+   * body-runs.ts). If the message is not part of a body, falls back to
+   * single-message remove. Atomic from the caller's perspective.
    */
   removeBodyGroup(messageId: MessageId): void {
     const index = this.lookupIndex(messageId);
@@ -600,24 +660,22 @@ export class MessageStore {
       // Not sharded — defer to normal remove path (re-look up via getInternal
       // since the normal `remove` checks bodyGroupId).
       this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+      bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
       this.allCache = null; // rare path: plain invalidation
       this.rebuildIndex();
       this.emit({ type: 'remove', messageId });
       return;
     }
-    // Find the contiguous run of shards with this bodyGroupId. Shards are
-    // stored consecutively (they're appended one after the other at
-    // ingestion), so we can scan outward from `index`.
-    const groupId = target.bodyGroupId;
+    // Find this body's shards: stored consecutively, one ingestion at a
+    // time. Another ingestion of the same text carries the same group id
+    // and is another body (see body-runs.ts), so the run stops there.
     const all = this.getAllInternal();
-    let from = index;
-    while (from > 0 && all[from - 1].bodyGroupId === groupId) from--;
-    let to = index;
-    while (to + 1 < all.length && all[to + 1].bodyGroupId === groupId) to++;
+    const { from, to } = bodyBoundsIn(all, index);
     const firstId = all[from].id;
     const lastId = all[to].id;
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, from, to + 1);
     this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
@@ -627,9 +685,11 @@ export class MessageStore {
   /**
    * Remove a range of messages from the store.
    *
-   * If the range starts or ends in the middle of a bodyGroup, throws —
-   * removeRange must align to bodyGroup boundaries. (Use `removeBodyGroup`
-   * to remove an entire group, then call `removeRange` over plain messages.)
+   * If the range starts or ends in the middle of a body, throws: removeRange
+   * must align to body boundaries. A boundary between two bodies of one
+   * group id (two copies of one text) is a body boundary. (Use
+   * `removeBodyGroup` to remove one whole body, then call `removeRange` over
+   * plain messages.)
    */
   removeRange(fromId: MessageId, toId: MessageId): void {
     const fromIndex = this.lookupIndex(fromId);
@@ -642,22 +702,23 @@ export class MessageStore {
       throw new Error(`Message not found: ${toId}`);
     }
 
-    // Verify the range doesn't bisect a bodyGroup.
+    // Verify the range doesn't bisect a body: neither edge may sit between
+    // two shards of one body. The boundary between two ingestions of the
+    // same text (one group id) is not a bisection.
     const all = this.getAllInternal();
-    const startGroup = all[fromIndex].bodyGroupId;
-    const endGroup = all[toIndex].bodyGroupId;
-    if (startGroup && fromIndex > 0 && all[fromIndex - 1].bodyGroupId === startGroup) {
+    if (fromIndex > 0 && continuesBody(all[fromIndex - 1], all[fromIndex])) {
       throw new Error(
-        `removeRange would bisect bodyGroup ${startGroup} at start. Use removeBodyGroup(${fromId}) first.`,
+        `removeRange would bisect bodyGroup ${all[fromIndex].bodyGroupId} at start. Use removeBodyGroup(${fromId}) first.`,
       );
     }
-    if (endGroup && toIndex + 1 < all.length && all[toIndex + 1].bodyGroupId === endGroup) {
+    if (toIndex + 1 < all.length && continuesBody(all[toIndex], all[toIndex + 1])) {
       throw new Error(
-        `removeRange would bisect bodyGroup ${endGroup} at end. Use removeBodyGroup(${toId}) first.`,
+        `removeRange would bisect bodyGroup ${all[toIndex].bodyGroupId} at end. Use removeBodyGroup(${toId}) first.`,
       );
     }
 
     this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, fromIndex, toIndex + 1);
     this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
@@ -713,35 +774,49 @@ export class MessageStore {
     // view (internalToStored + resolveBlobs + new Date() per message) each time
     // dominated large moves:0 compiles (Sol, 2026-07-31). Key on the same
     // freshness tokens as allCache: appends bump sequence, edits/redacts bump
-    // the shared writeVersion, branch switches change branch — any of which
+    // the shared writeVersion, branch switches change branch ID — any of which
     // misses and rebuilds. The mapped array is immutable to callers, same as
     // getAllInternal's contract.
-    const branch = this.store.currentBranch().name;
-    const sequence = this.store.currentSequence();
+    const branchId = this.store.currentBranch().id;
     const writeVersion = currentWriteVersion(this.store, this.stateId);
     const c = this.allStoredCache;
+    // getAllInternal already revalidates across foreign state writes (the
+    // store-global sequence moves on every receipt or resolution write) and
+    // hands back the same array; keying on that array, not the sequence,
+    // keeps this view alive across them too. Same-instance mutators bump
+    // writeVersion (edits in place, appends by push), so both still miss.
     if (
       c &&
-      c.branch === branch &&
-      c.sequence === sequence &&
+      c.branchId === branchId &&
+      c.internals === internals &&
       c.writeVersion === writeVersion &&
       c.stored.length === internals.length
     ) {
       return c.stored;
     }
-    const stored = internals.map((internal, i) =>
-      this.internalToStored(internal, internal.id, i)
-    );
-    this.allStoredCache = { branch, sequence, writeVersion, stored };
+    // An append changes only the sequence. Every earlier message is still
+    // the same record under the same writeVersion, so keep its mapped object:
+    // per-message caches keyed on the object (salience, token estimates) then
+    // survive appends instead of missing on every compile.
+    const editVersion = currentEditVersion(this.store, this.stateId);
+    const previous = c && c.branchId === branchId && c.editVersion === editVersion ? c.stored : null;
+    const stored = internals.map((internal, i) => {
+      const reused = previous?.[i];
+      return reused && reused.id === internal.id && reused.sequence === internal.sequence
+        ? reused
+        : this.internalToStored(internal, internal.id, i);
+    });
+    this.allStoredCache = { branchId, internals, writeVersion, editVersion, stored };
     return stored;
   }
 
   /** Cached mapped view for getAll(), invalidated by the same freshness tokens
    *  as allCache (see getAll). */
   private allStoredCache: {
-    branch: string;
-    sequence: number;
+    branchId: string;
+    internals: StoredMessageInternal[];
     writeVersion: number;
+    editVersion: number;
     stored: StoredMessage[];
   } | null = null;
 
@@ -762,25 +837,13 @@ export class MessageStore {
     }
 
     if (opts.alignToBodyGroups) {
-      // Shards of a bodyGroup are contiguous by construction (removeRange
-      // refuses to bisect a group). Walk edges outward with O(item) point
-      // lookups until the group boundary.
-      const first = this.getInternal(start);
-      if (first?.bodyGroupId !== undefined) {
-        while (start > 0) {
-          const prev = this.getInternal(start - 1);
-          if (prev?.bodyGroupId !== first.bodyGroupId) break;
-          start--;
-        }
-      }
-      const last = this.getInternal(end - 1);
-      if (last?.bodyGroupId !== undefined) {
-        while (end < totalCount) {
-          const next = this.getInternal(end);
-          if (next?.bodyGroupId !== last.bodyGroupId) break;
-          end++;
-        }
-      }
+      // A body's shards are contiguous by construction (removeRange refuses
+      // to bisect one). Walk the edges outward with O(item) point lookups to
+      // the body boundary, which falls between two ingestions of the same
+      // text too (see body-runs.ts).
+      const at = (i: number) => this.getInternal(i);
+      start = bodyStart(at, start);
+      end = bodyEnd(totalCount, at, end - 1) + 1;
     }
 
     const internals = this.getSliceInternal(start, end - start);
@@ -824,12 +887,29 @@ export class MessageStore {
    * Estimate tokens for a message.
    */
   estimateTokens(message: StoredMessage): number {
+    const content = message.content;
+    const hit = this._messageTokens.get(message);
+    if (hit && hit.calibration === this.tokenCalibration && hit.blocks.length === content.length) {
+      let same = true;
+      for (let i = 0; same && i < content.length; i++) same = hit.blocks[i] === content[i];
+      if (same) return hit.tokens;
+    }
     let tokens = 0;
-    for (const block of message.content) {
+    for (const block of content) {
       tokens += this.estimateBlockTokens(block);
     }
+    this._messageTokens.set(message, { blocks: content.slice(), calibration: this.tokenCalibration, tokens });
     return tokens;
   }
+
+  /** Whole-message estimate per mapped message object. Guarded by the
+   *  identity of every block (a caller may replace one inside the same
+   *  content array) and by the calibration factor, so a changed block or a
+   *  recalibration never serves a stale sum. Entries die with the message
+   *  objects. */
+  private _messageTokens = new WeakMap<StoredMessage, {
+    blocks: readonly ContentBlock[]; calibration: number; tokens: number;
+  }>();
 
   /**
    * Closed-loop calibration multiplier applied to every estimate (default 1).
@@ -919,6 +999,40 @@ export class MessageStore {
     return raw;
   }
 
+  /**
+   * Membrane's XML-history carriers (membrane#101): a `tool_attempt` is the
+   * model's own tool-call block that dispatched nothing, replayed verbatim; a
+   * `tool_notice` is the harness's notice about refused or warned invokes,
+   * replayed as one `<tool_call_notice>` element each, escaped as membrane's
+   * formatToolCallNotice escapes it. Both reach the provider
+   * as text, so both are priced as the markup they replay as — never 0. Read
+   * structurally, so this holds whatever membrane version typed the block.
+   * Any other unknown block stays at 0. Shared with ContextLog's estimator,
+   * which applies the same uncalibrated rule; the store's calibration still
+   * applies on top of its own estimate, as for every block.
+   */
+  static xmlHistoryCarrierTokens(block: unknown): number {
+    const carrier = block as { type?: unknown; rawXml?: unknown; notices?: unknown };
+    if (carrier.type === 'tool_attempt' && typeof carrier.rawXml === 'string') {
+      return jsonTokenEstimator(carrier.rawXml);
+    }
+    if (carrier.type === 'tool_notice' && Array.isArray(carrier.notices)) {
+      // As membrane's formatToolCallNotice writes it: `&`, `<` and `>` escaped
+      // in the message and the tool name, and `"` too in the tool attribute.
+      const escapeText = (text: string): string =>
+        text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const rendered = carrier.notices
+        .map((notice) => {
+          const { invoke, toolName, kind, message } = (notice ?? {}) as Record<string, unknown>;
+          const tool = escapeText(String(toolName)).replace(/"/g, '&quot;');
+          return `<tool_call_notice invoke="${String(invoke)}" tool="${tool}" kind="${String(kind)}">${escapeText(String(message))}</tool_call_notice>`;
+        })
+        .join('\n');
+      return jsonTokenEstimator(rendered);
+    }
+    return 0;
+  }
+
   private computeBlockTokensRaw(block: ContentBlock): number {
     switch (block.type) {
       case 'text':
@@ -970,7 +1084,7 @@ export class MessageStore {
       case 'video':
         return 1000; // Default estimate for media
       default:
-        return 0;
+        return MessageStore.xmlHistoryCarrierTokens(block);
     }
   }
 
@@ -1600,19 +1714,19 @@ export class MessageStore {
   }
 
   private getAllInternal(): StoredMessageInternal[] {
-    const branch = this.store.currentBranch().name;
+    const branchId = this.store.currentBranch().id;
     const sequence = this.store.currentSequence();
     const writeVersion = currentWriteVersion(this.store, this.stateId);
     let missReason = 'no-cache';
     if (this.allCache) {
       missReason =
-        this.allCache.branch !== branch
-          ? `branch ${this.allCache.branch}→${branch}`
+        this.allCache.branchId !== branchId
+          ? `branch ${this.allCache.branchId}→${branchId}`
           : this.allCache.writeVersion !== writeVersion
             ? `writeVersion ${this.allCache.writeVersion}→${writeVersion}`
             : 'revalidate-fail';
     }
-    if (this.allCache && this.allCache.branch === branch && this.allCache.writeVersion === writeVersion) {
+    if (this.allCache && this.allCache.branchId === branchId && this.allCache.writeVersion === writeVersion) {
       if (this.allCache.sequence === sequence) {
         return this.allCache.internals;
       }
@@ -1656,7 +1770,7 @@ export class MessageStore {
     const state = this.store.getStateJson(this.stateId);
     const internals =
       !state || !Array.isArray(state) ? [] : (state as StoredMessageInternal[]);
-    this.allCache = { branch, sequence, internals, writeVersion };
+    this.allCache = { branchId, sequence, internals, writeVersion };
     cacheDiag(`getAllInternal MISS (${missReason}) stateId=${this.stateId} rebuilt ${internals.length} in ${Date.now() - _t}ms`);
     return internals;
   }
