@@ -148,14 +148,20 @@ describe('compression request preparation', () => {
     assert.deepEqual(Object.keys(input), ['__proto__']);
     assert.match(JSON.stringify(input), /^\{"__proto__":"\[embedded image\/png data URL omitted/);
   });
-  it('replaces a data URL in arguments that did not parse', () => {
-    const unparseableInput = '{"image":"data:image/png;base64,' + 'A'.repeat(5000) + '","caption":';
-    const call = { type: 'tool_use', id: 't', name: 'post', input: {}, unparseableInput } as ContentBlock;
-    const result = new Prepared().prepare(request([call]));
-    assert.equal(result.serializedMediaReplacements, 1);
-    const prepared = result.request.messages[0].content[0] as unknown as { unparseableInput: string };
-    assert.equal(prepared.unparseableInput,
-      '{"image":"[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]","caption":');
+  it('replaces a data URL in arguments that did not parse, beside one in the input, and leaves the stored call as it was', () => {
+    const url = 'data:image/png;base64,' + 'A'.repeat(5000);
+    const marker = '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]';
+    const unparseableInput = '{"image":"' + url + '","caption":';
+    const call = { type: 'tool_use', id: 't', name: 'post', input: { image: url }, unparseableInput } as ContentBlock;
+    const input = request([call]);
+    const before = JSON.stringify(input);
+    freeze(input);
+    const result = new Prepared().prepare(input);
+    assert.equal(result.serializedMediaReplacements, 2);
+    const prepared = result.request.messages[0].content[0] as unknown as { input: { image: string }; unparseableInput: string };
+    assert.equal(prepared.input.image, marker);
+    assert.equal(prepared.unparseableInput, '{"image":"' + marker + '","caption":');
+    assert.equal(JSON.stringify(input), before);
   });
   it('keeps every member of a tool call input it rebuilds, a __proto__ member included', () => {
     const url = 'data:image/png;base64,' + 'A'.repeat(5000);

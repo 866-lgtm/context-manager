@@ -11519,12 +11519,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Replace large base64 data URLs that a compression prompt carries as text:
-   * in text blocks, in tool results (string or block array), and in the
-   * strings of a tool call's input. An imported tool result can carry a
+   * in text blocks, in tool results (string or block array), and in a tool
+   * call's input, its strings or the text of arguments that didn't parse. An imported tool result can carry a
    * foreign harness's image JSON instead of a native image block; the image
    * byte cap can't see those bytes, and they are priced as prose (a 1 MiB
-   * image is about 1.4 million base64 characters). Prompt-only:
-   * stored Chronicle messages are never mutated; the marker keeps the media
+   * image is about 1.4 million base64 characters). It replaces each given
+   * message's content array and copies the blocks it changes, so a caller
+   * passes message wrappers it owns, as prepareCompressionRequest does, and
+   * stored Chronicle messages are never mutated. The marker keeps the media
    * type and the payload's length.
    */
   protected stripSerializedCompressionMedia(messages: Array<{ content: ContentBlock[] }>): number {
@@ -11546,11 +11548,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // string that almost matches fails in linear time: overlapping choices
     // took time exponential in its number of parameters.
     const dataUrl =
-      /data:((?:[A-Za-z0-9]|\\+u(?!002f)[0-9a-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u(?!002f)[0-9a-f]{4})*(?:\\*\/|\\+u002f)(?:[A-Za-z0-9]|\\+u(?!002f)[0-9a-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u(?!002f)[0-9a-f]{4})*)(?:;[A-Za-z0-9!#$&^_.+-]+=(?:\\*"[^"\\]*\\*"|(?:[^;,:\s"\\]|\\+u[0-9a-f]{4})*))*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
+      /data:((?:[A-Za-z0-9]|\\+u(?!002f)[0-9a-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u(?!002f)[0-9a-f]{4})*(?:\\*\/|\\+u002f)(?:[A-Za-z0-9]|\\+u(?!002f)[0-9a-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u(?!002f)[0-9a-f]{4})*)(?:;[A-Za-z0-9!#$&^_.+-]+=(?:\\*"(?:[^"\\]|\\+u[0-9a-f]{4})*\\*"|(?:[^;,:\s"\\]|\\+u[0-9a-f]{4})*))*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
     let replaced = 0;
-    const unescapeType = (type: string) => type
-      .replace(/\\+u([0-9A-Fa-f]{4})/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
-      .replace(/\\+\//, '/');
+    // Every backslash run in a matched type ends in `u` and four hex digits
+    // or in its slash, so one pass reads each run once.
+    const unescapeType = (type: string) => type.replace(
+      /\\+(?:u([0-9a-f]{4})|\/)/gi, (_, hex?: string) => (hex ? String.fromCharCode(parseInt(hex, 16)) : '/'),
+    );
+    // A data URL's head, matched in place, to tell a run that reaches the
+    // next data URL from one that runs into a word ending in `data`.
+    const dataUrlAt = new RegExp(dataUrl.source, 'iy');
     const stripText = (text: string): string => {
       let out = '';
       let copied = 0;
@@ -11561,14 +11568,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         let payloadEnd = m.index + match.length;
         // A run that reaches the next data URL (`…AAAAdata:`, or `…\ndata:`
         // in JSON) ends before it. The scan resumes where the payload ends.
-        if (text[payloadEnd] === ':' && run.slice(-4).toLowerCase() === 'data') payloadEnd -= 4;
+        if (text[payloadEnd] === ':' && run.slice(-4).toLowerCase() === 'data') {
+          dataUrlAt.lastIndex = payloadEnd - 4;
+          if (dataUrlAt.test(text)) payloadEnd -= 4;
+        }
         // A payload never ends in an escape of a character base64 doesn't
         // use, such as a `\n` or `\u0026` after its last line, so such
         // escapes are trimmed from the end of every run, and so are
         // backslashes that escape the character after the run (`\"`). An
         // escaped base64 character (`\/`, `\u002B`) is payload.
         for (;;) {
-          const escape = /\\(?:[bfnrt]|u([0-9A-Fa-f]{4}))$/.exec(text.slice(Math.max(payloadStart, payloadEnd - 6), payloadEnd));
+          const escape = /\\(?:[bfnrt]|u([0-9a-f]{4}))$/i.exec(text.slice(Math.max(payloadStart, payloadEnd - 6), payloadEnd));
           if (escape && !(escape[1] && /[A-Za-z0-9+/=_-]/.test(String.fromCharCode(parseInt(escape[1], 16))))) {
             payloadEnd -= escape[0].length;
           } else if (payloadEnd > payloadStart && text[payloadEnd - 1] === '\\') {

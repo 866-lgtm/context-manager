@@ -237,6 +237,8 @@ describe('matcher coverage', () => {
     const marker = (n: number) => '[embedded image/png data URL omitted from compression prompt: ' + n + ' serialized payload characters]';
     assert.equal(one('"data:image/png;base64,' + 'A'.repeat(5000) + '\\n"').text, '"' + marker(5000) + '\\n"');
     assert.equal(one('"data:image/png;base64,' + 'A'.repeat(5000) + '\\u0020"').text, '"' + marker(5000) + '\\u0020"');
+    assert.equal(one('"data:image/png;base64,' + 'A'.repeat(5000) + '\\f"').text, '"' + marker(5000) + '\\f"');
+    assert.equal(one('"data:image/png;base64,' + 'A'.repeat(5000) + '\\U000A"').text, '"' + marker(5000) + '\\U000A"');
     assert.equal(one('"data:image/png;base64,' + 'A'.repeat(4998) + '\\u002B"').text, '"' + marker(5004) + '"');
     assert.equal(one('"data:image/png;base64,' + 'A'.repeat(4998) + '\\/"').text, '"' + marker(5000) + '"');
   });
@@ -278,6 +280,26 @@ describe('matcher coverage', () => {
     const slashes = timed('data:a' + '\\u002F'.repeat(5000) + ' end');
     assert.equal(slashes.n, 0);
     assert.ok(slashes.ms < 1000, `${slashes.ms} ms`);
+  });
+  it('reads one slash in a type, and quoted parameter values that hold \\u escapes but no other backslash or quote', () => {
+    const marker = '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]';
+    assert.equal(one('data:image\\u002Fpng\\u002Fx;base64,' + 'A'.repeat(5000)).n, 0, 'a type has one slash');
+    for (const parameter of [';name="caf\\u00e9.png"', ';name=\\"caf\\u00e9 a.png\\"']) {
+      assert.equal(one('data:image/png' + parameter + ';base64,' + 'A'.repeat(5000)).text, marker, parameter);
+    }
+    for (const parameter of [';name="a\\\\b.png"', ';name=a"b']) {
+      assert.equal(one('data:image/png' + parameter + ';base64,' + 'A'.repeat(5000)).n, 0, parameter);
+    }
+  });
+  it('names a type behind a long run of backslashes in linear time', () => {
+    const started = performance.now();
+    const r = one('data:a' + '\\'.repeat(100_000) + '/b;base64,' + 'A'.repeat(5000));
+    assert.ok(performance.now() - started < 1000);
+    assert.equal(r.text, '[embedded a/b data URL omitted from compression prompt: 5000 serialized payload characters]');
+  });
+  it("ends a payload before 'data' only when a data URL follows it", () => {
+    const r = one('data:image/png;base64,' + 'A'.repeat(4094) + 'data: next');
+    assert.equal(r.text, '[embedded image/png data URL omitted from compression prompt: 4098 serialized payload characters]: next');
   });
   it("keeps 'data' at the end of a payload when no colon follows it", () => {
     const r = one('data:image/png;base64,' + 'A'.repeat(4996) + 'data"');
