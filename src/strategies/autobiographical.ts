@@ -9428,8 +9428,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 this.store?.setStateJson(this.calibrationStateId, { multiplier: this._calibration, at: Date.now(), pricing: current });
               } catch { /* persistence is best-effort */ }
             }
-          } else {
+          } else if (epoch < current) {
             const reset: CalibrationReset = { discardedMultiplier: saved.multiplier!, fromEpoch: epoch, at: Date.now() };
+            this._calibrationReset = reset;
             if (commit) {
               console.warn(
                 `[estimator-calibration] DISCARDED multiplier ${saved.multiplier!.toFixed(2)} learned under ` +
@@ -9440,21 +9441,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                   `setStateJson('${this.calibrationStateId}', { multiplier, at, pricing: ${current} }). ` +
                   `Shown as calibration.reset in render stats until then.`,
               );
-            }
-            // Persist the reset for records from an OLDER (or unstamped) epoch, so a
-            // rollback to a binary that ignores the stamp can't reload the stale
-            // multiplier and re-arm the wedge, and the discard isn't re-logged on
-            // every restart. A record from a NEWER epoch belongs to a later binary:
-            // leave it on disk and just don't use it here.
-            if (epoch < current) {
-              this._calibrationReset = reset;
-              if (commit) {
-                try {
-                  this.store?.setStateJson(this.calibrationStateId, { multiplier: 1, at: Date.now(), pricing: current, reset });
-                } catch { /* persistence is best-effort */ }
-              }
+              // Persist the reset, so a rollback to a binary that ignores the
+              // stamp can't reload the stale multiplier and re-arm the wedge,
+              // and the discard isn't re-logged on every restart.
+              try {
+                this.store?.setStateJson(this.calibrationStateId, { multiplier: 1, at: Date.now(), pricing: current, reset });
+              } catch { /* persistence is best-effort */ }
             }
           }
+          // A record from a NEWER epoch belongs to a later binary. The load
+          // leaves it on disk and doesn't use it, and logs nothing, since
+          // re-stamping it as the discard warning advises would destroy it.
+          // This binary's learner still writes its own record over it on its
+          // first applied sample (see CALIBRATION_PRICING_EPOCH).
         }
       } catch { /* absent slot is fine */ }
     }

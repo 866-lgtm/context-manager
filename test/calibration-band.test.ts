@@ -142,11 +142,23 @@ describe('estimator calibration band', () => {
     first.internals.store!.setStateJson(first.internals.calibrationStateId, future);
     first.cm.close();
 
-    const reopened = await openManager('newer-epoch');
-    await reopened.cm.compile(BUDGET);
-    assert.equal(reopened.internals._calibration, 1);
-    assert.deepEqual(reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId), future);
-    reopened.cm.close();
+    // It gets no warning either: the discard warning's re-stamp advice would
+    // overwrite the record the load means to keep.
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+    try {
+      const reopened = await openManager('newer-epoch');
+      await reopened.cm.compile(BUDGET);
+      assert.equal(reopened.internals._calibration, 1);
+      assert.deepEqual(reopened.cm.getRenderStats()!.calibration,
+        { multiplier: 1, pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH }, 'no reset either');
+      assert.deepEqual(reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId), future);
+      reopened.cm.close();
+    } finally {
+      console.warn = warn;
+    }
+    assert.deepEqual(warned.filter((l) => l.includes('[estimator-calibration]')), []);
   });
 
   it('a multiplier learned under the current pricing epoch survives reopen', async () => {
