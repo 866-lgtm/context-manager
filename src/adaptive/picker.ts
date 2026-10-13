@@ -185,6 +185,12 @@ export interface PickerChunk {
   id: ChunkId;
   sequence: number;
   rawTokens: number;
+  /**
+   * The level this chunk carries in from the last committed solve. The greedy
+   * solvers and kv-stable render a pinned chunk raw whatever it carries (the
+   * greedy solvers seed it at 0); kv-unified composes a pin with the chunk's
+   * other constraints, a lock among them.
+   */
   currentResolution: number;
   lockedByAgent: boolean;
   bodyGroupId?: string;

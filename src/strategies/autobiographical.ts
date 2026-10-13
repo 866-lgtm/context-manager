@@ -1563,7 +1563,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Lock a message so the adaptive picker won't change its resolution.
+   * Lock a message so the adaptive picker won't change its stored resolution.
+   * A classic pin (one without a `level` or `maxLevel`) still overrides the
+   * lock while it stands: under the greedy solvers and kv-stable, the pinned
+   * message renders raw, and its locked level stays stored and returns when
+   * the pin is removed. kv-unified treats a pin and a lock as constraints and
+   * reports a conflict when they are incompatible.
    * No-op when adaptiveResolution is false. Set-only programmatic API per
    * the design (no agent-facing tool in V1). Persisted to chronicle.
    */
