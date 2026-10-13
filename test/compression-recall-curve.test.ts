@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { after, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
@@ -16,6 +17,7 @@ const paths: string[] = [];
 function freshPath(): string {
   const path = `${BASE}-${sequence++}`;
   paths.push(path);
+  if (existsSync(path)) rmSync(path, { recursive: true, force: true });
   return path;
 }
 
@@ -193,6 +195,8 @@ class ProbeStrategy extends AutobiographicalStrategy {
     }).compressionRefusalQuarantine;
     return [...projection.keys()].sort();
   }
+
+  inputBound(request: NormalizedRequest): number { return (this as unknown as { compressionRequestInputBoundTokens(r: NormalizedRequest): number }).compressionRequestInputBoundTokens(request); }
 
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> {
     return this.compressChunkHierarchical(chunk, ctx);
@@ -2344,5 +2348,42 @@ describe('compression refusal recall curves', () => {
     );
     assert.equal(sent.length, 1, 'initialization retries the pending keyed alert attempt');
     fx.manager.close();
+  });
+});
+
+describe('prepared recall expansions', () => {
+  after(cleanup);
+  it('retains expansion eligibility and prices/hashes the prepared requests for parent and child data URLs', async () => {
+    for (const location of ['parent', 'child']) {
+      const mock = flexibleMembrane([
+        { stop: 'refusal', omitUsage: true }, { stop: 'refusal', omitUsage: true }, { stop: 'refusal', omitUsage: true },
+      ]);
+      const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 2 });
+      const payload = 'U'.repeat(20000);
+      const entry = location === 'parent' ? fx.parents[1] : fx.children[2];
+      entry.content = 'authored data:image/png;base64,' + payload;
+      fx.strategy.flushSummaries();
+      const storedBefore = JSON.stringify(fx.manager.getStore().getStateJson('default/autobio:summaries'));
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      assert.equal(mock.calls.length, 3);
+      assert.ok(recallIds(mock.calls[1].request).includes('L1-102'), 'newest parent remains expandable');
+      for (const call of mock.calls) assert.ok(!JSON.stringify(call.request).includes(payload));
+      const expectedCall = location === 'parent' ? mock.calls[0] : mock.calls[1];
+      assert.ok(JSON.stringify(expectedCall.request).includes('omitted from compression prompt'));
+      const record = quarantineEvents(fx.manager).map(e => e.record).find(Boolean) as {
+        canonicalRequestHash: string; canonicalRequestBoundTokens: number;
+        plan: Array<{ requestHash: string; deterministicInputBoundTokens: number }>;
+      };
+      const hash = (r: NormalizedRequest) => createHash('sha256').update(JSON.stringify(r)).digest('hex');
+      assert.equal(record.canonicalRequestHash, hash(mock.calls[0].request));
+      assert.equal(record.canonicalRequestBoundTokens, fx.strategy.inputBound(mock.calls[0].request));
+      for (const call of mock.calls.slice(1)) {
+        const planned = record.plan.find(p => p.requestHash === hash(call.request));
+        assert.ok(planned, 'family plan hashes the actual prepared candidate');
+        assert.equal(planned.deterministicInputBoundTokens, fx.strategy.inputBound(call.request));
+      }
+      assert.equal(JSON.stringify(fx.manager.getStore().getStateJson('default/autobio:summaries')), storedBefore);
+      fx.manager.close();
+    }
   });
 });

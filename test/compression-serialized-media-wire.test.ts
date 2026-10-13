@@ -117,6 +117,8 @@ describe('split-stitch rung', () => {
       cm.addMessage('User', [{ type: 'text', text: `split me data:image/png;base64,${payload}` }]);
       for (let i = 0; i < 40; i++) cm.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: filler(i) }]);
     }, 2);
+    assert.ok(requests[1].includes(MARKER), 'the refused source-only request was prepared too');
+    assert.ok(!requests[1].includes(payload), 'no payload in the source-only attempt');
     const split = requests.slice(2).filter((r) => r.includes('split me'));
     assert.ok(split.length > 0, 'the split rung ran and replayed the media message');
     assert.equal(split.filter((r) => r.includes(payload)).length, 0, 'payload in a split sub-request');
@@ -140,5 +142,25 @@ describe('matcher coverage', () => {
   });
   it('still survives a ~9M-character escaped payload on V8', () => {
     assert.equal(one('data:image\\/png;base64,' + 'A\\/'.repeat(3e6)).n, 1);
+  });
+});
+
+describe('transition request preparation', () => {
+  it('projects the transition head without changing its stored message', async () => {
+    const payload = 'T'.repeat(5000);
+    const { membrane, requests } = recorder();
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: 'm', headWindowTokens: 100000, recentWindowTokens: 100000,
+      autoTickOnNewMessage: false,
+    });
+    const cm = await ContextManager.open({ path: join(dir, 'transition'), strategy, membrane: membrane as never });
+    const id = cm.addMessage('User', [{ type: 'text', text: 'data:image/png;base64,' + payload }]);
+    const ctx = (cm as unknown as { createStrategyContext(): never }).createStrategyContext();
+    await strategy.generateTransitionSummary(ctx);
+    assert.equal(requests.length, 1);
+    assert.ok(requests[0].includes(MARKER));
+    assert.ok(!requests[0].includes(payload));
+    assert.ok(JSON.stringify(cm.getMessage(id)).includes(payload));
+    cm.close();
   });
 });

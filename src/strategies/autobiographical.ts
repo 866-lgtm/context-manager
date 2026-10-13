@@ -3063,13 +3063,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       const leafCoverageHash = sha256Json(childLeaves);
       try {
+        const preparedRequest = this.prepareCompressionCandidate(request, `recall-expansion:${parent.id}`);
         variants.push({
           parent,
           children,
           leafCoverageHash,
-          request,
-          requestHash: sha256Json(request),
-          deterministicInputBoundTokens: this.compressionRequestInputBoundTokens(request),
+          request: preparedRequest,
+          requestHash: sha256Json(preparedRequest),
+          deterministicInputBoundTokens: this.compressionRequestInputBoundTokens(preparedRequest),
         });
       } catch {
         // One malformed/unsupported variant cannot suppress later candidates.
@@ -6148,21 +6149,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // code has no way to recover the older one. On either reading, omitting
     // it is what installs a competing (system-promptless) identity.
     // See ContextManager.setSystemPrompt.
-    // Own the byte wall here rather than delegating to membrane's shed: cap
-    // the prompt's inline image bytes newest-first before the request is built.
-    // A tighter budget than the live window's: a compression prompt also
-    // carries the head, the whole recall frontier and the raw chunk, so the
-    // image share must leave room for all of it under the API's 32MB cap.
-    //
-    // Cap `cleaned` — the list the wire messages are derived from — not
-    // `llmMessages`: splitMixedToolMessages/collapse REBUILD message objects,
-    // so a cap applied to the pre-split list logs its strips against copies
-    // the request never ships (field repro 2026-09-21: "replaced 1 older
-    // image ... kept 0MB" logged while the mint still 400'd on
-    // image_input_not_supported). The merge builder has always capped its
-    // post-split list; this aligns the L1 builder with it.
-    this.projectCompressionWireMessages(cleaned as Array<{ content: ContentBlock[] }>);
-
+    // Build authored recall pairs before preparation. A projected answer no
+    // longer equals the stored authored answer that the expansion matches.
     // Final wire-shape messages. Sanitize: strip empty text blocks and drop
     // any message left with no content (empty text reaches the API as a 400
     // that stalls ALL compression — see the twin note on the request below).
@@ -6175,7 +6163,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       keptSummaries.length < priorSummaries.length,
     );
 
-    const request: NormalizedRequest = {
+    const authoredRequest: NormalizedRequest = {
       // Served FIRST, ahead of the head — the live activation's own layout
       // (system prompt -> head -> middle). Conditionally spread rather than
       // assigned: an undeclared prompt must leave the request shape, its
@@ -6220,12 +6208,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       tools: ctx.tools,
     };
 
+    const request = this.prepareCompressionCandidate(authoredRequest, 'canonical');
     let sourceOnlyFallbackRequest: NormalizedRequest | undefined;
     if (sourceOnlyFallbackMessages) {
       const sourceOnlyCleaned = stripUnpairedToolBlocks(
         this.collapseConsecutiveMessages(splitMixedToolMessages(sourceOnlyFallbackMessages)),
       );
-      this.projectCompressionWireMessages(sourceOnlyCleaned as Array<{ content: ContentBlock[] }>);
       const sourceOnlyFallbackWireMessages = sourceOnlyCleaned
         .map(m => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) }))
         .filter(m => m.content.length > 0);
@@ -6243,7 +6231,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       };
     }
 
-    // Retain the exact normalized canonical request and frontier. Variants are
+    if (sourceOnlyFallbackRequest) {
+      sourceOnlyFallbackRequest = this.prepareCompressionCandidate(sourceOnlyFallbackRequest, 'source-only');
+    }
+
+    // Retain the exact prepared canonical request and authored frontier. Variants are
     // derived solely by replacing one isolated recall pair; the canonical call
     // below is always issued first and is never rebuilt through fallback code.
     const canonicalRequestHash = sha256Json(request);
@@ -6251,7 +6243,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ? sha256Json(sourceOnlyFallbackRequest)
       : undefined;
     const variants = this.buildRecallCurveVariants(
-      request,
+      authoredRequest,
       keptSummaries,
       allMessages,
     );
@@ -6393,6 +6385,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         expandedParentId?: string,
         expandedChildIds?: string[],
       ): Promise<unknown> => {
+        attemptRequest = this.prepareCompressionCandidate(attemptRequest, curveLabel);
         const started = Date.now();
         let response: unknown;
         // The request the transport ACCEPTED, which is the one that authored
@@ -6424,7 +6417,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             operation: 'compress_l1',
             metadata: { curveLabel, error: String(error).slice(0, 300) },
           });
-          acceptedRequest = stripReasoningFromRequest(attemptRequest);
+          acceptedRequest = this.prepareCompressionCandidate(
+            stripReasoningFromRequest(attemptRequest), `${curveLabel}:text-only`,
+          );
           response = await ctx.membrane!.complete(
             acceptedRequest,
             { formatter: this.nativeFormatter },
@@ -6573,6 +6568,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           recallLevels: number[],
           coverageHash: string,
         ): Promise<void> => {
+          hoistedRequest = this.prepareCompressionCandidate(hoistedRequest, curveLabel);
           const requestHash = sha256Json(hoistedRequest);
           try {
             const rungResponse = await runAttempt(hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash);
@@ -6857,14 +6853,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               { participant: 'Context Manager', content: [{ type: 'text', text: this.applyIdentityReminder(this.getCompressionInstruction(chunk, target)) }] as ContentBlock[] },
             ];
             const cleaned = stripUnpairedToolBlocks(this.collapseConsecutiveMessages(splitMixedToolMessages(msgs)));
-            this.projectCompressionWireMessages(cleaned as Array<{ content: ContentBlock[] }>);
-            return {
+            return this.prepareCompressionCandidate({
               ...(ctx.systemPrompt ? { system: ctx.systemPrompt } : {}),
               shedOversizeImages: true,
               messages: cleaned.map((m) => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) })).filter((m) => m.content.length > 0),
               config: structuredClone(request.config),
               tools: ctx.tools,
-            } as NormalizedRequest;
+            } as NormalizedRequest, 'split');
           };
           type SplitPart = { range: [number, number]; kind: 'fold' | 'placeholder'; tokens: number; inputTokens?: number; requestHash?: string; responseContentHash?: string; contentHash: string; text: string };
           const chunkChars = Math.max(1, chunk.messages.reduce((n, m) => n + textOf(m).length, 0));
@@ -7935,13 +7930,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const collapsed = this.collapseConsecutiveMessages(split);
     const cleaned = stripUnpairedToolBlocks(collapsed);
 
-    // Byte wall on the MERGE prompt too (2026-07-12). A merge expands its
-    // sources ONE LEVEL DEEPER — an L2 merge therefore replays the RAW
-    // messages under its L1s, images and all (including screenshots nested in
-    // tool_results). This is the path that kept tripping membrane's transport
-    // shed at 27MB after the L1 site was already capped. Own it here.
-    this.projectCompressionWireMessages(cleaned as Array<{ content: ContentBlock[] }>);
-
     // Final wire-shape messages. Sanitize: strip empty text blocks and drop
     // any message left with no content (empty text reaches the API as a 400
     // that stalls ALL compression — see the twin note on the request below).
@@ -8017,9 +8005,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // — same rationale as the L1 site's 'canonical-toolless' stage.
     const toollessEscalation =
       retryAfterToolUse && (this.mergeQueue[0]?.attempts ?? 0) >= 2;
-    const dispatchRequest = toollessEscalation
-      ? withoutToolsParam(request)
-      : request;
+    const dispatchRequest = this.prepareCompressionCandidate(
+      toollessEscalation ? withoutToolsParam(request) : request, `merge-l${targetLevel}`,
+    );
     if (toollessEscalation) {
       console.warn(
         `[autobiographical] L${targetLevel} merge retry ${this.mergeQueue[0]?.attempts} — escalating to tools-less request`,
@@ -8053,7 +8041,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           operation: `merge_l${targetLevel}`,
           metadata: { error: String(error).slice(0, 300) },
         });
-        acceptedRequest = stripReasoningFromRequest(dispatchRequest);
+        acceptedRequest = this.prepareCompressionCandidate(
+          stripReasoningFromRequest(dispatchRequest), `merge-l${targetLevel}:text-only`,
+        );
         response = await ctx.membrane.complete(acceptedRequest, { formatter: this.nativeFormatter });
       }
       // Request identity — persisted on the authored summary (provenance) and
@@ -10780,7 +10770,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       },
     };
 
-    const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
+    const prepared = this.prepareCompressionCandidate(request, 'transition');
+    const response = await ctx.membrane.complete(prepared, { formatter: this.nativeFormatter });
     if (!this.isCompressionBranchCurrent(sourceBranch)) {
       throw new Error('Transition summary crossed a branch generation; reinitialize before retrying');
     }
@@ -11410,26 +11401,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  their images, so they get a tighter image budget than the live window. */
   protected static readonly DEFAULT_MAX_COMPRESSION_IMAGE_BYTES = 12 * 1024 * 1024;
 
-  /** Base64 payload size of an image block (0 for non-base64 sources). */
+  /** Serialized inline payload characters (0 for remote URL sources). */
   protected static imageBlockBytes(b: unknown): number {
-    const src = (b as { source?: { data?: string } }).source;
-    return typeof src?.data === 'string' ? src.data.length : 0;
+    const image = b as { data?: unknown; source?: { data?: unknown; url?: unknown } };
+    const src = image.source;
+    if (typeof src?.data === 'string') return src.data.length;
+    if (typeof src?.url === 'string' && /^data:/i.test(src.url)) {
+      const comma = src.url.indexOf(',');
+      return comma < 0 ? src.url.length : src.url.length - comma - 1;
+    }
+    // MCP image blocks carry the base64 payload directly, beside mimeType.
+    return typeof image.data === 'string' ? image.data.length : 0;
   }
 
   /**
-   * The ONE final projection of a compression prompt's wire messages: replace
-   * serialized base64 media carried as text, then cap inline image bytes.
-   * Every compression request builder (L1 canonical, L1 source-only, merge,
-   * split-stitch) calls this on the post-split list it actually ships; a
-   * projection applied to a pre-split list lands on copies the request never
-   * sends. Prompt-only: Chronicle messages are never mutated (copy-on-write).
+   * Prepare an independent compression candidate. Message wrappers are owned
+   * by the result; content is copied only where it changes. Stored history
+   * and other candidates retain their blocks, arrays and replay forms.
+   * No logging or dispatch: callers report the returned replacement counts.
    */
-  protected projectCompressionWireMessages(messages: Array<{ content: ContentBlock[] }>): void {
-    this.stripSerializedCompressionMedia(messages);
-    this.capCompressionImageBytes(
-      messages,
+  protected prepareCompressionRequest(request: NormalizedRequest): {
+    request: NormalizedRequest; serializedMediaReplacements: number; imageReplacements: number;
+  } {
+    const prepared = { ...request, messages: request.messages.map(message => ({ ...message })) };
+    const serializedMediaReplacements = this.stripSerializedCompressionMedia(prepared.messages);
+    const imageReplacements = this.capCompressionImageBytes(
+      prepared.messages,
       this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
     );
+    return { request: prepared, serializedMediaReplacements, imageReplacements };
+  }
+
+  private prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest {
+    const prepared = this.prepareCompressionRequest(request);
+    if (prepared.serializedMediaReplacements || prepared.imageReplacements) {
+      console.error(
+        `[autobiographical] prepared compression candidate '${label}': replaced ` +
+          `${prepared.serializedMediaReplacements} serialized data URL(s) and ` +
+          `${prepared.imageReplacements} inline image(s); preparation is not dispatch`,
+      );
+    }
+    return prepared.request;
   }
 
   /** Ignore short data-URL examples while catching actual serialized media. */
@@ -11462,29 +11474,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (payload.length < minChars) return match;
         replaced++;
         return `[embedded ${mediaType.replace('\\/', '/')} data URL omitted from compression prompt: ` +
-          `${payload.length} base64 characters; original preserved in Chronicle]`;
+          `${payload.length} serialized payload characters; original preserved in Chronicle]`;
       });
-    const strip = (blocks: ContentBlock[]): ContentBlock[] =>
-      blocks.map((block) => {
+    const strip = (blocks: ContentBlock[]): ContentBlock[] => {
+      let changed = false;
+      const stripped = blocks.map((block) => {
+        let next = block;
         if (block.type === 'text') {
           const text = stripText(block.text);
-          return text === block.text ? block : ({ ...block, text } as ContentBlock);
-        }
-        const nested = (block as { type: string; content?: unknown }).content;
-        if (block.type === 'tool_result') {
-          // Both shapes: membrane's ToolResultContent.content is string | ContentBlock[],
-          // and the string form is the common carrier (importers and AF's direct
-          // path stringify tool output).
+          if (text !== block.text) next = { ...block, text } as ContentBlock;
+        } else if (block.type === 'tool_result') {
+          const nested = block.content;
           if (typeof nested === 'string') {
             const text = stripText(nested);
-            return text === nested ? block : ({ ...block, content: text } as ContentBlock);
-          }
-          if (Array.isArray(nested)) {
-            return { ...block, content: strip(nested as ContentBlock[]) } as ContentBlock;
+            if (text !== nested) next = { ...block, content: text } as ContentBlock;
+          } else if (Array.isArray(nested)) {
+            const inner = strip(nested);
+            if (inner !== nested) next = { ...block, content: inner } as ContentBlock;
           }
         }
-        return block;
+        if (next !== block) changed = true;
+        return next;
       });
+      return changed ? releaseEditedRawForms(blocks, stripped) : blocks;
+    };
     for (const message of messages) message.content = strip(message.content);
     return replaced;
   }
@@ -11540,12 +11553,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const m = messages[i];
       if (!Array.isArray(m.content)) continue;
       m.content = capBlocks(m.content);
-    }
-    if (dropped > 0) {
-      console.error(
-        `[autobiographical] compression prompt: replaced ${dropped} older image(s) with placeholders ` +
-          `to stay under the ${Math.round(capBytes / 1e6)}MB image-byte budget (kept ${Math.round(kept / 1e6)}MB, newest-first)`,
-      );
     }
     return dropped;
   }
