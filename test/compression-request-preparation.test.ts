@@ -115,20 +115,30 @@ describe('compression request preparation', () => {
     }
     assert.equal(Prepared.bytes({ type: 'image', source: { type: 'url', url: 'https://example.test/a.png' } }), 0);
   });
-  it('replaces a data URL in a tool call input and releases the call replay form', () => {
+  it('replaces a data URL in a tool call input, changes nothing else in it, and releases the call replay form', () => {
     const url = 'data:image/png;base64,' + 'A'.repeat(5000);
+    const marker = '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]';
     const rawXml = '<function_calls><invoke name="post">' + url + '</invoke></function_calls>';
-    const call = { type: 'tool_use', id: 't', name: 'post', input: { caption: 'a cat', files: [{ url }] }, rawXml } as ContentBlock;
+    const fields = { caption: 'a cat', count: 3, ok: true, none: null, files: [{ url, size: 10 }, 'plain', [1, 'two']] };
+    const call = { type: 'tool_use', id: 't', name: 'post', input: fields, rawXml } as ContentBlock;
     const input = request([call]);
     const before = JSON.stringify(input);
     freeze(input);
     const result = new Prepared().prepare(input);
     assert.equal(result.serializedMediaReplacements, 1);
-    const prepared = result.request.messages[0].content[0] as unknown as { input: { caption: string; files: Array<{ url: string }> }; rawXml?: string };
-    assert.equal(prepared.input.caption, 'a cat');
-    assert.match(prepared.input.files[0]!.url, /^\[embedded image\/png data URL omitted from compression prompt: 5000 /);
+    const prepared = result.request.messages[0].content[0] as unknown as { input: unknown; rawXml?: string };
+    assert.deepEqual(prepared.input, { ...fields, files: [{ url: marker, size: 10 }, 'plain', [1, 'two']] });
+    assert.strictEqual((prepared.input as typeof fields).files[2], fields.files[2], 'an unchanged array keeps its identity');
     assert.equal(prepared.rawXml, undefined);
     assert.equal(JSON.stringify(input), before);
+  });
+  it('leaves a tool call whose input holds no long data URL as it is, its replay form included', () => {
+    const call = { type: 'tool_use', id: 't', name: 'post', input: { caption: 'short', list: [1, 'two', null, true] },
+      rawXml: '<function_calls><invoke name="post">short</invoke></function_calls>' } as ContentBlock;
+    const input = request([call]);
+    const prepared = new Prepared().prepare(input);
+    assert.strictEqual(prepared.request.messages[0].content, input.messages[0].content);
+    assert.strictEqual(prepared.request.messages[0].content[0], call);
   });
   it('keeps every member of a tool call input it rebuilds, a __proto__ member included', () => {
     const url = 'data:image/png;base64,' + 'A'.repeat(5000);
@@ -170,7 +180,7 @@ describe('preparation counts and logging', () => {
     assert.deepEqual(sent.logs, [
       '[autobiographical] compression prompt: replaced 1 serialized data URL(s) with markers [count-test]',
       '[autobiographical] compression prompt: replaced 1 image(s) with placeholders to stay under the ' +
-        '3.0MiB image budget (kept 2.5MiB, newest messages first) [count-test]',
+        '3.0MiB base64 image budget (kept 2.5MiB, newest messages first) [count-test]',
     ]);
     assert.deepEqual(captureErrors(() => strategy.send(request([{ type: 'text', text: 'plain' }]), 'unchanged')).logs, []);
   });

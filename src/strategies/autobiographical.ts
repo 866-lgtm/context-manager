@@ -8202,10 +8202,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         operation: `merge_l${targetLevel}`,
         // The DISPATCHED bytes — see the twin note at the compress_l1 site
         // for why this must not re-read ctx.systemPrompt after the await.
-        // `acceptedRequest` is what the transport accepted: `request`
-        // prepared, or its tools-less escalation prepared, or either with its
-        // reasoning stripped by the text-only retry. Each carries `system`
-        // through by spread, as preparation does.
+        // `acceptedRequest` is the request last sent: `request` prepared, or
+        // its tools-less escalation prepared, or, after a carrier rejection,
+        // either with its reasoning stripped, which the transport accepted
+        // unless that retry threw too. Each carries `system` through by
+        // spread, as preparation does.
         system: acceptedRequest.system ? summarizeTelemetryText(acceptedRequest.system) : null,
         messages: summarizeTelemetryMessages(acceptedRequest.messages),
         metadata: {
@@ -11507,7 +11508,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const mib = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)}MiB`;
       console.error(
         `[autobiographical] compression prompt: replaced ${counts.imageReplacements} image(s) with placeholders ` +
-          `to stay under the ${mib(counts.imageBudgetBytes)} image budget ` +
+          `to stay under the ${mib(counts.imageBudgetBytes)} base64 image budget ` +
           `(kept ${mib(counts.imageBytesKept)}, newest messages first) [${label}]`,
       );
     }
@@ -11521,8 +11522,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * in text blocks, in tool results (string or block array), and in the
    * strings of a tool call's input. An imported tool result can carry a
    * foreign harness's image JSON instead of a native image block; the image
-   * byte cap can't see those bytes, and the tokenizer prices them as prose
-   * (one image can become hundreds of thousands of tokens). Prompt-only:
+   * byte cap can't see those bytes, and they are priced as prose (a 1 MiB
+   * image is about 1.4 million base64 characters). Prompt-only:
    * stored Chronicle messages are never mutated; the marker keeps the media
    * type and the payload's length.
    */
@@ -11532,16 +11533,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // quantifier once a MATCHING run reaches ~8M characters (node 22), which
     // is exactly the media size this targets. The length floor is applied
     // below instead.
-    // Also matches MIME parameters before `;base64` (`;charset=…`, `;name=…`)
-    // and the JSON escapes serializers emit: escaped slashes, however many
-    // times the text was serialized (`image\/png`, `image\\\/png`), and
-    // escapes inside the payload, such as `\n` where base64 was wrapped or
+    // Also matches MIME parameters before `;base64` (`;charset=…`,
+    // `;name="a.png"`) and the JSON escapes serializers emit: escaped slashes,
+    // however many times the text was serialized (`image\/png`,
+    // `image\\\/png`), `\u` escapes in the type (`image\u002Fsvg\u002Bxml`),
+    // and escapes inside the payload, such as `\n` where base64 was wrapped or
     // `\u002F`. Any letter case matches (`DATA:`, `;BASE64,`), as URL schemes
     // and the base64 token do. Bare base64 under a JSON key (Anthropic
     // `"source":{"data":…}`) is out of scope.
     const dataUrl =
-      /data:([A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\\*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*)(?:;[A-Za-z0-9!#$&^_.+-]+=[^;,"\s]*)*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
+      /data:((?:[A-Za-z0-9]|\\u[0-9A-Fa-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\u[0-9A-Fa-f]{4})*(?:\\*\/|\\u002[Ff])(?:[A-Za-z0-9]|\\u[0-9A-Fa-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\u[0-9A-Fa-f]{4})*)(?:;[A-Za-z0-9!#$&^_.+-]+=[^;,\s]*)*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
     let replaced = 0;
+    const unescapeType = (type: string) => type
+      .replace(/\\u([0-9A-Fa-f]{4})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+      .replace(/\\+\//, '/');
     const stripText = (text: string): string => {
       let out = '';
       let copied = 0;
@@ -11551,12 +11556,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const payloadStart = m.index + match.length - run.length;
         let payloadEnd = m.index + match.length;
         // A run that reaches the next data URL (`…AAAAdata:`, or `…\ndata:`
-        // in JSON) ends before it and before the escapes that separate the
-        // two. The scan resumes there.
+        // in JSON) ends before it and before the line-break and tab escapes
+        // that separate the two (`\n`, `\r`, `\t`, `\u000a`, `\u000d`,
+        // `\u0009`). The scan resumes there.
         if (text[payloadEnd] === ':' && run.slice(-4).toLowerCase() === 'data') {
           payloadEnd -= 4;
-          while (payloadEnd - payloadStart >= 2 && text[payloadEnd - 2] === '\\' && 'nrt'.includes(text[payloadEnd - 1])) {
-            payloadEnd -= 2;
+          for (;;) {
+            const separator = /(?:\\[nrt]|\\u000[9aAdD])$/.exec(text.slice(Math.max(payloadStart, payloadEnd - 6), payloadEnd));
+            if (!separator) break;
+            payloadEnd -= separator[0].length;
           }
         }
         // Backslashes at the end of a run escape the character after it
@@ -11565,7 +11573,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const length = payloadEnd - payloadStart;
         if (length >= minChars) {
           out += text.slice(copied, m.index) +
-            `[embedded ${mediaType.replace(/\\+\//, '/')} data URL omitted from compression prompt: ` +
+            `[embedded ${unescapeType(mediaType)} data URL omitted from compression prompt: ` +
             `${length} serialized payload characters]`;
           copied = payloadEnd;
           replaced++;

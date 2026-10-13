@@ -206,6 +206,29 @@ describe('matcher coverage', () => {
     assert.equal(afterShort.n, 1, 'a short data URL before the escape is kept, and the next one is still found');
     assert.equal(afterShort.text, 'data:image/png;base64,AAAA\\n' + marker);
   });
+  it('matches a type written with \\u escapes, and names it unescaped', () => {
+    const svg = one('data:image\\u002Fsvg\\u002Bxml;base64,' + 'A'.repeat(5000));
+    assert.equal(svg.n, 1);
+    assert.equal(svg.text, '[embedded image/svg+xml data URL omitted from compression prompt: 5000 serialized payload characters]');
+  });
+  it('matches a MIME parameter whose value is quoted', () => {
+    const r = one('data:image/png;name=\\"a.png\\";base64,' + 'A'.repeat(5000));
+    assert.equal(r.n, 1);
+    assert.equal(r.text, '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]');
+  });
+  it('ends a payload before each line-break or tab escape that separates it from an abutting data URL', () => {
+    const url = 'data:image/png;base64,' + 'A'.repeat(5000);
+    const marker = '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]';
+    for (const separator of ['\\r\\n', '\\t', '\\u000a', '\\u000D']) {
+      const r = one(url + separator + url);
+      assert.equal(r.n, 2, separator);
+      assert.equal(r.text, marker + separator + marker, separator);
+    }
+  });
+  it("keeps 'data' at the end of a payload when no colon follows it", () => {
+    const r = one('data:image/png;base64,' + 'A'.repeat(4996) + 'data"');
+    assert.equal(r.text, '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]"');
+  });
   it('matches the scheme and the base64 token in any letter case', () => {
     const r = one('DATA:image/png;BASE64,' + 'P'.repeat(5000));
     assert.equal(r.n, 1); assert.match(r.text, /^\[embedded image\/png data URL omitted/);
