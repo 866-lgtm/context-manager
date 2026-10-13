@@ -967,7 +967,8 @@ export interface AutobiographicalConfig {
    * or that list a summary at their own level or above, and the summaries
    * above them, resolves each summary's parent pointers, and
    * reopens or removes the chunk records and queued merges that name a
-   * summary it doesn't keep.
+   * summary it doesn't keep. It also stores the summary-id counter when the
+   * stored one trails the ids the store holds.
    */
   auditOnly?: boolean;
   /** Legacy first-choice target-only merge request. Default false. */

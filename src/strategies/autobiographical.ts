@@ -2024,6 +2024,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * memory, rather than clearing them (#166).
    */
   protected loadPersistedState(options: { keepKvUnifiedPresentation?: boolean } = {}): void {
+    // The summaries a load takes up can end an overlap the guard refused, so
+    // the next queue build tests those chunks again. The orphaned-records
+    // halt and its warning stay as they are: rebuildChunks recomputes the
+    // halt, and an open clears both (clearBranchMirrors).
+    this._overlapBlocked.clear();
     if (!this.store) {
       this.summaries = [];
       this.summaryIdCounter = 0;
@@ -2045,11 +2050,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const n = Number(r.id.replace(/^c-/, ''));
         return Number.isFinite(n) && n >= max ? n + 1 : max;
       }, 0);
-      // The summaries a load takes up can end an overlap the guard refused, so
-      // the next queue build tests those chunks again. The orphaned-records
-      // halt and its warning stay as they are: rebuildChunks recomputes the
-      // halt, and an open clears both (clearBranchMirrors).
-      this._overlapBlocked.clear();
     }
     const summaries = this.store.getStateJson(this.summariesStateId);
     const loaded = Array.isArray(summaries) ? (summaries as SummaryEntry[]) : [];
@@ -2073,6 +2073,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       else copiesById.set(summary.id, [summary]);
     }
     const dupes = loaded.length - malformed - copiesById.size;
+    // The counter starts past every summary id the store holds, dropped ones
+    // included, and is stored when that raises it, before any repair below
+    // removes a summary: no later open then mints a number the store has
+    // used. A store whose counter an older version wrote can trail its ids.
+    const counter = this.store.getStateJson(this.counterStateId);
+    const pastIds = [...copiesById.keys()].reduce((past, id) => {
+      const n = Number(/^L\d+-(\d+)$/.exec(id)?.[1]);
+      return Number.isFinite(n) && n >= past ? n + 1 : past;
+    }, 0);
+    const storedCounter = typeof counter === 'number' ? counter : 0;
+    this.summaryIdCounter = Math.max(storedCounter, pastIds);
+    if (this.summaryIdCounter > storedCounter) {
+      this.store.setStateJson(this.counterStateId, this.summaryIdCounter);
+      console.warn(`[autobiographical] raised the summary-id counter from ${storedCounter} to ${this.summaryIdCounter}, past the summary ids the store holds`);
+    }
 
     // A compressed chunk record names its L1 and holds the ordered message
     // ids it gives that L1: the ids compression read, unless a repair has
@@ -2233,19 +2248,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // The counter starts past every summary id the store holds, dropped ones
-    // included, and is stored when that raises it, so no later open mints a
-    // number the store has used. A store whose counter an older version
-    // wrote can trail its ids.
-    const counter = this.store.getStateJson(this.counterStateId);
-    const pastIds = [...copiesById.keys()].reduce((past, id) => {
-      const n = Number(/^L\d+-(\d+)$/.exec(id)?.[1]);
-      return Number.isFinite(n) && n >= past ? n + 1 : past;
-    }, 0);
-    const storedCounter = typeof counter === 'number' ? counter : 0;
-    this.summaryIdCounter = Math.max(storedCounter, pastIds);
-    if (this.summaryIdCounter > storedCounter) this.store.setStateJson(this.counterStateId, this.summaryIdCounter);
-
     const queue = this.store.getStateJson(this.mergeQueueStateId);
     this.mergeQueue = Array.isArray(queue)
       ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; serverErrorStreak?: number }>)
@@ -2265,7 +2267,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const removed = this.mergeQueue.length - validMergeQueue.length;
       this.mergeQueue = validMergeQueue;
       this.store.setStateJson(this.mergeQueueStateId, this.mergeQueue);
-      console.warn(`[autobiographical] removed ${removed} merge queue item(s) with missing sources`);
+      console.warn(`[autobiographical] removed ${removed} merge queue item(s) with missing or unreadable sources`);
     }
 
     this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();

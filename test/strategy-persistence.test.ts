@@ -128,6 +128,35 @@ class TestableStrategy extends AutobiographicalStrategy {
     this.loadPersistedState({ keepKvUnifiedPresentation: true });
   }
 
+  /** The state ids the next load writes, in order. */
+  stateWrites: string[] | null = null;
+
+  stateIds(): { counter: string; summaries: string } {
+    return { counter: this.counterStateId, summaries: this.summariesStateId };
+  }
+
+  protected override loadPersistedState(options: { keepKvUnifiedPresentation?: boolean } = {}): void {
+    const store = this.store;
+    if (!store || !this.stateWrites) return super.loadPersistedState(options);
+    const writes = this.stateWrites;
+    const own = Object.getOwnPropertyDescriptor(store, 'setStateJson');
+    const write = store.setStateJson.bind(store);
+    Object.defineProperty(store, 'setStateJson', {
+      configurable: true,
+      writable: true,
+      value: (id: string, value: unknown) => {
+        writes.push(id);
+        return write(id, value);
+      },
+    });
+    try {
+      super.loadPersistedState(options);
+    } finally {
+      if (own) Object.defineProperty(store, 'setStateJson', own);
+      else delete (store as { setStateJson?: unknown }).setStateJson;
+    }
+  }
+
   readPersistedResolutions(): Record<string, number> {
     return (this.store?.getStateJson(this.resolutionsStateId) as Record<string, number> | null) ?? {};
   }
@@ -759,6 +788,7 @@ describe('AutobiographicalStrategy — persistence', () => {
     try {
       const stored = new Map(strategy.readPersistedSummaries().map((s) => [s.id, s]));
       assert.ok(!stored.has(upId), 'the summary listing one above it is dropped');
+      assert.ok(!stored.has(besideId), 'and so is the one listing an L2 the load drops as empty');
       assert.ok(stored.has(bId), 'its L1 is kept');
       assert.equal(stored.get(bId)!.mergedInto, undefined, 'and has no parent left');
       const line = warnings.find((w) => w.includes('repaired summary state')) ?? '';
@@ -923,6 +953,40 @@ describe('AutobiographicalStrategy — persistence', () => {
       assert.equal(strategy.getCounter(), 2, 'the next id repeats none in the store');
       assert.equal(strategy.readPersistedCounter(), 2, 'and the open stores the counter it raised');
     } finally { manager.close(); }
+  });
+
+  it('stores a raised counter before the repair removes the summary whose id raised it, and a second open writes nothing', async (t) => {
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      for (const text of ['one', 'two']) strategy.seedL1(text, [manager.addMessage('User', textBlock(text))]);
+      // The highest id is empty, so the open drops it; the stored counter trails it.
+      strategy.persistRawSummaries(strategy.getSummariesView().map((s) => (s.id === 'L1-1' ? { ...s, content: '' } : s)));
+      strategy.persistRawCounter(1);
+      manager.sync();
+      manager.close();
+    }
+    const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+    strategy.stateWrites = [];
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      const { counter, summaries } = strategy.stateIds();
+      assert.deepEqual(strategy.readPersistedSummaries().map((s) => s.id), ['L1-0'], 'the empty L1 is dropped');
+      assert.equal(strategy.readPersistedCounter(), 2);
+      const writes = strategy.stateWrites;
+      assert.ok(writes.includes(counter) && writes.includes(summaries), JSON.stringify(writes));
+      assert.ok(writes.indexOf(counter) < writes.indexOf(summaries), 'an open stopped between the two writes still has the counter: ' + JSON.stringify(writes));
+      assert.ok(warnings.some((w) => w.includes('raised the summary-id counter from 1 to 2')), JSON.stringify(warnings));
+    } finally { manager.close(); }
+    const again = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+    again.stateWrites = [];
+    const reopened = await ContextManager.open({ path: TEST_STORE_PATH, strategy: again });
+    try {
+      assert.deepEqual(again.stateWrites, [], 'the repaired store needs no write, the counter included');
+      assert.equal(again.getCounter(), 2);
+    } finally { reopened.close(); }
   });
 
   it('mints no id twice across instances on one store, or across a reload', async (t) => {
