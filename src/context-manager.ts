@@ -1260,8 +1260,9 @@ export class ContextManager {
   /**
    * V2 dynamic pin-at-level-k: fix a range to render at EXACTLY fold level
    * `level` (0 = raw) — the frontier cut passes through that L_k node. Honored
-   * only by `foldingStrategy: 'kv-stable'`; other strategies fall back to
-   * treating the range as raw. Returns the new pin id.
+   * by `foldingStrategy: 'kv-stable'` and `'kv-unified'` with adaptive
+   * resolution; under any other selector the range is raw, in the live view
+   * and in compression prompts alike. Returns the new pin id.
    */
   pinAtLevel(firstMessageId: MessageId, lastMessageId: MessageId, level: number, opts?: { name?: string }): string {
     return this.pinRange(firstMessageId, lastMessageId, { name: opts?.name, level });

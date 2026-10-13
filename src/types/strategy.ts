@@ -1516,8 +1516,16 @@ export interface ProtectedRange {
    * un-folded shallower. When set, this range is NOT a classic force-raw pin.
    * Takes precedence over `maxLevel`. Omitted → not a fixed-level pin.
    *
-   * Honored only by the KV-stable controller (`foldingStrategy: 'kv-stable'`);
-   * other strategies fall back to treating the range as raw (a safe superset).
+   * Honored by the folding strategies that read level bounds
+   * (`foldingStrategy: 'kv-stable'` and `'kv-unified'`, with
+   * `adaptiveResolution`); under any other selector, and without adaptive
+   * resolution, the range is raw (a safe superset). An L1 compression prompt
+   * shows raw what the configured selector keeps raw; it doesn't hold a span
+   * at its pinned level. Under the strategies that read it, a range pinned
+   * at a level above 0 is still compressed, since only a summary can supply
+   * that level. Where pins overlap at a message, a bound takes a classic
+   * pin's place there, `level` takes `maxLevel`'s, and the lowest of each
+   * kind wins.
    */
   level?: number;
   /**
@@ -1526,7 +1534,7 @@ export interface ProtectedRange {
    * under the window-pressure emergency. `maxLevel: 0` ≡ classic pin-raw.
    * Ignored when `level` is set. Omitted → this pin imposes no depth cap.
    *
-   * Honored only by the KV-stable controller; see `level`.
+   * Honored where `level` is; see `level`.
    */
   maxLevel?: number;
 }

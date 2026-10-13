@@ -801,6 +801,11 @@ function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?
   return maxLevel !== undefined ? { maxLevel } : {};
 }
 
+/** The fold bound a pinned message position resolves to
+ *  (`AutobiographicalStrategy.resolvedPinBounds`): raw, a fixed level, or a
+ *  depth cap. */
+export type ResolvedPinBound = 'raw' | { level: number } | { maxLevel: number };
+
 /**
  * Drop empty text blocks (`{type:'text', text:''}` or whitespace-only). The
  * Anthropic API rejects them with 400 "text content blocks must be non-empty",
@@ -2242,9 +2247,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * V2 dynamic pin-at-level-k convenience: fix a range to render at EXACTLY
-   * fold level `level` (0 = raw). Honored only by `foldingStrategy: 'kv-stable'`;
-   * other strategies fall back to treating the range as raw. Equivalent to
-   * `pinRange(first, last, { level })`.
+   * fold level `level` (0 = raw). Honored by `foldingStrategy: 'kv-stable'`
+   * and `'kv-unified'` with adaptive resolution; under any other selector the
+   * range is raw, in the live view and in compression prompts alike
+   * (`resolvedPinBounds`).
+   * Equivalent to `pinRange(first, last, { level })`.
    */
   pinAtLevel(firstMessageId: string, lastMessageId: string, level: number, opts?: { name?: string }): string {
     return this.pinRange(firstMessageId, lastMessageId, { name: opts?.name, level });
@@ -2454,25 +2461,56 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Resolve the V2 dynamic-pin fold-depth bounds (`ProtectedRange.level` /
-   * `maxLevel`) to message positions. Only pins that carry a bound appear; a
-   * classic raw pin (no bound) is absent here and handled by `pinnedPositions`.
-   * When ranges overlap, the FINEST requirement wins (lowest effective level):
-   * a fixed `level` clamps both ends; a `maxLevel` only caps depth. Honored
-   * solely by the KV-stable controller — see `ProtectedRange`.
+   * The fold bound each pinned message position resolves to, decided once
+   * for compression and every selector: raw, a fixed level, or a depth cap.
+   * Bounds (`ProtectedRange.level` / `maxLevel`) are honored only by the
+   * folding strategies that read them, `kv-stable` and `kv-unified`. Under
+   * every other selector, and without adaptive resolution, a pinned position
+   * is raw, as `pinAtLevel` documents. Where pins overlap at one position,
+   * kv-stable's reading applies: a bound there takes the place of a classic
+   * pin, a fixed level takes the place of a cap, and within each kind the
+   * lowest wins (`pinLevelBounds`). A level or cap of 0 is raw
+   * (`isRawPinBound`).
    */
-  /**
-   * Whether a pin bound forces a message raw, with the same precedence as the
-   * kv-stable selector: a fixed `level` wins over `maxLevel`, so
-   * `{level: 2, maxLevel: 0}` is held at L2 (not raw). A pinned position with
-   * no level bound is a classic raw pin.
-   */
-  static isForceRawPinBound(bound: { level?: number; maxLevel?: number } | undefined): boolean {
-    if (bound === undefined) return true;
-    if (bound.level !== undefined) return bound.level === 0;
-    return bound.maxLevel === 0;
+  protected resolvedPinBounds(messages: StoredMessage[]): Map<number, ResolvedPinBound> {
+    const out = new Map<number, ResolvedPinBound>();
+    const pinned = this.pinnedPositions(messages);
+    if (pinned.size === 0) return out;
+    const honorsBounds = !!this.config.adaptiveResolution &&
+      (this.config.foldingStrategy === 'kv-stable' || this.config.foldingStrategy === 'kv-unified');
+    const bounds = honorsBounds ? this.pinLevelBounds(messages) : undefined;
+    for (const position of pinned) {
+      const bound = bounds?.get(position);
+      if (bound?.level !== undefined) out.set(position, { level: bound.level });
+      else if (bound?.maxLevel !== undefined) out.set(position, { maxLevel: bound.maxLevel });
+      else out.set(position, 'raw');
+    }
+    return out;
   }
 
+  /** Whether a resolved pin bound keeps its message raw: a classic pin, or a
+   *  level or cap of 0. */
+  static isRawPinBound(bound: ResolvedPinBound): boolean {
+    if (bound === 'raw') return true;
+    return 'level' in bound ? bound.level === 0 : bound.maxLevel === 0;
+  }
+
+  /** Positions of the messages that pins keep raw (`resolvedPinBounds`). */
+  protected forceRawPinPositions(messages: StoredMessage[]): Set<number> {
+    const out = new Set<number>();
+    for (const [position, bound] of this.resolvedPinBounds(messages)) {
+      if (AutobiographicalStrategy.isRawPinBound(bound)) out.add(position);
+    }
+    return out;
+  }
+
+  /**
+   * The V2 dynamic-pin fold-depth bounds (`ProtectedRange.level` /
+   * `maxLevel`) by message position. Only pins that carry a bound appear; a
+   * classic raw pin (no bound) is absent here and handled by `pinnedPositions`.
+   * Where bounded pins overlap, the lowest fixed level and the lowest cap are
+   * kept; `resolvedPinBounds` decides between them and a classic pin.
+   */
   protected pinLevelBounds(messages: StoredMessage[]): Map<number, { level?: number; maxLevel?: number }> {
     const out = new Map<number, { level?: number; maxLevel?: number }>();
     if (this.pins.length === 0) return out;
@@ -5907,8 +5945,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       allMessages.map((message, index) => [message.id, index]),
     );
     // Raw pins in the canonical L1 prompt's recall. The live view shows a
-    // force-raw message raw; recall here used to include the summary covering
-    // it anyway. A frontier summary that can't be shown as a recall pair (it
+    // message a pin keeps raw (forceRawPinPositions) raw; recall here used to
+    // include the summary covering it anyway. A frontier summary that can't be shown as a recall pair (it
     // covers a force-raw message, or its content is empty) is DESCENDED, not
     // dropped: its children take its place, so only the branch containing the
     // pin opens up, sibling branches stay folded, and the raw added to the
@@ -5921,15 +5959,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // transition summaries and the source-only L1 do not consult pins.
     const summariesById = new Map<string, SummaryEntry>();
     for (const s of this.summaries) summariesById.set(s.id, s);
-    const pinnedPositionsSet = this.pinnedPositions(allMessages);
-    const pinBounds = this.pinLevelBounds(allMessages);
     const rawPinnedMessageIds = new Set<MessageId>();
-    for (let i = 0; i < allMessages.length; i++) {
-      if (!pinnedPositionsSet.has(i)) continue;
-      if (AutobiographicalStrategy.isForceRawPinBound(pinBounds.get(i))) {
-        rawPinnedMessageIds.add(allMessages[i].id);
-      }
-    }
+    for (const i of this.forceRawPinPositions(allMessages)) rawPinnedMessageIds.add(allMessages[i].id);
     const summaryTouchesRawPin = (summary: SummaryEntry): boolean => {
       if (rawPinnedMessageIds.size === 0) return false;
       const leaves = new Set<MessageId>();
@@ -8433,14 +8464,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       chunksByMessageId = byId;
     }
 
-    // Pinned-position set so the picker doesn't fold messages the user
-    // explicitly marked as keep-raw. Built once and reused.
-    const pinnedSet = this.pinnedPositions(messages);
-    // V2 dynamic-pin fold-depth bounds (level / maxLevel). A position with a
-    // bound is NOT a classic force-raw pin — the KV-stable controller must be
-    // able to move it to/within its bound — so it renders as `pinned: false`
-    // carrying `pinLevel` / `pinMaxLevel` instead.
-    const pinBounds = this.pinLevelBounds(messages);
+    // Each pinned position's fold bound, resolved once (resolvedPinBounds),
+    // so the picker doesn't fold what the user marked keep-raw and every
+    // selector reads a pin as compression does. A chunk carries at most one
+    // of `pinned` (raw: a classic pin, or a level or cap of 0), `pinLevel` or
+    // `pinMaxLevel`, so every reader of `pinned` agrees on what stays raw.
+    // The last two appear only under the strategies that honor them
+    // (kv-stable, kv-unified), which must be able to move the chunk to or
+    // within its bound; elsewhere a bounded pin resolves to `pinned`. Built
+    // once and reused.
+    const pinBounds = this.resolvedPinBounds(messages);
 
     // O(1) summary lookup for findAncestorAt — avoids O(summaries) find()
     // calls during emission.
@@ -8485,11 +8518,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         rawTokens: tokens,
         currentResolution: this.resolutions.get(msg.id) ?? 0,
         lockedByAgent: this.locked.has(msg.id),
-        // A classic pin (in pinnedSet with no level bound) stays force-raw. A
-        // leveled pin is not force-raw; it carries its bound instead.
-        pinned: pinnedSet.size > 0 && pinnedSet.has(i) && bound === undefined,
-        pinLevel: bound?.level,
-        pinMaxLevel: bound?.maxLevel,
+        pinned: bound !== undefined && AutobiographicalStrategy.isRawPinBound(bound),
+        pinLevel: bound !== undefined && bound !== 'raw' && 'level' in bound && bound.level > 0 ? bound.level : undefined,
+        pinMaxLevel: bound !== undefined && bound !== 'raw' && 'maxLevel' in bound && bound.maxLevel > 0 ? bound.maxLevel : undefined,
         l1Id: ch?.summaryId ?? l1ByMessage.get(msg.id),
         salience: salience[i],
       });
@@ -10219,7 +10250,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Q/A pair between head and tail; pinned messages still emit raw, in
     // their chronological positions, after the combined recall pair.
     const positionOf = this.positionIndex(messages);
-    const pinnedPositionsSet = this.pinnedPositions(messages);
+    // Without adaptive resolution no selector reads a pin's level bound, so
+    // every pinned position resolves to raw (resolvedPinBounds).
+    const pinnedPositionsSet = this.forceRawPinPositions(messages);
     // Pinned messages between head and recent (head/recent pinned ones
     // already emit raw via Phase 0 / Phase 4).
     const pinnedInMiddle: { msg: StoredMessage; position: number }[] = [];
@@ -10879,16 +10912,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Get messages in the compressible zone: outside both head window and
-   * recent window AND not inside any pinned range. Returns messages from
-   * [0, headStart) ∪ [headEnd, recentStart) minus any positions covered
-   * by a pin or document mark.
+   * recent window AND not kept raw by a pin. Returns messages from
+   * [0, headStart) ∪ [headEnd, recentStart) minus any position a pin or
+   * document mark keeps raw (forceRawPinPositions). A pin with a positive
+   * level or cap, under the strategies that honor one, is compressible: it
+   * renders at a level, which only a summary can supply.
    */
   protected getCompressibleMessages(store: MessageStoreView, exclude?: Uint8Array): StoredMessage[] {
     const messages = store.getAll();
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     const recentStart = this.getRecentWindowStart(store);
-    const pinned = this.pinnedPositions(messages);
+    const pinned = this.forceRawPinPositions(messages);
     const out: StoredMessage[] = [];
     for (let i = 0; i < recentStart; i++) {
       if (i >= headStart && i < headEnd) continue;
