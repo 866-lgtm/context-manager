@@ -11589,13 +11589,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       if (value !== null && typeof value === 'object') {
         let changed = false;
-        const fields: Record<string, unknown> = {};
-        for (const [key, item] of Object.entries(value)) {
+        const fields = Object.entries(value).map(([key, item]) => {
           const next = stripJson(item);
           if (next !== item) changed = true;
-          fields[key] = next;
-        }
-        return changed ? fields : value;
+          return [key, next] as const;
+        });
+        // fromEntries defines each key as the object's own, as JSON.parse
+        // does, so a `__proto__` member stays a member.
+        return changed ? Object.fromEntries(fields) : value;
       }
       return value;
     };

@@ -130,6 +130,16 @@ describe('compression request preparation', () => {
     assert.equal(prepared.rawXml, undefined);
     assert.equal(JSON.stringify(input), before);
   });
+  it('keeps every member of a tool call input it rebuilds, a __proto__ member included', () => {
+    const url = 'data:image/png;base64,' + 'A'.repeat(5000);
+    const parsed = JSON.parse(JSON.stringify({ image: url }).replace('{', '{"__proto__":{"note":"keep"},')) as Record<string, unknown>;
+    assert.deepEqual(Object.keys(parsed), ['__proto__', 'image']);
+    const call = { type: 'tool_use', id: 't', name: 'post', input: parsed } as ContentBlock;
+    const result = new Prepared().prepare(request([call]));
+    const input = (result.request.messages[0].content[0] as unknown as { input: Record<string, unknown> }).input;
+    assert.deepEqual(Object.keys(input), ['__proto__', 'image']);
+    assert.equal(JSON.stringify(input).startsWith('{"__proto__":{"note":"keep"},"image":"[embedded image/png'), true);
+  });
   it('reports serialized payload characters including JSON slash escapes, at the existing floor', () => {
     const payload = 'A\\/'.repeat(1500);
     const result = new Prepared().prepare(request([{ type: 'text', text: 'data:image\\/png;base64,' + payload }]));
