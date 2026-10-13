@@ -1,1 +1,0 @@
-- A block moved out of a message gives up its Responses item's id when it belongs to a reasoning pairing, as an edit does, so neither the moved block nor its partner left behind keeps an id that names the other. Context repair moves only tool results, which pair with nothing, so no request it builds today changes.

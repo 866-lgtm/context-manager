@@ -188,6 +188,18 @@ describe('raw forms: keys and release', () => {
     // An item that pairs with nothing in its message keeps its id when it moves.
     const result = { type: 'tool_result', toolUseId: 'call_1', content: 'read', rawItem: { type: 'function_call_output', id: 'fco_1' } } as ContentBlock;
     assert.equal(releaseSharedRawFormsOnMove(result, [result, itemText('after')]), result);
+    // So does one in a message whose pairing it isn't part of: after the follower, or after it in place of reasoning.
+    const fc2 = { type: 'tool_use', id: 'call_2', name: 'fs:read', input: { path: '/b' }, rawItem: { type: 'function_call', id: 'fc_2' } } as ContentBlock;
+    assert.equal(releaseSharedRawFormsOnMove(fc2, [rs1, fc1, fc2]), fc2);
+    // Reasoning at the end of a message pairs with nothing, and keeps its id.
+    const rs9 = { type: 'redacted_thinking', data: 'nine', rawItem: { type: 'reasoning', id: 'rs_9' } } as ContentBlock;
+    assert.equal(releaseSharedRawFormsOnMove(rs9, [fc1, rs9]), rs9);
+  });
+
+  it('a moved opaque carrier keeps its item even in a pairing, as a carrier always does', () => {
+    const think = reasoning();
+    const search = searchCall();
+    assert.equal(releaseSharedRawFormsOnMove(search, [think, search]), search);
   });
 });
 

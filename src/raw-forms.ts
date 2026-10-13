@@ -271,9 +271,10 @@ export function releaseTrailingReasoning(content: ContentBlock[]): ContentBlock[
  * up the raw forms it shares with any block that stays behind. A raw form it
  * carries alone moves with it, unless it belongs to a reasoning pairing: moved
  * alone, a reasoning item or the item it led to would keep the id that ties it
- * to a partner it no longer sits with, so it gives that id up too. The blocks
- * left behind are reconciled with releaseEditedRawForms, which releases the
- * rest of the pairing.
+ * to a partner it no longer sits with, so it gives that item up too, as an
+ * edit does. An opaque carrier keeps its item, as everywhere (see above). The
+ * blocks left behind are reconciled with releaseEditedRawForms, which
+ * releases the rest of the pairing.
  */
 export function releaseSharedRawFormsOnMove(
   moved: ContentBlock,
