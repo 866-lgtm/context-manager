@@ -29,6 +29,7 @@ function cleanup(): void {
 
 interface RecordedCall {
   request: NormalizedRequest;
+  originalRequest?: NormalizedRequest;
 }
 
 function response(stopReason: 'refusal' | 'end_turn' | 'max_tokens', text = '') {
@@ -84,7 +85,7 @@ function flexibleMembrane(handlers: AttemptHandler[]) {
     membrane: {
       complete: async (request: NormalizedRequest) => {
         const handler = handlers[calls.length] ?? handlers[handlers.length - 1]!;
-        calls.push({ request: structuredClone(request) });
+        calls.push({ request: structuredClone(request), originalRequest: request });
         if ('error' in handler) throw handler.error;
         if ('raw' in handler) return handler.raw;
         const result = response(handler.stop, handler.text ?? '');
@@ -398,6 +399,8 @@ describe('compression refusal recall curves', () => {
     await fx.strategy.run(fx.target, managerContext(fx.manager));
 
     assert.equal(mock.calls.length, 2, 'one retry, zero curve-fallback calls');
+    assert.notStrictEqual(mock.calls[0].originalRequest!.messages[0],
+      mock.calls[1].originalRequest!.messages[0], 'a mode rewrite owns its unchanged message wrappers');
     assert.ok(
       !JSON.stringify(mock.calls[0]!.request).includes('do not call any tools'),
       'first attempt stays byte-identical to the canonical prompt',
@@ -2385,5 +2388,28 @@ describe('prepared recall expansions', () => {
       assert.equal(JSON.stringify(fx.manager.getStore().getStateJson('default/autobio:summaries')), storedBefore);
       fx.manager.close();
     }
+  });
+});
+
+describe('prepared source-only identity', () => {
+  after(cleanup);
+  it('records the source-only hash from the prepared dispatched request', async () => {
+    const mock = scriptedMembrane(['refusal', 'refusal']);
+    const fx = await fixture(mock.membrane, {
+      compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true,
+    });
+    const payload = 'V'.repeat(20000);
+    fx.target.messages = fx.target.messages.map((m, i) => i ? m : {
+      ...m, content: [text('data:image/png;base64,' + payload)],
+    });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2);
+    assert.ok(!JSON.stringify(mock.calls[1].request).includes(payload));
+    const record = quarantineEvents(fx.manager).map(e => e.record).find(Boolean) as {
+      normalizedConfig: { sourceOnlyFallbackRequestHash: string };
+    };
+    const actualHash = createHash('sha256').update(JSON.stringify(mock.calls[1].request)).digest('hex');
+    assert.equal(record.normalizedConfig.sourceOnlyFallbackRequestHash, actualHash);
+    fx.manager.close();
   });
 });

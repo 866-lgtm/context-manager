@@ -6853,13 +6853,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               { participant: 'Context Manager', content: [{ type: 'text', text: this.applyIdentityReminder(this.getCompressionInstruction(chunk, target)) }] as ContentBlock[] },
             ];
             const cleaned = stripUnpairedToolBlocks(this.collapseConsecutiveMessages(splitMixedToolMessages(msgs)));
-            return this.prepareCompressionCandidate({
+            // runAttempt prepares this request before dispatch and trace hashing.
+            return {
               ...(ctx.systemPrompt ? { system: ctx.systemPrompt } : {}),
               shedOversizeImages: true,
               messages: cleaned.map((m) => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) })).filter((m) => m.content.length > 0),
               config: structuredClone(request.config),
               tools: ctx.tools,
-            } as NormalizedRequest, 'split');
+            } as NormalizedRequest;
           };
           type SplitPart = { range: [number, number]; kind: 'fold' | 'placeholder'; tokens: number; inputTokens?: number; requestHash?: string; responseContentHash?: string; contentHash: string; text: string };
           const chunkChars = Math.max(1, chunk.messages.reduce((n, m) => n + textOf(m).length, 0));
