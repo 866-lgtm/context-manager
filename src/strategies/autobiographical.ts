@@ -1605,7 +1605,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Lock a message so the adaptive picker won't change its resolution.
+   * Lock a message so the adaptive picker won't change its stored resolution.
+   * A classic pin (one without a `level` or `maxLevel`) still overrides the
+   * lock while it stands: under the greedy solvers and kv-stable, the pinned
+   * message renders raw, and its locked level stays stored and returns when
+   * the pin is removed. kv-unified treats a pin and a lock as constraints and
+   * reports a conflict when they are incompatible.
    * No-op when adaptiveResolution is false. Set-only programmatic API per
    * the design (no agent-facing tool in V1). Persisted to chronicle.
    */
@@ -2009,9 +2014,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Load summaries, counter, and pending merges from chronicle into the
    * in-memory mirrors. Called on every (re)initialize so branch switches
-   * pick up the new branch's state.
+   * pick up the new branch's state, and by a compression that waited on
+   * another instance's in-flight compression of its family, to take up that
+   * result (compressChunkHierarchical). That waiter passes
+   * `keepKvUnifiedPresentation`: a kv-unified strategy then keeps its own
+   * receipt chain, whose pending submission is never persisted, rather than
+   * replacing it from the store, and keeps its draft and pending layout (with
+   * the layout's marker indices and immutable prefix hash), which live only in
+   * memory, rather than clearing them (#166).
    */
-  protected loadPersistedState(): void {
+  protected loadPersistedState(options: { keepKvUnifiedPresentation?: boolean } = {}): void {
     if (!this.store) {
       this.summaries = [];
       this.summaryIdCounter = 0;
@@ -2244,14 +2256,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     if (this.config.foldingStrategy === 'kv-unified') {
-      const receiptState = this.store.getStateJson(this.kvUnifiedReceiptStateId);
-      this.kvUnifiedReceipts = receiptState && typeof receiptState === 'object'
-        ? KvUnifiedReceiptChain.deserialize(receiptState as unknown as SerializedReceiptChain)
-        : new KvUnifiedReceiptChain();
-      this.kvUnifiedDraft = null;
-      this.kvUnifiedPendingLayout = null;
-      this.kvUnifiedPendingMarkerUnitIndices = [];
-      this.kvUnifiedPendingImmutablePrefixHash = null;
+      if (!options.keepKvUnifiedPresentation) {
+        const receiptState = this.store.getStateJson(this.kvUnifiedReceiptStateId);
+        this.kvUnifiedReceipts = receiptState && typeof receiptState === 'object'
+          ? KvUnifiedReceiptChain.deserialize(receiptState as unknown as SerializedReceiptChain)
+          : new KvUnifiedReceiptChain();
+        this.kvUnifiedDraft = null;
+        this.kvUnifiedPendingLayout = null;
+        this.kvUnifiedPendingMarkerUnitIndices = [];
+        this.kvUnifiedPendingImmutablePrefixHash = null;
+      }
     } else {
       // A presentation receipt is kv-unified's record of the LAST accepted
       // presentation. Once another folding strategy PRESENTS from this store
@@ -4976,7 +4990,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (a dry rebuild at a preview's chunk size can read them as orphaned) go
     // back to the last committing rebuild's, so no tick compresses what only
     // a dry run (or a preview's overridden chunk size) cut.
+    // The image watermark (imageStripHysteresisRatio) goes back too, with the
+    // post-strip estimates priced from it. The dry run advances it for its own
+    // render and writes nothing, so a preview can't strip images from the next
+    // live compile. It's loaded here, before it's saved, so the value put back
+    // is the loaded one.
     const saved = {
+      imageWatermark: this.imageWatermark(),
+      postStripMemo: this._postStripMemo,
       chunks: this.chunks,
       compressionQueue: this.compressionQueue,
       chunkRecordsOrphaned: this.chunkRecordsOrphaned,
@@ -5004,6 +5025,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this._lastRenderStats !== saved.lastRenderStats) {
         this._lastPreviewStats = this._lastRenderStats ?? undefined;
       }
+      this._imageWatermark = saved.imageWatermark;
+      this._postStripMemo = saved.postStripMemo;
       this.chunks = saved.chunks;
       this.compressionQueue = saved.compressionQueue;
       this.chunkRecordsOrphaned = saved.chunkRecordsOrphaned;
@@ -5615,7 +5638,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   getRenderStats(store: MessageStoreView): RenderStats {
     this.requireLoadedBranch('getRenderStats');
-    return this._lastRenderStats ?? this.reconstructRenderStats(store);
+    if (this._lastRenderStats) return this._lastRenderStats;
+    // Reconstructing the recent window prices images and may advance the
+    // watermark. Like a dry select, this observer uses that advance locally
+    // and restores the watermark together with the estimates priced from it.
+    const savedWatermark = this.imageWatermark();
+    const savedMemo = this._postStripMemo;
+    const savedDryRun = this._dryRunSelect;
+    this._dryRunSelect = true;
+    try {
+      return this.reconstructRenderStats(store);
+    } finally {
+      this._dryRunSelect = savedDryRun;
+      this._imageWatermark = savedWatermark;
+      this._postStripMemo = savedMemo;
+    }
   }
 
   /**
@@ -6483,8 +6520,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The producer may belong to a different strategy instance. Reload the
       // same namespace's durable result so a successful waiter gets its L1 and
       // an exhausted waiter gets the quarantine projection rather than merely
-      // returning after somebody else's work.
-      this.loadPersistedState();
+      // returning after somebody else's work. This instance's kv-unified
+      // presentation in flight stays as it is (#166).
+      this.loadPersistedState({ keepKvUnifiedPresentation: true });
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       const coalescedSummary = this.findExactL1(chunkIdKey);
       if (coalescedSummary) {
@@ -11463,6 +11501,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
     if (next === undefined || (w !== undefined && next <= w)) return;
     this._imageWatermark = next;
+    // Dry selections and observer reconstructions advance it locally only;
+    // their finally blocks restore it together with the post-strip memo.
+    if (this._dryRunSelect) return;
     try {
       this.store?.setStateJson(this.imageWatermarkStateId, { sequence: next, at: Date.now() });
     } catch { /* persistence is best-effort */ }
@@ -11494,13 +11535,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
     // A compile asks for this pass more than once (recent-window scan, then
     // the picker inputs). The listing array is the store's own cached view,
-    // so its identity plus the knobs read here identify the answer. Callers
-    // treat the array as read-only.
+    // so its identity, calibration and the knobs key the memo, the
+    // hysteresis ratio among them: it decides whether and how the watermark
+    // strips. The watermark is not in the key: it advances only on a memo
+    // miss, and dry selections and observer reconstructions restore it with
+    // the memo. A branch reload clears both. Callers treat the array as read-only.
     const memoCalibration = store.getTokenCalibration?.() ?? 1;
+    const ratio = this.imageHysteresisRatio();
     const memo = this._postStripMemo;
     if (
       memo && memo.messages === messages && memo.calibration === memoCalibration &&
-      memo.stripDepth === stripDepth && memo.maxLive === maxLive && memo.maxLiveBytes === maxLiveBytes
+      memo.stripDepth === stripDepth && memo.maxLive === maxLive && memo.maxLiveBytes === maxLiveBytes &&
+      memo.ratio === ratio
     ) return memo.out;
     const out = new Array<number>(messages.length);
     const stripActive = stripDepth > 0 || maxLive > 0 || maxLiveBytes > 0;
@@ -11542,12 +11588,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Belt and braces: a message never costs less than nothing.
       out[i] = Math.max(0, est);
     }
-    this._postStripMemo = { messages, calibration: memoCalibration, stripDepth, maxLive, maxLiveBytes, out };
+    this._postStripMemo = { messages, calibration: memoCalibration, stripDepth, maxLive, maxLiveBytes, ratio, out };
     return out;
   }
 
   private _postStripMemo: {
-    messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; out: number[];
+    messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; ratio: number | undefined; out: number[];
   } | null = null;
 
   /** Byte wall default: 20MB of base64 (API total-request cap is 32MB). */

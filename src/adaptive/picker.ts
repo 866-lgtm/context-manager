@@ -185,10 +185,14 @@ export interface PickerChunk {
   id: ChunkId;
   sequence: number;
   rawTokens: number;
-  /** The fold level the solvers start this chunk from (0 = raw). The
-   *  autobiographical strategy passes the level the chunk was last presented
-   *  at, or, when the summaries over it no longer reach that level, the
-   *  deepest level below it that they reach. */
+  /**
+   * The level this chunk starts the solve at (0 = raw). The autobiographical
+   * strategy passes the level it carries in from the last committed solve, or,
+   * when the summaries over it no longer reach that level, the deepest level
+   * below it that they reach. The greedy solvers and kv-stable render a pinned
+   * chunk raw whatever it carries (the greedy solvers seed it at 0); kv-unified
+   * composes a pin with the chunk's other constraints, a lock among them.
+   */
   currentResolution: number;
   lockedByAgent: boolean;
   bodyGroupId?: string;
