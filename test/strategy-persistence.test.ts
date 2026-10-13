@@ -1142,27 +1142,67 @@ describe('AutobiographicalStrategy — persistence', () => {
     }
   });
 
-  it('adopts a live-appended L1 with its range derived and its parent pointers as stored', async () => {
+  it('takes up the store\'s summaries when the live lookup finds another instance\'s L1', async (t) => {
+    t.mock.method(console, 'warn', () => {});
     const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
     const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
     try {
       const ids = ['live one', 'live two', 'other chunk'].map((text) => manager.addMessage('User', textBlock(text)));
       const key = ids.slice(0, 2);
       const base = { id: 'L1-live', level: 1, content: 'live', tokens: 1, sourceLevel: 0, sourceRange: { first: ids[0], last: ids[1] }, created: 0 };
+      // What another instance wrote after this one loaded: two L1s and the L2
+      // it merged them into, beside entries readers can't use.
       strategy.persistRawSummaries([
-        { ...base, id: 'L1-other-chunk', sourceIds: [ids[2]] },
+        { ...base, id: 'L1-other-chunk', sourceIds: [ids[2]], sourceRange: { first: ids[2], last: ids[2] }, mergedInto: 'L2-other-instance' },
         { ...base, id: 'L1-string', sourceIds: ids[0] },
-        { ...base, id: 'L1-number', sourceIds: 1 },
-        { ...base, id: 'L1-null', sourceIds: null },
         { ...base, id: 'L1-empty', sourceIds: key, content: ' ' },
-        { ...base, sourceIds: key, sourceRange: undefined, mergedInto: 'L2-another-instance' },
+        { ...base, sourceIds: key, sourceRange: undefined, mergedInto: 'L2-other-instance' },
+        { id: 'L2-other-instance', level: 2, content: 'above both', tokens: 1, sourceLevel: 1, sourceIds: ['L1-live', 'L1-other-chunk'], sourceRange: { first: ids[0], last: ids[2] }, created: 0 },
       ]);
-      assert.equal(strategy.exactL1([ids[2]!])?.id, 'L1-other-chunk', 'each chunk finds its own L1');
       const found = strategy.exactL1(key);
       assert.equal(found?.id, 'L1-live');
-      assert.deepEqual(found?.sourceRange, { first: ids[0], last: ids[1] }, 'its range is derived from its sources');
-      assert.equal(found?.mergedInto, 'L2-another-instance', 'its parent stays as the store has it');
-      assert.ok(strategy.getSummariesView().includes(found!));
+      assert.deepEqual(found?.sourceRange, { first: ids[0], last: ids[1] }, 'its range is derived from its sources, as the loader derives it');
+      assert.equal(found?.mergedInto, 'L2-other-instance');
+      const held = new Map(strategy.getSummariesView().map((s) => [s.id, s]));
+      assert.ok(held.has('L2-other-instance'), 'the parent its pointer names is held too');
+      assert.equal(held.get('L1-other-chunk')?.mergedInto, 'L2-other-instance', 'and so is the rest of what the other instance wrote');
+      assert.ok(!held.has('L1-string') && !held.has('L1-empty'), 'what readers can\'t use is dropped, as on an open');
+      assert.equal(strategy.exactL1([ids[2]!])?.id, 'L1-other-chunk', 'each chunk finds its own L1');
+      assert.equal(strategy.exactL1(['not written']), undefined);
+    } finally { manager.close(); }
+  });
+
+  it('compiles under kv-unified after the live lookup finds an L1 that another instance merged', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    t.mock.method(console, 'error', () => {});
+    const strategy = new TestableStrategy({ targetChunkTokens: 300, adaptiveResolution: true, recentWindowTokens: 40, ...kvUnified });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      const ids = Array.from({ length: 8 }, (_, i) => manager.addMessage(i % 2 ? 'Claude' : 'User', textBlock(`MSG${i} ` + 'word '.repeat(60))));
+      manager.addMessage('User', textBlock('TAIL'));
+      const groups = [ids.slice(0, 4), ids.slice(4)];
+      // After this instance loaded, another compressed both chunks and merged their L1s.
+      const l1 = (g: number, content: string) => ({
+        id: `L1-other-${g}`, level: 1, content, tokens: 3, sourceLevel: 0, sourceIds: groups[g]!,
+        sourceRange: { first: groups[g]![0]!, last: groups[g]![3]! }, created: 0, mergedInto: 'L2-other',
+      });
+      strategy.persistRawSummaries([
+        l1(0, 'B-SUMMARY'), l1(1, 'C-SUMMARY'),
+        { id: 'L2-other', level: 2, content: 'P-SUMMARY', tokens: 3, sourceLevel: 1, sourceIds: ['L1-other-0', 'L1-other-1'], sourceRange: { first: ids[0]!, last: ids[7]! }, created: 0 },
+      ]);
+      strategy.persistRawChunks(groups.map((group, g) => ({ id: `c-${g}`, sourceIds: group, compressed: true, summaryId: `L1-other-${g}` })));
+      assert.equal(strategy.exactL1(groups[0]!)?.id, 'L1-other-0');
+      for (const dryRun of [true, false]) {
+        // Raw, the eight messages are far over this budget; their summaries are under it.
+        const texts = textsOf(await manager.compile({ maxTokens: 150, reserveForResponse: 0 }, undefined, { dryRun }));
+        const count = (text: string) => texts.filter((value) => value === text).length;
+        assert.ok(!texts.some((text) => text.startsWith('MSG')), JSON.stringify(texts));
+        assert.ok(
+          (count('P-SUMMARY') === 1 && count('B-SUMMARY') + count('C-SUMMARY') === 0) ||
+            (count('P-SUMMARY') === 0 && count('B-SUMMARY') === 1 && count('C-SUMMARY') === 1),
+          'each message renders once: ' + JSON.stringify(texts),
+        );
+      }
     } finally { manager.close(); }
   });
 

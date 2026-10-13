@@ -2677,11 +2677,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.store?.appendToStateJson(this.summariesStateId, entry);
   }
 
-  /** Read the durable log as well as the local mirror for cross-instance L1 races. */
-  /** First live L1 per joined source-id key, rebuilt only when the summary
+  /**
+   * The L1 written for a chunk, by its joined source ids. Another instance
+   * sharing the store may have written it since this one loaded, perhaps
+   * with summaries above it that this one doesn't hold, so a miss here reads
+   * the store too. When the store has it, this instance takes up the store's
+   * summaries as an open would, and as a compression that waited on another
+   * instance's does, keeping its kv-unified presentation in flight (#166).
+   * The L1 then comes with the summaries above it, repaired as the loader
+   * repairs them. Adopting the L1 alone left its parent pointer naming a
+   * summary this instance didn't hold, which kv-unified's canonical forest
+   * refuses on every compile.
+   */
+  private findExactL1(chunkIdKey: string): SummaryEntry | undefined {
+    const held = this.heldExactL1(chunkIdKey);
+    if (held) return held;
+    const persisted = this.store?.getStateJson(this.summariesStateId);
+    if (!Array.isArray(persisted)) return undefined;
+    const written = (persisted as Array<SummaryEntry | null>).some(
+      (summary) => summary?.level === 1 && isIdList(summary.sourceIds) && summary.sourceIds.join(':') === chunkIdKey,
+    );
+    if (!written) return undefined;
+    this.loadPersistedState({ keepKvUnifiedPresentation: true });
+    return this.heldExactL1(chunkIdKey);
+  }
+
+  /** First held L1 per joined source-id key, rebuilt only when the summary
    *  list's entries change (the scan joined every L1's ids on every call). */
   private _exactL1: { entries: readonly SummaryEntry[]; byKey: Map<string, SummaryEntry> } | null = null;
-  private findExactL1(chunkIdKey: string): SummaryEntry | undefined {
+  private heldExactL1(chunkIdKey: string): SummaryEntry | undefined {
     const memo = this._exactL1;
     const current = this.summaries;
     let byKey: Map<string, SummaryEntry>;
@@ -2696,24 +2720,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       this._exactL1 = { entries: [...current], byKey };
     }
-    const local = byKey.get(chunkIdKey);
-    if (local) return local;
-    const persisted = this.store?.getStateJson(this.summariesStateId);
-    if (!Array.isArray(persisted)) return undefined;
-    // Another instance may have appended it since this one loaded. Adopt it
-    // if it has text and a list of ids, with its range their ends, as the
-    // loader keeps an L1. Its parent pointers stay as the store has them: a
-    // parent this instance hasn't loaded may be in the store, and the next
-    // open resolves them as the loader does.
-    const match = (persisted as SummaryEntry[]).find(
-      (summary) => summary?.level === 1 && isIdList(summary.sourceIds) && summary.sourceIds.join(':') === chunkIdKey &&
-        hasSummaryText(summary),
-    );
-    if (!match) return undefined;
-    const ids = match.sourceIds;
-    const found: SummaryEntry = { ...match, sourceRange: { first: ids[0]!, last: ids[ids.length - 1]! } };
-    if (!this.summaries.some((summary) => summary.id === found.id)) this.summaries.push(found);
-    return found;
+    return byKey.get(chunkIdKey);
   }
 
   /**
