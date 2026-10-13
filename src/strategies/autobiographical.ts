@@ -32,12 +32,6 @@ import type {
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
-
-/** A persisted reset record is trusted only if it has the expected shape. */
-function isCalibrationReset(v: unknown): v is CalibrationReset {
-  const r = v as CalibrationReset | null | undefined;
-  return !!r && Number.isFinite(r.discardedMultiplier) && Number.isFinite(r.fromEpoch) && Number.isFinite(r.at);
-}
 import { resolveEffectiveConfig, type ConfigLayer, type EffectiveConfigReport } from '../config-provenance.js';
 import { selectKeeperL1s } from './keeper-selection.js';
 import { splitMixedToolMessages, stripUnpairedToolBlocks } from '../normalize-tool-messages.js';
@@ -79,6 +73,12 @@ import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms } from '../raw-forms.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
+
+/** A persisted reset record is trusted only if it has the expected shape. */
+function isCalibrationReset(v: unknown): v is CalibrationReset {
+  const r = v as CalibrationReset | null | undefined;
+  return !!r && Number.isFinite(r.discardedMultiplier) && Number.isFinite(r.fromEpoch) && Number.isFinite(r.at);
+}
 
 /**
  * Append a JSONL entry describing one compression LLM call to the path

@@ -529,13 +529,6 @@ export function isSummaryOverviewStrategy(s: ContextStrategy): s is SummaryOverv
   );
 }
 
-/**
- * Per-render observability stats from a strategy. Counts and token sums for
- * head / tail / summaries / pending work, suitable for TUIs and dashboards
- * that want to display "how much of the context is folded vs raw" at a
- * glance. Token sums use the strategy's own estimates so they line up with
- * the numbers `select()` uses for budget math.
- */
 /** A calibration multiplier discarded on load (see `RenderStats.calibration`). */
 export interface CalibrationReset {
   /** The multiplier that was discarded. */
@@ -546,6 +539,13 @@ export interface CalibrationReset {
   at: number;
 }
 
+/**
+ * Per-render observability stats from a strategy. Counts and token sums for
+ * head / tail / summaries / pending work, suitable for TUIs and dashboards
+ * that want to display "how much of the context is folded vs raw" at a
+ * glance. Token sums use the strategy's own estimates so they line up with
+ * the numbers `select()` uses for budget math.
+ */
 export interface RenderStats {
   head: { messages: number; tokens: number };
   tail: { messages: number; tokens: number };
@@ -570,14 +570,6 @@ export interface RenderStats {
   total: { messages: number; tokens: number };
 
   /**
-   * Planner/emitter reconciliation for this compile. `planned` is the picker's
-   * projection after folding; `actual` is what the emitter committed. A
-   * persistent positive `delta` means the emitter spends in units the planner
-   * doesn't model, and the overrun lands on whatever renders last — the recent
-   * window — which is how tail eviction becomes reachable despite the picker
-   * reporting `budgetMet`. Absent when no picker ran (hierarchical path).
-   */
-  /**
    * Estimator calibration in force for this compile: the multiplier applied
    * to every token estimate and the pricing epoch it was learned under.
    * `reset` is present once a multiplier from an older epoch (a record
@@ -595,6 +587,14 @@ export interface RenderStats {
     reset?: CalibrationReset;
   };
 
+  /**
+   * Planner/emitter reconciliation for this compile. `planned` is the picker's
+   * projection after folding; `actual` is what the emitter committed. A
+   * persistent positive `delta` means the emitter spends in units the planner
+   * doesn't model, and the overrun lands on whatever renders last — the recent
+   * window — which is how tail eviction becomes reachable despite the picker
+   * reporting `budgetMet`. Absent when no picker ran (hierarchical path).
+   */
   planVsActual?: {
     planned: number;
     actual: number;
