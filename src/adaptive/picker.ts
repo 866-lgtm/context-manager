@@ -185,6 +185,10 @@ export interface PickerChunk {
   id: ChunkId;
   sequence: number;
   rawTokens: number;
+  /** The fold level the solvers start this chunk from (0 = raw). The
+   *  autobiographical strategy passes the level the chunk was last presented
+   *  at, or, when the summaries over it no longer reach that level, the
+   *  deepest level below it that they reach. */
   currentResolution: number;
   lockedByAgent: boolean;
   bodyGroupId?: string;
@@ -259,7 +263,8 @@ export interface PickerResult {
    *  full folding exceeds the hard wall (a dead-band hold is NOT exhausted).
    *  Falls back to the greedy formula when a solver doesn't set it. */
   exhausted: boolean;
-  /** Number of chunks whose resolution changed vs the carried state. */
+  /** Number of chunks whose resolution changed from the `currentResolution`
+   *  they started at. */
   moves: number;
   /** Solver-frontier entries that reference no live chunk (summaries whose
    *  sources were removed by store surgery). Dropped from application;

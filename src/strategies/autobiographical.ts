@@ -754,11 +754,14 @@ function hasSummaryText(summary: SummaryEntry): boolean {
  */
 function reachableLevel(saved: number, l1Id: SummaryId | undefined, summariesById: ReadonlyMap<SummaryId, SummaryEntry>): number {
   let level = 0;
-  let current = saved > 0 && l1Id !== undefined ? summariesById.get(l1Id) : undefined;
+  let current = l1Id === undefined ? undefined : summariesById.get(l1Id);
   while (current && current.level <= saved) {
     level = current.level;
     const parentId = getSummaryParentId(current);
     const parent = parentId ? summariesById.get(parentId) : undefined;
+    // The load repair keeps only parents a level up, but the live lookup
+    // adopts an appended L1's pointers as stored; stopping at a parent that
+    // isn't higher keeps this walk finite.
     current = parent && parent.level > current.level ? parent : undefined;
   }
   return level;
@@ -2122,7 +2125,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // parent, every pointer that isn't null is cleared, so the summary renders
     // and merges again. A null pointer counts as none.
     const reparentedIds: string[] = [];
-    let clearedPointers = 0;
+    const clearedIds: string[] = [];
     const covers = (pointer: unknown, summary: SummaryEntry): pointer is string => {
       const parent = typeof pointer === 'string' ? byId.get(pointer) : undefined;
       return !!parent && parent.level > summary.level && parent.sourceIds.includes(summary.id);
@@ -2138,8 +2141,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const own = summary[field] as unknown;
           if (own === undefined || own === null) continue;
           delete edit()[field];
-          clearedPointers++;
         }
+        if (repaired !== summary) clearedIds.push(summary.id);
         return repaired;
       }
       if (summary.mergedInto !== parent) edit().mergedInto = parent;
@@ -2151,14 +2154,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const droppedIds = [...copiesById.keys()].filter((id) => !byId.has(id));
     const keptRebuiltIds = rebuiltIds.filter((id) => byId.has(id));
     if (malformed > 0 || dupes > 0 || droppedIds.length > 0 || keptRebuiltIds.length > 0 ||
-        reparentedIds.length > 0 || clearedPointers > 0) {
+        reparentedIds.length > 0 || clearedIds.length > 0) {
       this.store.setStateJson(this.summariesStateId, this.summaries);
       console.warn(
         `[autobiographical] repaired summary state: removed ${malformed} malformed entr(ies) and deduped ${dupes}; ` +
           `dropped empty [${emptyIds.join(', ')}], with unreadable sources or range [${unreadableIds.join(', ')}], ` +
           `naming a missing summary [${ancestorIds.join(', ')}]; rebuilt sources or range of ` +
           `[${keptRebuiltIds.join(', ')}]; set the parent of [${reparentedIds.join(', ')}]; cleared ` +
-          `${clearedPointers} parent pointer(s) naming no kept parent`,
+          `the parent pointers of [${clearedIds.join(', ')}], which named no kept parent`,
       );
     }
 

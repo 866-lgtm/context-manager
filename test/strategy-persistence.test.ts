@@ -383,63 +383,84 @@ describe('AutobiographicalStrategy — persistence', () => {
     });
   }
 
+  const kvUnified = {
+    foldingStrategy: 'kv-unified',
+    kvUnified: {
+      policy: {
+        alpha: 0.7, budgetLowRatio: 0.5, budgetHighRatio: 0.9, budgetUnderLambda: 10, budgetOverLambda: 10,
+        cacheLambda: 1, cacheScale: 1000, cacheReadPrice: 0.1, cacheWritePrice: 1.25,
+        continuityLambda: 1, continuityScale: 1000, continuityRecencyHalfLifeTokens: 1000, continuityRecencyFloor: 0.2,
+        continuityStableHalfLife: 10, continuityStableFloor: 0.25,
+      },
+      tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100, labelCeiling: 10_000, adoptEpsilon: 0,
+      treeifyNonContiguousSummaries: false, preserveGapBearingSummaries: false,
+    },
+  } as const;
   for (const [label, options] of [
     ['default solver', {}],
     ['oldest-first', { foldingStrategy: 'oldest-first' }],
     ['kv-stable', { foldingStrategy: 'kv-stable' }],
+    ['kv-unified', kvUnified],
   ] as const) {
     it(`plans a message whose saved level names a dropped summary from the summaries still over it (${label})`, async (t) => {
       t.mock.method(console, 'warn', () => {});
       t.mock.method(console, 'error', () => {});
       const config = { targetChunkTokens: 300, adaptiveResolution: true, recentWindowTokens: 40, ...options };
       let ids: string[] = [];
+      // Group 0: L1 B under an L2 that also names a missing L1, saved at 2.
+      // Group 1: L1 C under L2 Q, saved at 2, which it still reaches.
+      // Group 2: L1 D under L2 R, saved at 1.
+      // Group 3: L1 E under L2 S under an L3 that also names a missing L2,
+      // saved at 3. The load drops the two summaries naming missing ones.
+      const saved = [2, 2, 1, 3];
+      const level = (i: number) => saved[Math.floor(i / 4)]!;
       {
         const strategy = new TestableStrategy(config);
         const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
-        ids = Array.from({ length: 12 }, (_, i) => manager.addMessage(i % 2 ? 'Claude' : 'User', textBlock(`MSG${i} ` + 'word '.repeat(60))));
+        ids = Array.from({ length: 16 }, (_, i) => manager.addMessage(i % 2 ? 'Claude' : 'User', textBlock(`MSG${i} ` + 'word '.repeat(60))));
         manager.addMessage('User', textBlock('TAIL'));
-        const groups = [ids.slice(0, 4), ids.slice(4, 8), ids.slice(8)];
-        const pairs = groups.map((group, g) => {
-          const l1 = strategy.seedL1(`${'BCD'[g]}-SUMMARY`, group);
-          return [l1, strategy.seedL2([l1.id], `${'PQR'[g]}-SUMMARY`)] as const;
-        });
+        const groups = [0, 1, 2, 3].map((g) => ids.slice(4 * g, 4 * g + 4));
+        const l1s = groups.map((group, g) => strategy.seedL1(`${'BCDE'[g]}-SUMMARY`, group));
+        const l2s = l1s.map((l1, g) => strategy.seedL2([l1.id], `${'PQRS'[g]}-SUMMARY`));
+        const l3 = strategy.seedParent(3, [l2s[3]!.id], 'T-SUMMARY');
         const view = new Map(strategy.getSummariesView().map((summary) => [summary.id, summary]));
-        // The first L2 also names an L1 that an earlier version dropped, so the
-        // load drops it. Its four messages were last presented through it.
-        strategy.persistRawSummaries(pairs.flatMap(([l1, l2], g) => [
-          view.get(l1.id)!,
-          g === 0 ? { ...view.get(l2.id)!, sourceIds: ['L1-gone', l1.id] } : view.get(l2.id)!,
-        ]));
-        strategy.persistRawChunks(pairs.map(([l1], g) => ({ id: `c-${g}`, sourceIds: groups[g]!, compressed: true, summaryId: l1.id })));
-        // The second group's messages were presented at L2 and the third's at
-        // L1, both of which they still reach; those and one message of the
-        // first group are locked, so every solver keeps their levels.
-        strategy.persistRawResolutions(
-          Object.fromEntries(ids.map((id, i) => [id, i < 8 ? 2 : 1])),
-          [ids[3]!, ...ids.slice(4)],
-        );
+        strategy.persistRawSummaries([
+          ...l1s.map((l1) => view.get(l1.id)!),
+          ...l2s.map((l2, g) => (g === 0 ? { ...view.get(l2.id)!, sourceIds: ['L1-gone', l2.sourceIds[0]!] } : view.get(l2.id)!)),
+          { ...view.get(l3.id)!, sourceIds: [l2s[3]!.id, 'L2-gone'] },
+        ]);
+        strategy.persistRawChunks(l1s.map((l1, g) => ({ id: `c-${g}`, sourceIds: groups[g]!, compressed: true, summaryId: l1.id })));
+        // One message of group 0 and every message of the others are locked,
+        // so every solver keeps the levels they are planned from.
+        strategy.persistRawResolutions(Object.fromEntries(ids.map((id, i) => [id, level(i)])), [ids[3]!, ...ids.slice(4)]);
         manager.sync();
         manager.close();
       }
       const strategy = new TestableStrategy(config);
       const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
       try {
-        assert.deepEqual(strategy.getSummariesView().map((s) => s.id).sort(), ['L1-0', 'L1-2', 'L1-4', 'L2-3', 'L2-5'], 'the L2 naming a missing L1 is dropped');
-        const saved = Object.fromEntries(ids.map((id, i) => [id, i < 8 ? 2 : 1]));
-        // Raw, the first group's messages are over this budget; its L1's recall is far under it.
+        const kept = strategy.getSummariesView().map((s) => s.content).sort();
+        assert.deepEqual(kept, ['B-SUMMARY', 'C-SUMMARY', 'D-SUMMARY', 'E-SUMMARY', 'Q-SUMMARY', 'R-SUMMARY', 'S-SUMMARY'], 'the two summaries naming missing ones are dropped');
+        const before = Object.fromEntries(ids.map((id, i) => [id, level(i)]));
+        // Raw, group 0's messages are over this budget; its L1's recall is far under it.
         const dry = await manager.compile({ maxTokens: 150, reserveForResponse: 0 }, undefined, { dryRun: true });
-        assert.deepEqual(strategy.readPersistedResolutions(), saved, 'a dry compile saves no level');
+        assert.deepEqual(strategy.readPersistedResolutions(), before, 'a dry compile saves no level');
         const live = await manager.compile({ maxTokens: 150, reserveForResponse: 0 });
         for (const context of [dry, live]) {
           const texts = context.messages.flatMap((message) => message.content).map((block) => (block as { text?: string }).text ?? '');
-          for (const [text, count] of [['B-SUMMARY', 1], ['Q-SUMMARY', 1], ['D-SUMMARY', 1], ['C-SUMMARY', 0], ['R-SUMMARY', 0]] as const) {
+          // Group 0 renders through B, group 1 through Q, group 2 through D, and
+          // group 3 through S, the deepest summary over it at or below 3.
+          for (const [text, count] of [
+            ['B-SUMMARY', 1], ['Q-SUMMARY', 1], ['D-SUMMARY', 1], ['S-SUMMARY', 1],
+            ['C-SUMMARY', 0], ['R-SUMMARY', 0], ['E-SUMMARY', 0],
+          ] as const) {
             assert.equal(texts.filter((value) => value === text).length, count, text + ' in ' + JSON.stringify(texts));
           }
           assert.ok(!texts.some((text) => text.startsWith('MSG')), JSON.stringify(texts));
         }
         assert.deepEqual(
           strategy.readPersistedResolutions(),
-          { ...saved, [ids[0]!]: 1, [ids[1]!]: 1, [ids[2]!]: 1 },
+          { ...before, [ids[0]!]: 1, [ids[1]!]: 1, [ids[2]!]: 1 },
           'the compile saves the level it presented, and a locked message keeps its own',
         );
       } finally {
@@ -593,7 +614,8 @@ describe('AutobiographicalStrategy — persistence', () => {
         assert.deepEqual(strategy.readPersistedSummaries(), strategy.getSummariesView());
         if (open === 0) {
           const line = warnings.find((w) => w.includes('repaired summary state')) ?? '';
-          assert.match(line, /cleared 3 parent pointer\(s\)/, line);
+          const cleared = line.match(/cleared the parent pointers of \[([^\]]*)\]/)?.[1]?.split(', ').sort();
+          assert.deepEqual(cleared, [ids['PTR-B'], ids['PTR-D']].sort(), line);
           const reparented = line.match(/set the parent of \[([^\]]*)\]/)?.[1]?.split(', ').sort();
           assert.deepEqual(reparented, [ids['PTR-A'], ids['PTR-C']].sort(), line);
         } else {
@@ -641,23 +663,31 @@ describe('AutobiographicalStrategy — persistence', () => {
 
   it('gives no parent a summary at its own level, so two summaries cannot be each other\'s parent', async (t) => {
     t.mock.method(console, 'warn', () => {});
+    let l1Id = '';
     let lowerId = '';
     {
       const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
       const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
       const l1 = strategy.seedL1('level one', [manager.addMessage('User', textBlock('level one'))]);
       const lower = strategy.seedL2([l1.id], 'lower');
-      const sameLevel = { ...lower, id: 'L2-same', sourceIds: [lower.id] };
+      l1Id = l1.id;
       lowerId = lower.id;
-      strategy.persistRawSummaries([...strategy.getSummariesView().filter((s) => s.id !== lower.id), { ...lower, mergedInto: 'L2-same' }, sameLevel]);
+      // Two summaries at one level that list each other and point at each other.
+      strategy.persistRawSummaries([
+        ...strategy.getSummariesView().filter((s) => s.id !== lower.id),
+        { ...lower, sourceIds: [l1.id, 'L2-same'], mergedInto: 'L2-same' },
+        { ...lower, id: 'L2-same', sourceIds: [lower.id], mergedInto: lower.id },
+      ]);
       manager.sync();
       manager.close();
     }
     const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
     const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
     try {
-      const lower = strategy.getSummariesView().find((s) => s.id === lowerId)!;
-      assert.equal(lower.mergedInto, undefined, 'a summary at the same level is no parent, though it lists this one');
+      const stored = new Map(strategy.readPersistedSummaries().map((s) => [s.id, s]));
+      assert.equal(stored.get(lowerId)?.mergedInto, undefined, 'a summary at the same level is no parent, though it lists this one');
+      assert.equal(stored.get('L2-same')?.mergedInto, undefined, 'and neither is the other');
+      assert.equal(stored.get(l1Id)?.mergedInto, lowerId, 'the L1 keeps the parent a level up that lists it');
     } finally { manager.close(); }
   });
 
