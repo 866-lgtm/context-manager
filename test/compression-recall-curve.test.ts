@@ -2391,6 +2391,34 @@ describe('prepared recall expansions', () => {
   });
 });
 
+describe('prepared recall expansions: what is logged', () => {
+  after(cleanup);
+  it('logs a recall expansion\'s replacements when it is sent, not when it is enumerated', async () => {
+    // One fallback: the newer parent's expansion is sent, the older one's
+    // is enumerated and never sent.
+    for (const location of ['parent', 'child'] as const) {
+      const mock = flexibleMembrane([{ stop: 'refusal', omitUsage: true }, { stop: 'refusal', omitUsage: true }]);
+      const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 1 });
+      const entry = location === 'parent' ? fx.parents[1] : fx.children[2];
+      entry.content = 'authored data:image/png;base64,' + 'U'.repeat(20000);
+      fx.strategy.flushSummaries();
+      const logs: string[] = [];
+      const original = console.error;
+      console.error = (...parts: unknown[]) => { logs.push(parts.map(String).join(' ')); };
+      try {
+        await fx.strategy.run(fx.target, managerContext(fx.manager));
+      } finally { console.error = original; }
+      assert.equal(mock.calls.length, 2, 'the canonical request and one recall expansion');
+      const sentWithMarker = mock.calls.filter((call) => JSON.stringify(call.request).includes('omitted from compression prompt'));
+      const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
+      assert.equal(sentWithMarker.length, 1, `${location}: one sent request carried the data URL`);
+      assert.equal(lines.length, 1, `${location}: one line, for the request that was sent`);
+      assert.equal(lines[0]!.endsWith('[canonical]'), location === 'parent', `${location}: ${lines[0]}`);
+      fx.manager.close();
+    }
+  });
+});
+
 describe('prepared source-only identity', () => {
   after(cleanup);
   it('records the source-only hash from the prepared dispatched request', async () => {

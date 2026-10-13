@@ -6,7 +6,7 @@
  */
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -92,6 +92,28 @@ describe('serialized media on the wire', () => {
     assert.equal(merges.filter((r) => r.includes(payload)).length, 0, 'payload in a merge request');
     cm.close();
   });
+
+  it('the L1 and merge receipts summarize the prepared messages, not the payload', async () => {
+    const payload = 'K'.repeat(20_000);
+    const log = join(dir, 'receipts', 'compression-log.jsonl');
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+    try {
+      const { cm } = await run('receipts', { mergeThreshold: 3 }, (cm) => {
+        cm.addMessage('User', [{ type: 'text', text: `see data:image/png;base64,${payload}` }]);
+        for (let i = 0; i < 60; i++) cm.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: filler(i) }]);
+      });
+      cm.close();
+    } finally { delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG; }
+    const receipts = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as {
+      event?: string; operation?: string; messages?: Array<{ textChars: number }>;
+    }).filter((entry) => !entry.event && entry.messages);
+    assert.ok(receipts.some((entry) => entry.operation === 'compress_l1'), 'an L1 receipt');
+    assert.ok(receipts.some((entry) => /^merge_l/.test(entry.operation ?? '')), 'a merge receipt');
+    for (const entry of receipts) {
+      const longest = Math.max(...entry.messages!.map((message) => message.textChars));
+      assert.ok(longest < payload.length, `${entry.operation}'s receipt counts ${longest} characters in one message`);
+    }
+  });
 });
 
 describe('the data-URL matcher at scale (V8)', () => {
@@ -142,6 +164,21 @@ describe('matcher coverage', () => {
   });
   it('still survives a ~9M-character escaped payload on V8', () => {
     assert.equal(one('data:image\\/png;base64,' + 'A\\/'.repeat(3e6)).n, 1);
+  });
+  it('ends the payload at an escape other than an escaped slash, keeping the escape and what follows', () => {
+    const payload = 'A'.repeat(5000);
+    const newline = one('see data:image/png;base64,' + payload + '\\nThe next line');
+    assert.equal(newline.n, 1);
+    assert.match(newline.text, /: 5000 serialized payload characters\]\\nThe next line$/);
+    const quoted = one('{\\"u\\":\\"data:image/png;base64,' + payload + '\\"}');
+    assert.equal(quoted.n, 1);
+    assert.match(quoted.text, /: 5000 serialized payload characters\]\\"\}$/);
+    const short = one('data:image/png;base64,' + 'A'.repeat(4095) + '\\n' + 'B'.repeat(10));
+    assert.equal(short.n, 0, 'what follows the escape does not count toward the floor');
+  });
+  it('matches the scheme and the base64 token in any letter case', () => {
+    const r = one('DATA:image/png;BASE64,' + 'P'.repeat(5000));
+    assert.equal(r.n, 1); assert.match(r.text, /^\[embedded image\/png data URL omitted/);
   });
 });
 
