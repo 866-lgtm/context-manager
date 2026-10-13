@@ -1807,6 +1807,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     delete this.kvUnifiedReuse.forest;
     delete this.kvUnifiedReuse.tree;
     delete this.kvUnifiedReuse.certificate;
+    delete this.kvUnifiedReuse.whatIf;
   }
 
   /**
@@ -2620,16 +2621,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * count as prefix: a merge's expanded SOURCE pairs are its volatile
    * payload, and marking them would cache-write content that never recurs.
    *
-   * `capped` requests get no markers: recall-budget front-eviction shifts
-   * the prefix on every subsequent mint, and cache writes on a shifting
-   * prefix are pure waste (measured up to +42% total cost at 1h TTL).
+   * `capped` requests get the head marker only: recall-budget front-eviction
+   * shifts the pairs on every subsequent mint, and cache writes on a shifting
+   * prefix are pure waste (measured up to +42% total cost at 1h TTL). The
+   * head boundary sits before the ladder, so eviction cannot move it; with
+   * no head window a capped request carries no marker at all.
    * Effective ladder reuse also requires the append-stable source order
    * fix (2026-08-19); on stores minted under the older lexical order the
    * markers are merely harmless.
    *
    * Returns true iff at least one breakpoint was placed — callers attach
    * `cacheTtl` only then, so every marker-less request (kill switch, capped
-   * ladder, no ladder yet) keeps the exact pre-seam request shape and its
+   * ladder with no head window, no ladder yet) keeps the exact pre-seam request shape and its
    * canonical hash / quarantine identity.
    */
   protected applyMintCacheSeams(
@@ -2657,7 +2660,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
       }
     }
-    if (capped) return false;
     const levelById = new Map(recallLadder.map((s) => [s.id, s.level]));
     let headEnd = -1;
     let deepEnd = -1;
@@ -2676,10 +2678,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (level >= 2) deepEnd = i + 1;
     }
     if (frontierEnd === -1) return false; // no ladder yet — nothing stable to cache
-    for (const idx of new Set([headEnd, deepEnd, frontierEnd])) {
-      if (idx >= 0) messages[idx]!.cacheBreakpoint = true;
+    // A capped ladder front-evicts on every mint, so the pair seams shift and
+    // writing them is waste. The head seam does not: tools, system prompt and
+    // head window precede the ladder and are the same request after request,
+    // unless image shedding (one byte budget, spent newest-first) replaces a
+    // head image for one payload and not for the next.
+    let placed = false;
+    for (const idx of new Set(capped ? [headEnd] : [headEnd, deepEnd, frontierEnd])) {
+      if (idx < 0) continue;
+      messages[idx]!.cacheBreakpoint = true;
+      placed = true;
     }
-    return true;
+    return placed;
   }
 
   private sameAuthoredSummary(a: SummaryEntry, b: SummaryEntry): boolean {
