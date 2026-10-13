@@ -801,9 +801,8 @@ function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?
   return maxLevel !== undefined ? { maxLevel } : {};
 }
 
-/** The fold bound a pinned message position resolves to
- *  (`AutobiographicalStrategy.resolvedPinBounds`): raw, a fixed level, or a
- *  depth cap. */
+/** The fold bound a pinned message position resolves to (the strategy's
+ *  `resolvedPinBounds`): raw, a fixed level, or a depth cap. */
 export type ResolvedPinBound = 'raw' | { level: number } | { maxLevel: number };
 
 /**
@@ -2476,9 +2475,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const out = new Map<number, ResolvedPinBound>();
     const pinned = this.pinnedPositions(messages);
     if (pinned.size === 0) return out;
-    const honorsBounds = !!this.config.adaptiveResolution &&
-      (this.config.foldingStrategy === 'kv-stable' || this.config.foldingStrategy === 'kv-unified');
-    const bounds = honorsBounds ? this.pinLevelBounds(messages) : undefined;
+    const bounds = this.readsPinBounds() ? this.pinLevelBounds(messages) : undefined;
     for (const position of pinned) {
       const bound = bounds?.get(position);
       if (bound?.level !== undefined) out.set(position, { level: bound.level });
@@ -2486,6 +2483,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       else out.set(position, 'raw');
     }
     return out;
+  }
+
+  /** Whether this selector reads pin bounds (`ProtectedRange.level` /
+   *  `maxLevel`): `kv-stable` and `kv-unified`, with adaptive resolution. */
+  protected readsPinBounds(): boolean {
+    return !!this.config.adaptiveResolution &&
+      (this.config.foldingStrategy === 'kv-stable' || this.config.foldingStrategy === 'kv-unified');
   }
 
   /** Whether a resolved pin bound keeps its message raw: a classic pin, or a
@@ -5916,8 +5920,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // There is intentionally NO tail_after_chunk: that would leak
     // future information into the model's KV state and corrupt the
     // as-of framing of memory formation.
-    const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
-
     const allMessages = ctx.messageStore.getAll();
     const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
     // Compression holds: provisional content never enters a prompt, not even
@@ -5956,15 +5958,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // existed.
     //
     // The L1s a pin opens are recorded (openedChunks). Their messages render
-    // raw wherever they fall before the chunk, before the head window too,
-    // in source order with the recall pairs after the head window (section
-    // 2). Only they lose coverage, so a merged L1 the descent can't reach (a
-    // parent whose sourceIds miss it) stays covered as before, unless a pin
-    // opens it. The raw that pins add is spent from the recall budget
-    // (below).
+    // raw wherever they lie before the chunk, including before the head
+    // window; the head window always comes first, and after it they go in
+    // source order with the recall pairs (section 2). Only they lose
+    // coverage, so a merged L1 the descent can't reach (a parent whose
+    // sourceIds miss it) stays covered, as on main, unless a pin opens it.
+    // The raw that pins add is spent from the recall budget (below).
     //
-    // Scope: the canonical L1 prompt. Merge recall, L3+ merge inputs,
-    // transition summaries and the source-only L1 do not consult pins.
+    // Scope: the canonical L1 prompt, and only pins before the chunk. Merge
+    // recall, L3+ merge inputs, transition summaries and the source-only L1
+    // do not consult pins.
     const summariesById = new Map<string, SummaryEntry>();
     for (const s of this.summaries) summariesById.set(s.id, s);
     // Priced as the store prices a message, images and tool blocks included,
@@ -6127,9 +6130,146 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // off rich memories (stop=max_tokens).
     const outputReserveTokens = this.capCompressionTokens(Math.max(16000, Math.round(targetTokens * 1.5)));
 
+    // Pins count only before the chunk being compressed: this prompt is the
+    // history the chunk follows. A summary after it (a chunk compressed out of
+    // order, after a head-window reset or an unpin) is recalled as on main.
     const forceRawMessageIds = new Set<MessageId>();
-    for (const i of this.forceRawPinPositions(allMessages)) forceRawMessageIds.add(allMessages[i].id);
+    for (const i of this.forceRawPinPositions(allMessages)) {
+      if (i < chunkStartIdx) forceRawMessageIds.add(allMessages[i].id);
+    }
     const recallBudget = sourceOnly ? 0 : (this.config.compressionRecallBudgetTokens ?? 100_000);
+
+    // The canonical request's messages for one layout of history, sections 1
+    // to 6, shaped as they are sent. Admitting the pins prices this list.
+    const assemble = (
+      { priorSummaryMessageIds, rawMiddle }: ReturnType<typeof layoutHistory>,
+      keptSummaries: readonly SummaryEntry[],
+    ) => {
+      const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
+
+      // ---- 1. Head window (raw, FIRST, ownership-capped) ----
+      //
+      // The head is the foundational identity anchor: the actual opening
+      // of the chronicle (the user's first message, the agent's first
+      // reply, the system context if any). It establishes WHO is speaking
+      // to WHOM. Without it, when the chunk content is heavily first-person
+      // from someone other than the agent (e.g., a user-shared document),
+      // the agent loses its first-person grounding and drifts into the
+      // content author's voice.
+      //
+      // The head is the configured head window — not "everything before
+      // the chunk." For doc-heavy chronicles, "everything before" would
+      // be hundreds of thousands of tokens; the recall pairs below
+      // represent that intermediate content. The head is just the
+      // permanent prefix that the original instance always saw.
+      //
+      // ONE-TO-ONE INVARIANT: chunk records (and the summaries over them)
+      // are the persistent authority over how a message is represented.
+      // The token-derived head boundary is only chunking *policy* — it is
+      // recomputed from the live estimator on every call and is NOT stable
+      // (estimator changes move it; transient headWindowTokens<=0 states
+      // let sweeps take ownership of head messages; store surgery can do
+      // the same — all observed in production, see issue #42). When the
+      // two authorities disagree, ownership wins: a head-range message
+      // covered by a live summary renders via its recall pair below, not
+      // raw. Rendering it both ways duplicated the seed in every payload.
+      let headCoveredSkipped = 0;
+      for (let i = headStartIdx; !sourceOnly && i < headEndIdx && i < allMessages.length; i++) {
+        const m = allMessages[i];
+        if (priorSummaryMessageIds.has(m.id)) {
+          headCoveredSkipped++;
+          continue;
+        }
+        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+      }
+
+      // ---- 2. Prior recall pairs (budget-capped, above) and the raw middle ----
+
+      // One sequence by source position after the head window, which always
+      // comes first, so the summarizer never reads an older raw turn as coming
+      // after a later memory. Where the raw middle follows every recall pair,
+      // as it does when chunking runs contiguously, this is the order the
+      // prompt always had: recall pairs, then raw.
+      const middle: Array<{ position: number; summary?: SummaryEntry; message?: StoredMessage }> = [
+        ...keptSummaries.map((summary) => ({
+          position: messageOrder.get(summary.sourceRange.first) ?? Number.MAX_SAFE_INTEGER,
+          summary,
+        })),
+        ...rawMiddle,
+      ].sort((a, b) => a.position - b.position);
+      for (const { summary: s, message: m } of middle) {
+        if (m) {
+          llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+          continue;
+        }
+        llmMessages.push({
+          participant: 'Context Manager',
+          content: [{ type: 'text', text: `[CM] Recall memory ${s!.id}.` }],
+        });
+        // Recall answers carry the summary's verbatim reasoning carriers
+        // (signed thinking) when captured — validated 2026-07-16 on a
+        // deterministically-refusing mythos compress request: text-only →
+        // reasoning_extraction refusal; with carriers → end_turn. Replaying
+        // the model's own text WITH its encrypted reasoning reads as its own
+        // history rather than harvested output, the same KV-honesty argument
+        // as declaring tools. Raw message thinking is still stripped at
+        // insertion (unvalidated: the API rejects thinking blocks whose turn
+        // shape was modified, and split/collapse rewrites raw turns).
+        llmMessages.push({
+          participant: agentParticipant,
+          content: this.summaryAnswerContent(s!),
+        });
+      }
+
+      // ---- 4. In-band marker ----
+      // Structural start of the exact source-only shape. Never recover this by
+      // searching text: the target itself may quote the marker.
+      const sourceOnlyStartIndex = llmMessages.length;
+      llmMessages.push({
+        participant: 'Context Manager',
+        content: [{ type: 'text', text: COMPRESSION_MARKER }],
+      });
+
+      // ---- 5. Chunk messages raw ----
+      for (const m of chunk.messages) {
+        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+      }
+
+      // ---- 6. Instruction (reading-mode aware; worked out above) ----
+      llmMessages.push({
+        participant: 'Context Manager',
+        content: [{ type: 'text', text: instructionText }],
+      });
+
+      // Split any bundled tool_use+tool_result cycles in non-user turns into
+      // separate API-shape messages. claude.ai-imported sessions carry these
+      // bundles (a tool_result in an assistant message rejects the request);
+      // for fresh imports the conhost importer splits at ingest time, but
+      // already-warmed sessions hit this path. See `normalize-tool-messages.ts`.
+      const split = splitMixedToolMessages(llmMessages);
+
+      // Collapse consecutive same-participant messages for API compliance
+      const collapsed = this.collapseConsecutiveMessages(split);
+
+      // Defense in depth against chunk boundaries that cut a tool cycle
+      // (rebuildChunks tries to avoid this, but covers only the most common
+      // case). The API rejects any tool_use that isn't immediately followed
+      // by its tool_result, and any tool_result that doesn't follow a use.
+      const cleaned = stripUnpairedToolBlocks(collapsed);
+
+      return { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped };
+    };
+
+    // The store's price of a request: each message's content, the system
+    // prompt, the tools and the output reserve.
+    const priceRequest = (messages: ReadonlyArray<{ content: ContentBlock[] }>): number => {
+      let total = outputReserveTokens +
+        (ctx.systemPrompt ? tokensOf([{ type: 'text', text: ctx.systemPrompt }]) : 0) +
+        (ctx.tools && ctx.tools.length > 0 ? tokensOf([{ type: 'text', text: JSON.stringify(ctx.tools) }]) : 0);
+      for (const message of messages) total += tokensOf(message.content);
+      return total;
+    };
+
     let history = layoutHistory(forceRawMessageIds);
     // Token-budget cap (see capRecallPairs), after the raw that pins add.
     // Defense-in-depth: even with merged exclusion the unmerged frontier can
@@ -6138,106 +6278,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // AND buildRecallCurveVariants has no frontier to expand (canonical-only,
     // one call).
     let recall = this.capRecallPairs(history.priorSummaries, recallBudget - history.pinnedRawTokens);
+    let built = assemble(history, recall.kept);
+    // Pins are honored here only if the raw they add fits the recall budget
+    // and the request with it fits compressionContextBudgetTokens, priced as
+    // the store prices the messages it would send (the image cap below only
+    // replaces images with placeholders), with the system prompt, tools and
+    // output reserve. A request without pins is always attempted, as before.
+    // Otherwise this compression lays history out as if no pin applied,
+    // recalling the summaries the pins override, and says so once it goes
+    // ahead. Waiting for the pins to fit would stall every later L1 too,
+    // since the pinned history precedes each of them, and with them the L1s
+    // the live selector needs when even its deepest fold is over budget. The
+    // live view still shows the pins raw.
+    let pinsOverBudget: { history: typeof history; requestTokens?: number; contextBudget: number } | undefined;
     if (history.pinnedRawTokens > 0) {
-      // Pins are honored here only if the raw they add fits the recall budget
-      // and the complete request with it fits compressionContextBudgetTokens:
-      // head, kept recall pairs, raw, marker, chunk, instruction, system
-      // prompt, tools and the output reserve, priced as the store prices
-      // them. (Splitting, collapsing and the image cap below only shrink
-      // what is sent.) A request without pins is always attempted, as
-      // before. Otherwise this compression lays history out as if no pin
-      // applied, recalling the summaries the pins override, and says so.
-      // Waiting for the pins to fit would stall every later L1 too, since
-      // the pinned history precedes each of them, and with them the L1s the
-      // live selector needs when even its deepest fold is over budget. The
-      // live view still shows the pins raw.
       const contextBudget = this.normalizedCompressionContextBudget();
-      let requestTokens: number | undefined;
-      if (history.pinnedRawTokens <= recallBudget) {
-        requestTokens = outputReserveTokens + recall.keptTokens +
-          tokensOf([{ type: 'text', text: COMPRESSION_MARKER }]) +
-          tokensOf([{ type: 'text', text: instructionText }]) +
-          (ctx.systemPrompt ? tokensOf([{ type: 'text', text: ctx.systemPrompt }]) : 0) +
-          (ctx.tools && ctx.tools.length > 0 ? tokensOf([{ type: 'text', text: JSON.stringify(ctx.tools) }]) : 0);
-        for (const m of chunk.messages) requestTokens += tokensOf(stripThinkingBlocks(m.content));
-        for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
-          const m = allMessages[i];
-          if (!history.priorSummaryMessageIds.has(m.id)) requestTokens += tokensOf(stripThinkingBlocks(m.content));
-        }
-        for (const { message } of history.rawMiddle) requestTokens += tokensOf(stripThinkingBlocks(message.content));
-      }
+      const requestTokens = history.pinnedRawTokens <= recallBudget ? priceRequest(built.cleaned) : undefined;
       if (requestTokens === undefined || requestTokens > contextBudget) {
-        const pinnedRawSet = new Set(history.pinnedRaw);
-        const positionOf = this.positionIndex(allMessages);
-        const pins = this.pins.filter((pin) => {
-          const first = positionOf.get(pin.firstMessageId);
-          const last = positionOf.get(pin.lastMessageId);
-          if (first === undefined || last === undefined) return false;
-          for (let i = Math.min(first, last); i <= Math.max(first, last); i++) if (pinnedRawSet.has(i)) return true;
-          return false;
-        }).map((pin) => pin.name ?? pin.id);
-        const limit = requestTokens === undefined
-          ? `exceeds compressionRecallBudgetTokens (${recallBudget})`
-          : `would bring the request to ~${requestTokens} tokens, over compressionContextBudgetTokens (${contextBudget})`;
-        console.warn(
-          `autobio: L1 compression of ${chunk.messages.length} message(s) from ${chunkFirstId} recalls the summaries ` +
-            `its pins override: the pinned history it would show raw (~${history.pinnedRawTokens} tokens in ` +
-            `${history.pinnedRaw.length} message(s); pins: ${pins.join(', ') || 'none found'}) ${limit}. ` +
-            `Narrow the pins or raise the budget to show them raw here.`,
-        );
-        logCompressionCall({
-          event: 'compression:pinned-raw-over-budget',
-          site: 'compression',
-          pinnedRawTokens: history.pinnedRawTokens,
-          pinnedRawMessages: history.pinnedRaw.length,
-          pins,
-          chunk_message_ids: chunk.messages.map((message) => message.id),
-          ...(requestTokens === undefined
-            ? { limit: 'recall', budgetTokens: recallBudget }
-            : { limit: 'context', requestTokens, budgetTokens: contextBudget }),
-        });
+        pinsOverBudget = { history, requestTokens, contextBudget };
         history = layoutHistory(new Set());
         recall = this.capRecallPairs(history.priorSummaries, recallBudget);
+        built = assemble(history, recall.kept);
       }
     }
-    const { priorSummaries, priorSummaryMessageIds, rawMiddle, pinnedRawTokens } = history;
+    const { priorSummaries, pinnedRawTokens } = history;
     const { kept: keptSummaries, keptTokens: recallTokens } = recall;
+    const { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped } = built;
 
-    // ---- 1. Head window (raw, FIRST, ownership-capped) ----
-    //
-    // The head is the foundational identity anchor: the actual opening
-    // of the chronicle (the user's first message, the agent's first
-    // reply, the system context if any). It establishes WHO is speaking
-    // to WHOM. Without it, when the chunk content is heavily first-person
-    // from someone other than the agent (e.g., a user-shared document),
-    // the agent loses its first-person grounding and drifts into the
-    // content author's voice.
-    //
-    // The head is the configured head window — not "everything before
-    // the chunk." For doc-heavy chronicles, "everything before" would
-    // be hundreds of thousands of tokens; the recall pairs below
-    // represent that intermediate content. The head is just the
-    // permanent prefix that the original instance always saw.
-    //
-    // ONE-TO-ONE INVARIANT: chunk records (and the summaries over them)
-    // are the persistent authority over how a message is represented.
-    // The token-derived head boundary is only chunking *policy* — it is
-    // recomputed from the live estimator on every call and is NOT stable
-    // (estimator changes move it; transient headWindowTokens<=0 states
-    // let sweeps take ownership of head messages; store surgery can do
-    // the same — all observed in production, see issue #42). When the
-    // two authorities disagree, ownership wins: a head-range message
-    // covered by a live summary renders via its recall pair below, not
-    // raw. Rendering it both ways duplicated the seed in every payload.
-    let headCoveredSkipped = 0;
-    for (let i = headStartIdx; !sourceOnly && i < headEndIdx && i < allMessages.length; i++) {
-      const m = allMessages[i];
-      if (priorSummaryMessageIds.has(m.id)) {
-        headCoveredSkipped++;
-        continue;
-      }
-      llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
-    }
+    // Section 1's ownership warning and the recall cap's, for the layout chosen.
     if (headCoveredSkipped > 0) {
       console.warn(
         `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries; ` +
@@ -6252,8 +6320,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         headEndIdx,
       });
     }
-
-    // ---- 2. Prior recall pairs (budget-capped, above) and the raw middle ----
 
     if (!sourceOnly && keptSummaries.length < priorSummaries.length) {
       const dropped = priorSummaries.length - keptSummaries.length;
@@ -6274,81 +6340,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
     }
 
-    // One sequence by source position after the head window, which always
-    // comes first, so the summarizer never reads an older raw turn as coming
-    // after a later memory. Where the raw middle follows every recall pair,
-    // as it does when chunking runs contiguously, this is the order the
-    // prompt always had: recall pairs, then raw.
-    const middle: Array<{ position: number; summary?: SummaryEntry; message?: StoredMessage }> = [
-      ...keptSummaries.map((summary) => ({
-        position: messageOrder.get(summary.sourceRange.first) ?? Number.MAX_SAFE_INTEGER,
-        summary,
-      })),
-      ...rawMiddle,
-    ].sort((a, b) => a.position - b.position);
-    for (const { summary: s, message: m } of middle) {
-      if (m) {
-        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
-        continue;
-      }
-      llmMessages.push({
-        participant: 'Context Manager',
-        content: [{ type: 'text', text: `[CM] Recall memory ${s!.id}.` }],
-      });
-      // Recall answers carry the summary's verbatim reasoning carriers
-      // (signed thinking) when captured — validated 2026-07-16 on a
-      // deterministically-refusing mythos compress request: text-only →
-      // reasoning_extraction refusal; with carriers → end_turn. Replaying
-      // the model's own text WITH its encrypted reasoning reads as its own
-      // history rather than harvested output, the same KV-honesty argument
-      // as declaring tools. Raw message thinking is still stripped at
-      // insertion (unvalidated: the API rejects thinking blocks whose turn
-      // shape was modified, and split/collapse rewrites raw turns).
-      llmMessages.push({
-        participant: agentParticipant,
-        content: this.summaryAnswerContent(s!),
-      });
-    }
-
-    // ---- 4. In-band marker ----
-    // Structural start of the exact source-only shape. Never recover this by
-    // searching text: the target itself may quote the marker.
-    const sourceOnlyStartIndex = llmMessages.length;
-    llmMessages.push({
-      participant: 'Context Manager',
-      content: [{ type: 'text', text: COMPRESSION_MARKER }],
-    });
-
-    // ---- 5. Chunk messages raw ----
-    for (const m of chunk.messages) {
-      llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
-    }
-
-    // ---- 6. Instruction (reading-mode aware; worked out above) ----
-    llmMessages.push({
-      participant: 'Context Manager',
-      content: [{ type: 'text', text: instructionText }],
-    });
-
     const sourceOnlyFallbackMessages = this.config.compressionSourceOnlyFallback === true && !sourceOnly
       ? structuredClone(llmMessages.slice(sourceOnlyStartIndex))
       : undefined;
-
-    // Split any bundled tool_use+tool_result cycles in non-user turns into
-    // separate API-shape messages. claude.ai-imported sessions carry these
-    // bundles (a tool_result in an assistant message rejects the request);
-    // for fresh imports the conhost importer splits at ingest time, but
-    // already-warmed sessions hit this path. See `normalize-tool-messages.ts`.
-    const split = splitMixedToolMessages(llmMessages);
-
-    // Collapse consecutive same-participant messages for API compliance
-    const collapsed = this.collapseConsecutiveMessages(split);
-
-    // Defense in depth against chunk boundaries that cut a tool cycle
-    // (rebuildChunks tries to avoid this, but covers only the most common
-    // case). The API rejects any tool_use that isn't immediately followed
-    // by its tool_result, and any tool_result that doesn't follow a use.
-    const cleaned = stripUnpairedToolBlocks(collapsed);
 
     // Without the agent's live tool definitions a summarizer request that
     // replays tool-block-bearing history is deterministically refused
@@ -6371,6 +6365,48 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if ((chunkHasToolBlocks || toolsLessRefusingFamily) && !(ctx.tools && ctx.tools.length > 0)) {
       console.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; ${chunkHasToolBlocks ? 'history contains tool blocks' : 'Fable/Mythos-family summarizer refuses tools-less requests'}) — will retry after tools are pushed`);
       return;
+    }
+
+    if (pinsOverBudget) {
+      const { history: pinned, requestTokens, contextBudget } = pinsOverBudget;
+      // The pins that keep one of those messages raw: a pin whose own bound
+      // reads as raw here, over a message the pins keep raw.
+      const pinnedRawSet = new Set(pinned.pinnedRaw);
+      const forceRawPositions = this.forceRawPinPositions(allMessages);
+      const readsBounds = this.readsPinBounds();
+      const positionOf = this.positionIndex(allMessages);
+      const pins = this.pins.filter((pin) => {
+        const own: ResolvedPinBound = pin.level !== undefined ? { level: pin.level }
+          : pin.maxLevel !== undefined ? { maxLevel: pin.maxLevel } : 'raw';
+        if (readsBounds && !AutobiographicalStrategy.isRawPinBound(own)) return false;
+        const first = positionOf.get(pin.firstMessageId);
+        const last = positionOf.get(pin.lastMessageId);
+        if (first === undefined || last === undefined) return false;
+        for (let i = Math.min(first, last); i <= Math.max(first, last); i++) {
+          if (pinnedRawSet.has(i) && forceRawPositions.has(i)) return true;
+        }
+        return false;
+      }).map((pin) => pin.name ?? pin.id);
+      const limit = requestTokens === undefined
+        ? `exceeds compressionRecallBudgetTokens (${recallBudget})`
+        : `would bring the request to ~${requestTokens} tokens, over compressionContextBudgetTokens (${contextBudget})`;
+      console.warn(
+        `autobio: L1 compression of ${chunk.messages.length} message(s) from ${chunkFirstId} recalls the summaries ` +
+          `its pins override: the pinned history it would show raw (~${pinned.pinnedRawTokens} tokens in ` +
+          `${pinned.pinnedRaw.length} message(s); pins: ${pins.join(', ') || 'none found'}) ${limit}. ` +
+          `Narrow the pins or raise the budget to show them raw here.`,
+      );
+      logCompressionCall({
+        event: 'compression:pinned-raw-over-budget',
+        site: 'compression',
+        pinnedRawTokens: pinned.pinnedRawTokens,
+        pinnedRawMessages: pinned.pinnedRaw.length,
+        pins,
+        chunk_message_ids: chunk.messages.map((message) => message.id),
+        ...(requestTokens === undefined
+          ? { limit: 'recall', budgetTokens: recallBudget }
+          : { limit: 'context', requestTokens, budgetTokens: contextBudget }),
+      });
     }
 
     // The HOST's system prompt, or none — never a synthetic one. With no

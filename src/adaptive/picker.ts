@@ -192,8 +192,8 @@ export interface PickerChunk {
    * A pin keeps this chunk raw: never folded. That's a classic pin, a level
    * or cap of 0, and under a folding strategy that doesn't read level
    * bounds, every pin. A chunk carries at most one of `pinned`, `pinLevel`
-   * and `pinMaxLevel`, as its pins resolve
-   * (`AutobiographicalStrategy.resolvedPinBounds`).
+   * and `pinMaxLevel`, as its pins resolve (the autobiographical strategy's
+   * `resolvedPinBounds`).
    */
   pinned: boolean;
   /**

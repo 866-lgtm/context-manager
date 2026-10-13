@@ -23,6 +23,17 @@ after(() => rmSync(dir, { recursive: true, force: true }));
 
 const MARKER = 'You will soon form a new memory';
 
+const KV_UNIFIED = {
+  policy: {
+    alpha: 0.7, budgetLowRatio: 0.5, budgetHighRatio: 0.9, budgetUnderLambda: 10, budgetOverLambda: 10,
+    cacheLambda: 1, cacheScale: 1000, cacheReadPrice: 0.1, cacheWritePrice: 1.25,
+    continuityLambda: 1, continuityScale: 1000, continuityRecencyHalfLifeTokens: 1000, continuityRecencyFloor: 0.2,
+    continuityStableHalfLife: 10, continuityStableFloor: 0.25,
+  },
+  tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100, labelCeiling: 10_000, adoptEpsilon: 0,
+  treeifyNonContiguousSummaries: false, preserveGapBearingSummaries: false,
+} as never;
+
 interface Summary { id: string; level: number; content: string; sourceIds: string[]; mergedInto?: string }
 type Internals = {
   summaries: Summary[];
@@ -80,6 +91,44 @@ function l1Holding(internals: Internals, id: string): Summary {
   return l1!;
 }
 
+/** A real head window from message 200 on (the forest's own head is empty),
+ *  so the messages named lie before it. */
+function headFrom200(cm: ContextManager, internals: Internals, ids: string[], before: number[]): void {
+  internals.config.headWindowTokens = 400;
+  internals.resetHeadWindow(ids[200]);
+  const view = (cm as unknown as { strategyMessageView(): unknown }).strategyMessageView();
+  const headStart = internals.getHeadWindowStartIndex(view);
+  const headEnd = internals.getHeadWindowEnd(view);
+  assert.ok(headStart === 200 && headEnd > headStart, `setup: a head window [${headStart}, ${headEnd})`);
+  for (const at of before) assert.ok(at < headStart, `setup: message ${at} lies before the head window`);
+}
+
+/** Every recall pair sits on the side of the raw turn its source order puts it. */
+function assertSourceOrder(texts: string[], rawText: string, rawPosition: number, internals: Internals, ids: string[]): { before: number; after: number } {
+  const rawAt = texts.indexOf(rawText);
+  assert.ok(rawAt >= 0, 'the raw turn is in the prompt');
+  const position = new Map(ids.map((id, i) => [id, i]));
+  let before = 0, after = 0;
+  texts.forEach((t, at) => {
+    const match = /^\[CM\] Recall memory (.+)\.$/.exec(t);
+    if (!match) return;
+    const summary = internals.summaries.find((s) => s.id === match[1]) as (Summary & { sourceRange: { first: string } }) | undefined;
+    const first = summary ? position.get(summary.sourceRange.first) : undefined;
+    if (first === undefined) return;
+    if (first < rawPosition) { before++; assert.ok(at < rawAt, `memory from message ${first} comes before the raw turn`); }
+    else { after++; assert.ok(at > rawAt, `memory from message ${first} comes after the raw turn`); }
+  });
+  return { before, after };
+}
+
+/** The unmerged summary whose leaves hold a message. */
+function rootHolding(internals: Internals, id: string): Summary {
+  let node: Summary | undefined = l1Holding(internals, id);
+  while (node?.mergedInto) node = internals.summaries.find((s) => s.id === node!.mergedInto);
+  assert.ok(node, `setup: a root summary holds ${id}`);
+  return node!;
+}
+
 async function captureWarnings<T>(run: () => Promise<T>): Promise<{ result: T; warnings: string[] }> {
   const warnings: string[] = [];
   const original = console.warn;
@@ -118,13 +167,15 @@ describe('raw pins open only their own branch of the L1 recall frontier', () => 
   it('an opened chunk before the head window renders raw instead of vanishing', async () => {
     const { cm, internals, ids, textOf, requests } = await forest('before-head');
     const opened = l1Holding(internals, ids[5]);
-    internals.resetHeadWindow(ids[200]);
+    headFrom200(cm, internals, ids, opened.sourceIds.map((id) => ids.indexOf(id)));
     cm.pinRange(ids[5], ids[5], { name: 'before-head' });
     const request = await nextL1(cm, requests);
     assert.ok(request, 'the L1 request was sent');
     const texts = textsOf(request);
-    for (const id of opened.sourceIds) assert.ok(texts.includes(textOf.get(id)!), `opened chunk message ${id} is in the prompt`);
+    for (const id of opened.sourceIds) assert.equal(texts.filter((t) => t === textOf.get(id)).length, 1, `opened chunk message ${id} is in the prompt once`);
     assert.ok(!texts.includes(`[CM] Recall memory ${opened.id}.`), 'the opened L1 is not recalled');
+    const { after } = assertSourceOrder(texts, textOf.get(ids[5])!, 5, internals, ids);
+    assert.ok(after > 0, 'setup: later memories follow it');
     cm.close();
   });
 
@@ -135,10 +186,52 @@ describe('raw pins open only their own branch of the L1 recall frontier', () => 
       if (messageIds.length === 4) manager.pinRange(messageIds[3], messageIds[3], { name: 'never-chunked' });
     });
     assert.ok(!internals.summaries.some((s) => s.sourceIds.includes(ids[3])), 'setup: no summary covers it');
-    internals.resetHeadWindow(ids[200]);
+    headFrom200(cm, internals, ids, [3]);
     const request = await nextL1(cm, requests);
     assert.ok(request, 'the L1 request was sent');
-    assert.ok(textsOf(request).includes(textOf.get(ids[3])!), 'the pinned message is raw in the prompt');
+    assert.equal(textsOf(request).filter((t) => t === textOf.get(ids[3])).length, 1, 'the pinned message is raw in the prompt, once');
+    cm.close();
+  });
+
+  it('a pinned message no summary covers, between the head window and the chunk, renders raw once', async () => {
+    const { cm, internals, ids, textOf, requests } = await forest('pinned-after-head', {}, (manager, messageIds) => {
+      if (messageIds.length === 101) manager.pinRange(messageIds[100], messageIds[100], { name: 'never-chunked' });
+    });
+    assert.ok(!internals.summaries.some((s) => s.sourceIds.includes(ids[100])), 'setup: no summary covers it');
+    internals.config.headWindowTokens = 400;
+    const view = (cm as unknown as { strategyMessageView(): unknown }).strategyMessageView();
+    const headEnd = internals.getHeadWindowEnd(view);
+    assert.ok(headEnd > 0 && headEnd < 100, `setup: the head window [0, ${headEnd}) ends before it`);
+    const request = await nextL1(cm, requests);
+    assert.ok(request, 'the L1 request was sent');
+    assert.equal(textsOf(request).filter((t) => t === textOf.get(ids[100])).length, 1, 'the pinned message is raw in the prompt, once');
+    cm.close();
+  });
+
+  it('a pin after the chunk being compressed opens nothing: its summary is recalled, as on main', async () => {
+    // A message the chunker skipped while it was pinned raw, then unpinned, is
+    // compressed out of order, after the history that follows it.
+    let skippedPin = '';
+    const { cm, internals, ids, textOf, requests } = await forest('after-chunk', {}, (manager, messageIds) => {
+      if (messageIds.length === 31) skippedPin = manager.pinRange(messageIds[30], messageIds[30], { name: 'skipped' });
+    });
+    assert.ok(!internals.summaries.some((s) => s.sourceIds.includes(ids[30])), 'setup: the chunker skipped it');
+    cm.unpin(skippedPin);
+    cm.pinRange(ids[100], ids[100], { name: 'after-the-chunk' });
+    const root = rootHolding(internals, ids[100]);
+    requests.length = 0;
+    for (let i = 0; i < 20; i++) cm.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `NEW-${i} ${'word '.repeat(30)}` }]);
+    const compressing = (r: any): boolean => {
+      const texts = textsOf(r);
+      const marker = texts.findIndex((t) => t.includes(MARKER));
+      return marker >= 0 && texts.indexOf(textOf.get(ids[30])!) > marker;
+    };
+    for (let round = 0; round < 10 && !requests.some(compressing); round++) { await cm.compile(); await cm.tick(); }
+    const request = requests.find(compressing);
+    assert.ok(request, 'setup: the skipped message was compressed');
+    const texts = textsOf(request);
+    assert.ok(texts.includes(`[CM] Recall memory ${root.id}.`), 'the summary holding the later pin is recalled');
+    assert.ok(!texts.includes(textOf.get(ids[100])!), 'the later pin adds no raw');
     cm.close();
   });
 
@@ -207,6 +300,9 @@ describe('raw pins open only their own branch of the L1 recall frontier', () => 
     assert.equal(orphan.mergedInto, parent!.id, 'setup: the child still names its parent');
     const texts = textsOf(await nextL1(cm, requests));
     for (const id of orphan.sourceIds) assert.ok(!texts.includes(textOf.get(id)!), `unreachable merged L1's message ${id} is not replayed raw`);
+    let root: Summary | undefined = parent;
+    while (root?.mergedInto) root = internals.summaries.find((s) => s.id === root!.mergedInto);
+    assert.ok(root && texts.includes(`[CM] Recall memory ${root.id}.`), 'its parent\'s branch is still recalled');
     cm.close();
   });
 });
@@ -288,7 +384,7 @@ describe('the raw pins add is spent from the recall budget', () => {
     cm.pinRange(ids[1], ids[1], { name: 'in-head' });
     const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
     assert.ok(request, 'the compression ran');
-    assert.ok(!textsOf(request).includes(textOf.get(ids[1])!), 'one token short, the pinned chunk is recalled, not shown raw in the head');
+    for (const id of opened.sourceIds) assert.ok(!textsOf(request).includes(textOf.get(id)!), `one token short, the pinned chunk's message ${id} is recalled, not shown raw in the head`);
     assert.ok(warnings.some((w) => w.includes('recalls the summaries its pins override') && w.includes('in-head')), 'the warning names the pin');
     cm.close();
   });
@@ -304,6 +400,60 @@ describe('the raw pins add is spent from the recall budget', () => {
     assert.ok(!textsOf(request).includes(textOf.get(ids[5])!), 'the pinned message is recalled, not raw');
     assert.ok(warnings.some((w) => w.includes('compressionContextBudgetTokens') && w.includes('past-context')), 'the warning names the limit and the pin');
     cm.close();
+  });
+
+  it('the warning names the pins that keep the history raw, not a level pin beside them', async () => {
+    const { cm, internals, ids, textOf, requests } = await forest('names', { foldingStrategy: 'kv-stable' });
+    const opened = l1Holding(internals, ids[5]);
+    const sibling = opened.sourceIds.find((id) => id !== ids[5]);
+    assert.ok(sibling, 'setup: the opened chunk has another message');
+    internals.config.compressionRecallBudgetTokens = 1;
+    cm.pinRange(ids[5], ids[5], { name: 'raw-one' });
+    cm.pinAtLevel(sibling!, sibling!, 2, { name: 'level-two' });
+    const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
+    assert.ok(request, 'the compression ran');
+    assert.ok(!textsOf(request).includes(textOf.get(ids[5])!), 'setup: the pins are over budget');
+    const warning = warnings.find((w) => w.includes('recalls the summaries its pins override'));
+    assert.ok(warning && warning.includes('raw-one'), 'the raw pin is named');
+    assert.ok(!warning!.includes('level-two'), 'the level pin keeps nothing raw, so it is not named');
+    cm.close();
+  });
+
+  it('a compression deferred for its tool definitions says nothing yet about its pins', async () => {
+    // A summarizer family that refuses tools-less requests: without tools the
+    // compression defers before any provider call.
+    const { cm, internals, ids, requests } = await forest('deferred');
+    internals.config.compressionModel = 'claude-fable-5';
+    internals.config.compressionRecallBudgetTokens = 1;
+    cm.pinRange(ids[5], ids[5], { name: 'over-budget' });
+    const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
+    assert.equal(request, undefined, 'setup: the compression deferred');
+    assert.ok(warnings.some((w) => w.includes('deferring chunk compression')), 'setup: it deferred for its tools');
+    assert.ok(!warnings.some((w) => w.includes('recalls the summaries its pins override')), 'no pin warning for a compression that did not run');
+    cm.close();
+  });
+
+  it('pins are kept up to compressionContextBudgetTokens, priced as the request is sent', async () => {
+    const run = async (name: string, budget: number) => {
+      const { cm, internals, ids, textOf, requests } = await forest(name);
+      internals.config.compressionContextBudgetTokens = budget;
+      cm.pinRange(ids[5], ids[5], { name: 'at-the-limit' });
+      const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
+      assert.ok(request, 'the compression ran');
+      const view = (cm as unknown as { strategyMessageView(): { estimateTokens(m: unknown): number } }).strategyMessageView();
+      const price = request.config.maxTokens +
+        request.messages.reduce((sum: number, m: { content: unknown[] }) => sum + view.estimateTokens({ content: m.content }), 0);
+      const raw = textsOf(request).includes(textOf.get(ids[5])!);
+      cm.close();
+      return { price, raw, warnings };
+    };
+    const roomy = await run('context-roomy', 10_000_000);
+    assert.ok(roomy.raw, 'setup: with room, the pinned message is raw');
+    const exact = await run('context-exact', roomy.price);
+    assert.ok(exact.raw && exact.price === roomy.price, `a request of exactly the budget (${roomy.price}) keeps the pins`);
+    const over = await run('context-over', roomy.price - 1);
+    assert.ok(!over.raw, 'one token less, the pins are recalled');
+    assert.ok(over.warnings.some((w) => w.includes(`~${roomy.price} tokens`)), 'the warning gives the price of the request it would have sent');
   });
 
   it('pinned raw is priced as the store prices it, images included, without adaptive selection too', async () => {
@@ -339,7 +489,7 @@ describe('the raw pins add is spent from the recall budget', () => {
 });
 
 describe('a pin resolves once, for compression and every selector', () => {
-  const messages = Array.from({ length: 9 }, (_, i) => ({ id: `m${i}` }));
+  const messages = Array.from({ length: 11 }, (_, i) => ({ id: `m${i}` }));
   const pins: Array<Omit<ProtectedRange, 'firstMessageId' | 'lastMessageId' | 'kind' | 'created' | 'id'> & { at: number }> = [
     { at: 1 },                          // classic raw pin
     { at: 2, level: 0 },
@@ -349,6 +499,8 @@ describe('a pin resolves once, for compression and every selector', () => {
     { at: 6, level: 2 }, { at: 6, maxLevel: 0 },   // a fixed level wins over a cap
     { at: 7 }, { at: 7, maxLevel: 3 },              // a bound takes a classic pin's place
     { at: 8, level: 0 }, { at: 8, maxLevel: 3 },
+    { at: 9, level: 2 }, { at: 9, level: 1 },      // within a kind, the lowest wins
+    { at: 10, maxLevel: 3 }, { at: 10, maxLevel: 1 },
   ];
   const resolve = (config: Record<string, unknown>) => {
     const strategy = new AutobiographicalStrategy({ autoTickOnNewMessage: false, ...config });
@@ -370,9 +522,9 @@ describe('a pin resolves once, for compression and every selector', () => {
       });
       assert.deepEqual([...bounds.entries()].sort(([a], [b]) => a - b), [
         [1, 'raw'], [2, { level: 0 }], [3, { maxLevel: 0 }], [4, { level: 2 }], [5, { maxLevel: 2 }],
-        [6, { level: 2 }], [7, { maxLevel: 3 }], [8, { level: 0 }],
+        [6, { level: 2 }], [7, { maxLevel: 3 }], [8, { level: 0 }], [9, { level: 1 }], [10, { maxLevel: 1 }],
       ]);
-      assert.deepEqual([...raw].sort(), [1, 2, 3, 8]);
+      assert.deepEqual([...raw].sort((a, b) => a - b), [1, 2, 3, 8]);
     });
   }
 
@@ -383,18 +535,21 @@ describe('a pin resolves once, for compression and every selector', () => {
   ] as const) {
     it(`${name} keeps every pinned message raw`, () => {
       const { bounds, raw } = resolve(config);
-      assert.deepEqual([...bounds.values()], Array(8).fill('raw'));
-      assert.deepEqual([...raw].sort(), [1, 2, 3, 4, 5, 6, 7, 8]);
+      assert.deepEqual([...bounds.values()], Array(10).fill('raw'));
+      assert.deepEqual([...raw].sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     });
   }
 
   type ChunkPins = { pinned: boolean; pinLevel?: number; pinMaxLevel?: number };
+  const BOUNDED_CHUNKS: ChunkPins[] = [
+    { pinned: true }, { pinned: true }, { pinned: true }, { pinned: false, pinLevel: 2 }, { pinned: false, pinMaxLevel: 2 },
+    { pinned: false, pinLevel: 2 }, { pinned: false, pinMaxLevel: 3 }, { pinned: true },
+    { pinned: false, pinLevel: 1 }, { pinned: false, pinMaxLevel: 1 },
+  ];
   const pickerCases: Array<[string, Record<string, unknown>, ChunkPins[]]> = [
-    ['kv-stable', { foldingStrategy: 'kv-stable' }, [
-      { pinned: true }, { pinned: true }, { pinned: true }, { pinned: false, pinLevel: 2 }, { pinned: false, pinMaxLevel: 2 },
-      { pinned: false, pinLevel: 2 }, { pinned: false, pinMaxLevel: 3 }, { pinned: true },
-    ]],
-    ['flat-profile', {}, Array(8).fill({ pinned: true })],
+    ['kv-stable', { foldingStrategy: 'kv-stable' }, BOUNDED_CHUNKS],
+    ['kv-unified', { foldingStrategy: 'kv-unified', kvUnified: KV_UNIFIED }, BOUNDED_CHUNKS],
+    ['flat-profile', {}, Array(10).fill({ pinned: true })],
   ];
   for (const [name, config, expected] of pickerCases) {
     it(`${name}'s picker chunks carry the resolution: a raw one as pinned, at most one bound`, async () => {
@@ -410,9 +565,15 @@ describe('a pin resolves once, for compression and every selector', () => {
       const cm = await ContextManager.open({ path: join(dir, `picker-${name}`), strategy });
       const ids = Array.from({ length: 40 }, (_, i) => cm.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `M-${i}` }]));
       for (const { at, ...bound } of pins) cm.pinRange(ids[at], ids[at], bound);
-      await cm.compile();
+      try {
+        await cm.compile();
+      } catch (error) {
+        // kv-unified refuses a level no summary supplies yet; the chunks were
+        // read before it solved.
+        if (!(name === 'kv-unified' && /constraints are infeasible/.test(String(error)))) throw error;
+      }
       assert.ok(captured, 'setup: the picker was built');
-      for (let at = 1; at <= 8; at++) {
+      for (let at = 1; at <= 10; at++) {
         const chunk: ChunkPins | undefined = captured!.find((c) => c.id === ids[at]);
         assert.ok(chunk, `setup: message ${at} is a picker chunk`);
         const got: ChunkPins = {
@@ -434,6 +595,27 @@ describe('a pin resolves once, for compression and every selector', () => {
     const covered = (id: string) => internals.summaries.some((s) => s.level === 1 && s.sourceIds.includes(id));
     assert.ok(covered(ids[3]), 'the level-2 pin\'s message has an L1, so it can render at its level');
     assert.ok(!covered(ids[7]), 'the raw pin\'s message was never chunked');
+    cm.close();
+  });
+
+  it('under kv-stable, a message the chunker skipped, later pinned at a level, gets an L1 of its own and renders at it', async () => {
+    // The store an earlier version leaves for a message pinned at a level
+    // before compression: its neighbours compressed and merged around it.
+    let skippedPin = '';
+    const { cm, internals, ids, textOf, requests } = await forest('skipped-then-level', { foldingStrategy: 'kv-stable' }, (manager, messageIds) => {
+      if (messageIds.length === 31) skippedPin = manager.pinRange(messageIds[30], messageIds[30], { name: 'skipped' });
+    });
+    assert.ok(!internals.summaries.some((s) => s.sourceIds.includes(ids[30])), 'setup: the chunker skipped it');
+    assert.ok(internals.summaries.some((s) => s.level >= 2), 'setup: its neighbours merged');
+    cm.unpin(skippedPin);
+    cm.pinAtLevel(ids[30], ids[30], 2, { name: 'at-level' });
+    for (let round = 0; round < 2; round++) await nextL1(cm, requests);
+    const own = internals.summaries.find((s) => s.level === 1 && s.sourceIds.includes(ids[30]));
+    assert.ok(own && own.sourceIds.length === 1, 'it has an L1 of its own');
+    assert.ok(!own!.mergedInto, 'nothing merges it');
+    const live = JSON.stringify(await cm.compile());
+    assert.ok(!live.includes(textOf.get(ids[30])!), 'it no longer renders raw');
+    assert.ok(live.includes(own!.content), 'kv-stable renders it at its L1');
     cm.close();
   });
 

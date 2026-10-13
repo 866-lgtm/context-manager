@@ -1262,7 +1262,8 @@ export class ContextManager {
    * `level` (0 = raw) — the frontier cut passes through that L_k node. Honored
    * by `foldingStrategy: 'kv-stable'` and `'kv-unified'` with adaptive
    * resolution; under any other selector the range is raw, in the live view
-   * and in compression prompts alike. Returns the new pin id.
+   * and in the canonical L1 compression prompt where its budgets allow (see
+   * `compressionRecallBudgetTokens`). Returns the new pin id.
    */
   pinAtLevel(firstMessageId: MessageId, lastMessageId: MessageId, level: number, opts?: { name?: string }): string {
     return this.pinRange(firstMessageId, lastMessageId, { name: opts?.name, level });
