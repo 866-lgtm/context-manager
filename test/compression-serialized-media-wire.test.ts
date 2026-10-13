@@ -211,10 +211,18 @@ describe('matcher coverage', () => {
     assert.equal(svg.n, 1);
     assert.equal(svg.text, '[embedded image/svg+xml data URL omitted from compression prompt: 5000 serialized payload characters]');
   });
-  it('matches a MIME parameter whose value is quoted', () => {
-    const r = one('data:image/png;name=\\"a.png\\";base64,' + 'A'.repeat(5000));
-    assert.equal(r.n, 1);
-    assert.equal(r.text, '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]');
+  it('matches a type whose \\u escapes were serialized twice', () => {
+    const svg = one('data:image\\\\u002Fsvg\\\\u002Bxml;base64,' + 'A'.repeat(5000));
+    assert.equal(svg.n, 1);
+    assert.equal(svg.text, '[embedded image/svg+xml data URL omitted from compression prompt: 5000 serialized payload characters]');
+  });
+  it('matches a MIME parameter whose value is quoted, spaces included', () => {
+    const marker = '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]';
+    for (const parameter of [';name=\\"a.png\\"', ';name="a b.png"', ';name=\\"a b.png\\"', ';name=\\\\\\"a b.png\\\\\\"']) {
+      const r = one('data:image/png' + parameter + ';base64,' + 'A'.repeat(5000));
+      assert.equal(r.n, 1, parameter);
+      assert.equal(r.text, marker, parameter);
+    }
   });
   it('ends a payload before each line-break or tab escape that separates it from an abutting data URL', () => {
     const url = 'data:image/png;base64,' + 'A'.repeat(5000);

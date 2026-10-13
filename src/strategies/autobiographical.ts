@@ -11534,18 +11534,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // is exactly the media size this targets. The length floor is applied
     // below instead.
     // Also matches MIME parameters before `;base64` (`;charset=…`,
-    // `;name="a.png"`) and the JSON escapes serializers emit: escaped slashes,
-    // however many times the text was serialized (`image\/png`,
+    // `;name="a b.png"`) and the JSON escapes serializers emit, however many
+    // times the text was serialized: escaped slashes (`image\/png`,
     // `image\\\/png`), `\u` escapes in the type (`image\u002Fsvg\u002Bxml`),
     // and escapes inside the payload, such as `\n` where base64 was wrapped or
     // `\u002F`. Any letter case matches (`DATA:`, `;BASE64,`), as URL schemes
     // and the base64 token do. Bare base64 under a JSON key (Anthropic
     // `"source":{"data":…}`) is out of scope.
     const dataUrl =
-      /data:((?:[A-Za-z0-9]|\\u[0-9A-Fa-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\u[0-9A-Fa-f]{4})*(?:\\*\/|\\u002[Ff])(?:[A-Za-z0-9]|\\u[0-9A-Fa-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\u[0-9A-Fa-f]{4})*)(?:;[A-Za-z0-9!#$&^_.+-]+=[^;,\s]*)*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
+      /data:((?:[A-Za-z0-9]|\\+u[0-9A-Fa-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u[0-9A-Fa-f]{4})*(?:\\*\/|\\+u002[Ff])(?:[A-Za-z0-9]|\\+u[0-9A-Fa-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u[0-9A-Fa-f]{4})*)(?:;[A-Za-z0-9!#$&^_.+-]+=(?:\\*"[^"]*?\\*"|[^;,\s]*))*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
     let replaced = 0;
     const unescapeType = (type: string) => type
-      .replace(/\\u([0-9A-Fa-f]{4})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+      .replace(/\\+u([0-9A-Fa-f]{4})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
       .replace(/\\+\//, '/');
     const stripText = (text: string): string => {
       let out = '';
