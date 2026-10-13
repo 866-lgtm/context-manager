@@ -23,7 +23,14 @@ export interface MessageStoreView {
   length(): number;
   /** Estimate tokens for a message */
   estimateTokens(message: StoredMessage): number;
-  /** Closed-loop estimator calibration (optional — MessageStore provides it). */
+  /**
+   * Closed-loop estimator calibration (optional — MessageStore provides it).
+   * The strategy owns the factor (see MessageStore's tokenCalibration). A view
+   * supplies both of these or neither: a dry select reads the factor before
+   * its load changes it and puts it back afterwards, so it throws for a view
+   * with the setter alone rather than change a factor it can't restore. A
+   * view with neither is a fixed estimator.
+   */
   setTokenCalibration?(factor: number): void;
   getTokenCalibration?(): number;
   /**

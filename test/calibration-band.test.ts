@@ -239,6 +239,156 @@ describe('estimator calibration band', () => {
     cm.close();
   });
 
+  it('a dry select leaves the record as it was, and the next real compile persists the load', async () => {
+    // A preview (previewContext) and a dry compile each select with dryRun:
+    // the load decides as a real one would, but writes and logs nothing, and
+    // it must not latch, or the real compile after it would never persist.
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const cases = [
+      { name: 'dry-reset-preview', signedThinking: true, dry: 'preview' },
+      { name: 'dry-reset-compile', signedThinking: true, dry: 'compile' },
+      { name: 'dry-restamp-preview', signedThinking: false, dry: 'preview' },
+      { name: 'dry-restamp-compile', signedThinking: false, dry: 'compile' },
+    ] as const;
+    for (const c of cases) {
+      const first = await openManager(c.name, { signedThinking: c.signedThinking });
+      await first.cm.compile(BUDGET);
+      const old = { multiplier: 0.7, at: 1, pricing: 0 };
+      first.internals.store!.setStateJson(first.internals.calibrationStateId, old);
+      first.cm.close();
+
+      const reopened = await openManager(c.name, { signedThinking: c.signedThinking });
+      const warned: string[] = [];
+      const warn = console.warn;
+      console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+      try {
+        if (c.dry === 'preview') assert.ok(reopened.cm.previewContext(BUDGET));
+        else await reopened.cm.compile(BUDGET, undefined, { dryRun: true });
+        const calibrationLines = () => warned.filter((l) => l.includes('[estimator-calibration]'));
+        assert.deepEqual(reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId), old,
+          `${c.name}: a dry select must not write the record`);
+        assert.equal(calibrationLines().length, 0, `${c.name}: a dry select logs nothing`);
+        await reopened.cm.compile(BUDGET);
+        assert.equal(calibrationLines().length, 1, `${c.name}: the real compile logs the load once`);
+      } finally {
+        console.warn = warn;
+      }
+      const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as
+        { multiplier?: number; pricing?: number; reset?: { discardedMultiplier: number } };
+      assert.equal(saved.pricing, epoch, `${c.name}: the real compile persists the load's decision`);
+      assert.equal(saved.multiplier, c.signedThinking ? 1 : 0.7);
+      assert.equal(saved.reset?.discardedMultiplier, c.signedThinking ? 0.7 : undefined);
+      reopened.cm.close();
+    }
+  });
+
+  it('a dry select prices by the multiplier its load decided', async () => {
+    // The dry load applies its decision to the store, so a preview's plan is
+    // priced as the next real compile's is: a kept 0.7 against no record.
+    const plans: number[] = [];
+    const cases = [['priced-kept', { multiplier: 0.7, at: 1 }], ['priced-none', null]] as const;
+    for (const [name, record] of cases) {
+      const first = await openManager(name);
+      await first.cm.compile(BUDGET);
+      if (record) first.internals.store!.setStateJson(first.internals.calibrationStateId, record);
+      first.cm.close();
+      const reopened = await openManager(name);
+      const preview = reopened.cm.previewContext(BUDGET)!;
+      await reopened.cm.compile(BUDGET);
+      assert.equal(preview.finalTokens, reopened.cm.getRenderStats()!.planVsActual!.planned,
+        `${name}: the preview's plan is the real compile's`);
+      plans.push(preview.finalTokens);
+      reopened.cm.close();
+    }
+    assert.ok(plans[0] < plans[1] * 0.8, `the kept 0.7 priced the preview: ${plans.join(' vs ')}`);
+  });
+
+  it('a real load after a dry one decides from the record and history as they are then', async () => {
+    // Whatever a dry load decided stays its own: the store can change before
+    // the first real compile, and that compile's load decides afresh, for the
+    // multiplier and for the reset alike.
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const storeCalibration = (cm: ContextManager) =>
+      (cm as unknown as { messageStore: { getTokenCalibration(): number } }).messageStore.getTokenCalibration();
+    // Returns the multiplier the dry select priced by, where it reports one.
+    const dryRun = async (cm: ContextManager, how: 'preview' | 'compile') => {
+      if (how === 'preview') return cm.previewContext(BUDGET, undefined, { render: true })!.stats!.calibration!.multiplier;
+      await cm.compile(BUDGET, undefined, { dryRun: true });
+      return undefined;
+    };
+    for (const how of ['preview', 'compile'] as const) {
+      // Kept by the dry load (nothing repriced held yet); unstamped signed
+      // thinking arrives, so the real load discards it.
+      const first = await openManager(`dry-keep-then-discard-${how}`);
+      await first.cm.compile(BUDGET);
+      first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 0.7, at: 1, pricing: 0 });
+      first.cm.close();
+      const kept = await openManager(`dry-keep-then-discard-${how}`);
+      const priced = await dryRun(kept.cm, how);
+      if (how === 'preview') assert.equal(priced, 0.7, 'the preview priced by the kept 0.7');
+      // Nothing the dry load decided is left: neither the strategy's multiplier
+      // nor the one the store prices new messages by, which chunking reads.
+      assert.equal(kept.internals._calibration, 1, `${how}: the strategy's multiplier is as it was`);
+      assert.equal(storeCalibration(kept.cm), 1, `${how}: the store prices by what it did before`);
+      kept.cm.addMessage('Claude', [SIGNED_THINKING as never, { type: 'text', text: 'and then' }]);
+      await kept.cm.compile(BUDGET);
+      assert.equal(kept.internals._calibration, 1, `${how}: the real load discarded it`);
+      assert.equal(kept.cm.getRenderStats()!.calibration!.multiplier, 1);
+      const discarded = kept.internals.store!.getStateJson(kept.internals.calibrationStateId) as
+        { multiplier?: number; pricing?: number; reset?: { discardedMultiplier: number } };
+      assert.deepEqual([discarded.multiplier, discarded.pricing, discarded.reset?.discardedMultiplier], [1, epoch, 0.7]);
+      kept.cm.close();
+
+      // Discarded by the dry load (unstamped signed thinking); that content
+      // goes, so the real load keeps it, with no reset anywhere.
+      const second = await openManager(`dry-discard-then-keep-${how}`, { signedThinking: true });
+      await second.cm.compile(BUDGET);
+      second.internals.store!.setStateJson(second.internals.calibrationStateId, { multiplier: 0.7, at: 1, pricing: 0 });
+      second.cm.close();
+      const reset = await openManager(`dry-discard-then-keep-${how}`, { signedThinking: true });
+      await dryRun(reset.cm, how);
+      for (const m of reset.cm.getAllMessages()) {
+        if (m.content.some((b) => (b as { type?: string }).type === 'thinking')) reset.cm.removeMessage(m.id);
+      }
+      await reset.cm.compile(BUDGET);
+      assert.equal(reset.internals._calibration, 0.7, `${how}: the real load kept it`);
+      assert.deepEqual(reset.cm.getRenderStats()!.calibration, { multiplier: 0.7, pricingEpoch: epoch }, `${how}: no reset`);
+      const restamped = reset.internals.store!.getStateJson(reset.internals.calibrationStateId) as
+        { multiplier?: number; pricing?: number; reset?: unknown };
+      assert.deepEqual([restamped.multiplier, restamped.pricing, restamped.reset], [0.7, epoch, undefined]);
+      reset.cm.close();
+    }
+  });
+
+  it('a dry select refuses a store view whose calibration it could not put back', async () => {
+    // A view with the calibration setter but not the getter: select() can't
+    // read its factor to restore it, so a dry select refuses before changing
+    // it, and the caller's own factor stays.
+    const first = await openManager('setter-only');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId,
+      { multiplier: 0.7, at: 1, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
+    first.cm.close();
+    const reopened = await openManager('setter-only');
+    const cm = reopened.cm as unknown as {
+      strategyMessageView(): Record<string, unknown>;
+      messageStore: { getTokenCalibration(): number; setTokenCalibration(factor: number): void };
+    };
+    const build = Object.getPrototypeOf(reopened.cm).strategyMessageView as () => Record<string, unknown>;
+    cm.strategyMessageView = function (this: unknown) {
+      const view = build.call(this);
+      delete view.getTokenCalibration;
+      return view;
+    };
+    cm.messageStore.setTokenCalibration(1.3); // the caller's own factor
+    assert.throws(() => reopened.cm.previewContext(BUDGET), /getTokenCalibration/);
+    await assert.rejects(reopened.cm.compile(BUDGET, undefined, { dryRun: true }), /getTokenCalibration/);
+    assert.equal(cm.messageStore.getTokenCalibration(), 1.3, 'neither dry select changed the caller\'s factor');
+    await reopened.cm.compile(BUDGET);
+    assert.equal(cm.messageStore.getTokenCalibration(), 0.7, 'a real compile applies the loaded one');
+    reopened.cm.close();
+  });
+
   it('a drift inside 2% is not applied; once the EMA passes 2% it is', async () => {
     const { cm, strategy, internals } = await openManager('deadband');
     await cm.compile(BUDGET);
