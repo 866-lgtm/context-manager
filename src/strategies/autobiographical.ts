@@ -1997,48 +1997,87 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const summaries = this.store.getStateJson(this.summariesStateId);
     const loaded = Array.isArray(summaries) ? (summaries as SummaryEntry[]) : [];
-    // Drop empty-content summaries (bugged/empty generations from before the
-    // production guards). Recalling or merging one yields an empty text block →
-    // Anthropic 400 "content must be non-empty". Never let them re-enter memory.
-    // Drop summaries whose sources can't be read as a list of ids too: every
-    // reader of `sourceIds` iterates it (the adaptive picker's L1 index walks
-    // every L1, merged or not), so one such record threw on every compile.
-    // Their dependents are repaired below, as for an empty one.
-    const hasContent = (s: SummaryEntry) => typeof s.content === 'string' && s.content.trim().length > 0;
-    const hasSources = (s: SummaryEntry) =>
-      Array.isArray(s.sourceIds) && s.sourceIds.length > 0 &&
-      s.sourceIds.every(id => typeof id === 'string' && id.length > 0);
-    const readable = loaded.filter(s => s && hasContent(s) && hasSources(s));
-    const droppedEmpty = loaded.filter(s => s && !hasContent(s)).length;
-    const droppedNoSources = loaded.filter(s => s && hasContent(s) && !hasSources(s)).length;
-    const removedIds = new Set(
-      loaded
-        .filter(s => s && !(hasContent(s) && hasSources(s)))
-        .map(s => s.id),
-    );
-    if (droppedEmpty > 0) console.warn(`[autobiographical] dropped ${droppedEmpty} empty summary(ies) on load`);
-    if (droppedNoSources > 0) {
-      console.warn(`[autobiographical] dropped ${droppedNoSources} summary(ies) whose sourceIds aren't a list of ids on load`);
-    }
-    // Dedupe by id, keeping the copy with mergedInto set (position of first
-    // occurrence preserved). Duplicate-id copies with diverging merge state
-    // exist in stores touched by the pre-fix setMergedInto index-desync bug;
-    // without dedupe, the plain copy stays on the unmerged frontier and its
-    // content renders twice (once itself, once via its parent's merge).
+    // Empty text cannot be recalled or merged. Source lists must also be
+    // readable: the adaptive picker's L1 index iterates them, and the local
+    // exact-L1 index joins them. Null sources poison every adaptive compile;
+    // other malformed lists can misidentify a summary's message coverage.
+    const hasContent = (summary: SummaryEntry) =>
+      typeof summary.content === 'string' && summary.content.trim().length > 0;
+    const hasIds = (ids: unknown): ids is string[] =>
+      Array.isArray(ids) && ids.length > 0 &&
+      ids.every(id => typeof id === 'string' && id.length > 0);
+    const nonEmpty = loaded.filter(summary => summary && hasContent(summary));
+    const droppedEmpty = loaded.length - nonEmpty.length; // Includes null entries.
+
+    // Preserve main's duplicate selection: the merged copy owns the parent's
+    // coverage. Validate sources only after choosing it, so an unreadable
+    // merged copy can borrow provenance without exposing a plain copy beside
+    // the parent. Keep the position of the first occurrence.
     const byId = new Map<string, SummaryEntry>();
-    for (const s of readable) {
-      const prev = byId.get(s.id);
-      if (!prev) byId.set(s.id, s);
-      else if (!prev.mergedInto && s.mergedInto) byId.set(s.id, s);
+    const sourceDonors = new Map<string, SummaryEntry>();
+    for (const summary of nonEmpty) {
+      const previous = byId.get(summary.id);
+      if (!previous || (!previous.mergedInto && summary.mergedInto)) {
+        byId.set(summary.id, summary);
+      }
+      if (hasIds(summary.sourceIds) && !sourceDonors.has(summary.id)) {
+        sourceDonors.set(summary.id, summary);
+      }
     }
-    const dupes = readable.length - byId.size;
-    if (dupes > 0) console.warn(`[autobiographical] deduped ${dupes} duplicate summary id(s) on load`);
-    // Dropping an invalid parent is only half the repair. Its children may
-    // still carry `mergedInto: <dropped-id>`, which makes them simultaneously
-    // unavailable to the picker (no parent to render) and ineligible for a
-    // replacement merge (they still look merged). Clear every dangling edge
-    // and persist the canonicalized array so the poison does not return on
-    // every restart.
+    const dupes = nonEmpty.length - byId.size;
+
+    // A compressed chunk owns the exact, ordered message ids of its L1.
+    // Rebuild from that durable provenance instead of discarding good text
+    // and scheduling another compression. Uncompressed records are not proof
+    // that this summary was produced from their sources.
+    const chunksBySummary = new Map<string, ChunkRecord>();
+    for (const record of this.chunkRecords) {
+      if (record.compressed && record.summaryId && hasIds(record.sourceIds) &&
+          !chunksBySummary.has(record.summaryId)) {
+        chunksBySummary.set(record.summaryId, record);
+      }
+    }
+    const rebuiltIds: string[] = [];
+    const unreadableIds: string[] = [];
+    for (const [id, summary] of byId) {
+      if (hasIds(summary.sourceIds)) continue;
+      const donor = sourceDonors.get(id);
+      const chunk = summary.level === 1 ? chunksBySummary.get(id) : undefined;
+      if (donor) {
+        byId.set(id, { ...summary, sourceIds: [...donor.sourceIds], sourceRange: { ...donor.sourceRange } });
+        rebuiltIds.push(id);
+      } else if (chunk) {
+        byId.set(id, {
+          ...summary,
+          sourceIds: [...chunk.sourceIds],
+          sourceRange: { first: chunk.sourceIds[0], last: chunk.sourceIds[chunk.sourceIds.length - 1] },
+        });
+        rebuiltIds.push(id);
+      } else {
+        byId.delete(id);
+        unreadableIds.push(id);
+      }
+    }
+
+    // A kept parent must not still cover a dropped summary while that
+    // summary's children return to the frontier. Drop ancestors to a fixed
+    // point, including ancestors of empty-content summaries. Descendants are
+    // unmerged below, and the surviving sources can build replacement merges.
+    // A rejected duplicate does not remove an id that has a surviving copy.
+    const removedIds = new Set(loaded.filter(summary => summary && !byId.has(summary.id)).map(summary => summary.id));
+    const ancestorIds: string[] = [];
+    let changed: boolean;
+    do {
+      changed = false;
+      for (const [id, summary] of byId) {
+        if (!summary.sourceIds.some(sourceId => removedIds.has(sourceId))) continue;
+        byId.delete(id);
+        removedIds.add(id);
+        ancestorIds.push(id);
+        changed = true;
+      }
+    } while (changed);
+
     let danglingParents = 0;
     this.summaries = [...byId.values()].map((summary) => {
       if (!summary.mergedInto || byId.has(summary.mergedInto)) return summary;
@@ -2046,11 +2085,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const { mergedInto: _dropped, ...repaired } = summary;
       return repaired as SummaryEntry;
     });
-    if (droppedEmpty > 0 || droppedNoSources > 0 || dupes > 0 || danglingParents > 0) {
+    if (droppedEmpty > 0 || unreadableIds.length > 0 || rebuiltIds.length > 0 ||
+        ancestorIds.length > 0 || dupes > 0 || danglingParents > 0) {
       this.store.setStateJson(this.summariesStateId, this.summaries);
       console.warn(
-        `[autobiographical] repaired summary state: removed ${droppedEmpty} empty and ${droppedNoSources} without readable sourceIds, ` +
-          `deduped ${dupes}, cleared ${danglingParents} dangling parent pointer(s)`,
+        '[autobiographical] repaired summary state: removed ' + droppedEmpty + ' empty/malformed entries, ' +
+          unreadableIds.length + ' without readable sourceIds and ' + ancestorIds.length + ' ancestors; ' +
+          'rebuilt ' + rebuiltIds.length + ' [' + rebuiltIds.join(', ') + ']; ' +
+          'dropped ids [' + [...removedIds].join(', ') + ']; ' +
+          'deduped ' + dupes + ', cleared ' + danglingParents + ' dangling parent pointer(s)',
       );
     }
 
@@ -2090,7 +2133,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .map((r) => [r.key, r]),
     );
     const validMergeQueue = this.mergeQueue.filter(
-      merge => Array.isArray(merge.sourceIds) && !merge.sourceIds.some(id => removedIds.has(id) && !byId.has(id)),
+      merge => merge && hasIds(merge.sourceIds) && !merge.sourceIds.some(id => removedIds.has(id)),
     );
     if (validMergeQueue.length !== this.mergeQueue.length) {
       const removed = this.mergeQueue.length - validMergeQueue.length;
@@ -2546,7 +2589,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const persisted = this.store?.getStateJson(this.summariesStateId);
     if (!Array.isArray(persisted)) return undefined;
     const found = (persisted as SummaryEntry[]).find(
-      (summary) => summary?.level === 1 && summary.sourceIds?.join(':') === chunkIdKey,
+      (summary) => summary?.level === 1 && Array.isArray(summary.sourceIds) && summary.sourceIds.join(':') === chunkIdKey,
     );
     if (found && !this.summaries.some((summary) => summary.id === found.id)) {
       this.summaries.push(found);
@@ -3754,10 +3797,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     entry.mergedInto = mergedIntoId;
     if (!this.store) return;
     // Resolve the log position by ID against the PERSISTED array — never by
-    // in-memory index. `loadPersistedState` filters empty-content summaries
-    // out of `this.summaries` while they remain in the log, so after a reload
-    // the in-memory index is shifted relative to the log slot. Editing by
-    // in-memory index wrote merge-updates onto NEIGHBORING entries, silently
+    // in-memory index. loadPersistedState now drops empty and unreadable
+    // summaries and persists the canonical array, so its mirror matches the
+    // log on load. Cross-instance appends can still change the log afterward.
+    // Before that canonical repair, editing by in-memory index wrote
+    // merge-updates onto NEIGHBORING entries, silently
     // clobbering them (4 summaries lost in the 2026-07 Lena incident, leaving
     // duplicate-id copies with diverging mergedInto). Update every stored
     // copy with this id so past duplicates converge too.
