@@ -1967,9 +1967,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Load summaries, counter, and pending merges from chronicle into the
    * in-memory mirrors. Called on every (re)initialize so branch switches
-   * pick up the new branch's state.
+   * pick up the new branch's state, and by a compression that waited on
+   * another instance's in-flight compression of its family, to take up that
+   * result (compressChunkHierarchical). That waiter passes
+   * `keepKvUnifiedPresentation`: a kv-unified strategy then keeps its own
+   * receipt chain, whose pending submission is never persisted, rather than
+   * replacing it from the store, and keeps its draft and pending layout (with
+   * the layout's marker indices and immutable prefix hash), which live only in
+   * memory, rather than clearing them (#166).
    */
-  protected loadPersistedState(): void {
+  protected loadPersistedState(options: { keepKvUnifiedPresentation?: boolean } = {}): void {
     if (!this.store) {
       this.summaries = [];
       this.summaryIdCounter = 0;
@@ -2119,14 +2126,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     if (this.config.foldingStrategy === 'kv-unified') {
-      const receiptState = this.store.getStateJson(this.kvUnifiedReceiptStateId);
-      this.kvUnifiedReceipts = receiptState && typeof receiptState === 'object'
-        ? KvUnifiedReceiptChain.deserialize(receiptState as unknown as SerializedReceiptChain)
-        : new KvUnifiedReceiptChain();
-      this.kvUnifiedDraft = null;
-      this.kvUnifiedPendingLayout = null;
-      this.kvUnifiedPendingMarkerUnitIndices = [];
-      this.kvUnifiedPendingImmutablePrefixHash = null;
+      if (!options.keepKvUnifiedPresentation) {
+        const receiptState = this.store.getStateJson(this.kvUnifiedReceiptStateId);
+        this.kvUnifiedReceipts = receiptState && typeof receiptState === 'object'
+          ? KvUnifiedReceiptChain.deserialize(receiptState as unknown as SerializedReceiptChain)
+          : new KvUnifiedReceiptChain();
+        this.kvUnifiedDraft = null;
+        this.kvUnifiedPendingLayout = null;
+        this.kvUnifiedPendingMarkerUnitIndices = [];
+        this.kvUnifiedPendingImmutablePrefixHash = null;
+      }
     } else {
       // A presentation receipt is kv-unified's record of the LAST accepted
       // presentation. Once another folding strategy PRESENTS from this store
@@ -6350,8 +6359,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The producer may belong to a different strategy instance. Reload the
       // same namespace's durable result so a successful waiter gets its L1 and
       // an exhausted waiter gets the quarantine projection rather than merely
-      // returning after somebody else's work.
-      this.loadPersistedState();
+      // returning after somebody else's work. This instance's kv-unified
+      // presentation in flight stays as it is (#166).
+      this.loadPersistedState({ keepKvUnifiedPresentation: true });
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       const coalescedSummary = this.findExactL1(chunkIdKey);
       if (coalescedSummary) {
