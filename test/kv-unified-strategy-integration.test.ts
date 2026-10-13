@@ -11,7 +11,7 @@ afterEach(() => {
   if (existsSync(STORE)) rmSync(STORE, { recursive: true, force: true });
 });
 
-function strategy(): AutobiographicalStrategy {
+function strategy(overrides: Record<string, unknown> = {}): AutobiographicalStrategy {
   return new AutobiographicalStrategy({
     adaptiveResolution: true,
     foldingStrategy: 'kv-unified',
@@ -43,6 +43,7 @@ function strategy(): AutobiographicalStrategy {
       treeifyNonContiguousSummaries: false,
       preserveGapBearingSummaries: false,
     },
+    ...overrides,
   });
 }
 
@@ -101,6 +102,64 @@ test('kv-unified failed submission clears single flight without committing', asy
   selected.reportKvUnifiedFailed('s1');
   assert.equal(receipts(selected).head, null);
   assert.equal(receipts(selected).inFlightSubmissionId, null);
+  manager.close();
+});
+
+test('a dry compile leaves the last real compile\u2019s kv-unified draft markers alone', async () => {
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  for (let i = 0; i < 12; i++) {
+    manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text: `turn ${i} ` + 'word '.repeat(30) }]);
+  }
+  const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+  await manager.compile(budget, undefined, { kvUnifiedImmutablePrefixHash: 'immutable-v1' });
+  const draft = () => (selected as unknown as { kvUnifiedDraft: { markerUnitIndices: number[] } | null }).kvUnifiedDraft;
+  const before = [...draft()!.markerUnitIndices];
+  for (let i = 0; i < 6; i++) {
+    manager.addMessage('user', [{ type: 'text', text: `later ${i} ` + 'word '.repeat(30) }]);
+  }
+  const draftBefore = draft();
+  const layoutBefore = (draftBefore as unknown as { layout: unknown }).layout;
+  await manager.compile(budget, undefined, { dryRun: true, kvUnifiedImmutablePrefixHash: 'immutable-v1' });
+  assert.deepEqual(draft()!.markerUnitIndices, before, 'the submission would carry markers from a layout never sent');
+  assert.strictEqual(draft(), draftBefore, 'the draft itself is the real compile\u2019s');
+  assert.strictEqual((draft() as unknown as { layout: unknown }).layout, layoutBefore, 'and so is its layout');
+  // A real compile at the same point moves the markers, or this test proves nothing.
+  await manager.compile(budget, undefined, { kvUnifiedImmutablePrefixHash: 'immutable-v1' });
+  assert.notDeepEqual(draft()!.markerUnitIndices, before, 'a real compile re-marks the new layout');
+  manager.close();
+});
+
+test('a dry compile refuses a kv-unified plan that selects a level with no summary, as a real compile does', async () => {
+  // A picker that selects L1 for the first chunk, which has no summary.
+  class Unavailable extends AutobiographicalStrategy {
+    protected buildPicker(...args: Parameters<AutobiographicalStrategy['buildPicker']>) {
+      const picker = super.buildPicker(...args);
+      const run = picker.run.bind(picker);
+      return Object.assign(Object.create(picker), {
+        run: (...runArgs: Parameters<typeof picker.run>) => {
+          const result = run(...runArgs);
+          const first = runArgs[0].chunks[0];
+          if (!first) return result;
+          const finalResolutions = new Map(result.finalResolutions);
+          finalResolutions.set(first.id, 1);
+          // The positional view (levelAt, levelsBySequence) describes the
+          // original levels; a stub that replaces the map drops it so the
+          // strategy reads the map.
+          return { ...result, finalResolutions, levelAt: undefined, levelsBySequence: undefined };
+        },
+      });
+    }
+  }
+  const base = strategy({ targetChunkTokens: 60 }) as unknown as { config: Record<string, unknown> };
+  const selected = new Unavailable(base.config as never);
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  for (let i = 0; i < 12; i++) {
+    manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text: `turn ${i} ` + 'word '.repeat(30) }]);
+  }
+  const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+  await assert.rejects(manager.compile(budget, undefined, { dryRun: true }), /kv-unified selected unavailable L1/);
+  await assert.rejects(manager.compile(budget), /kv-unified selected unavailable L1/, 'a real compile refuses it too');
   manager.close();
 });
 
@@ -452,4 +511,114 @@ test('a failed supersede write is retried by the next presentation (#98 review)'
   const reopened = await ContextManager.open({ path: STORE, strategy: back });
   assert.equal(receipts(back).head, null, 'the retried supersede emptied the chain');
   reopened.close();
+});
+
+test('kv-unified tail markers resolve through selectAdaptive to per-message tail units, including a sharded tail message', async () => {
+  const selected = strategy({ targetChunkTokens: 200, recentWindowTokens: 100_000 });
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  manager.addMessage('user', [{ type: 'text', text: 'first question' }]);
+  manager.addMessage('assistant', [{ type: 'text', text: 'paragraph. '.repeat(1000) }]);
+  const all = manager.getAllMessages();
+  const shards = all.filter((message) => message.bodyGroupId);
+  assert.ok(shards.length > 1, 'the last message is sharded');
+  const host = selected as unknown as { mergeAdjacentBodyGroupRaw: (...args: unknown[]) => ContextEntry[] };
+  const merge = host.mergeAdjacentBodyGroupRaw.bind(selected);
+  let emitted: ContextEntry[] = [];
+  host.mergeAdjacentBodyGroupRaw = (...args) => (emitted = merge(...args));
+  await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }, undefined, { kvUnifiedImmutablePrefixHash: 'v1' });
+  const draft = (selected as unknown as {
+    kvUnifiedDraft: { layout: { units: Array<{ kind: string; key: string }> }; markerUnitIndices: number[] };
+  }).kvUnifiedDraft;
+  // Every tail message, each shard included, is its own unit; nothing falls
+  // back to the opaque 'tail' block.
+  assert.deepEqual(draft.layout.units.map((unit) => unit.key), all.map((message) => message.id));
+  assert.ok(draft.layout.units.every((unit) => unit.kind !== 'tail'));
+  // The shards render as ONE entry, which carries the marker...
+  const shardIds = shards.map((message) => message.id);
+  const composite = emitted.filter((entry) => entry.sourceMessageIds?.some((id) => shardIds.includes(id)) ||
+    (entry.sourceMessageId !== undefined && shardIds.includes(entry.sourceMessageId)));
+  assert.equal(composite.length, 1, 'the sharded message is one emitted entry');
+  assert.deepEqual(composite[0].sourceMessageIds, shardIds);
+  assert.equal(composite[0].cacheMarker, true);
+  // ...and that marker lands on the last shard's unit.
+  const markedKeys = draft.markerUnitIndices.map((index) => draft.layout.units[index - 1].key);
+  assert.ok(markedKeys.includes(shards.at(-1)!.id), `markers on ${markedKeys.join(',')}`);
+  manager.close();
+});
+
+test('kv-unified latent demand keeps no ranking between compiles', async () => {
+  // A cross-compile ranking cache replayed stale demand after appends and
+  // policy changes, shared one slot with the production-budget shadow pick, and
+  // survived branch switches. The host passes none.
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  manager.addMessage('user', [{ type: 'text', text: 'hello' }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  const solver = (selected as unknown as { _lastKvUnified: { options: { latentDemand?: Record<string, unknown> } } })._lastKvUnified;
+  assert.ok(solver.options.latentDemand, 'the live adapter ranks latent demand');
+  // Stateless knobs may be added; a ranking cache needs somewhere to hold state.
+  const latent = solver.options.latentDemand;
+  assert.ok(!('cache' in latent), 'latent demand must not carry a ranking cache between compiles');
+  for (const [key, value] of Object.entries(latent)) {
+    assert.ok(value === null || typeof value !== 'object', `latentDemand.${key} holds state across compiles`);
+  }
+  manager.close();
+});
+
+test('a usage report inside the calibration dead band keeps the kv-unified forest derived across compiles', async () => {
+  // Summaries matter here: an applied multiplier reprices every recall pair,
+  // and a changed recall cost is what makes the forest decline to derive.
+  const membrane = {
+    complete: async () => ({
+      stopReason: 'end_turn',
+      content: [{ type: 'text', text: 'summary ' + 'word '.repeat(20) }],
+      usage: { inputTokens: 100, outputTokens: 30 },
+    }),
+  };
+  const selected = strategy({ targetChunkTokens: 60, compressionModel: 'mock' });
+  const internals = selected as unknown as {
+    summaries: unknown[];
+    _lastCompileEstimate: number;
+    _calibration: number;
+    _lastKvUnified: { lastTimings: { forestDerived: boolean } | null } | null;
+  };
+  const derived = () => internals._lastKvUnified?.lastTimings?.forestDerived;
+  const manager = await ContextManager.open({ path: STORE, strategy: selected, membrane: membrane as never });
+  let turn = 0;
+  const add = () => {
+    manager.addMessage(turn % 2 ? 'assistant' : 'user', [{ type: 'text', text: `turn ${turn} ` + 'word '.repeat(30) }]);
+    turn++;
+  };
+  for (let i = 0; i < 12; i++) add();
+  const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+  await manager.compile(budget);
+  for (let i = 0; i < 6 && internals.summaries.length === 0; i++) await manager.tick();
+  assert.ok(internals.summaries.length > 0, 'the fixture needs at least one summary');
+  // Let production settle, then take two appends: the second derives.
+  for (let i = 0; i < 6; i++) await manager.tick();
+  await manager.compile(budget);
+  add();
+  await manager.compile(budget);
+  assert.equal(derived(), true, 'control: an append derives the forest from the previous compile');
+
+  // A host reports the real input total once per compile. A 0.5% miss is the
+  // normal case; it must not reprice the store and force a full build.
+  selected.reportRealInputTokens(internals._lastCompileEstimate * 1.005);
+  assert.equal(internals._calibration, 1);
+  add();
+  await manager.compile(budget);
+  assert.equal(derived(), true, 'a sample inside the dead band keeps cross-compile reuse');
+
+  // A sustained 10% miss leaves the band, is applied, and reprices every
+  // recall pair: that compile builds in full, as every compile did before.
+  let applied = false;
+  for (let i = 0; i < 6 && !applied; i++) {
+    selected.reportRealInputTokens(internals._lastCompileEstimate * 1.1);
+    applied = internals._calibration !== 1;
+    add();
+    await manager.compile(budget);
+  }
+  assert.equal(applied, true);
+  assert.equal(derived(), false, 'an applied multiplier change is a full build');
+  manager.close();
 });
