@@ -107,6 +107,15 @@ class TestableStrategy extends AutobiographicalStrategy {
     return (this.store?.getStateJson(this.mergeQueueStateId) as unknown[] | null) ?? [];
   }
 
+  persistRawResolutions(levels: Record<string, number>, locked: string[] = []): void {
+    this.store?.setStateJson(this.resolutionsStateId, levels);
+    this.store?.setStateJson(this.locksStateId, locked);
+  }
+
+  readPersistedResolutions(): Record<string, number> {
+    return (this.store?.getStateJson(this.resolutionsStateId) as Record<string, number> | null) ?? {};
+  }
+
   exactL1(ids: string[]): SummaryEntry | undefined {
     return (this as unknown as { findExactL1(key: string): SummaryEntry | undefined }).findExactL1(ids.join(':'));
   }
@@ -368,6 +377,71 @@ describe('AutobiographicalStrategy — persistence', () => {
         }
         assert.ok(!strategy.getSummariesView().some((s) => s.id === 'L1-lost'), 'the record is dropped on load');
         assert.ok(!strategy.readPersistedSummaries().some((s) => s.id === 'L1-lost'), 'and the drop is persisted, with nothing else to repair');
+      } finally {
+        manager.close();
+      }
+    });
+  }
+
+  for (const [label, options] of [
+    ['default solver', {}],
+    ['oldest-first', { foldingStrategy: 'oldest-first' }],
+    ['kv-stable', { foldingStrategy: 'kv-stable' }],
+  ] as const) {
+    it(`plans a message whose saved level names a dropped summary from the summaries still over it (${label})`, async (t) => {
+      t.mock.method(console, 'warn', () => {});
+      t.mock.method(console, 'error', () => {});
+      const config = { targetChunkTokens: 300, adaptiveResolution: true, recentWindowTokens: 40, ...options };
+      let ids: string[] = [];
+      {
+        const strategy = new TestableStrategy(config);
+        const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+        ids = Array.from({ length: 12 }, (_, i) => manager.addMessage(i % 2 ? 'Claude' : 'User', textBlock(`MSG${i} ` + 'word '.repeat(60))));
+        manager.addMessage('User', textBlock('TAIL'));
+        const groups = [ids.slice(0, 4), ids.slice(4, 8), ids.slice(8)];
+        const pairs = groups.map((group, g) => {
+          const l1 = strategy.seedL1(`${'BCD'[g]}-SUMMARY`, group);
+          return [l1, strategy.seedL2([l1.id], `${'PQR'[g]}-SUMMARY`)] as const;
+        });
+        const view = new Map(strategy.getSummariesView().map((summary) => [summary.id, summary]));
+        // The first L2 also names an L1 that an earlier version dropped, so the
+        // load drops it. Its four messages were last presented through it.
+        strategy.persistRawSummaries(pairs.flatMap(([l1, l2], g) => [
+          view.get(l1.id)!,
+          g === 0 ? { ...view.get(l2.id)!, sourceIds: ['L1-gone', l1.id] } : view.get(l2.id)!,
+        ]));
+        strategy.persistRawChunks(pairs.map(([l1], g) => ({ id: `c-${g}`, sourceIds: groups[g]!, compressed: true, summaryId: l1.id })));
+        // The second group's messages were presented at L2 and the third's at
+        // L1, both of which they still reach; those and one message of the
+        // first group are locked, so every solver keeps their levels.
+        strategy.persistRawResolutions(
+          Object.fromEntries(ids.map((id, i) => [id, i < 8 ? 2 : 1])),
+          [ids[3]!, ...ids.slice(4)],
+        );
+        manager.sync();
+        manager.close();
+      }
+      const strategy = new TestableStrategy(config);
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      try {
+        assert.deepEqual(strategy.getSummariesView().map((s) => s.id).sort(), ['L1-0', 'L1-2', 'L1-4', 'L2-3', 'L2-5'], 'the L2 naming a missing L1 is dropped');
+        const saved = Object.fromEntries(ids.map((id, i) => [id, i < 8 ? 2 : 1]));
+        // Raw, the first group's messages are over this budget; its L1's recall is far under it.
+        const dry = await manager.compile({ maxTokens: 150, reserveForResponse: 0 }, undefined, { dryRun: true });
+        assert.deepEqual(strategy.readPersistedResolutions(), saved, 'a dry compile saves no level');
+        const live = await manager.compile({ maxTokens: 150, reserveForResponse: 0 });
+        for (const context of [dry, live]) {
+          const texts = context.messages.flatMap((message) => message.content).map((block) => (block as { text?: string }).text ?? '');
+          for (const [text, count] of [['B-SUMMARY', 1], ['Q-SUMMARY', 1], ['D-SUMMARY', 1], ['C-SUMMARY', 0], ['R-SUMMARY', 0]] as const) {
+            assert.equal(texts.filter((value) => value === text).length, count, text + ' in ' + JSON.stringify(texts));
+          }
+          assert.ok(!texts.some((text) => text.startsWith('MSG')), JSON.stringify(texts));
+        }
+        assert.deepEqual(
+          strategy.readPersistedResolutions(),
+          { ...saved, [ids[0]!]: 1, [ids[1]!]: 1, [ids[2]!]: 1 },
+          'the compile saves the level it presented, and a locked message keeps its own',
+        );
       } finally {
         manager.close();
       }

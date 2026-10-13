@@ -744,6 +744,27 @@ function hasSummaryText(summary: SummaryEntry): boolean {
 }
 
 /**
+ * The level a message is planned from: its saved level when the summaries
+ * over it reach that level, else the deepest one at or below it that they
+ * reach, walking up from its L1. A saved level names a summary's level, and
+ * the load repair can drop that summary while the message's L1 survives. The
+ * greedy solvers never lower a level and price one with no summary as raw,
+ * so such a message stayed raw, and a compile that its L1 would have fit
+ * failed.
+ */
+function reachableLevel(saved: number, l1Id: SummaryId | undefined, summariesById: ReadonlyMap<SummaryId, SummaryEntry>): number {
+  let level = 0;
+  let current = saved > 0 && l1Id !== undefined ? summariesById.get(l1Id) : undefined;
+  while (current && current.level <= saved) {
+    level = current.level;
+    const parentId = getSummaryParentId(current);
+    const parent = parentId ? summariesById.get(parentId) : undefined;
+    current = parent && parent.level > current.level ? parent : undefined;
+  }
+  return level;
+}
+
+/**
  * Chronicle state mutation is synchronous but not transactional across a
  * read/project/append sequence. Serialize those short sequences for strategy
  * instances sharing one JsStore in this process. Branch is part of the key so
@@ -8536,18 +8557,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ? Math.min(pse[i], msgCap + 50)
         : pse[i];
       const bound = pinBounds.size > 0 ? pinBounds.get(i) : undefined;
+      const l1Id = ch?.summaryId ?? l1ByMessage.get(msg.id);
       pickerChunks.push({
         id: msg.id,
         sequence: i,
         rawTokens: tokens,
-        currentResolution: this.resolutions.get(msg.id) ?? 0,
+        currentResolution: reachableLevel(this.resolutions.get(msg.id) ?? 0, l1Id, summariesById),
         lockedByAgent: this.locked.has(msg.id),
         // A classic pin (in pinnedSet with no level bound) stays force-raw. A
         // leveled pin is not force-raw; it carries its bound instead.
         pinned: pinnedSet.size > 0 && pinnedSet.has(i) && bound === undefined,
         pinLevel: bound?.level,
         pinMaxLevel: bound?.maxLevel,
-        l1Id: ch?.summaryId ?? l1ByMessage.get(msg.id),
+        l1Id,
         salience: salience[i],
       });
     }
@@ -8758,14 +8780,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const pendingResolutionChanges: Array<[string, number]> = [];
     let deepestLevel = 0;
     // The middle chunks are the prefix of pickerChunks (head and tail were
-    // appended after them); each carries the resolution it was built with.
+    // appended after them). A change is staged against the saved level, not
+    // the level the chunk was planned from, which is lower when the saved
+    // level's summary is gone (reachableLevel), so the commit saves what this
+    // compile presents. A locked chunk keeps its saved level.
     for (let k = 0; k < middleChunkCount; k++) {
       const chunk = pickerChunks[k];
       const id = chunk.id;
       const level = levelAt(chunk.sequence, id);
       if (level > deepestLevel) deepestLevel = level;
       if (this.locked.has(id)) continue;
-      const prev = chunk.currentResolution;
+      const prev = this.resolutions.get(id) ?? 0;
       if (prev !== level && !dryRun) pendingResolutionChanges.push([id, level]);
     }
     if (plan?.override) {
