@@ -199,7 +199,8 @@ export interface PickerChunk {
   /**
    * V2 dynamic pin — fix this chunk at EXACTLY this fold level, above 0 (a
    * level of 0 arrives as `pinned`). Set from a `ProtectedRange.level`, only
-   * under the folding strategies that read it (kv-stable, kv-unified). Such
+   * under the folding strategies that read it (kv-stable, kv-unified, with
+   * adaptive resolution). Such
    * a chunk is NOT `pinned` (the controller must be able to move it to its
    * level), but the controller holds it there and never folds/un-folds it.
    */
@@ -208,7 +209,8 @@ export interface PickerChunk {
    * V2 dynamic pin — this chunk may fold no deeper than this level (hard cap),
    * above 0 (a cap of 0 arrives as `pinned`). Set from a
    * `ProtectedRange.maxLevel`, only under the folding strategies that read it
-   * (kv-stable, kv-unified), and only when no `level` applies.
+   * (kv-stable, kv-unified, with adaptive resolution), and only when no
+   * `level` applies.
    * The KV-stable controller honors it throughout the solve — there is no
    * emergency path (design §13).
    */

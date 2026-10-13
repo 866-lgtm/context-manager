@@ -2248,8 +2248,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * V2 dynamic pin-at-level-k convenience: fix a range to render at EXACTLY
    * fold level `level` (0 = raw). Honored by `foldingStrategy: 'kv-stable'`
    * and `'kv-unified'` with adaptive resolution; under any other selector the
-   * range is raw, in the live view and in compression prompts alike
-   * (`resolvedPinBounds`).
+   * range is raw (`resolvedPinBounds`), in the live view and in the canonical
+   * L1 compression prompt where its budgets allow (see
+   * `compressionRecallBudgetTokens`).
    * Equivalent to `pinRange(first, last, { level })`.
    */
   pinAtLevel(firstMessageId: string, lastMessageId: string, level: number, opts?: { name?: string }): string {
@@ -5966,8 +5967,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The raw that pins add is spent from the recall budget (below).
     //
     // Scope: the canonical L1 prompt, and only pins before the chunk. Merge
-    // recall, L3+ merge inputs, transition summaries and the source-only L1
-    // do not consult pins.
+    // recall, L3+ merge inputs and transition summaries do not consult pins,
+    // and the source-only L1 shows no history for them to change.
     const summariesById = new Map<string, SummaryEntry>();
     for (const s of this.summaries) summariesById.set(s.id, s);
     // Priced as the store prices a message, images and tool blocks included,
@@ -6081,8 +6082,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // before any recall pair. A pinned message from the head window on
       // that no summary covers was never chunked, since the chunker skips
       // what pins keep raw; it renders raw with or without the pins and has
-      // no summary to recall, so it isn't charged here (the complete-request
-      // admission below counts it).
+      // no summary to recall, so it isn't charged here. When pins are
+      // admitted, the request's price includes it.
       const rawMiddle: Array<{ position: number; message: StoredMessage }> = [];
       const pinnedRaw: number[] = [];
       let pinnedRawTokens = 0;
@@ -6305,41 +6306,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const { kept: keptSummaries, keptTokens: recallTokens } = recall;
     const { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped } = built;
 
-    // Section 1's ownership warning and the recall cap's, for the layout chosen.
-    if (headCoveredSkipped > 0) {
-      console.warn(
-        `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries; ` +
-          `rendering them via recall pairs (ownership wins). The token-derived head boundary ` +
-          `disagrees with chunk ownership — likely store surgery or head-boundary drift.`,
-      );
-      logCompressionCall({
-        event: 'head-ownership-overlap',
-        site: 'compression',
-        skipped: headCoveredSkipped,
-        headStartIdx,
-        headEndIdx,
-      });
-    }
-
-    if (!sourceOnly && keptSummaries.length < priorSummaries.length) {
-      const dropped = priorSummaries.length - keptSummaries.length;
-      console.warn(
-        `autobio: compression recall-pair budget capped (${keptSummaries.length}/${priorSummaries.length} summaries kept, ` +
-          `~${recallTokens} tokens, budget ${recallBudget}` +
-          (pinnedRawTokens > 0 ? ` less ~${pinnedRawTokens} of pinned raw` : '') +
-          `; ${dropped} oldest dropped this compression).`,
-      );
-      logCompressionCall({
-        event: 'recall-budget-capped',
-        site: 'compression',
-        kept: keptSummaries.length,
-        total: priorSummaries.length,
-        tokens: recallTokens,
-        budgetTokens: recallBudget,
-        ...(pinnedRawTokens > 0 ? { pinnedRawTokens } : {}),
-      });
-    }
-
     const sourceOnlyFallbackMessages = this.config.compressionSourceOnlyFallback === true && !sourceOnly
       ? structuredClone(llmMessages.slice(sourceOnlyStartIndex))
       : undefined;
@@ -6365,48 +6331,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if ((chunkHasToolBlocks || toolsLessRefusingFamily) && !(ctx.tools && ctx.tools.length > 0)) {
       console.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; ${chunkHasToolBlocks ? 'history contains tool blocks' : 'Fable/Mythos-family summarizer refuses tools-less requests'}) — will retry after tools are pushed`);
       return;
-    }
-
-    if (pinsOverBudget) {
-      const { history: pinned, requestTokens, contextBudget } = pinsOverBudget;
-      // The pins that keep one of those messages raw: a pin whose own bound
-      // reads as raw here, over a message the pins keep raw.
-      const pinnedRawSet = new Set(pinned.pinnedRaw);
-      const forceRawPositions = this.forceRawPinPositions(allMessages);
-      const readsBounds = this.readsPinBounds();
-      const positionOf = this.positionIndex(allMessages);
-      const pins = this.pins.filter((pin) => {
-        const own: ResolvedPinBound = pin.level !== undefined ? { level: pin.level }
-          : pin.maxLevel !== undefined ? { maxLevel: pin.maxLevel } : 'raw';
-        if (readsBounds && !AutobiographicalStrategy.isRawPinBound(own)) return false;
-        const first = positionOf.get(pin.firstMessageId);
-        const last = positionOf.get(pin.lastMessageId);
-        if (first === undefined || last === undefined) return false;
-        for (let i = Math.min(first, last); i <= Math.max(first, last); i++) {
-          if (pinnedRawSet.has(i) && forceRawPositions.has(i)) return true;
-        }
-        return false;
-      }).map((pin) => pin.name ?? pin.id);
-      const limit = requestTokens === undefined
-        ? `exceeds compressionRecallBudgetTokens (${recallBudget})`
-        : `would bring the request to ~${requestTokens} tokens, over compressionContextBudgetTokens (${contextBudget})`;
-      console.warn(
-        `autobio: L1 compression of ${chunk.messages.length} message(s) from ${chunkFirstId} recalls the summaries ` +
-          `its pins override: the pinned history it would show raw (~${pinned.pinnedRawTokens} tokens in ` +
-          `${pinned.pinnedRaw.length} message(s); pins: ${pins.join(', ') || 'none found'}) ${limit}. ` +
-          `Narrow the pins or raise the budget to show them raw here.`,
-      );
-      logCompressionCall({
-        event: 'compression:pinned-raw-over-budget',
-        site: 'compression',
-        pinnedRawTokens: pinned.pinnedRawTokens,
-        pinnedRawMessages: pinned.pinnedRaw.length,
-        pins,
-        chunk_message_ids: chunk.messages.map((message) => message.id),
-        ...(requestTokens === undefined
-          ? { limit: 'recall', budgetTokens: recallBudget }
-          : { limit: 'context', requestTokens, budgetTokens: contextBudget }),
-      });
     }
 
     // The HOST's system prompt, or none — never a synthetic one. With no
@@ -6641,6 +6565,87 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       return;
     }
+
+    // The warnings for the layout sent: section 1's ownership, the recall
+    // cap's, and the pins' fallback. Logged once the compression goes ahead,
+    // past the deferral, the quarantine skip and in-flight coalescing, and
+    // before it registers as in flight, which the finally below settles.
+    if (headCoveredSkipped > 0) {
+      console.warn(
+        `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries; ` +
+          `rendering them via recall pairs (ownership wins). The token-derived head boundary ` +
+          `disagrees with chunk ownership — likely store surgery or head-boundary drift.`,
+      );
+      logCompressionCall({
+        event: 'head-ownership-overlap',
+        site: 'compression',
+        skipped: headCoveredSkipped,
+        headStartIdx,
+        headEndIdx,
+      });
+    }
+
+    if (!sourceOnly && keptSummaries.length < priorSummaries.length) {
+      const dropped = priorSummaries.length - keptSummaries.length;
+      console.warn(
+        `autobio: compression recall-pair budget capped (${keptSummaries.length}/${priorSummaries.length} summaries kept, ` +
+          `~${recallTokens} tokens, budget ${recallBudget}` +
+          (pinnedRawTokens > 0 ? ` less ~${pinnedRawTokens} of pinned raw` : '') +
+          `; ${dropped} oldest dropped this compression).`,
+      );
+      logCompressionCall({
+        event: 'recall-budget-capped',
+        site: 'compression',
+        kept: keptSummaries.length,
+        total: priorSummaries.length,
+        tokens: recallTokens,
+        budgetTokens: recallBudget,
+        ...(pinnedRawTokens > 0 ? { pinnedRawTokens } : {}),
+      });
+    }
+
+    if (pinsOverBudget) {
+      const { history: pinned, requestTokens, contextBudget } = pinsOverBudget;
+      // The pins that keep one of those messages raw: a pin whose own bound
+      // reads as raw here, over a message the pins keep raw.
+      const pinnedRawSet = new Set(pinned.pinnedRaw);
+      const forceRawPositions = this.forceRawPinPositions(allMessages);
+      const readsBounds = this.readsPinBounds();
+      const positionOf = this.positionIndex(allMessages);
+      const pins = this.pins.filter((pin) => {
+        const own: ResolvedPinBound = pin.level !== undefined ? { level: pin.level }
+          : pin.maxLevel !== undefined ? { maxLevel: pin.maxLevel } : 'raw';
+        if (readsBounds && !AutobiographicalStrategy.isRawPinBound(own)) return false;
+        const first = positionOf.get(pin.firstMessageId);
+        const last = positionOf.get(pin.lastMessageId);
+        if (first === undefined || last === undefined) return false;
+        for (let i = Math.min(first, last); i <= Math.max(first, last); i++) {
+          if (pinnedRawSet.has(i) && forceRawPositions.has(i)) return true;
+        }
+        return false;
+      }).map((pin) => pin.name ?? pin.id);
+      const limit = requestTokens === undefined
+        ? `exceeds compressionRecallBudgetTokens (${recallBudget})`
+        : `would bring the request to ~${requestTokens} tokens, over compressionContextBudgetTokens (${contextBudget})`;
+      console.warn(
+        `autobio: L1 compression of ${chunk.messages.length} message(s) from ${chunkFirstId} recalls the summaries ` +
+          `its pins override: the pinned history it would show raw (~${pinned.pinnedRawTokens} tokens in ` +
+          `${pinned.pinnedRaw.length} message(s); pins: ${pins.join(', ') || 'none found'}) ${limit}. ` +
+          `Narrow the pins or raise that budget to show them raw here.`,
+      );
+      logCompressionCall({
+        event: 'compression:pinned-raw-over-budget',
+        site: 'compression',
+        pinnedRawTokens: pinned.pinnedRawTokens,
+        pinnedRawMessages: pinned.pinnedRaw.length,
+        pins,
+        chunk_message_ids: chunk.messages.map((message) => message.id),
+        ...(requestTokens === undefined
+          ? { limit: 'recall', budgetTokens: recallBudget }
+          : { limit: 'context', requestTokens, budgetTokens: contextBudget }),
+      });
+    }
+
     let settleInFlight!: (result: CompressionInFlightResult) => void;
     const inFlightCompletion = new Promise<CompressionInFlightResult>((resolve) => {
       settleInFlight = resolve;

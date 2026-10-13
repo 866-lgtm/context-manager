@@ -49,6 +49,7 @@ async function forest(
   overrides: Record<string, unknown> = {},
   afterAdd?: (cm: ContextManager, ids: string[]) => void,
   content: (i: number, text: string) => unknown[] = (_i, text) => [{ type: 'text', text }],
+  participant: (i: number) => string = (i) => (i % 2 ? 'Claude' : 'User'),
 ) {
   const requests: any[] = [];
   let calls = 0;
@@ -62,7 +63,7 @@ async function forest(
   const textOf = new Map<string, string>();
   for (let i = 0; i < 240; i++) {
     const text = `OLD-${i} ${'word '.repeat(30)}`;
-    const id = cm.addMessage(i % 2 ? 'Claude' : 'User', content(i, text) as never);
+    const id = cm.addMessage(participant(i), content(i, text) as never);
     ids.push(id);
     textOf.set(id, text);
     afterAdd?.(cm, ids);
@@ -395,9 +396,11 @@ describe('the raw pins add is spent from the recall budget', () => {
     internals.config.compressionContextBudgetTokens = 1;
     assert.ok(await nextL1(cm, requests), 'without pins, the canonical request is attempted as before');
     cm.pinRange(ids[5], ids[5], { name: 'past-context' });
+    const root = rootHolding(internals, ids[5]);
     const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
     assert.ok(request, 'the compression ran');
     assert.ok(!textsOf(request).includes(textOf.get(ids[5])!), 'the pinned message is recalled, not raw');
+    assert.ok(textsOf(request).includes(`[CM] Recall memory ${root.id}.`), 'the summary the pin overrides is recalled');
     assert.ok(warnings.some((w) => w.includes('compressionContextBudgetTokens') && w.includes('past-context')), 'the warning names the limit and the pin');
     cm.close();
   });
@@ -408,14 +411,17 @@ describe('the raw pins add is spent from the recall budget', () => {
     const sibling = opened.sourceIds.find((id) => id !== ids[5]);
     assert.ok(sibling, 'setup: the opened chunk has another message');
     internals.config.compressionRecallBudgetTokens = 1;
-    cm.pinRange(ids[5], ids[5], { name: 'raw-one' });
-    cm.pinAtLevel(sibling!, sibling!, 2, { name: 'level-two' });
+    // ids[5] is raw by its level-0 pin, the lowest level there; the level-2
+    // pins keep nothing raw, one on the same message, one beside it.
+    cm.pinAtLevel(ids[5], ids[5], 0, { name: 'raw-one' });
+    cm.pinAtLevel(ids[5], ids[5], 2, { name: 'level-two' });
+    cm.pinAtLevel(sibling!, sibling!, 2, { name: 'level-two-beside' });
     const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
     assert.ok(request, 'the compression ran');
     assert.ok(!textsOf(request).includes(textOf.get(ids[5])!), 'setup: the pins are over budget');
     const warning = warnings.find((w) => w.includes('recalls the summaries its pins override'));
     assert.ok(warning && warning.includes('raw-one'), 'the raw pin is named');
-    assert.ok(!warning!.includes('level-two'), 'the level pin keeps nothing raw, so it is not named');
+    assert.ok(!warning!.includes('level-two'), 'the level pins keep nothing raw, so neither is named');
     cm.close();
   });
 
@@ -434,25 +440,41 @@ describe('the raw pins add is spent from the recall budget', () => {
   });
 
   it('pins are kept up to compressionContextBudgetTokens, priced as the request is sent', async () => {
+    // The pinned chunk carries an image and two turns of one speaker, which
+    // the request collapses into one with a separator, and the host serves a
+    // system prompt and tools, so every term of the price is in play.
+    const image = { type: 'image', source: { type: 'base64', data: 'A'.repeat(64), mediaType: 'image/png' } };
+    const tools = [{ name: 'lookup', description: 'Look something up.', inputSchema: { type: 'object', properties: { q: { type: 'string' } } } }];
     const run = async (name: string, budget: number) => {
-      const { cm, internals, ids, textOf, requests } = await forest(name);
+      const { cm, internals, ids, textOf, requests } = await forest(name, {}, undefined,
+        (i, text) => (i === 5 ? [image, { type: 'text', text }] : [{ type: 'text', text }]),
+        (i) => (i % 2 === 0 || i === 5 ? 'User' : 'Claude'));
+      cm.setSystemPrompt('You are the agent whose memory this is.');
+      cm.setToolDefinitions(tools as never);
       internals.config.compressionContextBudgetTokens = budget;
       cm.pinRange(ids[5], ids[5], { name: 'at-the-limit' });
+      const root = rootHolding(internals, ids[5]);
       const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
       assert.ok(request, 'the compression ran');
+      assert.ok(request.system && request.tools?.length, 'setup: the request carries the system prompt and tools');
       const view = (cm as unknown as { strategyMessageView(): { estimateTokens(m: unknown): number } }).strategyMessageView();
+      const priceOf = (content: unknown[]) => view.estimateTokens({ content });
       const price = request.config.maxTokens +
-        request.messages.reduce((sum: number, m: { content: unknown[] }) => sum + view.estimateTokens({ content: m.content }), 0);
-      const raw = textsOf(request).includes(textOf.get(ids[5])!);
+        priceOf([{ type: 'text', text: request.system }]) +
+        priceOf([{ type: 'text', text: JSON.stringify(request.tools) }]) +
+        request.messages.reduce((sum: number, m: { content: unknown[] }) => sum + priceOf(m.content), 0);
+      const texts = textsOf(request);
+      const raw = texts.includes(textOf.get(ids[5])!);
+      const recalled = texts.includes(`[CM] Recall memory ${root.id}.`);
       cm.close();
-      return { price, raw, warnings };
+      return { price, raw, recalled, warnings };
     };
     const roomy = await run('context-roomy', 10_000_000);
     assert.ok(roomy.raw, 'setup: with room, the pinned message is raw');
     const exact = await run('context-exact', roomy.price);
     assert.ok(exact.raw && exact.price === roomy.price, `a request of exactly the budget (${roomy.price}) keeps the pins`);
     const over = await run('context-over', roomy.price - 1);
-    assert.ok(!over.raw, 'one token less, the pins are recalled');
+    assert.ok(!over.raw && over.recalled, 'one token less, the summary the pin overrides is recalled instead');
     assert.ok(over.warnings.some((w) => w.includes(`~${roomy.price} tokens`)), 'the warning gives the price of the request it would have sent');
   });
 
@@ -499,8 +521,8 @@ describe('a pin resolves once, for compression and every selector', () => {
     { at: 6, level: 2 }, { at: 6, maxLevel: 0 },   // a fixed level wins over a cap
     { at: 7 }, { at: 7, maxLevel: 3 },              // a bound takes a classic pin's place
     { at: 8, level: 0 }, { at: 8, maxLevel: 3 },
-    { at: 9, level: 2 }, { at: 9, level: 1 },      // within a kind, the lowest wins
-    { at: 10, maxLevel: 3 }, { at: 10, maxLevel: 1 },
+    { at: 9, level: 1 }, { at: 9, level: 2 },      // within a kind, the lowest wins, not the last
+    { at: 10, maxLevel: 1 }, { at: 10, maxLevel: 3 },
   ];
   const resolve = (config: Record<string, unknown>) => {
     const strategy = new AutobiographicalStrategy({ autoTickOnNewMessage: false, ...config });
@@ -619,14 +641,22 @@ describe('a pin resolves once, for compression and every selector', () => {
     cm.close();
   });
 
-  it('the flat-profile live view keeps a message pinned at a level raw, as compression does', async () => {
-    const { cm, ids } = await forest('flat-live');
-    // Pinned while raw (the forest's compiles fit their default budget), then
-    // compiled under a budget that folds its unpinned neighbour.
-    cm.pinAtLevel(ids[100], ids[100], 2, { name: 'at-level' });
-    const live = JSON.stringify(await cm.compile({ maxTokens: 4000, reserveForResponse: 0 }));
-    assert.ok(!live.includes('OLD-101 '), 'setup: an unpinned neighbour folds under this budget');
-    assert.ok(live.includes('OLD-100 '), 'pinned at a level, it stays raw where levels are not read');
-    cm.close();
-  });
+  for (const [name, overrides] of [
+    ['flat-profile', {}],
+    ['hierarchical selection', { adaptiveResolution: false }],
+  ] as const) {
+    it(`the ${name} live view keeps a message pinned at a level raw, as compression does`, async () => {
+      const { cm, internals, ids, textOf, requests } = await forest(`live-${name.replace(' ', '-')}`, overrides);
+      assert.ok(internals.summaries.some((s) => s.level === 1 && s.sourceIds.includes(ids[100])), 'setup: it has an L1 to fold to');
+      // Pinned once compressed, then compiled under a budget that folds its
+      // unpinned neighbour.
+      cm.pinAtLevel(ids[100], ids[100], 2, { name: 'at-level' });
+      const live = JSON.stringify(await cm.compile({ maxTokens: 4000, reserveForResponse: 0 }));
+      assert.ok(!live.includes('OLD-101 '), 'setup: an unpinned neighbour folds under this budget');
+      assert.ok(live.includes('OLD-100 '), 'pinned at a level, it stays raw where levels are not read');
+      const request = await nextL1(cm, requests);
+      assert.ok(request && textsOf(request).includes(textOf.get(ids[100])!), 'the L1 prompt shows it raw too');
+      cm.close();
+    });
+  }
 });

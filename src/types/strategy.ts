@@ -1144,9 +1144,10 @@ export interface AutobiographicalConfig {
    *
    * It also decides whether an L1 prompt shows pinned history raw: with the
    * raw that pins add, the canonical request must fit it, priced as the
-   * message store prices the messages it would send (after splitting and
-   * collapsing, before the image cap, which only replaces images), with the
-   * system prompt, tools and output reserve. Otherwise that compression lays
+   * message store prices the messages it would send (after splitting,
+   * collapsing and dropping unpaired tool blocks, before the image cap,
+   * which only replaces images), with the system prompt, tools and output
+   * reserve. Otherwise that compression lays
    * history out as it would without pins (see
    * `compressionRecallBudgetTokens`). A canonical request without pins is
    * still always attempted.
@@ -1537,7 +1538,10 @@ export interface ProtectedRange {
    * Honored by the folding strategies that read level bounds
    * (`foldingStrategy: 'kv-stable'` and `'kv-unified'`, with
    * `adaptiveResolution`). There a level above 0 doesn't keep the range raw:
-   * it is still compressed, since only a summary can supply that level. Under
+   * it is still compressed, since only a summary can supply that level.
+   * Under kv-unified, a pinned level on a message between the head window
+   * and the recent window that no summary supplies yet is a constraint
+   * conflict, and every compile fails until one does. Under
    * any other selector, and without adaptive resolution, the range is raw (a
    * safe superset). The canonical L1 compression prompt shows raw what the
    * configured selector keeps raw, where its budgets allow (see
