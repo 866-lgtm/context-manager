@@ -959,10 +959,12 @@ export interface AutobiographicalConfig {
    * opens stores this way; a plain open under a config that is not the
    * resident's own would otherwise mint chunk records with the wrong head
    * window and chunk size. Loading repairs what readers can't use on every
-   * open, this one included, and persists the repair: summaries that are
-   * empty or whose sources or range can't be read or recovered, the
-   * summaries above them, and the chunk records and queued merges that name
-   * them.
+   * open, this one included, and persists the repair: it merges duplicate
+   * copies of a summary, rebuilds sources and ranges it can recover, drops
+   * summaries that are empty or whose sources or range it can't, and the
+   * summaries above them, resolves each summary's parent pointers, and
+   * reopens or removes the chunk records and queued merges that name a
+   * dropped summary.
    */
   auditOnly?: boolean;
   /** Legacy first-choice target-only merge request. Default false. */

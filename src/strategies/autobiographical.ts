@@ -2024,8 +2024,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // log slot by id, a merge could be written over a neighbour's slot,
     // leaving duplicates whose merge state diverged. The summary keeps the
     // text of a non-empty copy, a merged one if there is one, and its first
-    // copy's position; its parent pointers are resolved across all its copies
-    // below.
+    // copy's position; its parent is resolved across all its copies below.
     const copiesById = new Map<string, SummaryEntry[]>();
     let malformed = 0;
     for (const summary of loaded) {
@@ -2092,38 +2091,50 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // Each parent pointer (`parentId`, which readers take first, and the
-    // older `mergedInto`) keeps the summary's own value if it names a kept
-    // summary, else the first such value on another of its copies: a child
-    // its parent covers renders only through that parent. A pointer that
-    // names no kept summary is cleared, so the child renders and merges
-    // again.
+    // A summary has one parent: the first of its own pointers, then its other
+    // copies' (`parentId` before the older `mergedInto` in each, as readers
+    // take them), that names a kept summary listing it among its sources.
+    // `mergedInto`, which this strategy writes and its frontier reads, is set
+    // to that parent, and so is a `parentId` naming anything else, so every
+    // reader sees the one parent that renders the summary. With no such
+    // parent, every pointer that isn't null is cleared, so the summary renders
+    // and merges again. A null pointer counts as none.
+    const reparentedIds: string[] = [];
     let clearedPointers = 0;
-    let repointed = 0;
-    const kept = (pointer: unknown): pointer is string => typeof pointer === 'string' && byId.has(pointer);
+    const covers = (pointer: unknown, id: string): pointer is string =>
+      typeof pointer === 'string' && byId.get(pointer)?.sourceIds.includes(id) === true;
     this.summaries = [...byId.values()].map((summary) => {
+      const pointers = [summary, ...copiesById.get(summary.id)!]
+        .flatMap((copy) => [copy.parentId, copy.mergedInto] as unknown[]);
+      const parent = pointers.find((pointer): pointer is string => covers(pointer, summary.id));
       let repaired = summary;
-      for (const field of ['parentId', 'mergedInto'] as const) {
-        const own = summary[field] as unknown;
-        if (kept(own)) continue;
-        const adopted = copiesById.get(summary.id)!.map((copy) => copy[field] as unknown).find(kept);
-        if (adopted === undefined && typeof own !== 'string') continue;
-        if (repaired === summary) repaired = { ...summary };
-        if (adopted !== undefined) repaired[field] = adopted;
-        else { delete repaired[field]; clearedPointers++; }
+      const edit = () => (repaired === summary ? (repaired = { ...summary }) : repaired);
+      if (parent === undefined) {
+        for (const field of ['parentId', 'mergedInto'] as const) {
+          const own = summary[field] as unknown;
+          if (own === undefined || own === null) continue;
+          delete edit()[field];
+          clearedPointers++;
+        }
+        return repaired;
       }
-      if (repaired !== summary) repointed++;
+      if (summary.mergedInto !== parent) edit().mergedInto = parent;
+      const ownParentId = summary.parentId as unknown;
+      if (ownParentId !== undefined && ownParentId !== null && ownParentId !== parent) edit().parentId = parent;
+      if (repaired !== summary) reparentedIds.push(summary.id);
       return repaired;
     });
     const droppedIds = [...copiesById.keys()].filter((id) => !byId.has(id));
     const keptRebuiltIds = rebuiltIds.filter((id) => byId.has(id));
-    if (malformed > 0 || dupes > 0 || droppedIds.length > 0 || keptRebuiltIds.length > 0 || repointed > 0) {
+    if (malformed > 0 || dupes > 0 || droppedIds.length > 0 || keptRebuiltIds.length > 0 ||
+        reparentedIds.length > 0 || clearedPointers > 0) {
       this.store.setStateJson(this.summariesStateId, this.summaries);
       console.warn(
         `[autobiographical] repaired summary state: removed ${malformed} malformed entr(ies) and deduped ${dupes}; ` +
           `dropped empty [${emptyIds.join(', ')}], with unreadable sources or range [${unreadableIds.join(', ')}], ` +
           `naming a missing summary [${ancestorIds.join(', ')}]; rebuilt sources or range of ` +
-          `[${keptRebuiltIds.join(', ')}]; cleared ${clearedPointers} dangling parent pointer(s)`,
+          `[${keptRebuiltIds.join(', ')}]; set the parent of [${reparentedIds.join(', ')}]; cleared ` +
+          `${clearedPointers} parent pointer(s) naming no kept parent`,
       );
     }
 
@@ -2621,8 +2632,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const persisted = this.store?.getStateJson(this.summariesStateId);
     if (!Array.isArray(persisted)) return undefined;
     // Another instance may have appended it since this one loaded. Adopt it
-    // as the loader would keep it: it has text, its range is its sources'
-    // ends, and a parent pointer names a summary this instance holds.
+    // as the loader would keep it: it has text and a list of ids, and its
+    // range is their ends. Its parent pointers stay as the store has them,
+    // since a parent this instance hasn't loaded is still in the store.
     const match = (persisted as SummaryEntry[]).find(
       (summary) => summary?.level === 1 && isIdList(summary.sourceIds) && summary.sourceIds.join(':') === chunkIdKey &&
         hasSummaryText(summary),
@@ -2630,10 +2642,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!match) return undefined;
     const ids = match.sourceIds;
     const found: SummaryEntry = { ...match, sourceRange: { first: ids[0]!, last: ids[ids.length - 1]! } };
-    for (const field of ['parentId', 'mergedInto'] as const) {
-      const parent = found[field] as unknown;
-      if (typeof parent === 'string' && !this.summaries.some((summary) => summary.id === parent)) delete found[field];
-    }
     if (!this.summaries.some((summary) => summary.id === found.id)) this.summaries.push(found);
     return found;
   }
