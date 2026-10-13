@@ -218,7 +218,7 @@ describe('matcher coverage', () => {
   });
   it('matches a MIME parameter whose value is quoted, spaces included', () => {
     const marker = '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]';
-    for (const parameter of [';name=\\"a.png\\"', ';name="a b.png"', ';name=\\"a b.png\\"', ';name=\\\\\\"a b.png\\\\\\"']) {
+    for (const parameter of [';name=\\"a.png\\"', ';name="a b.png"', ';name=\\"a b.png\\"', ';name=\\\\\\"a b.png\\\\\\"', ';name=a\\u0020b.png']) {
       const r = one('data:image/png' + parameter + ';base64,' + 'A'.repeat(5000));
       assert.equal(r.n, 1, parameter);
       assert.equal(r.text, marker, parameter);
@@ -257,8 +257,27 @@ describe('matcher coverage', () => {
     assert.equal(r.text, '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]');
   });
   it('keeps a short data URL with a parameter apart from a base64 one that abuts it', () => {
-    const r = one('data:image/png;name=a\\ndata:image/jpeg;base64,' + 'A'.repeat(5000));
-    assert.equal(r.text, 'data:image/png;name=a\\n[embedded image/jpeg data URL omitted from compression prompt: 5000 serialized payload characters]');
+    const marker = '[embedded image/jpeg data URL omitted from compression prompt: 5000 serialized payload characters]';
+    for (const between of ['\\n', '']) {
+      const r = one('data:image/png;name=a' + between + 'data:image/jpeg;base64,' + 'A'.repeat(5000));
+      assert.equal(r.text, 'data:image/png;name=a' + between + marker, JSON.stringify(between));
+    }
+  });
+  it('fails a string that almost matches in linear time', () => {
+    const timed = (text: string) => {
+      const started = performance.now();
+      const r = one(text);
+      return { n: r.n, ms: performance.now() - started };
+    };
+    // Counts at which overlapping choices took seconds, so a regression fails here rather than hanging.
+    for (const [parameter, count] of [[';x="1"', 28], [';x=\\"1\\"', 18], [';x=\\\\\\"1\\\\\\"', 16], [';x=1', 200], [';x=\\u00411', 200]] as const) {
+      const r = timed('data:a/b' + parameter.repeat(count) + ' end');
+      assert.equal(r.n, 0, parameter);
+      assert.ok(r.ms < 1000, `${parameter}: ${r.ms} ms`);
+    }
+    const slashes = timed('data:a' + '\\u002F'.repeat(5000) + ' end');
+    assert.equal(slashes.n, 0);
+    assert.ok(slashes.ms < 1000, `${slashes.ms} ms`);
   });
   it("keeps 'data' at the end of a payload when no colon follows it", () => {
     const r = one('data:image/png;base64,' + 'A'.repeat(4996) + 'data"');

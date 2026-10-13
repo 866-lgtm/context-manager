@@ -11540,9 +11540,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // and escapes inside the payload, such as `\n` where base64 was wrapped or
     // `\u002F`. Any letter case matches (`DATA:`, `;BASE64,`), as URL schemes
     // and the base64 token do. Bare base64 under a JSON key (Anthropic
-    // `"source":{"data":…}`) is out of scope.
+    // `"source":{"data":…}`) is out of scope. Every choice in the pattern is
+    // decided by the next character (a \u002F escape is only ever the type's
+    // slash, and a quoted parameter value holds no backslash or quote), so a
+    // string that almost matches fails in linear time: overlapping choices
+    // took time exponential in its number of parameters.
     const dataUrl =
-      /data:((?:[A-Za-z0-9]|\\+u[0-9A-Fa-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u[0-9A-Fa-f]{4})*(?:\\*\/|\\+u002[Ff])(?:[A-Za-z0-9]|\\+u[0-9A-Fa-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u[0-9A-Fa-f]{4})*)(?:;[A-Za-z0-9!#$&^_.+-]+=(?:\\*"[^"]*?\\*"|[^;,:"\s]*))*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
+      /data:((?:[A-Za-z0-9]|\\+u(?!002f)[0-9a-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u(?!002f)[0-9a-f]{4})*(?:\\*\/|\\+u002f)(?:[A-Za-z0-9]|\\+u(?!002f)[0-9a-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u(?!002f)[0-9a-f]{4})*)(?:;[A-Za-z0-9!#$&^_.+-]+=(?:\\*"[^"\\]*\\*"|(?:[^;,:\s"\\]|\\+u[0-9a-f]{4})*))*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
     let replaced = 0;
     const unescapeType = (type: string) => type
       .replace(/\\+u([0-9A-Fa-f]{4})/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
