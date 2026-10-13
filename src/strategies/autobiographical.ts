@@ -2023,9 +2023,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Copies of one id are one summary. Before setMergedInto resolved its
     // log slot by id, a merge could be written over a neighbour's slot,
     // leaving duplicates whose merge state diverged. The summary keeps the
-    // text of a non-empty copy, a merged one if there is one, and the parent
-    // pointer of any copy that has one: its parent covers it, so left
-    // unmerged it would render twice. It keeps its first copy's position.
+    // text of a non-empty copy, a merged one if there is one, and its first
+    // copy's position; its parent pointers are resolved across all its copies
+    // below.
     const copiesById = new Map<string, SummaryEntry[]>();
     let malformed = 0;
     for (const summary of loaded) {
@@ -2050,25 +2050,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const emptyIds: string[] = [];
     const unreadableIds: string[] = [];
     const rebuiltIds: string[] = [];
-    const hasParent = (summary: SummaryEntry) => typeof getSummaryParentId(summary) === 'string';
     for (const [id, copies] of copiesById) {
       const withText = copies.filter(hasSummaryText);
-      const chosen = withText.find(hasParent) ?? withText[0];
-      if (!chosen) { emptyIds.push(id); continue; }
-      let summary = chosen;
-      const merged = hasParent(summary) ? undefined : copies.find(hasParent);
-      if (merged) {
-        summary = { ...summary };
-        if (typeof merged.parentId === 'string') summary.parentId = merged.parentId;
-        if (typeof merged.mergedInto === 'string') summary.mergedInto = merged.mergedInto;
-      }
+      let summary = withText.find((copy) => typeof getSummaryParentId(copy) === 'string') ?? withText[0];
+      if (!summary) { emptyIds.push(id); continue; }
       if (summary.level === 1) {
         // An L1's own sources, else its compressed chunk record's, else a
-        // copy's. Its range is their ends whenever they're adopted or it
-        // can't be read.
+        // copy's. Its range is their ends, which every L1 writer sets.
         const ids = [summary.sourceIds, chunkSources.get(id), ...copies.map((copy) => copy.sourceIds)].find(isIdList);
         if (!ids) { unreadableIds.push(id); continue; }
-        if (ids !== summary.sourceIds || !isReadableRange(summary.sourceRange)) {
+        const range = summary.sourceRange as { first?: unknown; last?: unknown } | undefined;
+        if (ids !== summary.sourceIds || range?.first !== ids[0] || range?.last !== ids[ids.length - 1]) {
           summary = { ...summary, sourceIds: [...ids], sourceRange: { first: ids[0]!, last: ids[ids.length - 1]! } };
           rebuiltIds.push(id);
         }
@@ -2100,28 +2092,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // A parent pointer to a summary that is gone is cleared, so its child
-    // renders and merges again. Readers take `parentId` before the older
-    // `mergedInto`, so each is checked.
-    let danglingParents = 0;
-    const dangling = (parent: string | undefined) => parent !== undefined && !byId.has(parent);
+    // Each parent pointer (`parentId`, which readers take first, and the
+    // older `mergedInto`) keeps the summary's own value if it names a kept
+    // summary, else the first such value on another of its copies: a child
+    // its parent covers renders only through that parent. A pointer that
+    // names no kept summary is cleared, so the child renders and merges
+    // again.
+    let clearedPointers = 0;
+    let repointed = 0;
+    const kept = (pointer: unknown): pointer is string => typeof pointer === 'string' && byId.has(pointer);
     this.summaries = [...byId.values()].map((summary) => {
-      if (!dangling(summary.parentId) && !dangling(summary.mergedInto)) return summary;
-      danglingParents++;
-      const repaired = { ...summary };
-      if (dangling(repaired.parentId)) delete repaired.parentId;
-      if (dangling(repaired.mergedInto)) delete repaired.mergedInto;
+      let repaired = summary;
+      for (const field of ['parentId', 'mergedInto'] as const) {
+        const own = summary[field] as unknown;
+        if (kept(own)) continue;
+        const adopted = copiesById.get(summary.id)!.map((copy) => copy[field] as unknown).find(kept);
+        if (adopted === undefined && typeof own !== 'string') continue;
+        if (repaired === summary) repaired = { ...summary };
+        if (adopted !== undefined) repaired[field] = adopted;
+        else { delete repaired[field]; clearedPointers++; }
+      }
+      if (repaired !== summary) repointed++;
       return repaired;
     });
     const droppedIds = [...copiesById.keys()].filter((id) => !byId.has(id));
-    if (malformed > 0 || dupes > 0 || droppedIds.length > 0 || rebuiltIds.length > 0 || danglingParents > 0) {
+    const keptRebuiltIds = rebuiltIds.filter((id) => byId.has(id));
+    if (malformed > 0 || dupes > 0 || droppedIds.length > 0 || keptRebuiltIds.length > 0 || repointed > 0) {
       this.store.setStateJson(this.summariesStateId, this.summaries);
       console.warn(
-        `[autobiographical] repaired summary state: removed ${malformed} malformed entr(ies); dropped ` +
-          `${emptyIds.length} empty, ${unreadableIds.length} with unreadable sources or range, and ` +
-          `${ancestorIds.length} naming a missing summary [${droppedIds.join(', ')}]; rebuilt the sources of ` +
-          `${rebuiltIds.length} [${rebuiltIds.join(', ')}]; deduped ${dupes}; cleared ${danglingParents} ` +
-          `dangling parent pointer(s)`,
+        `[autobiographical] repaired summary state: removed ${malformed} malformed entr(ies) and deduped ${dupes}; ` +
+          `dropped empty [${emptyIds.join(', ')}], with unreadable sources or range [${unreadableIds.join(', ')}], ` +
+          `naming a missing summary [${ancestorIds.join(', ')}]; rebuilt sources or range of ` +
+          `[${keptRebuiltIds.join(', ')}]; cleared ${clearedPointers} dangling parent pointer(s)`,
       );
     }
 
@@ -2619,14 +2621,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const persisted = this.store?.getStateJson(this.summariesStateId);
     if (!Array.isArray(persisted)) return undefined;
     // Another instance may have appended it since this one loaded. Adopt it
-    // only as the loader would keep it: text, a list of ids and a range.
-    const found = (persisted as SummaryEntry[]).find(
+    // as the loader would keep it: it has text, its range is its sources'
+    // ends, and a parent pointer names a summary this instance holds.
+    const match = (persisted as SummaryEntry[]).find(
       (summary) => summary?.level === 1 && isIdList(summary.sourceIds) && summary.sourceIds.join(':') === chunkIdKey &&
-        hasSummaryText(summary) && isReadableRange(summary.sourceRange),
+        hasSummaryText(summary),
     );
-    if (found && !this.summaries.some((summary) => summary.id === found.id)) {
-      this.summaries.push(found);
+    if (!match) return undefined;
+    const ids = match.sourceIds;
+    const found: SummaryEntry = { ...match, sourceRange: { first: ids[0]!, last: ids[ids.length - 1]! } };
+    for (const field of ['parentId', 'mergedInto'] as const) {
+      const parent = found[field] as unknown;
+      if (typeof parent === 'string' && !this.summaries.some((summary) => summary.id === parent)) delete found[field];
     }
+    if (!this.summaries.some((summary) => summary.id === found.id)) this.summaries.push(found);
     return found;
   }
 

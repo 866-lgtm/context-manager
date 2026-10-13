@@ -463,6 +463,125 @@ describe('AutobiographicalStrategy — persistence', () => {
     } finally { manager.close(); }
   });
 
+  it('resolves each parent pointer across copies: a kept parent on any copy wins over a dangling one, which is cleared once', async (t) => {
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
+    let childId = '';
+    let parentId = '';
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, recentWindowTokens: 1, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const ids = ['PTR-A', 'PTR-B'].map((text) => manager.addMessage('User', textBlock(text)));
+      const [child, other] = ids.map((id, i) => strategy.seedL1(['PTR-A', 'PTR-B'][i], [id]));
+      const parent = strategy.seedL2([child.id], 'PTR-A');
+      childId = child.id;
+      parentId = parent.id;
+      const plain = { ...strategy.getSummariesView()[0] };
+      delete (plain as { mergedInto?: string }).mergedInto;
+      strategy.persistRawSummaries([
+        { ...plain, parentId: 'L2-gone', mergedInto: '' },
+        { ...plain, content: '', parentId: parent.id, mergedInto: parent.id },
+        { ...other, parentId: null, mergedInto: 'L9-gone' },
+        parent,
+      ]);
+      manager.sync();
+      manager.close();
+    }
+    for (let open = 0; open < 2; open++) {
+      warnings.length = 0;
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, recentWindowTokens: 1, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      try {
+        const kept = new Map(strategy.getSummariesView().map((summary) => [summary.id, summary]));
+        assert.equal(kept.get(childId)!.parentId, parentId, 'the kept parent on the empty copy wins over a dangling one');
+        assert.equal(kept.get(childId)!.mergedInto, parentId, 'and over an empty-string one');
+        const other = [...kept.values()].find((summary) => summary.content === 'PTR-B')!;
+        assert.equal(other.mergedInto, undefined, 'a dangling pointer is cleared');
+        assert.equal(other.parentId, null, 'a null pointer is no pointer, and is left as it is');
+        assert.deepEqual(strategy.readPersistedSummaries(), strategy.getSummariesView());
+        if (open === 0) assert.ok(warnings.some((line) => /cleared 1 dangling parent pointer/.test(line)), warnings.join('\n'));
+        else assert.ok(!warnings.some((line) => line.includes('repaired summary state')), warnings.join('\n'));
+        const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+        const rendered = JSON.stringify(compiled.messages.map((message) => message.content));
+        assert.equal(rendered.split('PTR-A').length - 1, 1, rendered);
+      } finally { manager.close(); }
+    }
+  });
+
+  it('a store whose only defect is a dangling parent pointer is repaired and persisted once', async (t) => {
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const id = manager.addMessage('User', textBlock('alone'));
+      const l1 = strategy.seedL1('alone', [id]);
+      strategy.persistRawSummaries([{ ...l1, mergedInto: 'L2-gone' }]);
+      manager.sync();
+      manager.close();
+    }
+    for (let open = 0; open < 2; open++) {
+      warnings.length = 0;
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      try {
+        assert.equal(strategy.readPersistedSummaries()[0]!.mergedInto, undefined);
+        assert.equal(warnings.some((line) => line.includes('repaired summary state')), open === 0, warnings.join('\n'));
+      } finally { manager.close(); }
+    }
+  });
+
+  it('takes the sources and range of a summary above L1 together from a readable copy', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    let ids: string[] = [];
+    let parentId = '';
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      ids = ['up-a', 'up-b'].map((text) => manager.addMessage('User', textBlock(text)));
+      const children = ids.map((id, i) => strategy.seedL1('child ' + i, [id]));
+      const parent = strategy.seedL2(children.map((child) => child.id), 'parent text');
+      parentId = parent.id;
+      strategy.persistRawSummaries([
+        ...strategy.getSummariesView().filter((summary) => summary.id !== parent.id),
+        { ...parent, sourceIds: null, sourceRange: undefined },
+        { ...parent, content: 'older parent text' },
+      ]);
+      manager.sync();
+      manager.close();
+    }
+    const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      const parent = strategy.getSummariesView().find((summary) => summary.id === parentId)!;
+      assert.equal(parent.content, 'parent text');
+      assert.deepEqual(parent.sourceIds, ['L1-0', 'L1-1']);
+      assert.deepEqual(parent.sourceRange, { first: ids[0], last: ids[1] });
+    } finally { manager.close(); }
+  });
+
+  it('keeps an L1 own sources over its chunk record, and rebuilds a range that is not their ends', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    let ids: string[] = [];
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      ids = ['own-a', 'own-b', 'own-c'].map((text) => manager.addMessage('User', textBlock(text)));
+      const l1 = strategy.seedL1('own sources', ids.slice(0, 2));
+      strategy.persistRawChunks([{ id: 'c-0', sourceIds: ids, compressed: true, summaryId: l1.id }]);
+      strategy.persistRawSummaries([{ ...l1, sourceRange: { first: ids[0]!, last: ids[2]! } }]);
+      manager.sync();
+      manager.close();
+    }
+    const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      const [l1] = strategy.getSummariesView();
+      assert.deepEqual(l1.sourceIds, ids.slice(0, 2));
+      assert.deepEqual(l1.sourceRange, { first: ids[0], last: ids[1] });
+    } finally { manager.close(); }
+  });
+
   it('keeps the parent pointer of an empty merged copy, so its plain copy renders only through its parent', async (t) => {
     t.mock.method(console, 'warn', () => {});
     let childId = '';
@@ -704,10 +823,13 @@ describe('AutobiographicalStrategy — persistence', () => {
         { ...base, id: 'L1-number', sourceIds: 1 },
         { ...base, id: 'L1-null', sourceIds: null },
         { ...base, id: 'L1-empty', sourceIds: [id], content: ' ' },
-        { ...base, id: 'L1-no-range', sourceIds: [id], sourceRange: undefined },
-        { ...base, sourceIds: [id] },
+        { ...base, sourceIds: [id], sourceRange: undefined, mergedInto: 'L2-elsewhere' },
       ]);
-      assert.equal(strategy.exactL1([id])?.id, 'L1-live');
+      const found = strategy.exactL1([id]);
+      assert.equal(found?.id, 'L1-live');
+      assert.deepEqual(found?.sourceRange, { first: id, last: id }, 'its range is derived from its sources');
+      assert.equal(found?.mergedInto, undefined, 'a parent this instance does not hold is not adopted');
+      assert.ok(strategy.getSummariesView().includes(found!));
     } finally { manager.close(); }
   });
 
