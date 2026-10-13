@@ -5491,7 +5491,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   getRenderStats(store: MessageStoreView): RenderStats {
     this.requireLoadedBranch('getRenderStats');
-    return this._lastRenderStats ?? this.reconstructRenderStats(store);
+    if (this._lastRenderStats) return this._lastRenderStats;
+    // Reconstructing the recent window prices images and may advance the
+    // watermark. Like a dry select, this observer uses that advance locally
+    // and restores the watermark together with the estimates priced from it.
+    const savedWatermark = this.imageWatermark();
+    const savedMemo = this._postStripMemo;
+    const savedDryRun = this._dryRunSelect;
+    this._dryRunSelect = true;
+    try {
+      return this.reconstructRenderStats(store);
+    } finally {
+      this._dryRunSelect = savedDryRun;
+      this._imageWatermark = savedWatermark;
+      this._postStripMemo = savedMemo;
+    }
   }
 
   /**
@@ -11335,7 +11349,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
     if (next === undefined || (w !== undefined && next <= w)) return;
     this._imageWatermark = next;
-    // A dry select advances it for its own render only; select() puts it back.
+    // Dry selections and observer reconstructions advance it locally only;
+    // their finally blocks restore it together with the post-strip memo.
     if (this._dryRunSelect) return;
     try {
       this.store?.setStateJson(this.imageWatermarkStateId, { sequence: next, at: Date.now() });
@@ -11368,9 +11383,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
     // A compile asks for this pass more than once (recent-window scan, then
     // the picker inputs). The listing array is the store's own cached view,
-    // so its identity plus the knobs read here identify the answer, the
+    // so its identity, calibration and the knobs key the memo, the
     // hysteresis ratio among them: it decides whether and how the watermark
-    // strips. Callers treat the array as read-only.
+    // strips. The watermark is not in the key: it advances only on a memo
+    // miss, and dry selections and observer reconstructions restore it with
+    // the memo. A branch reload clears both. Callers treat the array as read-only.
     const memoCalibration = store.getTokenCalibration?.() ?? 1;
     const ratio = this.imageHysteresisRatio();
     const memo = this._postStripMemo;

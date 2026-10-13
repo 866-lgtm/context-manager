@@ -235,6 +235,8 @@ export interface SelectOptions {
    * A compression hold ends at its deadline, whoever looks: the manager
    * releases an expired hold at any compile or hold query, a dry compile
    * included, and that release is the one thing a dry compile can leave.
+   * The release's committing rebuild includes any image-watermark advance;
+   * the dry select then restores the state it found after that rebuild.
    */
   dryRun?: boolean;
   /** Exact normalized tools/system/context-prefix identity supplied by the
