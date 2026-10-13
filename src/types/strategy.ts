@@ -995,6 +995,14 @@ export interface AutobiographicalConfig {
    *
    * Set to Infinity to disable the cap and surface overflow as a
    * 400 from the API rather than silently dropping oldest memories.
+   *
+   * In the L1 prompt, the raw that pins add (a chunk a pin opens, so its
+   * summary isn't recalled, and a pinned message before the head window) is
+   * spent from this budget first, and recall pairs get the rest. When that
+   * raw alone exceeds the budget, or the complete request with it exceeds
+   * `compressionContextBudgetTokens`, that compression recalls the summaries
+   * the pins override instead, as if no pin applied, and warns naming the
+   * pins; the live view still shows them raw.
    */
   compressionRecallBudgetTokens?: number;
 
@@ -1132,6 +1140,13 @@ export interface AutobiographicalConfig {
    * uses provider-total input plus a positive serialized expansion delta, then
    * adds the output reserve. Zero, partial, or unknown usage contracts retain
    * the conservative bound. Default: 200000.
+   *
+   * It also decides whether an L1 prompt shows pinned history raw: with the
+   * raw that pins add, the complete canonical request (head, recall pairs,
+   * raw, chunk, instruction, system prompt, tools and output reserve,
+   * priced as the message store prices them) must fit it, or that
+   * compression recalls what the pins override. A canonical request without
+   * pins is still always attempted.
    */
   compressionContextBudgetTokens?: number;
 
