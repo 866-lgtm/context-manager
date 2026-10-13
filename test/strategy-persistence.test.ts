@@ -116,6 +116,18 @@ class TestableStrategy extends AutobiographicalStrategy {
     this.store?.setStateJson(this.counterStateId, value);
   }
 
+  readPersistedCounter(): unknown {
+    return this.store?.getStateJson(this.counterStateId);
+  }
+
+  mintId(): number {
+    return this.nextSummaryIdCounter();
+  }
+
+  reload(): void {
+    this.loadPersistedState({ keepKvUnifiedPresentation: true });
+  }
+
   readPersistedResolutions(): Record<string, number> {
     return (this.store?.getStateJson(this.resolutionsStateId) as Record<string, number> | null) ?? {};
   }
@@ -717,6 +729,7 @@ describe('AutobiographicalStrategy — persistence', () => {
     t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
     let upId = '';
     let bId = '';
+    let besideId = '';
     {
       const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
       const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
@@ -726,8 +739,18 @@ describe('AutobiographicalStrategy — persistence', () => {
       const up = strategy.seedL2([b!.id], 'up');
       upId = up.id;
       bId = b!.id;
-      // An L2 that lists the L3 above it beside its own L1.
-      strategy.persistRawSummaries(strategy.getSummariesView().map((s) => (s.id === up.id ? { ...s, sourceIds: [b!.id, top.id] } : s)));
+      const [c, d] = ['c', 'd'].map((text) => strategy.seedL1(text, [manager.addMessage('User', textBlock(text))]));
+      const emptyL2 = strategy.seedL2([d!.id], 'empty');
+      const beside = strategy.seedL2([c!.id], 'beside');
+      besideId = beside.id;
+      // An L2 that lists the L3 above it beside its own L1, and one that lists
+      // an L2 the load drops as empty.
+      strategy.persistRawSummaries(strategy.getSummariesView().map((s) => {
+        if (s.id === up.id) return { ...s, sourceIds: [b!.id, top.id] };
+        if (s.id === beside.id) return { ...s, sourceIds: [c!.id, emptyL2.id] };
+        if (s.id === emptyL2.id) return { ...s, content: '' };
+        return s;
+      }));
       manager.sync();
       manager.close();
     }
@@ -736,9 +759,10 @@ describe('AutobiographicalStrategy — persistence', () => {
     try {
       const stored = new Map(strategy.readPersistedSummaries().map((s) => [s.id, s]));
       assert.ok(!stored.has(upId), 'the summary listing one above it is dropped');
-      assert.equal(stored.get(bId)?.mergedInto, undefined, 'and its L1 has no parent left');
+      assert.ok(stored.has(bId), 'its L1 is kept');
+      assert.equal(stored.get(bId)!.mergedInto, undefined, 'and has no parent left');
       const line = warnings.find((w) => w.includes('repaired summary state')) ?? '';
-      assert.equal(line.match(/naming one not below it \[([^\]]*)\]/)?.[1], upId, line);
+      assert.deepEqual(line.match(/naming one not below it \[([^\]]*)\]/)?.[1]?.split(', ').sort(), [upId, besideId].sort(), 'whatever dropped what it lists: ' + line);
     } finally { manager.close(); }
   });
 
@@ -829,7 +853,8 @@ describe('AutobiographicalStrategy — persistence', () => {
     const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
     try {
       const stored = new Map(strategy.readPersistedSummaries().map((s) => [s.id, s]));
-      assert.equal(stored.get(xId)?.mergedInto, undefined, 'with two parents listing it, neither is chosen');
+      assert.ok(stored.has(xId));
+      assert.equal(stored.get(xId)!.mergedInto, undefined, 'with two parents listing it, neither is chosen');
       assert.equal(stored.get(wId)?.mergedInto, wParentId, 'the summary listing it a level up is its parent; the one two levels up is not');
       assert.equal(stored.get(uId)?.mergedInto, uParentId, 'of two listing it, the one another copy names is its parent');
     } finally { manager.close(); }
@@ -875,7 +900,8 @@ describe('AutobiographicalStrategy — persistence', () => {
       assert.equal(stored.get(ids.tc!)?.parentId, ids.pa, 'parentId is read first');
       assert.equal(stored.get(ids.tc!)?.mergedInto, ids.pa, 'and mergedInto is set to the same parent');
       assert.equal(stored.get(ids.rc!)?.mergedInto, ids.rr, 'a summary listing it twice is one parent');
-      assert.equal(stored.get(ids.kc!)?.mergedInto, undefined, 'a summary at its own level is no parent, though it lists it');
+      assert.ok(stored.has(ids.kc!));
+      assert.equal(stored.get(ids.kc!)!.mergedInto, undefined, 'a summary at its own level is no parent, though it lists it');
     } finally { manager.close(); }
   });
 
@@ -895,7 +921,28 @@ describe('AutobiographicalStrategy — persistence', () => {
     try {
       assert.deepEqual(strategy.getSummariesView().map((s) => s.id), ['L1-0', 'L1-1']);
       assert.equal(strategy.getCounter(), 2, 'the next id repeats none in the store');
+      assert.equal(strategy.readPersistedCounter(), 2, 'and the open stores the counter it raised');
     } finally { manager.close(); }
+  });
+
+  it('mints no id twice across instances on one store, or across a reload', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    const first = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: first });
+    const second = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+    const secondManager = await ContextManager.open({ store: manager.getStore(), strategy: second });
+    try {
+      // Both loaded the same counter; the second mints after the first, with no reload between.
+      const minted = [first.mintId(), second.mintId(), first.mintId()];
+      // The first reloads while an id it minted has no summary in the store yet.
+      first.reload();
+      minted.push(first.mintId(), second.mintId());
+      assert.equal(new Set(minted).size, minted.length, 'every minted id is new: ' + JSON.stringify(minted));
+      assert.equal(first.readPersistedCounter(), Math.max(...minted) + 1, 'the stored counter only rises');
+    } finally {
+      secondManager.close();
+      manager.close();
+    }
   });
 
   it('keeps the text of a copy whose pointer names a parent that lists it, over copies whose pointer is empty, dangling or names a summary that does not list it', async (t) => {
@@ -1282,8 +1329,8 @@ describe('AutobiographicalStrategy — persistence', () => {
       latches.chunkRecordsOrphaned = true;
       latches._overlapBlocked.add('refused-chunk');
       const found = strategy.exactL1(key);
-      assert.equal(latches.chunkRecordsOrphaned, true, 'the reload leaves the latches rebuildChunks owns');
-      assert.ok(latches._overlapBlocked.has('refused-chunk'));
+      assert.equal(latches.chunkRecordsOrphaned, true, 'the reload leaves the orphaned-records halt to rebuildChunks');
+      assert.ok(!latches._overlapBlocked.has('refused-chunk'), 'and clears the overlap refusals, which the summaries it took up can end');
       latches.chunkRecordsOrphaned = false;
       assert.equal(found?.id, 'L1-live');
       assert.deepEqual(found?.sourceRange, { first: ids[0], last: ids[1] }, 'its range is derived from its sources, as the loader derives it');

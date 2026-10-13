@@ -1740,12 +1740,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (abortIfStale()) return;
       this.registerStates();
       if (abortIfStale()) return;
-      // An open starts afresh the latches that rebuildChunks owns. A reload
-      // during a compression (loadPersistedState's other callers) leaves them
-      // for rebuildChunks to recompute.
-      this.chunkRecordsOrphaned = false;
-      this._orphanWarned = false;
-      this._overlapBlocked.clear();
       this.loadPersistedState();
       if (abortIfStale()) return;
       await this.deliverPendingCompressionQuarantineAlerts(sourceBranch);
@@ -2019,9 +2013,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Load summaries, counter, and pending merges from chronicle into the
    * in-memory mirrors. Called on every (re)initialize so branch switches
-   * pick up the new branch's state, and by a compression that waited on
-   * another instance's in-flight compression of its family, to take up that
-   * result (compressChunkHierarchical). That waiter passes
+   * pick up the new branch's state, by a compression that waited on another
+   * instance's in-flight compression of its family, to take up that result
+   * (compressChunkHierarchical), and by the live lookup when the store holds
+   * an L1 this instance doesn't (findExactL1). Those two reloads pass
    * `keepKvUnifiedPresentation`: a kv-unified strategy then keeps its own
    * receipt chain, whose pending submission is never persisted, rather than
    * replacing it from the store, and keeps its draft and pending layout (with
@@ -2050,6 +2045,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const n = Number(r.id.replace(/^c-/, ''));
         return Number.isFinite(n) && n >= max ? n + 1 : max;
       }, 0);
+      // The summaries a load takes up can end an overlap the guard refused, so
+      // the next queue build tests those chunks again. The orphaned-records
+      // halt and its warning stay as they are: rebuildChunks recomputes the
+      // halt, and an open clears both (clearBranchMirrors).
+      this._overlapBlocked.clear();
     }
     const summaries = this.store.getStateJson(this.summariesStateId);
     const loaded = Array.isArray(summaries) ? (summaries as SummaryEntry[]) : [];
@@ -2131,7 +2131,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // depend on which summary the pass reaches first.
     const ancestorIds: string[] = [];
     const misplacedIds: string[] = [];
-    const loadedLevel = new Map([...byId].map(([id, summary]) => [id, summary.level]));
+    const loadedLevel = new Map([...copiesById].map(([id, copies]) => [id, (byId.get(id) ?? copies[0]!).level]));
     const notBelow = (summary: SummaryEntry) =>
       summary.sourceIds.some((sourceId) => (loadedLevel.get(sourceId) ?? 0) >= summary.level);
     for (let changed = true; changed;) {
@@ -2147,15 +2147,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // A summary has one parent: the first of its own pointers, then its other
     // copies' (`parentId` before the older `mergedInto` in each, as readers
     // take them), that names a kept summary above it listing it among its
-    // sources, so no two summaries can be each other's parent. Without one, its parent is the kept summary one level up that lists
-    // it, when exactly one does: a pointer can name a summary further up,
-    // such as a grandparent, or nothing, while the parent that covers the
-    // summary lists it, and clearing the pointer would render the summary
-    // beside that parent. `mergedInto`, which this strategy writes and its
-    // frontier reads, is set to the parent, and so is a `parentId` naming
-    // anything else, so every reader sees the one parent that renders the
-    // summary. With no parent, every pointer that isn't null is cleared, so
-    // the summary renders and merges again. A null pointer counts as none.
+    // sources. A parent sits above its summary, so no two summaries can be
+    // each other's parent. Without such a pointer, the parent is the kept
+    // summary one level up that lists the summary, when exactly one does: a
+    // pointer can name a summary further up, such as a grandparent, or
+    // nothing, while the parent that covers the summary lists it, and
+    // clearing the pointer would render the summary beside that parent.
+    // `mergedInto`, which this strategy writes and its frontier reads, is set
+    // to the parent, and so is a `parentId` naming anything else, so every
+    // reader sees the one parent that renders the summary. With no parent,
+    // every pointer that isn't null is cleared, so the summary renders and
+    // merges again. A null pointer counts as none.
     const reparentedIds: string[] = [];
     const clearedIds: string[] = [];
     const covers = (pointer: unknown, summary: SummaryEntry): pointer is string => {
@@ -2231,15 +2233,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // The counter is shared by every instance on the store, and each writes
-    // its own, so the stored value can trail ids already written. A new id
-    // must repeat none of them.
+    // The counter starts past every summary id the store holds, dropped ones
+    // included, and is stored when that raises it, so no later open mints a
+    // number the store has used. A store whose counter an older version
+    // wrote can trail its ids.
     const counter = this.store.getStateJson(this.counterStateId);
     const pastIds = [...copiesById.keys()].reduce((past, id) => {
       const n = Number(/^L\d+-(\d+)$/.exec(id)?.[1]);
       return Number.isFinite(n) && n >= past ? n + 1 : past;
     }, 0);
-    this.summaryIdCounter = Math.max(typeof counter === 'number' ? counter : 0, pastIds);
+    const storedCounter = typeof counter === 'number' ? counter : 0;
+    this.summaryIdCounter = Math.max(storedCounter, pastIds);
+    if (this.summaryIdCounter > storedCounter) this.store.setStateJson(this.counterStateId, this.summaryIdCounter);
 
     const queue = this.store.getStateJson(this.mergeQueueStateId);
     this.mergeQueue = Array.isArray(queue)
@@ -3965,6 +3970,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected nextSummaryIdCounter(): number {
     this.requireBranchMutation('nextSummaryIdCounter');
+    // Every instance on the store mints from the stored counter, which only
+    // rises, so no two of them hand out one id.
+    const stored = this.store?.getStateJson(this.counterStateId);
+    if (typeof stored === 'number' && stored > this.summaryIdCounter) this.summaryIdCounter = stored;
     const value = this.summaryIdCounter++;
     this.store?.setStateJson(this.counterStateId, this.summaryIdCounter);
     return value;
