@@ -9349,12 +9349,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * OverBudgetError, so no inference runs, no sample is ever reported, and
    * the band fix in reportRealInputTokens never gets a chance to decay it: a
    * permanent startup wedge. Bump this whenever MessageStore/ContextLog
-   * pricing changes shape.
+   * pricing changes shape, and give the new epoch an entry in
+   * CALIBRATION_EPOCH_REPRICES.
    *
-   *   0: unstamped (flat HIDDEN_THINKING_TOKENS_DEFAULT for signed thinking)
-   *   1: signed thinking priced by signature length
+   *   0: signed thinking at a flat HIDDEN_THINKING_TOKENS_DEFAULT (before 0.11.0)
+   *   1: signed thinking priced by signature length (0.11.0 on)
+   *   2: membrane's XML-history carriers (tool_attempt, tool_notice) priced as
+   *      the markup they replay as, where they had estimated as 0
+   *
+   * A record without a stamp counts as epoch 1: the releases from 0.11.0 until
+   * this stamp shipped wrote their records without one, under epoch 1's
+   * pricing. A record last learned before 0.11.0 has no stamp either and can't
+   * be told apart from those; the changelog gives its one-time repair.
+   *
+   * A binary from before a bump still learns after a rollback, and its first
+   * applied sample overwrites the newer epoch's record with its own stamp
+   * (reportRealInputTokens); rolling forward again treats that as an older
+   * record.
    */
-  static readonly CALIBRATION_PRICING_EPOCH = 1;
+  static readonly CALIBRATION_PRICING_EPOCH = 2;
 
   /**
    * For each pricing epoch, the content it repriced: a predicate over the
@@ -9374,6 +9387,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return block.type === 'thinking' && typeof block.signature === 'string' && block.signature.length > 0 &&
         typeof block.tokenEstimate !== 'number';
     })),
+    // 2: XML-history carriers, which estimated as 0 before (an unknown block)
+    // and are now priced by MessageStore.xmlHistoryCarrierTokens.
+    2: (messages) => messages.some((m) => m.content.some((b) => MessageStore.xmlHistoryCarrierTokens(b) > 0)),
   };
 
   /** Whether any epoch in (fromEpoch, CALIBRATION_PRICING_EPOCH] repriced content in this store. */
@@ -9410,22 +9426,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const saved = this.store?.getStateJson(this.calibrationStateId) as
           { multiplier?: number; pricing?: number; reset?: CalibrationReset } | null;
         if (saved && Number.isFinite(saved.multiplier)) {
-          const epoch = saved.pricing ?? 0;
+          // No stamp: written by a release from 0.11.0 until the stamp shipped
+          // (see CALIBRATION_PRICING_EPOCH).
+          const epoch = saved.pricing ?? 1;
           const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
           if (epoch === current) {
             this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
             this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
           } else if (epoch < current && !this.calibrationRepricedSince(epoch, store.getAll())) {
             // Nothing this store holds was repriced since that epoch, so the
-            // residual is still valid: keep it and re-stamp it.
+            // residual is still valid: keep it and re-stamp it. A reset it
+            // carries is this store's history and stays with it, as it does
+            // through the learner's writes.
             this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
             if (commit) {
               console.warn(
                 `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from pricing epoch ${epoch} ` +
                   `(current ${current}): this store holds no content repriced since then; re-stamped`,
               );
               try {
-                this.store?.setStateJson(this.calibrationStateId, { multiplier: this._calibration, at: Date.now(), pricing: current });
+                this.store?.setStateJson(this.calibrationStateId, {
+                  multiplier: this._calibration,
+                  at: Date.now(),
+                  pricing: current,
+                  ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+                });
               } catch { /* persistence is best-effort */ }
             }
           } else if (epoch < current) {
