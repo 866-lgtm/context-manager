@@ -30,7 +30,7 @@ type Internals = {
 /** Anthropic keep-all signed thinking: the content pricing epoch 1 repriced. */
 const SIGNED_THINKING = { type: 'thinking', thinking: '', signature: 'sig'.repeat(110) } as const;
 
-async function openManager(name: string, opts: { signedThinking?: boolean } = {}) {
+async function openManager(name: string, opts: { signedThinking?: boolean; stampedThinking?: boolean } = {}) {
   const membrane = new Membrane(new MockAdapter({}), { formatter: new NativeFormatter() });
   const strategy = new AutobiographicalStrategy({
     targetChunkTokens: 5_000,
@@ -42,6 +42,8 @@ async function openManager(name: string, opts: { signedThinking?: boolean } = {}
   for (let i = 0; i < 6; i++) {
     cm.addMessage(i % 2 ? 'Claude' : 'User', [
       ...(i % 2 && opts.signedThinking ? [SIGNED_THINKING as never] : []),
+      // As agent-framework stamps it from usage (src/thinking-token-stamp.ts).
+      ...(i % 2 && opts.stampedThinking ? [{ ...SIGNED_THINKING, tokenEstimate: 900 } as never] : []),
       { type: 'text', text: `turn ${i} ${'lorem ipsum '.repeat(120)}` },
     ]);
   }
@@ -237,6 +239,25 @@ describe('estimator calibration band', () => {
     await cm.compile(BUDGET);
     assert.deepEqual(cm.getRenderStats()!.calibration, { multiplier: 1, pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
     cm.close();
+  });
+
+  it('signed thinking stamped with its own tokenEstimate does not count as repriced', async () => {
+    // MessageStore and ContextLog price a block with a numeric tokenEstimate
+    // by that stamp, before epoch 1 and since, so in a store whose signed
+    // thinking is all stamped an older record still means what it did.
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const first = await openManager('stamped-thinking', { stampedThinking: true });
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 0.7, at: 1, pricing: 0 });
+    first.cm.close();
+    const reopened = await openManager('stamped-thinking', { stampedThinking: true });
+    await reopened.cm.compile(BUDGET);
+    assert.equal(reopened.internals._calibration, 0.7);
+    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 0.7, pricingEpoch: epoch });
+    const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { multiplier?: number; pricing?: number };
+    assert.equal(saved.multiplier, 0.7);
+    assert.equal(saved.pricing, epoch, 're-stamped under the current epoch');
+    reopened.cm.close();
   });
 
   it('a dry select leaves the record as it was, and the next real compile persists the load', async () => {

@@ -9366,10 +9366,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * entry here counts as repricing everything (discard, as before).
    */
   static readonly CALIBRATION_EPOCH_REPRICES: Readonly<Record<number, (messages: readonly StoredMessage[]) => boolean>> = {
-    // 1: signed thinking priced by signature length, not a flat 600.
+    // 1: signed thinking priced by signature length, not a flat 600. A block
+    // with a numeric `tokenEstimate` is priced by that stamp in both epochs
+    // (MessageStore and ContextLog read it first), so it wasn't repriced.
     1: (messages) => messages.some((m) => m.content.some((b) => {
-      const block = b as { type?: string; signature?: unknown };
-      return block.type === 'thinking' && typeof block.signature === 'string' && block.signature.length > 0;
+      const block = b as { type?: string; signature?: unknown; tokenEstimate?: unknown };
+      return block.type === 'thinking' && typeof block.signature === 'string' && block.signature.length > 0 &&
+        typeof block.tokenEstimate !== 'number';
     })),
   };
 
