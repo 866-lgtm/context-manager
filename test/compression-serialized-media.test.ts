@@ -22,7 +22,7 @@ describe('compression prompt serialized-media projection', () => {
     assert.equal(strategy.stripSerializedMedia(messages), 1);
     assert.match(
       (messages[0].content[0] as { type: 'text'; text: string }).text,
-      /before \[embedded image\/png data URL omitted from compression prompt: 5000 serialized payload characters; original preserved in Chronicle\] after/,
+      /before \[embedded image\/png data URL omitted from compression prompt: 5000 serialized payload characters\] after/,
     );
     assert.equal((original as { type: 'text'; text: string }).text.includes(payload), true);
   });

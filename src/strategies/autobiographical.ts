@@ -11475,7 +11475,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (payload.length < minChars) return match;
         replaced++;
         return `[embedded ${mediaType.replace('\\/', '/')} data URL omitted from compression prompt: ` +
-          `${payload.length} serialized payload characters; original preserved in Chronicle]`;
+          `${payload.length} serialized payload characters]`;
       });
     const strip = (blocks: ContentBlock[]): ContentBlock[] => {
       let changed = false;
