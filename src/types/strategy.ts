@@ -26,6 +26,15 @@ export interface MessageStoreView {
   /** Closed-loop estimator calibration (optional — MessageStore provides it). */
   setTokenCalibration?(factor: number): void;
   getTokenCalibration?(): number;
+  /**
+   * Whether a message is under a compression hold (ContextManager
+   * holdCompression / addMessage `holdCompression`). Compressing strategies
+   * must not fold a held message, anything after it, or the tool_use it
+   * answers. Absent on views not built by a ContextManager ⇒ nothing held.
+   */
+  isCompressionHeld?(id: MessageId): boolean;
+  /** Fast path: whether any hold exists (lets strategies skip scanning). */
+  hasCompressionHolds?(): boolean;
 }
 
 /**
@@ -144,6 +153,12 @@ export interface ContextStrategy {
   onNewMessage?(message: StoredMessage, ctx: StrategyContext): Promise<void>;
 
   /**
+   * Called when ContextManager.releaseCompression actually released a hold.
+   * Compressing strategies should re-queue work the hold deferred.
+   */
+  onCompressionHoldsReleased?(ctx: StrategyContext): void;
+
+  /**
    * Check if strategy is ready to compile.
    * Returns pending work info if not ready.
    */
@@ -155,10 +170,13 @@ export interface ContextStrategy {
    *
    * `opts.dryRun` requests a NON-COMMITTING select: the returned entries are
    * what a real compile at this budget would produce, but no fold resolutions
-   * are persisted, no compression/merge work is enqueued, and no transition
-   * bookkeeping is advanced. Implementations that cannot honour it must
-   * ignore it only if they are already side-effect-free (see
-   * `selectHierarchical`); any path that commits state MUST gate on it.
+   * or chunk records are persisted, no compression/merge work is enqueued, no transition
+   * bookkeeping is advanced, and what a select leaves for the next one or for
+   * observers (its cache-marker baseline, transition status, render stats,
+   * and calibration's estimate and arming) stays as the last committing
+   * select left it. Implementations that cannot
+   * honour it must ignore it only if they are already side-effect-free; any
+   * path that commits state MUST gate on it.
    */
   select(
     store: MessageStoreView,
@@ -188,16 +206,35 @@ export interface ContextStrategy {
 /**
  * Per-call options for `select()` / `compile()`.
  *
- * `dryRun` exists because the adaptive path is NOT side-effect-free: it
- * commits fold resolutions to Chronicle and enqueues real compression work.
- * An operator UI that previews a hypothetical budget must not do either, or
- * every slider drag would rewrite the fold plan and spend LLM tokens.
+ * `dryRun` exists because a select is NOT side-effect-free: it commits fold
+ * resolutions and chunk records to Chronicle, enqueues real compression work,
+ * and leaves state the next compile and observers read. An operator UI that
+ * previews a hypothetical budget must change none of it, or every slider drag
+ * would rewrite the fold plan, spend LLM tokens and change what the next real
+ * compile sends. The field's doc gives the whole contract.
  */
 export interface SelectOptions {
   /**
    * Compute the layout without committing anything: no resolution persistence,
-   * no produce/merge enqueue, no shadow production pick, and no transition
-   * bookkeeping. Over-budget becomes a reported condition rather than a throw.
+   * no chunk record and no compression queued for a chunk the select's
+   * rebuild closes, no produce/merge enqueue, no shadow production pick, no
+   * transition bookkeeping, and nothing a select leaves for the next one or for
+   * observers (the cache-marker baseline, the transition status, the render
+   * stats, calibration's estimate, arming and store view, the store order, the
+   * head-window memo, and whether chunk records are trusted), all on every
+   * path out, throws included.
+   *
+   * What a dry select refuses is what a real compile refuses, with one
+   * exception: an over-budget plan is not thrown at the plan check. A plain
+   * dry compile then returns that plan's entries with no verdict, and
+   * `previewContext` is where infeasibility is reported. The head-and-tail
+   * check before the plan check, and any later stage that can't fit, still
+   * throw as for a real compile, leaving nothing behind; `previewContext`
+   * reports an over-budget throw and passes any other throw through.
+   *
+   * A compression hold ends at its deadline, whoever looks: the manager
+   * releases an expired hold at any compile or hold query, a dry compile
+   * included, and that release is the one thing a dry compile can leave.
    */
   dryRun?: boolean;
   /** Exact normalized tools/system/context-prefix identity supplied by the
@@ -621,6 +658,13 @@ export interface KvUnifiedConfig {
   adoptEpsilon: number;
   treeifyNonContiguousSummaries: boolean;
   preserveGapBearingSummaries: boolean;
+  /**
+   * Certified hysteresis exit (see `docs/kv-unified-hysteresis-certificate.md`):
+   * when the accepted presentation provably remains the policy's selection,
+   * skip label propagation. Proves the exact hysteresis policy; it does not
+   * guarantee identity with every bucketed approximate solve. Off unless set.
+   */
+  hysteresisCertificate?: boolean;
 }
 
 export interface AutobiographicalConfig {
@@ -849,6 +893,19 @@ export interface AutobiographicalConfig {
   maxLiveImageBytes?: number;
 
   /**
+   * Opt-in, cost-conscious image trimming (default off). Without it the live
+   * image window slides one image at a time: once a limit binds
+   * (`maxLiveImages`, `imageStripDepthTokens`, `maxLiveImageBytes`), each new
+   * image strips the oldest live one, a change mid-history that invalidates
+   * the prompt cache from that message on, on every image. With a ratio in
+   * (0, 1), a binding limit instead trims down to ratio × each limit and
+   * records a watermark (a message sequence, persisted): every image at or
+   * before it stays stripped, so the stripped set changes once per trim, not
+   * once per image. E.g. 0.7. Costs up to (1 - ratio) of the image budget.
+   */
+  imageStripHysteresisRatio?: number;
+
+  /**
    * Image byte budget for COMPRESSION prompts (summarizer). Tighter than the
    * live window's: the prompt also carries the head, the recall frontier and
    * the raw chunk. Newest-first; older images become loud placeholders.
@@ -903,6 +960,31 @@ export interface AutobiographicalConfig {
    * (never silently retried in a loop, never canonized). Default: 5.
    */
   mergeAttemptLimit?: number;
+  /**
+   * Store-topology policy. On every load the summary archive is audited for
+   * crossed ownership: a summary whose leaves are not contiguous among the
+   * chunk-owned messages in store order (an interleaved live representation
+   * sits inside its span — issue #122's cross-era merges, restore/branch
+   * interleavings, hand surgery). `'reject'` (default) throws
+   * `StoreTopologyError` from `initialize`, so `ContextManager.open` fails
+   * and the operator repairs the store before the resident runs on it.
+   * `'report'` logs the violations at error level and reports them through
+   * `getCompressionDebt().topologyViolations` (state `critical`).
+   * A kv-unified config that explicitly opts into gap handling
+   * (`preserveGapBearingSummaries` or `treeifyNonContiguousSummaries`)
+   * defaults to `'report'`: those stores are known to carry gaps.
+   * Independent of this policy, a merge that WOULD mint a crossed node is
+   * never executed: it is refused into the merge quarantine.
+   */
+  topologyPolicy?: 'reject' | 'report';
+  /**
+   * Open for inspection only: `initialize` still loads and audits the store,
+   * but never chunks the uncovered frontier, enqueues merges, or rewrites the
+   * persisted merge queue. Audit and repair tooling opens stores this way; a
+   * plain open under a config that is not the resident's own would otherwise
+   * mint chunk records with the wrong head window and chunk size.
+   */
+  auditOnly?: boolean;
   /** Legacy first-choice target-only merge request. Default false. */
   compressionMergeSourceOnly?: boolean;
   /** Use target-only merge request only on the final persisted merge attempt. Default false. */
@@ -1007,6 +1089,36 @@ export interface AutobiographicalConfig {
 
   /** Final bounded source-only L1 attempt after canonical + recall variants. */
   compressionSourceOnlyFallback?: boolean;
+  /**
+   * Tool-prose hoist rung (2026-09-19, sill). Off unless set.
+   *
+   * Long prose in an argument of a private-reasoning tool (`skip_reply.reason`,
+   * `think.content`) makes the replayed history read as a reasoning trace and
+   * the L1 request is refused `reasoning_extraction` regardless of content. On
+   * a canonical REFUSAL (only then) the request is retried once with each such
+   * argument moved into a call to `intoTool` — a note-taking tool the agent
+   * really has — placed as its own round just before the original call, a short
+   * stub left behind. If the source-only final rung is enabled and also refuses,
+   * it gets the same rewrite once. Nothing the agent wrote is dropped.
+   *
+   * The rung is SKIPPED unless `intoTool` is among the tools the host declared:
+   * the summarizer is the agent, and it must never be shown itself using a tool
+   * it does not have. Enabling (or changing) this is a new request regime, so
+   * already-quarantined chunks earn a fresh bounded attempt without a manual
+   * clear. See `tool-prose-hoist.ts` for the canary record.
+   */
+  compressionToolProseFallback?: {
+    /** Declared name of the real note-taking tool that receives the prose. */
+    intoTool: string;
+    /** Tools to rewrite from (exact name or final `--` segment). Required. */
+    fromTools: string[];
+    /** Argument of `intoTool` that receives the prose (default `content`). */
+    field?: string;
+    /** tool_result content for the inserted calls (default: journal receipt). */
+    result?: string;
+    /** Rewrite string arguments longer than this many chars (default 100). */
+    minChars?: number;
+  };
   /**
    * Split-stitch rung (2026-09-05, princess): when every L1 rung (canonical, recall
    * expansions, source-only-final) is refused, fold the chunk in halves recursively
