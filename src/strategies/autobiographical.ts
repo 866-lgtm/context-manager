@@ -2000,26 +2000,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Drop empty-content summaries (bugged/empty generations from before the
     // production guards). Recalling or merging one yields an empty text block →
     // Anthropic 400 "content must be non-empty". Never let them re-enter memory.
-    const nonEmpty = loaded.filter(s => s && typeof s.content === 'string' && s.content.trim().length > 0);
-    const droppedEmpty = loaded.length - nonEmpty.length;
-    const removedEmptyIds = new Set(
+    // Drop summaries whose sources can't be read as a list of ids too: every
+    // reader of `sourceIds` iterates it (the adaptive picker's L1 index walks
+    // every L1, merged or not), so one such record threw on every compile.
+    // Their dependents are repaired below, as for an empty one.
+    const hasContent = (s: SummaryEntry) => typeof s.content === 'string' && s.content.trim().length > 0;
+    const hasSources = (s: SummaryEntry) =>
+      Array.isArray(s.sourceIds) && s.sourceIds.length > 0 &&
+      s.sourceIds.every(id => typeof id === 'string' && id.length > 0);
+    const readable = loaded.filter(s => s && hasContent(s) && hasSources(s));
+    const droppedEmpty = loaded.filter(s => s && !hasContent(s)).length;
+    const droppedNoSources = loaded.filter(s => s && hasContent(s) && !hasSources(s)).length;
+    const removedIds = new Set(
       loaded
-        .filter(s => s && (typeof s.content !== 'string' || s.content.trim().length === 0))
+        .filter(s => s && !(hasContent(s) && hasSources(s)))
         .map(s => s.id),
     );
     if (droppedEmpty > 0) console.warn(`[autobiographical] dropped ${droppedEmpty} empty summary(ies) on load`);
+    if (droppedNoSources > 0) {
+      console.warn(`[autobiographical] dropped ${droppedNoSources} summary(ies) whose sourceIds aren't a list of ids on load`);
+    }
     // Dedupe by id, keeping the copy with mergedInto set (position of first
     // occurrence preserved). Duplicate-id copies with diverging merge state
     // exist in stores touched by the pre-fix setMergedInto index-desync bug;
     // without dedupe, the plain copy stays on the unmerged frontier and its
     // content renders twice (once itself, once via its parent's merge).
     const byId = new Map<string, SummaryEntry>();
-    for (const s of nonEmpty) {
+    for (const s of readable) {
       const prev = byId.get(s.id);
       if (!prev) byId.set(s.id, s);
       else if (!prev.mergedInto && s.mergedInto) byId.set(s.id, s);
     }
-    const dupes = nonEmpty.length - byId.size;
+    const dupes = readable.length - byId.size;
     if (dupes > 0) console.warn(`[autobiographical] deduped ${dupes} duplicate summary id(s) on load`);
     // Dropping an invalid parent is only half the repair. Its children may
     // still carry `mergedInto: <dropped-id>`, which makes them simultaneously
@@ -2034,10 +2046,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const { mergedInto: _dropped, ...repaired } = summary;
       return repaired as SummaryEntry;
     });
-    if (droppedEmpty > 0 || dupes > 0 || danglingParents > 0) {
+    if (droppedEmpty > 0 || droppedNoSources > 0 || dupes > 0 || danglingParents > 0) {
       this.store.setStateJson(this.summariesStateId, this.summaries);
       console.warn(
-        `[autobiographical] repaired summary state: removed ${droppedEmpty} empty, ` +
+        `[autobiographical] repaired summary state: removed ${droppedEmpty} empty and ${droppedNoSources} without readable sourceIds, ` +
           `deduped ${dupes}, cleared ${danglingParents} dangling parent pointer(s)`,
       );
     }
@@ -2078,7 +2090,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .map((r) => [r.key, r]),
     );
     const validMergeQueue = this.mergeQueue.filter(
-      merge => !merge.sourceIds.some(id => removedEmptyIds.has(id) && !byId.has(id)),
+      merge => Array.isArray(merge.sourceIds) && !merge.sourceIds.some(id => removedIds.has(id) && !byId.has(id)),
     );
     if (validMergeQueue.length !== this.mergeQueue.length) {
       const removed = this.mergeQueue.length - validMergeQueue.length;

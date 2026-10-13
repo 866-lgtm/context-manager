@@ -81,6 +81,14 @@ class TestableStrategy extends AutobiographicalStrategy {
     this.store?.setStateJson(this.summariesStateId, entries);
   }
 
+  persistRawMergeQueue(items: unknown[]): void {
+    this.store?.setStateJson(this.mergeQueueStateId, items);
+  }
+
+  readPersistedSummaries(): SummaryEntry[] {
+    return (this.store?.getStateJson(this.summariesStateId) as SummaryEntry[] | null) ?? [];
+  }
+
   // Read-only views for assertions
   getSummariesView(): SummaryEntry[] { return [...this.summaries]; }
   getCounter(): number { return this.summaryIdCounter; }
@@ -228,6 +236,107 @@ describe('AutobiographicalStrategy — persistence', () => {
       manager.close();
     }
   });
+
+  it('drops summaries whose sourceIds are not a list of ids on load, and repairs what pointed at them', async () => {
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300 });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const a = strategy.seedL1('summary a', ['m1']);
+      const b = strategy.seedL1('summary b', ['m2']);
+      const parent = strategy.seedL2([a.id, b.id], 'parent whose sources were lost');
+      const kept = strategy.seedL1('summary c', ['m3']);
+      const other = strategy.seedL2([kept.id], 'parent of c');
+      const view = strategy.getSummariesView();
+      const corrupted: SummaryEntry[] = [
+        ...view.map((summary) =>
+          summary.id === parent.id ? ({ ...summary, sourceIds: null } as unknown as SummaryEntry) : summary),
+        // A superseded L1 with no sources, whose parent doesn't list it.
+        { ...kept, id: 'L1-lost', content: 'superseded', sourceIds: null, mergedInto: other.id } as unknown as SummaryEntry,
+        // Sources that aren't a list, or hold something other than ids.
+        { ...kept, id: 'L1-string', content: 'string sources', sourceIds: 'm3' } as unknown as SummaryEntry,
+        { ...kept, id: 'L1-mixed', content: 'mixed sources', sourceIds: ['m3', 7] } as unknown as SummaryEntry,
+        { ...kept, id: 'L1-none', content: 'no sources', sourceIds: [] } as unknown as SummaryEntry,
+      ];
+      strategy.persistRawSummaries(corrupted);
+      manager.sync();
+      manager.close();
+    }
+
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300 });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const summaries = strategy.getSummariesView();
+      assert.deepEqual(summaries.map((s) => s.id).sort(), ['L1-0', 'L1-1', 'L1-3', 'L2-4']);
+      assert.ok(summaries.every((s) => Array.isArray(s.sourceIds) && s.sourceIds.length > 0));
+      // The dropped parent's children are free to merge again; the kept parent's child stays merged.
+      assert.equal(summaries.find((s) => s.id === 'L1-0')?.mergedInto, undefined);
+      assert.equal(summaries.find((s) => s.id === 'L1-1')?.mergedInto, undefined);
+      assert.equal(summaries.find((s) => s.id === 'L1-3')?.mergedInto, 'L2-4');
+      assert.deepEqual(
+        strategy.readPersistedSummaries().map((s) => s.id).sort(),
+        ['L1-0', 'L1-1', 'L1-3', 'L2-4'],
+        'the repair is persisted, so it does not run again on the next open',
+      );
+      manager.close();
+    }
+  });
+
+  it('drops a merge queue item whose sourceIds are not a list on load', async () => {
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300 });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const m1 = manager.addMessage('User', textBlock('hello'));
+      const m2 = manager.addMessage('Claude', textBlock('hi back'));
+      const a = strategy.seedL1('summary a', [m1]);
+      const b = strategy.seedL1('summary b', [m2]);
+      strategy.persistRawMergeQueue([{ level: 2, sourceIds: null }, { level: 2, sourceIds: [a.id, b.id] }]);
+      manager.sync();
+      manager.close();
+    }
+
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300 });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      assert.deepEqual(strategy.getMergeQueueView(), [{ level: 2, sourceIds: ['L1-0', 'L1-1'] }]);
+      manager.close();
+    }
+  });
+
+  for (const [label, options] of [
+    ['hierarchical', {}],
+    ['adaptive, default solver', { adaptiveResolution: true }],
+    ['adaptive, kv-stable', { adaptiveResolution: true, foldingStrategy: 'kv-stable' }],
+  ] as const) {
+    it(`compiles a store that held an L1 with null sourceIds, after a reopen (${label})`, async () => {
+      {
+        const strategy = new TestableStrategy({ targetChunkTokens: 300, ...options });
+        const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+        const ids = ['one', 'two', 'three', 'four'].map((text, i) => manager.addMessage(i % 2 === 0 ? 'User' : 'Claude', textBlock(text)));
+        const good = strategy.seedL1('summary of one and two', ids.slice(0, 2));
+        const parent = strategy.seedL2([good.id], 'parent of the good one');
+        strategy.persistRawSummaries([
+          ...strategy.getSummariesView(),
+          // A superseded L1 that no chunk record points at, whose parent doesn't list it.
+          { ...good, id: 'L1-lost', content: 'superseded', sourceIds: null, mergedInto: parent.id } as unknown as SummaryEntry,
+        ]);
+        manager.sync();
+        manager.close();
+      }
+
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, ...options });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      try {
+        const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+        assert.ok(compiled.messages.length > 0);
+        const dry = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }, undefined, { dryRun: true });
+        assert.ok(dry.messages.length > 0);
+        assert.ok(!strategy.getSummariesView().some((s) => s.id === 'L1-lost'), 'the record is dropped on load');
+        assert.ok(!strategy.readPersistedSummaries().some((s) => s.id === 'L1-lost'), 'and the drop is persisted, with nothing else to repair');
+      } finally {
+        manager.close();
+      }
+    });
+  }
 
   it('isolates summary state per chronicle branch (fork)', async () => {
     const strategy = new TestableStrategy({ targetChunkTokens: 300 });
