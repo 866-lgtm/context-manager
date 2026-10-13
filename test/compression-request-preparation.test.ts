@@ -62,6 +62,18 @@ describe('compression request preparation', () => {
     assert.equal(JSON.stringify(preparedCanonical), before);
     assert.equal(head.content[0].type, 'image');
   });
+  it('preparing a prepared request replaces nothing more', () => {
+    const url = 'data:image/png;base64,' + 'A'.repeat(5000);
+    const image = (data: string) => ({ type: 'image', source: { type: 'base64', mediaType: 'image/png', data } }) as ContentBlock;
+    const strategy = new Prepared({ maxCompressionImageBytes: 4 });
+    const first = strategy.prepare(request([{ type: 'text', text: url + '\\n' + url + '\\"' }, image('AAAAAAAA'), image('AAA')]));
+    assert.equal(first.serializedMediaReplacements, 2);
+    assert.equal(first.imageReplacements, 1);
+    const second = strategy.prepare(first.request);
+    assert.equal(second.serializedMediaReplacements, 0);
+    assert.equal(second.imageReplacements, 0);
+    assert.equal(JSON.stringify(second.request), JSON.stringify(first.request));
+  });
   it('reports serialized payload characters including JSON slash escapes, at the existing floor', () => {
     const payload = 'A\\/'.repeat(1500);
     const result = new Prepared().prepare(request([{ type: 'text', text: 'data:image\\/png;base64,' + payload }]));

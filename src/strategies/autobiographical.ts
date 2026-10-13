@@ -11498,18 +11498,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const dataUrl =
       /data:([A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*(?:\\?\/)[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*)(?:;[A-Za-z0-9!#$&^_.+-]+=[^;,"\s]*)*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
     let replaced = 0;
-    const stripText = (text: string): string =>
-      text.replace(dataUrl, (match: string, mediaType: string, run: string) => {
+    const stripText = (text: string): string => {
+      let out = '';
+      let copied = 0;
+      dataUrl.lastIndex = 0;
+      for (let m = dataUrl.exec(text); m; m = dataUrl.exec(text)) {
+        const [match, mediaType, run] = m;
         // The payload class admits `\` for an escaped slash. Any other
         // backslash begins an escape after the payload (`\"`, `\n`), so the
-        // payload ends there, and the escape and what follows it stay.
-        const end = run.search(/\\(?!\/)/);
-        const payload = end < 0 ? run : run.slice(0, end);
-        if (payload.length < minChars) return match;
-        replaced++;
-        return `[embedded ${mediaType.replace('\\/', '/')} data URL omitted from compression prompt: ` +
-          `${payload.length} serialized payload characters]` + (end < 0 ? '' : run.slice(end));
-      });
+        // payload ends there. The scan resumes at that escape, since what
+        // follows it can begin the next data URL (`\ndata:…`).
+        const cut = run.search(/\\(?!\/)/);
+        const payload = cut < 0 ? run : run.slice(0, cut);
+        const payloadEnd = m.index + match.length - (run.length - payload.length);
+        if (payload.length >= minChars) {
+          out += text.slice(copied, m.index) +
+            `[embedded ${mediaType.replace('\\/', '/')} data URL omitted from compression prompt: ` +
+            `${payload.length} serialized payload characters]`;
+          copied = payloadEnd;
+          replaced++;
+        }
+        dataUrl.lastIndex = payloadEnd;
+      }
+      return copied === 0 ? text : out + text.slice(copied);
+    };
     const strip = (blocks: ContentBlock[]): ContentBlock[] => {
       let changed = false;
       const stripped = blocks.map((block) => {

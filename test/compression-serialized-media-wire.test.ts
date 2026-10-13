@@ -176,6 +176,16 @@ describe('matcher coverage', () => {
     const short = one('data:image/png;base64,' + 'A'.repeat(4095) + '\\n' + 'B'.repeat(10));
     assert.equal(short.n, 0, 'what follows the escape does not count toward the floor');
   });
+  it('replaces both of two data URLs that a JSON escape separates, in one pass', () => {
+    const url = 'data:image/png;base64,' + 'A'.repeat(5000);
+    const marker = '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]';
+    const r = one(url + '\\n' + url);
+    assert.equal(r.n, 2);
+    assert.equal(r.text, marker + '\\n' + marker);
+    const afterShort = one('data:image/png;base64,AAAA\\n' + url);
+    assert.equal(afterShort.n, 1, 'a short data URL before the escape is kept, and the next one is still found');
+    assert.equal(afterShort.text, 'data:image/png;base64,AAAA\\n' + marker);
+  });
   it('matches the scheme and the base64 token in any letter case', () => {
     const r = one('DATA:image/png;BASE64,' + 'P'.repeat(5000));
     assert.equal(r.n, 1); assert.match(r.text, /^\[embedded image\/png data URL omitted/);

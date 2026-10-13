@@ -2364,7 +2364,9 @@ describe('prepared recall expansions', () => {
       const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 2 });
       const payload = 'U'.repeat(20000);
       const entry = location === 'parent' ? fx.parents[1] : fx.children[2];
-      entry.content = 'authored data:image/png;base64,' + payload;
+      // Two data URLs a JSON escape separates: one preparation must replace both,
+      // or the hash recorded for a request differs from the request sent.
+      entry.content = 'authored data:image/png;base64,' + payload + '\\ndata:image/png;base64,' + payload;
       fx.strategy.flushSummaries();
       const storedBefore = JSON.stringify(fx.manager.getStore().getStateJson('default/autobio:summaries'));
       await fx.strategy.run(fx.target, managerContext(fx.manager));
