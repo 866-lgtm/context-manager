@@ -30,9 +30,9 @@ function imagePattern(entries: { content: ContentBlock[] }[], n: number): string
   let out = '';
   for (let i = 1; i <= n; i++) {
     const e = entries.find((x) => x.content.some((b) => b.type === 'text' && b.text === `img-${i}`));
-    out += e?.content.some((b) => b.type === 'image') ? 'I' : '.';
+    out += !e ? '-' : e.content.some((b) => b.type === 'image') ? 'I' : '.';
   }
-  return out; // e.g. "...II": img-1..3 stripped, img-4..5 live
+  return out; // e.g. "...II": img-1..3 stripped, img-4..5 live; '-' is a message missing from the render
 }
 
 async function stripped(m: ContextManager, n: number): Promise<string> {
@@ -198,10 +198,12 @@ describe('imageStripHysteresisRatio', () => {
           m.holdCompression([id], { timeoutMs: 100 });
           now += 100;
           const compiled = await m.compile(BUDGET, undefined, { dryRun });
-          assert.equal(m.getCompressionHoldDetails().size, 0, 'compile released the expired hold');
+          // Read what compile left before anything else expires holds:
+          // getCompressionHoldDetails releases an expired hold itself.
           const persisted = JSON.parse(slot(m, s));
-          assert.ok(persisted && typeof persisted.sequence === 'number', 'the release persisted a trim');
+          assert.ok(persisted && typeof persisted.sequence === 'number', 'compile released the expired hold and persisted its trim');
           assert.equal(watermark(s), persisted.sequence);
+          assert.equal(m.getCompressionHoldDetails().size, 0, 'no hold is left');
           const pattern = imagePattern(compiled.messages, 6);
           assert.equal(pattern, '....II');
           results.push({ pattern, watermark: watermark(s), sequence: persisted.sequence });
@@ -266,7 +268,8 @@ describe('imageStripHysteresisRatio', () => {
       try {
         const before = slot(m, s);
         assert.equal(watermark(s), undefined, 'ratio-off initialization has not loaded the persisted watermark');
-        assert.ok(m.getRenderStats(), 'the observer loads the stored trim while reconstructing');
+        assert.ok(m.getRenderStats(), 'the observer reconstructs its window');
+        assert.equal(watermark(s), JSON.parse(before).sequence, 'the observer loaded the stored watermark and left it as stored');
         assert.equal(slot(m, s), before);
         assert.equal(await stripped(m, 6), '...III', 'the next live compile retains the stored boundary');
       } finally {
