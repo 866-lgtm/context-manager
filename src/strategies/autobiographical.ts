@@ -2093,7 +2093,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // A summary has one parent: the first of its own pointers, then its other
     // copies' (`parentId` before the older `mergedInto` in each, as readers
-    // take them), that names a kept summary listing it among its sources.
+    // take them), that names a kept summary at a higher level listing it
+    // among its sources, so no two summaries can be each other's parent.
     // `mergedInto`, which this strategy writes and its frontier reads, is set
     // to that parent, and so is a `parentId` naming anything else, so every
     // reader sees the one parent that renders the summary. With no such
@@ -2101,12 +2102,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // and merges again. A null pointer counts as none.
     const reparentedIds: string[] = [];
     let clearedPointers = 0;
-    const covers = (pointer: unknown, id: string): pointer is string =>
-      typeof pointer === 'string' && byId.get(pointer)?.sourceIds.includes(id) === true;
+    const covers = (pointer: unknown, summary: SummaryEntry): pointer is string => {
+      const parent = typeof pointer === 'string' ? byId.get(pointer) : undefined;
+      return !!parent && parent.level > summary.level && parent.sourceIds.includes(summary.id);
+    };
     this.summaries = [...byId.values()].map((summary) => {
       const pointers = [summary, ...copiesById.get(summary.id)!]
         .flatMap((copy) => [copy.parentId, copy.mergedInto] as unknown[]);
-      const parent = pointers.find((pointer): pointer is string => covers(pointer, summary.id));
+      const parent = pointers.find((pointer): pointer is string => covers(pointer, summary));
       let repaired = summary;
       const edit = () => (repaired === summary ? (repaired = { ...summary }) : repaired);
       if (parent === undefined) {
@@ -2632,9 +2635,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const persisted = this.store?.getStateJson(this.summariesStateId);
     if (!Array.isArray(persisted)) return undefined;
     // Another instance may have appended it since this one loaded. Adopt it
-    // as the loader would keep it: it has text and a list of ids, and its
-    // range is their ends. Its parent pointers stay as the store has them,
-    // since a parent this instance hasn't loaded is still in the store.
+    // if it has text and a list of ids, with its range their ends, as the
+    // loader keeps an L1. Its parent pointers stay as the store has them: a
+    // parent this instance hasn't loaded may be in the store, and the next
+    // open resolves them as the loader does.
     const match = (persisted as SummaryEntry[]).find(
       (summary) => summary?.level === 1 && isIdList(summary.sourceIds) && summary.sourceIds.join(':') === chunkIdKey &&
         hasSummaryText(summary),

@@ -964,7 +964,7 @@ export interface AutobiographicalConfig {
    * summaries that are empty or whose sources or range it can't, and the
    * summaries above them, resolves each summary's parent pointers, and
    * reopens or removes the chunk records and queued merges that name a
-   * dropped summary.
+   * summary it doesn't keep.
    */
   auditOnly?: boolean;
   /** Legacy first-choice target-only merge request. Default false. */

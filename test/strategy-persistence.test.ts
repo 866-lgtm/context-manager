@@ -471,8 +471,8 @@ describe('AutobiographicalStrategy — persistence', () => {
     {
       const strategy = new TestableStrategy({ targetChunkTokens: 300, recentWindowTokens: 1, auditOnly: true });
       const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
-      // The parent covers A and C, which are next to each other; B comes after them.
-      const markers = ['PTR-A', 'PTR-C', 'PTR-B'];
+      // The parent covers A and C, which are next to each other; B and D come after them.
+      const markers = ['PTR-A', 'PTR-C', 'PTR-B', 'PTR-D'];
       const l1s = markers.map((marker) => strategy.seedL1(marker, [manager.addMessage('User', textBlock(marker))]));
       markers.forEach((marker, i) => { ids[marker] = l1s[i]!.id; });
       const parent = strategy.seedL2([ids['PTR-A']!, ids['PTR-C']!], 'PTR-A PTR-C');
@@ -491,6 +491,8 @@ describe('AutobiographicalStrategy — persistence', () => {
         // C's text copy has null pointers; its empty copy names the kept parent.
         { ...plain(ids['PTR-C']!), parentId: null, mergedInto: null },
         { ...plain(ids['PTR-C']!), content: '', mergedInto: parent.id },
+        // D has no parent: a null parentId and a pointer to a summary that's gone.
+        { ...plain(ids['PTR-D']!), parentId: null, mergedInto: 'L2-gone' },
         parent,
       ]);
       manager.sync();
@@ -511,10 +513,13 @@ describe('AutobiographicalStrategy — persistence', () => {
         const c = kept.get(ids['PTR-C']!)!;
         assert.equal(c.mergedInto, parentId, 'a null pointer takes the parent another copy names');
         assert.strictEqual((c as { parentId?: unknown }).parentId, null, 'a null parentId beside it is left as it is');
+        const d = kept.get(ids['PTR-D']!)!;
+        assert.equal(d.mergedInto, undefined, 'with no parent, a dangling pointer is cleared');
+        assert.strictEqual((d as { parentId?: unknown }).parentId, null, 'and a null one is left as it is');
         assert.deepEqual(strategy.readPersistedSummaries(), strategy.getSummariesView());
         if (open === 0) {
           const line = warnings.find((w) => w.includes('repaired summary state')) ?? '';
-          assert.match(line, /cleared 2 parent pointer\(s\)/, line);
+          assert.match(line, /cleared 3 parent pointer\(s\)/, line);
           const reparented = line.match(/set the parent of \[([^\]]*)\]/)?.[1]?.split(', ').sort();
           assert.deepEqual(reparented, [ids['PTR-A'], ids['PTR-C']].sort(), line);
         } else {
@@ -522,9 +527,64 @@ describe('AutobiographicalStrategy — persistence', () => {
         }
         const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
         const rendered = JSON.stringify(compiled.messages.map((message) => message.content));
-        for (const marker of ['PTR-A', 'PTR-B', 'PTR-C']) assert.equal(rendered.split(marker).length - 1, 1, rendered);
+        for (const marker of ['PTR-A', 'PTR-B', 'PTR-C', 'PTR-D']) assert.equal(rendered.split(marker).length - 1, 1, rendered);
       } finally { manager.close(); }
     }
+  });
+
+  it('gives a summary whose parent only parentId names the same mergedInto, once', async (t) => {
+    const warnings: string[] = [];
+    t.mock.method(console, 'warn', (...args: unknown[]) => warnings.push(args.map(String).join(' ')));
+    let childId = '';
+    let parentId = '';
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const child = strategy.seedL1('only parentId', [manager.addMessage('User', textBlock('only parentId'))]);
+      const parent = strategy.seedL2([child.id], 'its parent');
+      childId = child.id;
+      parentId = parent.id;
+      const plain = { ...strategy.getSummariesView().find((s) => s.id === child.id)! };
+      delete (plain as { mergedInto?: string }).mergedInto;
+      strategy.persistRawSummaries([{ ...plain, parentId: parent.id }, parent]);
+      manager.sync();
+      manager.close();
+    }
+    for (let open = 0; open < 2; open++) {
+      warnings.length = 0;
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      try {
+        const child = strategy.readPersistedSummaries().find((s) => s.id === childId)!;
+        assert.equal(child.mergedInto, parentId);
+        assert.equal(child.parentId, parentId);
+        const line = warnings.find((w) => w.includes('repaired summary state'));
+        if (open === 0) assert.match(line ?? '', new RegExp('set the parent of \\[' + childId + '\\]'), warnings.join('\n'));
+        else assert.equal(line, undefined, warnings.join('\n'));
+      } finally { manager.close(); }
+    }
+  });
+
+  it('gives no parent a summary at its own level, so two summaries cannot be each other\'s parent', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    let lowerId = '';
+    {
+      const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const l1 = strategy.seedL1('level one', [manager.addMessage('User', textBlock('level one'))]);
+      const lower = strategy.seedL2([l1.id], 'lower');
+      const sameLevel = { ...lower, id: 'L2-same', sourceIds: [lower.id] };
+      lowerId = lower.id;
+      strategy.persistRawSummaries([...strategy.getSummariesView().filter((s) => s.id !== lower.id), { ...lower, mergedInto: 'L2-same' }, sameLevel]);
+      manager.sync();
+      manager.close();
+    }
+    const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true, topologyPolicy: 'report' });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      const lower = strategy.getSummariesView().find((s) => s.id === lowerId)!;
+      assert.equal(lower.mergedInto, undefined, 'a summary at the same level is no parent, though it lists this one');
+    } finally { manager.close(); }
   });
 
   it('a store whose only defect is a dangling parent pointer is repaired and persisted once', async (t) => {
@@ -844,7 +904,7 @@ describe('AutobiographicalStrategy — persistence', () => {
     }
   });
 
-  it('adopts a live-appended L1 as the loader would keep it', async () => {
+  it('adopts a live-appended L1 with its range derived and its parent pointers as stored', async () => {
     const strategy = new TestableStrategy({ targetChunkTokens: 300, auditOnly: true });
     const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
     try {
