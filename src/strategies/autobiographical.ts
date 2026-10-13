@@ -8038,10 +8038,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let logResponse: string | undefined;
     let logError: string | undefined;
     let logNewSummaryId: string | undefined;
-    // The request the transport ACCEPTED — `dispatchRequest` unless the
-    // carrier fallback below fires, in which case the transport refused
-    // those bytes and the stripped copy is what authored the merge. See
-    // the L1 ladder's `acceptedRequest` (sol review, 2026-08-24).
+    // The request last sent: `dispatchRequest`, or after a carrier
+    // rejection its copy with the reasoning stripped. When the call
+    // succeeds it is the request the transport accepted, which authored the
+    // merge. See the L1 ladder's `acceptedRequest` (sol review, 2026-08-24).
     let acceptedRequest = dispatchRequest;
 
     try {
@@ -11508,7 +11508,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const mib = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)}MiB`;
       console.error(
         `[autobiographical] compression prompt: replaced ${counts.imageReplacements} image(s) with placeholders ` +
-          `to stay under the ${mib(counts.imageBudgetBytes)} base64 image budget ` +
+          `to stay under the ${mib(counts.imageBudgetBytes)} inline image budget ` +
           `(kept ${mib(counts.imageBytesKept)}, newest messages first) [${label}]`,
       );
     }
@@ -11542,10 +11542,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // and the base64 token do. Bare base64 under a JSON key (Anthropic
     // `"source":{"data":…}`) is out of scope.
     const dataUrl =
-      /data:((?:[A-Za-z0-9]|\\+u[0-9A-Fa-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u[0-9A-Fa-f]{4})*(?:\\*\/|\\+u002[Ff])(?:[A-Za-z0-9]|\\+u[0-9A-Fa-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u[0-9A-Fa-f]{4})*)(?:;[A-Za-z0-9!#$&^_.+-]+=(?:\\*"[^"]*?\\*"|[^;,\s]*))*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
+      /data:((?:[A-Za-z0-9]|\\+u[0-9A-Fa-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u[0-9A-Fa-f]{4})*(?:\\*\/|\\+u002[Ff])(?:[A-Za-z0-9]|\\+u[0-9A-Fa-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u[0-9A-Fa-f]{4})*)(?:;[A-Za-z0-9!#$&^_.+-]+=(?:\\*"[^"]*?\\*"|[^;,:"\s]*))*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
     let replaced = 0;
     const unescapeType = (type: string) => type
-      .replace(/\\+u([0-9A-Fa-f]{4})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+      .replace(/\\+u([0-9A-Fa-f]{4})/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
       .replace(/\\+\//, '/');
     const stripText = (text: string): string => {
       let out = '';
@@ -11556,20 +11556,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const payloadStart = m.index + match.length - run.length;
         let payloadEnd = m.index + match.length;
         // A run that reaches the next data URL (`…AAAAdata:`, or `…\ndata:`
-        // in JSON) ends before it and before the line-break and tab escapes
-        // that separate the two (`\n`, `\r`, `\t`, `\u000a`, `\u000d`,
-        // `\u0009`). The scan resumes there.
-        if (text[payloadEnd] === ':' && run.slice(-4).toLowerCase() === 'data') {
-          payloadEnd -= 4;
-          for (;;) {
-            const separator = /(?:\\[nrt]|\\u000[9aAdD])$/.exec(text.slice(Math.max(payloadStart, payloadEnd - 6), payloadEnd));
-            if (!separator) break;
-            payloadEnd -= separator[0].length;
+        // in JSON) ends before it. The scan resumes where the payload ends.
+        if (text[payloadEnd] === ':' && run.slice(-4).toLowerCase() === 'data') payloadEnd -= 4;
+        // A payload never ends in an escape of a character base64 doesn't
+        // use, such as a `\n` or `\u0026` after its last line, so such
+        // escapes are trimmed from the end of every run, and so are
+        // backslashes that escape the character after the run (`\"`). An
+        // escaped base64 character (`\/`, `\u002B`) is payload.
+        for (;;) {
+          const escape = /\\(?:[bfnrt]|u([0-9A-Fa-f]{4}))$/.exec(text.slice(Math.max(payloadStart, payloadEnd - 6), payloadEnd));
+          if (escape && !(escape[1] && /[A-Za-z0-9+/=_-]/.test(String.fromCharCode(parseInt(escape[1], 16))))) {
+            payloadEnd -= escape[0].length;
+          } else if (payloadEnd > payloadStart && text[payloadEnd - 1] === '\\') {
+            payloadEnd--;
+          } else {
+            break;
           }
         }
-        // Backslashes at the end of a run escape the character after it
-        // (`\"`), which isn't payload.
-        while (payloadEnd > payloadStart && text[payloadEnd - 1] === '\\') payloadEnd--;
         const length = payloadEnd - payloadStart;
         if (length >= minChars) {
           out += text.slice(copied, m.index) +
@@ -11628,6 +11631,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const input = (block as { input?: unknown }).input;
           const strippedInput = stripJson(input);
           if (strippedInput !== input) next = { ...block, input: strippedInput } as ContentBlock;
+          // Arguments that didn't parse are kept as their text.
+          const unparsed = (block as { unparseableInput?: unknown }).unparseableInput;
+          if (typeof unparsed === 'string') {
+            const strippedUnparsed = stripText(unparsed);
+            if (strippedUnparsed !== unparsed) next = { ...next, unparseableInput: strippedUnparsed } as ContentBlock;
+          }
         }
         if (next !== block) changed = true;
         return next;

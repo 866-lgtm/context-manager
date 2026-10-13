@@ -227,11 +227,38 @@ describe('matcher coverage', () => {
   it('ends a payload before each line-break or tab escape that separates it from an abutting data URL', () => {
     const url = 'data:image/png;base64,' + 'A'.repeat(5000);
     const marker = '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]';
-    for (const separator of ['\\r\\n', '\\t', '\\u000a', '\\u000D']) {
+    for (const separator of ['\\r\\n', '\\r', '\\t', '\\u0009', '\\u000a', '\\u000A', '\\u000d', '\\u000D', '\\u0026', '\\b']) {
       const r = one(url + separator + url);
       assert.equal(r.n, 2, separator);
       assert.equal(r.text, marker + separator + marker, separator);
     }
+  });
+  it('keeps an escape of a character outside base64 after the payload, and an escaped base64 character in it', () => {
+    const marker = (n: number) => '[embedded image/png data URL omitted from compression prompt: ' + n + ' serialized payload characters]';
+    assert.equal(one('"data:image/png;base64,' + 'A'.repeat(5000) + '\\n"').text, '"' + marker(5000) + '\\n"');
+    assert.equal(one('"data:image/png;base64,' + 'A'.repeat(5000) + '\\u0020"').text, '"' + marker(5000) + '\\u0020"');
+    assert.equal(one('"data:image/png;base64,' + 'A'.repeat(4998) + '\\u002B"').text, '"' + marker(5004) + '"');
+    assert.equal(one('"data:image/png;base64,' + 'A'.repeat(4998) + '\\/"').text, '"' + marker(5000) + '"');
+  });
+  it('reads the same payload on a second pass when a short data URL sits before a separator', () => {
+    const short = 'data:image/png;base64,' + 'A'.repeat(4095);
+    const long = 'data:image/png;base64,' + 'B'.repeat(5000);
+    for (const separator of ['\\n', '\\r\\n', '\\u000a', '\\t']) {
+      const first = one(short + separator + long);
+      assert.equal(first.n, 1, separator);
+      assert.equal(first.text, short + separator + '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]', separator);
+      const second = one(first.text);
+      assert.equal(second.n, 0, separator);
+      assert.equal(second.text, first.text, separator);
+    }
+  });
+  it('matches a type whose first characters are \\u escapes', () => {
+    const r = one('data:\\u0069mage/\\u0070ng;base64,' + 'A'.repeat(5000));
+    assert.equal(r.text, '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]');
+  });
+  it('keeps a short data URL with a parameter apart from a base64 one that abuts it', () => {
+    const r = one('data:image/png;name=a\\ndata:image/jpeg;base64,' + 'A'.repeat(5000));
+    assert.equal(r.text, 'data:image/png;name=a\\n[embedded image/jpeg data URL omitted from compression prompt: 5000 serialized payload characters]');
   });
   it("keeps 'data' at the end of a payload when no colon follows it", () => {
     const r = one('data:image/png;base64,' + 'A'.repeat(4996) + 'data"');

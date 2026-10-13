@@ -140,6 +140,23 @@ describe('compression request preparation', () => {
     assert.strictEqual(prepared.request.messages[0].content, input.messages[0].content);
     assert.strictEqual(prepared.request.messages[0].content[0], call);
   });
+  it('replaces a data URL held by a __proto__ member, which stays the input\'s own', () => {
+    const url = 'data:image/png;base64,' + 'A'.repeat(5000);
+    const parsed = JSON.parse('{"__proto__":' + JSON.stringify(url) + '}') as Record<string, unknown>;
+    const call = { type: 'tool_use', id: 't', name: 'post', input: parsed } as ContentBlock;
+    const input = (new Prepared().prepare(request([call])).request.messages[0].content[0] as unknown as { input: Record<string, unknown> }).input;
+    assert.deepEqual(Object.keys(input), ['__proto__']);
+    assert.match(JSON.stringify(input), /^\{"__proto__":"\[embedded image\/png data URL omitted/);
+  });
+  it('replaces a data URL in arguments that did not parse', () => {
+    const unparseableInput = '{"image":"data:image/png;base64,' + 'A'.repeat(5000) + '","caption":';
+    const call = { type: 'tool_use', id: 't', name: 'post', input: {}, unparseableInput } as ContentBlock;
+    const result = new Prepared().prepare(request([call]));
+    assert.equal(result.serializedMediaReplacements, 1);
+    const prepared = result.request.messages[0].content[0] as unknown as { unparseableInput: string };
+    assert.equal(prepared.unparseableInput,
+      '{"image":"[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]","caption":');
+  });
   it('keeps every member of a tool call input it rebuilds, a __proto__ member included', () => {
     const url = 'data:image/png;base64,' + 'A'.repeat(5000);
     const parsed = JSON.parse(JSON.stringify({ image: url }).replace('{', '{"__proto__":{"note":"keep"},')) as Record<string, unknown>;
@@ -180,7 +197,7 @@ describe('preparation counts and logging', () => {
     assert.deepEqual(sent.logs, [
       '[autobiographical] compression prompt: replaced 1 serialized data URL(s) with markers [count-test]',
       '[autobiographical] compression prompt: replaced 1 image(s) with placeholders to stay under the ' +
-        '3.0MiB base64 image budget (kept 2.5MiB, newest messages first) [count-test]',
+        '3.0MiB inline image budget (kept 2.5MiB, newest messages first) [count-test]',
     ]);
     assert.deepEqual(captureErrors(() => strategy.send(request([{ type: 'text', text: 'plain' }]), 'unchanged')).logs, []);
   });
