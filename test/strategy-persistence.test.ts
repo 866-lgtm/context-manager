@@ -471,7 +471,8 @@ describe('AutobiographicalStrategy — persistence', () => {
     {
       const strategy = new TestableStrategy({ targetChunkTokens: 300, recentWindowTokens: 1, auditOnly: true });
       const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
-      const markers = ['PTR-A', 'PTR-B', 'PTR-C'];
+      // The parent covers A and C, which are next to each other; B comes after them.
+      const markers = ['PTR-A', 'PTR-C', 'PTR-B'];
       const l1s = markers.map((marker) => strategy.seedL1(marker, [manager.addMessage('User', textBlock(marker))]));
       markers.forEach((marker, i) => { ids[marker] = l1s[i]!.id; });
       const parent = strategy.seedL2([ids['PTR-A']!, ids['PTR-C']!], 'PTR-A PTR-C');
