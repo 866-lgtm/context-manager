@@ -165,16 +165,36 @@ describe('matcher coverage', () => {
   it('still survives a ~9M-character escaped payload on V8', () => {
     assert.equal(one('data:image\\/png;base64,' + 'A\\/'.repeat(3e6)).n, 1);
   });
-  it('ends the payload at an escape other than an escaped slash, keeping the escape and what follows', () => {
+  it('keeps JSON escapes inside a payload, such as wrapped lines and unicode escapes, and replaces the payload whole', () => {
+    // Base64 wrapped at 76 characters, serialized into a JSON string.
+    const lines = Array.from({ length: 80 }, (_, i) => 'A'.repeat(75) + String.fromCharCode(66 + (i % 20)));
+    const wrapped = one('"data:image/png;base64,' + lines.join('\\n') + '"');
+    assert.equal(wrapped.n, 1);
+    assert.equal(wrapped.text, '"[embedded image/png data URL omitted from compression prompt: ' + (80 * 76 + 79 * 2) + ' serialized payload characters]"');
+    const unicode = one('data:image/png;base64,' + 'A'.repeat(3000) + '\\u002F' + 'A'.repeat(3000) + '\\u003d');
+    assert.equal(unicode.n, 1);
+    assert.equal(unicode.text, '[embedded image/png data URL omitted from compression prompt: 6012 serialized payload characters]');
+  });
+  it('leaves an escaped quote after the payload in place', () => {
     const payload = 'A'.repeat(5000);
-    const newline = one('see data:image/png;base64,' + payload + '\\nThe next line');
-    assert.equal(newline.n, 1);
-    assert.match(newline.text, /: 5000 serialized payload characters\]\\nThe next line$/);
     const quoted = one('{\\"u\\":\\"data:image/png;base64,' + payload + '\\"}');
     assert.equal(quoted.n, 1);
     assert.match(quoted.text, /: 5000 serialized payload characters\]\\"\}$/);
-    const short = one('data:image/png;base64,' + 'A'.repeat(4095) + '\\n' + 'B'.repeat(10));
-    assert.equal(short.n, 0, 'what follows the escape does not count toward the floor');
+    const twice = one('\\\\\\"data:image/png;base64,' + payload + '\\\\\\"');
+    assert.equal(twice.n, 1);
+    assert.match(twice.text, /: 5000 serialized payload characters\]\\\\\\"$/);
+  });
+  it('matches a data URL whose type was escaped more than once', () => {
+    const r = one('data:image\\\\\\/png;base64,' + 'A'.repeat(5000));
+    assert.equal(r.n, 1);
+    assert.equal(r.text, '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]');
+  });
+  it('replaces both of two data URLs that abut with no separator', () => {
+    const url = 'data:image/png;base64,' + 'A'.repeat(5000);
+    const marker = '[embedded image/png data URL omitted from compression prompt: 5000 serialized payload characters]';
+    const r = one(url + url.toUpperCase());
+    assert.equal(r.n, 2);
+    assert.equal(r.text, marker + marker.replace('image/png', 'IMAGE/PNG'));
   });
   it('replaces both of two data URLs that a JSON escape separates, in one pass', () => {
     const url = 'data:image/png;base64,' + 'A'.repeat(5000);

@@ -2421,6 +2421,32 @@ describe('prepared recall expansions: what is logged', () => {
   });
 });
 
+describe('prepared requests are logged when they are sent', () => {
+  after(cleanup);
+  it('logs the prepared source-only request only if it is sent', async () => {
+    const payload = 'V'.repeat(20000);
+    for (const [stops, sent] of [[['end_turn'], false], [['refusal', 'end_turn'], true]] as const) {
+      const mock = scriptedMembrane([...stops]);
+      const fx = await fixture(mock.membrane, {
+        compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true,
+      });
+      fx.target.messages = fx.target.messages.map((m, i) => i ? m : {
+        ...m, content: [text('data:image/png;base64,' + payload)],
+      });
+      const logs: string[] = [];
+      const original = console.error;
+      console.error = (...parts: unknown[]) => { logs.push(parts.map(String).join(' ')); };
+      try {
+        await fx.strategy.run(fx.target, managerContext(fx.manager));
+      } finally { console.error = original; }
+      assert.equal(mock.calls.length, sent ? 2 : 1);
+      const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
+      assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), sent ? ['[canonical]', '[source-only-final]'] : ['[canonical]']);
+      fx.manager.close();
+    }
+  });
+});
+
 describe('prepared source-only identity', () => {
   after(cleanup);
   it('records the source-only hash from the prepared dispatched request', async () => {

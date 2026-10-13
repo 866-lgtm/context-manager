@@ -691,13 +691,17 @@ interface CompressionInFlightResult {
   error?: unknown;
 }
 
-/** A compression request after preparation, with what preparation replaced. */
-interface CompressionPreparation {
-  request: NormalizedRequest;
+/** What preparing a compression request replaced in it. */
+interface PreparationCounts {
   serializedMediaReplacements: number;
   imageReplacements: number;
   imageBudgetBytes: number;
   imageBytesKept: number;
+}
+
+/** A compression request after preparation, with what preparation replaced. */
+interface CompressionPreparation extends PreparationCounts {
+  request: NormalizedRequest;
 }
 
 interface RecallCurveVariant {
@@ -705,8 +709,6 @@ interface RecallCurveVariant {
   children: SummaryEntry[];
   leafCoverageHash: string;
   request: NormalizedRequest;
-  /** What preparing `request` replaced, logged if the variant is dispatched. */
-  preparation: Omit<CompressionPreparation, 'request'>;
   requestHash: string;
   deterministicInputBoundTokens: number;
 }
@@ -3074,14 +3076,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       const leafCoverageHash = sha256Json(childLeaves);
       try {
-        // Logged only if it's dispatched; see prepareCompressionCandidate.
-        const { request: preparedRequest, ...preparation } = this.prepareCompressionRequest(request);
+        // Logged only if it's dispatched; see prepareCompressionAhead.
+        const preparedRequest = this.prepareCompressionAhead(request);
         variants.push({
           parent,
           children,
           leafCoverageHash,
           request: preparedRequest,
-          preparation,
           requestHash: sha256Json(preparedRequest),
           deterministicInputBoundTokens: this.compressionRequestInputBoundTokens(preparedRequest),
         });
@@ -6223,7 +6224,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // are built from the authored request, and each is prepared on its own:
     // a variant is found by matching a recall pair's answer against the stored
     // authored answer, which a prepared answer may no longer equal.
-    const request = this.prepareCompressionCandidate(authoredRequest, 'canonical');
+    const request = this.prepareCompressionAhead(authoredRequest);
     let sourceOnlyFallbackRequest: NormalizedRequest | undefined;
     if (sourceOnlyFallbackMessages) {
       const sourceOnlyCleaned = stripUnpairedToolBlocks(
@@ -6247,7 +6248,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     if (sourceOnlyFallbackRequest) {
-      sourceOnlyFallbackRequest = this.prepareCompressionCandidate(sourceOnlyFallbackRequest, 'source-only');
+      sourceOnlyFallbackRequest = this.prepareCompressionAhead(sourceOnlyFallbackRequest);
     }
 
     // Retain the exact prepared canonical request and authored frontier. Variants are
@@ -6432,7 +6433,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             operation: 'compress_l1',
             metadata: { curveLabel, error: String(error).slice(0, 300) },
           });
-          // Stripping only removes blocks, so the prepared request stays prepared.
+          // Stripping removes only blocks and the messages it empties, so the
+          // prepared request stays prepared.
           acceptedRequest = stripReasoningFromRequest(attemptRequest);
           response = await ctx.membrane!.complete(
             acceptedRequest,
@@ -6582,7 +6584,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           recallLevels: number[],
           coverageHash: string,
         ): Promise<void> => {
-          hoistedRequest = this.prepareCompressionCandidate(hoistedRequest, curveLabel);
+          // Hashed as prepared; runAttempt logs what was replaced as it sends it.
+          hoistedRequest = this.prepareCompressionAhead(hoistedRequest);
           const requestHash = sha256Json(hoistedRequest);
           try {
             const rungResponse = await runAttempt(hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash);
@@ -6682,7 +6685,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             continue;
           }
           let variantResponse: unknown;
-          this.logCompressionPreparation(variant.preparation, curveLabel);
           try {
             variantResponse = await runAttempt(
               variant.request,
@@ -8036,14 +8038,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let logResponse: string | undefined;
     let logError: string | undefined;
     let logNewSummaryId: string | undefined;
+    // The request the transport ACCEPTED — `dispatchRequest` unless the
+    // carrier fallback below fires, in which case the transport refused
+    // those bytes and the stripped copy is what authored the merge. See
+    // the L1 ladder's `acceptedRequest` (sol review, 2026-08-24).
+    let acceptedRequest = dispatchRequest;
 
     try {
       let response: NormalizedResponse;
-      // The request the transport ACCEPTED — `dispatchRequest` unless the
-      // carrier fallback below fires, in which case the transport refused
-      // those bytes and the stripped copy is what authored the merge. See
-      // the L1 ladder's `acceptedRequest` (sol review, 2026-08-24).
-      let acceptedRequest = dispatchRequest;
       try {
         response = await ctx.membrane.complete(dispatchRequest, { formatter: this.nativeFormatter });
       } catch (error) {
@@ -8059,7 +8061,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           operation: `merge_l${targetLevel}`,
           metadata: { error: String(error).slice(0, 300) },
         });
-        // Stripping only removes blocks, so the prepared request stays prepared.
+        // Stripping removes only blocks and the messages it empties, so the
+        // prepared request stays prepared.
         acceptedRequest = stripReasoningFromRequest(dispatchRequest);
         response = await ctx.membrane.complete(acceptedRequest, { formatter: this.nativeFormatter });
       }
@@ -8199,11 +8202,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         operation: `merge_l${targetLevel}`,
         // The DISPATCHED bytes — see the twin note at the compress_l1 site
         // for why this must not re-read ctx.systemPrompt after the await.
-        // `dispatchRequest` is what went on the wire: `request` prepared, or
-        // its tools-less escalation prepared, which drops the tools param and
-        // carries `system` through by spread, as preparation does.
-        system: dispatchRequest.system ? summarizeTelemetryText(dispatchRequest.system) : null,
-        messages: summarizeTelemetryMessages(dispatchRequest.messages),
+        // `acceptedRequest` is what the transport accepted: `request`
+        // prepared, or its tools-less escalation prepared, or either with its
+        // reasoning stripped by the text-only retry. Each carries `system`
+        // through by spread, as preparation does.
+        system: acceptedRequest.system ? summarizeTelemetryText(acceptedRequest.system) : null,
+        messages: summarizeTelemetryMessages(acceptedRequest.messages),
         metadata: {
           target_level: targetLevel,
           source_ids: sourceIds,
@@ -11425,10 +11429,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Inline payload characters of an image a compression prompt carries: a
+   * base64 source, a `data:` URL source, or a `data` field beside `mimeType`
+   * (MCP image blocks in tool results, generated images); 0 for a remote URL.
+   * The compression cap counts with this. The live window's image strip
+   * still counts with imageBlockBytes.
+   */
+  protected static compressionImageBytes(b: unknown): number {
+    const image = b as { data?: unknown; source?: { data?: unknown; url?: unknown } };
+    const src = image.source;
+    if (typeof src?.data === 'string') return src.data.length;
+    if (typeof src?.url === 'string' && src.url.slice(0, 5).toLowerCase() === 'data:') {
+      const comma = src.url.indexOf(',');
+      return comma < 0 ? src.url.length : src.url.length - comma - 1;
+    }
+    return typeof image.data === 'string' ? image.data.length : 0;
+  }
+
+  /** Requests prepared before they are sent, with what preparing them replaced. */
+  private readonly compressionPreparedAhead = new WeakMap<NormalizedRequest, PreparationCounts>();
+
+  /**
    * Prepare a compression request: serialized data URLs become markers, then
    * inline images are capped. The result owns its message wrappers and copies
-   * only what it changes, so stored messages and other candidates are never
-   * edited. It doesn't log; logCompressionPreparation reports what it replaced.
+   * only what it changes, so stored messages and other requests are never
+   * edited, and preparing a prepared request changes nothing. It doesn't log.
    */
   protected prepareCompressionRequest(request: NormalizedRequest): CompressionPreparation {
     const prepared = { ...request, messages: request.messages.map(message => ({ ...message })) };
@@ -11443,30 +11468,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Prepare a request that is about to go out, and log what preparation
-   * replaced in it. Recall-curve variants are prepared when they're
-   * enumerated, and most are never sent, so each is logged only when it's
-   * dispatched.
+   * Prepare a request that is hashed and priced before it is sent: the
+   * canonical and source-only L1 requests, the recall-curve variants and the
+   * tool-prose rewrite. Many are never sent, so what preparation replaced is
+   * logged only when one is, by prepareCompressionCandidate.
+   */
+  private prepareCompressionAhead(request: NormalizedRequest): NormalizedRequest {
+    const { request: prepared, ...counts } = this.prepareCompressionRequest(request);
+    this.compressionPreparedAhead.set(prepared, counts);
+    return prepared;
+  }
+
+  /**
+   * Prepare a request as it is sent, and log what preparation replaced in it,
+   * naming the request. A request prepared ahead is logged here, once.
    */
   private prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest {
+    const ahead = this.compressionPreparedAhead.get(request);
+    if (ahead) {
+      this.compressionPreparedAhead.delete(request);
+      this.logCompressionPreparation(ahead, label);
+      return request;
+    }
     const prepared = this.prepareCompressionRequest(request);
     this.logCompressionPreparation(prepared, label);
     return prepared.request;
   }
 
-  /** One line per kind of replacement, naming the request it was prepared for. */
-  private logCompressionPreparation(prepared: Omit<CompressionPreparation, 'request'>, label: string): void {
-    if (prepared.serializedMediaReplacements > 0) {
+  /** One line per kind of replacement, naming the request. */
+  private logCompressionPreparation(counts: PreparationCounts, label: string): void {
+    if (counts.serializedMediaReplacements > 0) {
       console.error(
-        `[autobiographical] compression prompt: replaced ${prepared.serializedMediaReplacements} ` +
+        `[autobiographical] compression prompt: replaced ${counts.serializedMediaReplacements} ` +
           `serialized data URL(s) with markers [${label}]`,
       );
     }
-    if (prepared.imageReplacements > 0) {
+    if (counts.imageReplacements > 0) {
+      const mib = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)}MiB`;
       console.error(
-        `[autobiographical] compression prompt: replaced ${prepared.imageReplacements} older image(s) with placeholders ` +
-          `to stay under the ${Math.round(prepared.imageBudgetBytes / 1e6)}MB image-byte budget ` +
-          `(kept ${Math.round(prepared.imageBytesKept / 1e6)}MB, newest-first) [${label}]`,
+        `[autobiographical] compression prompt: replaced ${counts.imageReplacements} image(s) with placeholders ` +
+          `to stay under the ${mib(counts.imageBudgetBytes)} image budget ` +
+          `(kept ${mib(counts.imageBytesKept)}, newest messages first) [${label}]`,
       );
     }
   }
@@ -11475,28 +11517,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected static readonly SERIALIZED_DATA_URL_MIN_CHARS = 4096;
 
   /**
-   * Replace large base64 data URLs that arrived inside TEXT blocks of a
-   * compression prompt — e.g. an imported tool result that serialized a
-   * foreign harness's image JSON instead of a native image block. The image
-   * byte cap cannot see those bytes and the tokenizer treats them as prose
+   * Replace large base64 data URLs that a compression prompt carries as text:
+   * in text blocks, in tool results (string or block array), and in the
+   * strings of a tool call's input. An imported tool result can carry a
+   * foreign harness's image JSON instead of a native image block; the image
+   * byte cap can't see those bytes, and the tokenizer prices them as prose
    * (one image can become hundreds of thousands of tokens). Prompt-only:
    * stored Chronicle messages are never mutated; the marker keeps the media
-   * type and size.
+   * type and the payload's length.
    */
   protected stripSerializedCompressionMedia(messages: Array<{ content: ContentBlock[] }>): number {
     const minChars = AutobiographicalStrategy.SERIALIZED_DATA_URL_MIN_CHARS;
     // `+`, not `{minChars,}`: V8's irregexp overflows the stack on a counted
     // quantifier once a MATCHING run reaches ~8M characters (node 22), which
-    // is exactly the media size this targets. The length floor is applied in
-    // the replacer instead.
+    // is exactly the media size this targets. The length floor is applied
+    // below instead.
     // Also matches MIME parameters before `;base64` (`;charset=…`, `;name=…`)
-    // and JSON-escaped slashes (`image\/png`, `\/` inside the payload), the
-    // forms serializers actually emit, in any letter case (`DATA:`, `;BASE64,`),
-    // as URL schemes and the base64 token are. Line-wrapped base64 and bare
-    // base64 under a JSON key (Anthropic `"source":{"data":…}`) are out of
-    // scope.
+    // and the JSON escapes serializers emit: escaped slashes, however many
+    // times the text was serialized (`image\/png`, `image\\\/png`), and
+    // escapes inside the payload, such as `\n` where base64 was wrapped or
+    // `\u002F`. Any letter case matches (`DATA:`, `;BASE64,`), as URL schemes
+    // and the base64 token do. Bare base64 under a JSON key (Anthropic
+    // `"source":{"data":…}`) is out of scope.
     const dataUrl =
-      /data:([A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*(?:\\?\/)[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*)(?:;[A-Za-z0-9!#$&^_.+-]+=[^;,"\s]*)*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
+      /data:([A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\\*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*)(?:;[A-Za-z0-9!#$&^_.+-]+=[^;,"\s]*)*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
     let replaced = 0;
     const stripText = (text: string): string => {
       let out = '';
@@ -11504,23 +11548,56 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       dataUrl.lastIndex = 0;
       for (let m = dataUrl.exec(text); m; m = dataUrl.exec(text)) {
         const [match, mediaType, run] = m;
-        // The payload class admits `\` for an escaped slash. Any other
-        // backslash begins an escape after the payload (`\"`, `\n`), so the
-        // payload ends there. The scan resumes at that escape, since what
-        // follows it can begin the next data URL (`\ndata:…`).
-        const cut = run.search(/\\(?!\/)/);
-        const payload = cut < 0 ? run : run.slice(0, cut);
-        const payloadEnd = m.index + match.length - (run.length - payload.length);
-        if (payload.length >= minChars) {
+        const payloadStart = m.index + match.length - run.length;
+        let payloadEnd = m.index + match.length;
+        // A run that reaches the next data URL (`…AAAAdata:`, or `…\ndata:`
+        // in JSON) ends before it and before the escapes that separate the
+        // two. The scan resumes there.
+        if (text[payloadEnd] === ':' && run.slice(-4).toLowerCase() === 'data') {
+          payloadEnd -= 4;
+          while (payloadEnd - payloadStart >= 2 && text[payloadEnd - 2] === '\\' && 'nrt'.includes(text[payloadEnd - 1])) {
+            payloadEnd -= 2;
+          }
+        }
+        // Backslashes at the end of a run escape the character after it
+        // (`\"`), which isn't payload.
+        while (payloadEnd > payloadStart && text[payloadEnd - 1] === '\\') payloadEnd--;
+        const length = payloadEnd - payloadStart;
+        if (length >= minChars) {
           out += text.slice(copied, m.index) +
-            `[embedded ${mediaType.replace('\\/', '/')} data URL omitted from compression prompt: ` +
-            `${payload.length} serialized payload characters]`;
+            `[embedded ${mediaType.replace(/\\+\//, '/')} data URL omitted from compression prompt: ` +
+            `${length} serialized payload characters]`;
           copied = payloadEnd;
           replaced++;
         }
         dataUrl.lastIndex = payloadEnd;
       }
       return copied === 0 ? text : out + text.slice(copied);
+    };
+    // A tool call's input is any JSON value; only its strings can carry a
+    // data URL. The same value comes back when nothing in it changed.
+    const stripJson = (value: unknown): unknown => {
+      if (typeof value === 'string') return stripText(value);
+      if (Array.isArray(value)) {
+        let changed = false;
+        const items = value.map((item) => {
+          const next = stripJson(item);
+          if (next !== item) changed = true;
+          return next;
+        });
+        return changed ? items : value;
+      }
+      if (value !== null && typeof value === 'object') {
+        let changed = false;
+        const fields: Record<string, unknown> = {};
+        for (const [key, item] of Object.entries(value)) {
+          const next = stripJson(item);
+          if (next !== item) changed = true;
+          fields[key] = next;
+        }
+        return changed ? fields : value;
+      }
+      return value;
     };
     const strip = (blocks: ContentBlock[]): ContentBlock[] => {
       let changed = false;
@@ -11538,6 +11615,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const inner = strip(nested);
             if (inner !== nested) next = { ...block, content: inner } as ContentBlock;
           }
+        } else if (block.type === 'tool_use') {
+          const input = (block as { input?: unknown }).input;
+          const strippedInput = stripJson(input);
+          if (strippedInput !== input) next = { ...block, input: strippedInput } as ContentBlock;
         }
         if (next !== block) changed = true;
         return next;
@@ -11553,11 +11634,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * window enforces `maxLiveImageBytes` through the strip policy; the
    * summarizer's raw-chunk replay had no such wall and leaned on membrane's
    * byte shed instead — which is a transport backstop, not a policy owner
-   * (it fired at 27MB on a live merge). Messages are walked newest-first, and
-   * the blocks within a message in order; each image is kept if it fits in
-   * what's left of the budget, and the others become the same loud
-   * placeholder the window uses, so the summarizer is told plainly that it is
-   * not seeing them.
+   * (it fired at 27MB on a live merge). Every inline image counts, whatever
+   * its shape (see compressionImageBytes), generated images included.
+   * Messages are walked newest-first, and the blocks within a message in
+   * order; each image is kept if it fits in what's left of the budget, and
+   * the others become the same loud placeholder the window uses, so the
+   * summarizer is told plainly that it is not seeing them.
    * Returns the number of images replaced; `stats`, when given, receives the
    * bytes kept.
    */
@@ -11578,8 +11660,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const capBlocks = (blocks: ContentBlock[]): ContentBlock[] => {
       let changed = false;
       const capped = blocks.map((b) => {
-        if (b.type === 'image') {
-          const bytes = AutobiographicalStrategy.imageBlockBytes(b);
+        if (b.type === 'image' || b.type === 'generated_image') {
+          const bytes = AutobiographicalStrategy.compressionImageBytes(b);
           if (kept + bytes <= capBytes) {
             kept += bytes;
             return b;

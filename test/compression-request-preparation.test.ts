@@ -5,6 +5,23 @@ import { AutobiographicalStrategy } from '../src/index.js';
 
 class Prepared extends AutobiographicalStrategy {
   prepare(request: NormalizedRequest) { return this.prepareCompressionRequest(request); }
+  static bytes(block: unknown) { return this.compressionImageBytes(block); }
+  private get preparation() {
+    return this as unknown as {
+      prepareCompressionAhead(r: NormalizedRequest): NormalizedRequest;
+      prepareCompressionCandidate(r: NormalizedRequest, label: string): NormalizedRequest;
+    };
+  }
+  ahead(request: NormalizedRequest) { return this.preparation.prepareCompressionAhead(request); }
+  send(request: NormalizedRequest, label: string) { return this.preparation.prepareCompressionCandidate(request, label); }
+}
+const MiB = 1024 * 1024;
+const image = (data: string) => ({ type: 'image', source: { type: 'base64', mediaType: 'image/png', data } }) as ContentBlock;
+function captureErrors<T>(run: () => T): { result: T; logs: string[] } {
+  const logs: string[] = [];
+  const original = console.error;
+  console.error = (...parts: unknown[]) => { logs.push(parts.map(String).join(' ')); };
+  try { return { result: run(), logs }; } finally { console.error = original; }
 }
 const request = (content: ContentBlock[]): NormalizedRequest => ({
   messages: [{ participant: 'User', content }], config: { model: 'mock', maxTokens: 1000 },
@@ -51,7 +68,6 @@ describe('compression request preparation', () => {
     assert.strictEqual((prepared.request.messages[0].content[0] as { content?: unknown }).content, nested);
   });
   it('preparing an expanded candidate cannot change the canonical head image', () => {
-    const image = (data: string) => ({ type: 'image', source: { type: 'base64', mediaType: 'image/png', data } }) as ContentBlock;
     const head = { participant: 'User', content: [image('AAAA')] };
     const canonical = { ...request([]), messages: [head] };
     const strategy = new Prepared({ maxCompressionImageBytes: 6 });
@@ -62,17 +78,57 @@ describe('compression request preparation', () => {
     assert.equal(JSON.stringify(preparedCanonical), before);
     assert.equal(head.content[0].type, 'image');
   });
-  it('preparing a prepared request replaces nothing more', () => {
+  it('preparing a prepared request replaces nothing more, and sending it logs nothing', () => {
     const url = 'data:image/png;base64,' + 'A'.repeat(5000);
-    const image = (data: string) => ({ type: 'image', source: { type: 'base64', mediaType: 'image/png', data } }) as ContentBlock;
     const strategy = new Prepared({ maxCompressionImageBytes: 4 });
-    const first = strategy.prepare(request([{ type: 'text', text: url + '\\n' + url + '\\"' }, image('AAAAAAAA'), image('AAA')]));
-    assert.equal(first.serializedMediaReplacements, 2);
+    const first = strategy.prepare(request([
+      { type: 'text', text: url + '\\n' + url + '\\"' },
+      { type: 'tool_use', id: 't', name: 'post', input: { image: url } } as ContentBlock,
+      image('AAAAAAAA'), image('AAA'),
+    ]));
+    assert.equal(first.serializedMediaReplacements, 3);
     assert.equal(first.imageReplacements, 1);
     const second = strategy.prepare(first.request);
     assert.equal(second.serializedMediaReplacements, 0);
     assert.equal(second.imageReplacements, 0);
     assert.equal(JSON.stringify(second.request), JSON.stringify(first.request));
+    const { logs } = captureErrors(() => strategy.send(first.request, 'resent'));
+    assert.deepEqual(logs, []);
+  });
+  it('the compression cap counts every inline image shape, generated images included, inside tool results too', () => {
+    const shapes = [
+      { type: 'image', source: { type: 'url', url: 'data:image/png;base64,AAAAAAAA' } },
+      { type: 'image', source: { type: 'url', url: 'DATA:image/png;base64,AAAAAAAA' } },
+      { type: 'image', data: 'AAAAAAAA', mimeType: 'image/png' },
+      { type: 'generated_image', data: 'AAAAAAAA', mimeType: 'image/png' },
+    ];
+    for (const shape of shapes) {
+      assert.equal(Prepared.bytes(shape), 8, JSON.stringify(shape));
+      const top = new Prepared({ maxCompressionImageBytes: 4 }).prepare(request([shape as ContentBlock]));
+      assert.equal(top.imageReplacements, 1);
+      assert.equal(top.request.messages[0].content[0].type, 'text');
+      const nested = { type: 'tool_result', toolUseId: 'a', content: [shape] } as ContentBlock;
+      const inner = new Prepared({ maxCompressionImageBytes: 4 }).prepare(request([nested]));
+      assert.equal(inner.imageReplacements, 1);
+      assert.equal((inner.request.messages[0].content[0] as { content: ContentBlock[] }).content[0].type, 'text');
+      assert.equal((nested as { content: ContentBlock[] }).content[0].type, shape.type, 'the stored block is unchanged');
+    }
+    assert.equal(Prepared.bytes({ type: 'image', source: { type: 'url', url: 'https://example.test/a.png' } }), 0);
+  });
+  it('replaces a data URL in a tool call input and releases the call replay form', () => {
+    const url = 'data:image/png;base64,' + 'A'.repeat(5000);
+    const rawXml = '<function_calls><invoke name="post">' + url + '</invoke></function_calls>';
+    const call = { type: 'tool_use', id: 't', name: 'post', input: { caption: 'a cat', files: [{ url }] }, rawXml } as ContentBlock;
+    const input = request([call]);
+    const before = JSON.stringify(input);
+    freeze(input);
+    const result = new Prepared().prepare(input);
+    assert.equal(result.serializedMediaReplacements, 1);
+    const prepared = result.request.messages[0].content[0] as unknown as { input: { caption: string; files: Array<{ url: string }> }; rawXml?: string };
+    assert.equal(prepared.input.caption, 'a cat');
+    assert.match(prepared.input.files[0]!.url, /^\[embedded image\/png data URL omitted from compression prompt: 5000 /);
+    assert.equal(prepared.rawXml, undefined);
+    assert.equal(JSON.stringify(input), before);
   });
   it('reports serialized payload characters including JSON slash escapes, at the existing floor', () => {
     const payload = 'A\\/'.repeat(1500);
@@ -88,34 +144,34 @@ describe('compression request preparation', () => {
 
 describe('preparation counts and logging', () => {
   it('returns its counts without logging; a candidate logs each kind of replacement once, naming the request', () => {
-    const strategy = new Prepared({ maxCompressionImageBytes: 4 });
-    const image = (data: string) => ({ type: 'image', source: { type: 'base64', mediaType: 'image/png', data } }) as ContentBlock;
+    const strategy = new Prepared({ maxCompressionImageBytes: 3 * MiB });
     const input = request([
       { type: 'text', text: 'data:image/png;base64,' + 'A'.repeat(5000) },
-      image('AAAAAAAA'),
-      image('AAA'),
+      image('A'.repeat(2.5 * MiB)),
+      image('A'.repeat(MiB)),
     ]);
-    const logs: string[] = [];
-    const original = console.error;
-    console.error = (...parts: unknown[]) => { logs.push(parts.map(String).join(' ')); };
-    try {
-      const prepared = strategy.prepare(input);
-      assert.equal(prepared.serializedMediaReplacements, 1);
-      assert.equal(prepared.imageReplacements, 1, 'the 8-byte image is over the budget, the 3-byte one fits');
-      assert.equal(prepared.imageBudgetBytes, 4);
-      assert.equal(prepared.imageBytesKept, 3);
-      assert.equal(logs.length, 0, 'prepareCompressionRequest logs nothing');
-      const candidate = (strategy as unknown as {
-        prepareCompressionCandidate(r: NormalizedRequest, label: string): NormalizedRequest;
-      }).prepareCompressionCandidate.bind(strategy);
-      candidate(input, 'count-test');
-      assert.deepEqual(logs, [
-        '[autobiographical] compression prompt: replaced 1 serialized data URL(s) with markers [count-test]',
-        '[autobiographical] compression prompt: replaced 1 older image(s) with placeholders to stay under the ' +
-          '0MB image-byte budget (kept 0MB, newest-first) [count-test]',
-      ]);
-      candidate(request([{ type: 'text', text: 'plain' }]), 'unchanged');
-      assert.equal(logs.length, 2, 'nothing replaced, nothing logged');
-    } finally { console.error = original; }
+    const { result: prepared, logs } = captureErrors(() => strategy.prepare(input));
+    assert.equal(prepared.serializedMediaReplacements, 1);
+    assert.equal(prepared.imageReplacements, 1, 'the 2.5 MiB image fits the 3 MiB budget, then the 1 MiB one does not');
+    assert.equal(prepared.imageBudgetBytes, 3 * MiB);
+    assert.equal(prepared.imageBytesKept, 2.5 * MiB);
+    assert.deepEqual(logs, [], 'prepareCompressionRequest logs nothing');
+    const sent = captureErrors(() => strategy.send(input, 'count-test'));
+    assert.deepEqual(sent.logs, [
+      '[autobiographical] compression prompt: replaced 1 serialized data URL(s) with markers [count-test]',
+      '[autobiographical] compression prompt: replaced 1 image(s) with placeholders to stay under the ' +
+        '3.0MiB image budget (kept 2.5MiB, newest messages first) [count-test]',
+    ]);
+    assert.deepEqual(captureErrors(() => strategy.send(request([{ type: 'text', text: 'plain' }]), 'unchanged')).logs, []);
+  });
+  it('a request prepared ahead logs what was replaced when it is sent, once', () => {
+    const strategy = new Prepared();
+    const input = request([{ type: 'text', text: 'data:image/png;base64,' + 'A'.repeat(5000) }]);
+    const { result: ahead, logs } = captureErrors(() => strategy.ahead(input));
+    assert.deepEqual(logs, [], 'nothing is logged when it is prepared');
+    const first = captureErrors(() => strategy.send(ahead, 'first-send'));
+    assert.strictEqual(first.result, ahead, 'it is sent as prepared');
+    assert.deepEqual(first.logs, ['[autobiographical] compression prompt: replaced 1 serialized data URL(s) with markers [first-send]']);
+    assert.deepEqual(captureErrors(() => strategy.send(ahead, 'second-send')).logs, []);
   });
 });
