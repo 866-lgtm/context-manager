@@ -963,8 +963,9 @@ export interface AutobiographicalConfig {
    * window and chunk size. Loading repairs what readers can't use on every
    * open, this one included, and persists the repair: it keeps one of a
    * summary's duplicate copies, rebuilds sources and ranges it can recover,
-   * drops summaries that are empty or whose sources or range it can't, and
-   * the summaries above them, resolves each summary's parent pointers, and
+   * drops summaries that are empty, whose sources or range it can't recover,
+   * or that list a summary at their own level or above, and the summaries
+   * above them, resolves each summary's parent pointers, and
    * reopens or removes the chunk records and queued merges that name a
    * summary it doesn't keep.
    */

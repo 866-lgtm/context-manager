@@ -2059,8 +2059,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Copies of one id are one summary. Before setMergedInto resolved its
     // log slot by id, a merge could be written over a neighbour's slot,
     // leaving duplicates whose merge state diverged. The summary keeps the
-    // text of a non-empty copy, a merged one if there is one, and its first
-    // copy's position; its parent is resolved across all its copies below.
+    // text of a non-empty copy, preferring one whose pointer names a stored
+    // summary above it that lists it, and its first copy's position; its
+    // parent is resolved across all its copies below.
     const copiesById = new Map<string, SummaryEntry[]>();
     let malformed = 0;
     for (const summary of loaded) {
@@ -2072,8 +2073,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const dupes = loaded.length - malformed - copiesById.size;
 
     // A compressed chunk record names its L1 and holds the ordered message
-    // ids that L1 was written from, the ids compression reads. An
-    // uncompressed record proves nothing about a summary.
+    // ids it gives that L1: the ids compression read, unless a repair has
+    // retargeted the record since. An uncompressed record proves nothing
+    // about a summary.
     const chunkSources = new Map<string, string[]>();
     for (const record of this.chunkRecords) {
       if (record.compressed && record.summaryId && isIdList(record.sourceIds) &&
@@ -2085,9 +2087,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const emptyIds: string[] = [];
     const unreadableIds: string[] = [];
     const rebuiltIds: string[] = [];
+    const namesParent = (copy: SummaryEntry, pointer: unknown): boolean =>
+      typeof pointer === 'string' && (copiesById.get(pointer) ?? []).some(
+        (parent) => parent.level > copy.level && Array.isArray(parent.sourceIds) && parent.sourceIds.includes(copy.id),
+      );
     for (const [id, copies] of copiesById) {
       const withText = copies.filter(hasSummaryText);
-      let summary = withText.find((copy) => typeof getSummaryParentId(copy) === 'string') ?? withText[0];
+      let summary = withText.find((copy) => namesParent(copy, copy.parentId) || namesParent(copy, copy.mergedInto)) ?? withText[0];
       if (!summary) { emptyIds.push(id); continue; }
       if (summary.level === 1) {
         // An L1's own sources, else its compressed chunk record's, else a
@@ -2110,42 +2116,63 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       byId.set(id, summary);
     }
 
-    // A summary above L1 is kept only while every summary it names is kept,
-    // whatever removed one and whenever: earlier versions dropped empty
-    // summaries without their parents. A parent naming a missing summary
-    // covers messages that are rendered, or compressed again, without it.
-    // Repeat to a fixed point. Dropping costs the ancestors' text; their
-    // surviving sources merge again.
+    // A summary above L1 is kept only while every summary it names is kept
+    // and sits below it, whatever removed one and whenever: earlier versions
+    // dropped empty summaries without their parents, and a parent naming a
+    // missing summary covers messages that are rendered, or compressed again,
+    // without it. A merge reads summaries below the one it writes, so a
+    // summary that lists one at its own level or above wasn't written from
+    // it, and two such summaries can list each other, each covering the
+    // other's messages. Repeat to a fixed point. Dropping costs the
+    // ancestors' text; their surviving sources merge again.
     const ancestorIds: string[] = [];
+    const misplacedIds: string[] = [];
     for (let changed = true; changed;) {
       changed = false;
       for (const [id, summary] of byId) {
-        if (!(summary.level > 1) || summary.sourceIds.every((sourceId) => byId.has(sourceId))) continue;
+        if (!(summary.level > 1)) continue;
+        const sources = summary.sourceIds.map((sourceId) => byId.get(sourceId));
+        if (sources.every((source) => source !== undefined && source.level < summary.level)) continue;
         byId.delete(id);
-        ancestorIds.push(id);
+        (sources.includes(undefined) ? ancestorIds : misplacedIds).push(id);
         changed = true;
       }
     }
 
     // A summary has one parent: the first of its own pointers, then its other
     // copies' (`parentId` before the older `mergedInto` in each, as readers
-    // take them), that names a kept summary at a higher level listing it
-    // among its sources, so no two summaries can be each other's parent.
-    // `mergedInto`, which this strategy writes and its frontier reads, is set
-    // to that parent, and so is a `parentId` naming anything else, so every
-    // reader sees the one parent that renders the summary. With no such
-    // parent, every pointer that isn't null is cleared, so the summary renders
-    // and merges again. A null pointer counts as none.
+    // take them), that names a kept summary listing it among its sources,
+    // which sits above it, as every kept summary sits above what it lists.
+    // Without one, its parent is the kept summary one level up that lists
+    // it, when exactly one does: a pointer can name a summary further up,
+    // such as a grandparent, or nothing, while the parent that covers the
+    // summary lists it, and clearing the pointer would render the summary
+    // beside that parent. `mergedInto`, which this strategy writes and its
+    // frontier reads, is set to the parent, and so is a `parentId` naming
+    // anything else, so every reader sees the one parent that renders the
+    // summary. With no parent, every pointer that isn't null is cleared, so
+    // the summary renders and merges again. A null pointer counts as none.
     const reparentedIds: string[] = [];
     const clearedIds: string[] = [];
     const covers = (pointer: unknown, summary: SummaryEntry): pointer is string => {
       const parent = typeof pointer === 'string' ? byId.get(pointer) : undefined;
-      return !!parent && parent.level > summary.level && parent.sourceIds.includes(summary.id);
+      return !!parent && parent.sourceIds.includes(summary.id);
     };
+    const listedBy = new Map<string, SummaryEntry[]>();
+    for (const summary of byId.values()) {
+      if (summary.level === 1) continue;
+      for (const sourceId of summary.sourceIds) {
+        const listers = listedBy.get(sourceId);
+        if (listers) listers.push(summary);
+        else listedBy.set(sourceId, [summary]);
+      }
+    }
     this.summaries = [...byId.values()].map((summary) => {
       const pointers = [summary, ...copiesById.get(summary.id)!]
         .flatMap((copy) => [copy.parentId, copy.mergedInto] as unknown[]);
-      const parent = pointers.find((pointer): pointer is string => covers(pointer, summary));
+      const listers = (listedBy.get(summary.id) ?? []).filter((lister) => lister.level === summary.level + 1);
+      const parent = pointers.find((pointer): pointer is string => covers(pointer, summary)) ??
+        (listers.length === 1 ? listers[0]!.id : undefined);
       let repaired = summary;
       const edit = () => (repaired === summary ? (repaired = { ...summary }) : repaired);
       if (parent === undefined) {
@@ -2171,7 +2198,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       console.warn(
         `[autobiographical] repaired summary state: removed ${malformed} malformed entr(ies) and deduped ${dupes}; ` +
           `dropped empty [${emptyIds.join(', ')}], with unreadable sources or range [${unreadableIds.join(', ')}], ` +
-          `naming a missing summary [${ancestorIds.join(', ')}]; rebuilt sources or range of ` +
+          `naming a missing summary [${ancestorIds.join(', ')}], naming one not below it [${misplacedIds.join(', ')}]; ` +
+          `rebuilt sources or range of ` +
           `[${keptRebuiltIds.join(', ')}]; set the parent of [${reparentedIds.join(', ')}]; cleared ` +
           `the parent pointers of [${clearedIds.join(', ')}], which named no kept parent`,
       );
