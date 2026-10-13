@@ -176,6 +176,19 @@ describe('raw forms: keys and release', () => {
     const moved = releaseSharedRawFormsOnMove(shared, [shared, xmlResult('b', 'small file')]);
     assert.equal(rawOf(moved).rawXml, undefined);
   });
+
+  it('a moved member of a reasoning pairing gives up its id, as its partner left behind does', () => {
+    const rs1 = { type: 'redacted_thinking', data: 'one', rawItem: { type: 'reasoning', id: 'rs_1' } } as ContentBlock;
+    const fc1 = { type: 'tool_use', id: 'call_1', name: 'fs:read', input: { path: '/a' }, rawItem: { type: 'function_call', id: 'fc_1' } } as ContentBlock;
+    const source = [rs1, fc1];
+    assert.equal(rawOf(releaseSharedRawFormsOnMove(fc1, source)).rawItem, undefined, 'the call moved without its reasoning');
+    assert.equal(rawOf(releaseEditedRawForms(source, [rs1])[0]).rawItem, undefined, 'and the reasoning left behind');
+    assert.equal(rawOf(releaseSharedRawFormsOnMove(rs1, source)).rawItem, undefined, 'the reasoning moved without its call');
+    assert.equal(rawOf(releaseEditedRawForms(source, [fc1])[0]).rawItem, undefined, 'and the call left behind');
+    // An item that pairs with nothing in its message keeps its id when it moves.
+    const result = { type: 'tool_result', toolUseId: 'call_1', content: 'read', rawItem: { type: 'function_call_output', id: 'fco_1' } } as ContentBlock;
+    assert.equal(releaseSharedRawFormsOnMove(result, [result, itemText('after')]), result);
+  });
 });
 
 describe('raw forms: opaque carriers, drops and appends', () => {
