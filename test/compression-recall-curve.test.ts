@@ -2413,3 +2413,37 @@ describe('prepared source-only identity', () => {
     fx.manager.close();
   });
 });
+
+describe('prepared tool-prose mode rewrite', () => {
+  after(cleanup);
+  it('prepares newly constructed result text before recording the rewrite hash', async () => {
+    const payload = 'W'.repeat(5000);
+    const mock = scriptedMembrane(['refusal', 'refusal']);
+    const fx = await fixture(mock.membrane, {
+      compressionRefusalCurveFallbacks: 0,
+      compressionToolProseFallback: {
+        intoTool: 'journal', field: 'content', minChars: 100, fromTools: ['skip_reply'],
+        result: 'data:image/png;base64,' + payload,
+      },
+    });
+    fx.manager.setToolDefinitions(['journal', 'skip_reply'].map(name => ({
+      name, description: name, inputSchema: { type: 'object' },
+    })));
+    fx.target.messages = fx.target.messages.map((m, i) => ({
+      ...m, participant: i ? 'User' : 'Claude',
+      content: i ? [{ type: 'tool_result', toolUseId: 't', content: '{"skipped":true}' } as ContentBlock]
+        : [{ type: 'tool_use', id: 't', name: 'skip_reply', input: { reason: 'note '.repeat(100) } } as ContentBlock],
+    }));
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2);
+    assert.ok(JSON.stringify(mock.calls[1].request).includes('omitted from compression prompt'));
+    assert.ok(!JSON.stringify(mock.calls[1].request).includes(payload));
+    const exhausted = quarantineEvents(fx.manager).find(e => e.kind === 'exhausted') as {
+      outcomes: Array<{ curveLabel: string; requestHash: string }>;
+    };
+    const outcome = exhausted.outcomes.find(o => o.curveLabel === 'tool-prose-hoist');
+    assert.ok(outcome);
+    assert.equal(outcome.requestHash, createHash('sha256').update(JSON.stringify(mock.calls[1].request)).digest('hex'));
+    fx.manager.close();
+  });
+});

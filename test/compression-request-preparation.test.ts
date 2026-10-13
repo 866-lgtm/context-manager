@@ -93,6 +93,35 @@ describe('compression request preparation', () => {
   });
 });
 
+describe('preparation counts and logging', () => {
+  it('keeps preparation pure and logs nonzero counts as candidate preparation', () => {
+    const strategy = new Prepared({ maxCompressionImageBytes: 4 });
+    const input = request([
+      { type: 'text', text: 'data:image/png;base64,' + 'A'.repeat(5000) },
+      { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AAAAAAAA' } } as ContentBlock,
+    ]);
+    const logs: string[] = [];
+    const original = console.error;
+    console.error = (...parts: unknown[]) => { logs.push(parts.map(String).join(' ')); };
+    try {
+      const prepared = strategy.prepare(input);
+      assert.equal(prepared.serializedMediaReplacements, 1);
+      assert.equal(prepared.imageReplacements, 1);
+      assert.equal(logs.length, 0, 'the pure preparation returns counts without logging');
+      const candidate = (strategy as unknown as {
+        prepareCompressionCandidate(r: NormalizedRequest, label: string): NormalizedRequest;
+      }).prepareCompressionCandidate.bind(strategy);
+      candidate(input, 'count-test');
+      assert.equal(logs.length, 1);
+      assert.match(logs[0], /prepared compression candidate 'count-test'/);
+      assert.match(logs[0], /1 serialized data URL.*1 inline image/);
+      assert.match(logs[0], /preparation is not dispatch/);
+      candidate(request([{ type: 'text', text: 'plain' }]), 'unchanged');
+      assert.equal(logs.length, 1, 'zero replacements remain quiet');
+    } finally { console.error = original; }
+  });
+});
+
 describe('inline image accounting in the live window', () => {
   const dir = mkdtempSync(join(tmpdir(), 'live-inline-image-'));
   const path = join(dir, 'store');
