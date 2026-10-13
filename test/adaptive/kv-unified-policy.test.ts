@@ -1485,6 +1485,8 @@ function certifiedWhatIfFixture(o: {
   budget: number; adoptEpsilon: number; hysteresisCertificate: boolean;
   /** Cross-compile holder, and ownerless raw leaves appended after the eight. */
   reuse?: KvUnifiedReuse; appended?: number;
+  /** All three bucket sizes; 1 (the default) makes the uncertified solve exact. */
+  bucket?: number;
 }) {
   const chronicle = new MockChronicle({ recallPairTokens: o.pairTokens });
   for (let i = 0; i < 8; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: o.raw[i] });
@@ -1511,7 +1513,8 @@ function certifiedWhatIfFixture(o: {
       alpha: 0, budgetLowRatio: 0.2, budgetHighRatio: 0.5, budgetUnderLambda: 4000, budgetOverLambda: 4000,
       cacheLambda: 0, continuityLambda: 0,
     },
-    tokenBucketSize: 1, continuityBucketSize: 1, fidelityBucketSize: 1, labelCeiling: 100_000,
+    tokenBucketSize: o.bucket ?? 1, continuityBucketSize: o.bucket ?? 1, fidelityBucketSize: o.bucket ?? 1,
+    labelCeiling: 100_000,
     adoptEpsilon: o.adoptEpsilon, hysteresisCertificate: o.hysteresisCertificate,
     latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 8 },
     presentation: { currentSeq: 1, leaves },
@@ -1521,11 +1524,12 @@ function certifiedWhatIfFixture(o: {
   return { strategy, result };
 }
 
-test('latent demand orders emitted merges the same with and without the certificate', () => {
+test('latent demand orders emitted merges the same with the certificate as an exact solve without it', () => {
   // Two merges pass the gate with equal conservative gains, so the expected
   // (p50) gain orders them. A certified expected solve understates its gain
   // by up to the certificate's slack, which here is enough to hide the lead
-  // of c4..c7 and let the weaker request be summarized first.
+  // of c4..c7 and let the weaker request be summarized first. Bucket size 1
+  // makes the uncertified solve exact.
   const build = (hysteresisCertificate: boolean) => certifiedWhatIfFixture({
     raw: [150, 150, 50, 100, 100, 100, 50, 150], salience: [1, 0.2, 1, 0.2, 0.5, 1, 0.5, 0.5],
     pairTokens: 100, seenL2: [10, 30, 100, 150], covered: 4, budget: 500, adoptEpsilon: 50, hysteresisCertificate,
@@ -1539,6 +1543,24 @@ test('latent demand orders emitted merges the same with and without the certific
     certified.strategy.lastDemandEvaluations.map((e) => Math.round(e.expectedImprovement)),
     unrestricted.strategy.lastDemandEvaluations.map((e) => Math.round(e.expectedImprovement)),
   );
+});
+
+test('latent demand keeps a certified what-if pool that its pruned re-solve does not beat', () => {
+  // Both certified what-ifs overlap, so both are solved again without the
+  // certificate. With bucket size 1000 that solve prunes and comes back
+  // worse than the certified pools, which are real layouts: taking it would
+  // lower c0..c3 from 350 to 222.5 and drop c4..c7 (202.5) below the gate.
+  const base = {
+    raw: [30, 50, 100, 100, 150, 100, 200, 30], salience: [1, 1, 0.2, 0.2, 0.2, 1, 0.5, 1],
+    pairTokens: 150, seenL2: [10, 20, 30, 40], covered: 0, budget: 800, adoptEpsilon: 200,
+  };
+  const certified = certifiedWhatIfFixture({ ...base, hysteresisCertificate: true, bucket: 1000 });
+  const exact = certifiedWhatIfFixture({ ...base, hysteresisCertificate: false });
+  const gains = (r: typeof certified) =>
+    r.strategy.lastDemandEvaluations.map((e) => [e.request.range.firstChunkId, e.conservativeImprovement]);
+  assert.deepEqual(gains(certified), [['c0', 350], ['c4', 202.5]]);
+  assert.deepEqual(gains(certified), gains(exact));
+  assert.deepEqual(certified.result.produced, exact.result.produced);
 });
 
 test('latent demand runs each expected-cost solve once when a certified what-if is decided late', () => {

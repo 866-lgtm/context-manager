@@ -173,6 +173,9 @@ export class KvUnifiedStrategy implements FoldingSolver {
     });
     const policy = normalizePolicy(this.options.policy);
     const multiplier = normalizeContinuityMultiplier(this.options.continuityMultiplier);
+    // Certified entries whose uncertified re-solve scored worse than the
+    // certified pool: they stand at the gain that pool proves.
+    const proven = new Set<object>();
     // Merges worth less than adoptEpsilon are not demanded; that is the
     // hysteresis policy's own tolerance, applied here to best-vs-best.
     const epsilon = Number.isFinite(this.options.adoptEpsilon) && (this.options.adoptEpsilon ?? 0) > 0
@@ -216,11 +219,15 @@ export class KvUnifiedStrategy implements FoldingSolver {
       // order of the requests: a certified what-if is solved again without
       // the certificate when its interval spans the gate, or when it passes
       // the gate and another passing candidate's interval overlaps it.
+      // The requests are then ordered by proven gains. That is the order of
+      // an exact uncertified solve; a pruned one can score below a
+      // certified pool and order differently.
       const gain = (entry: (typeof solved)[number]) => baseBest - best(entry.conservative);
-      const slack = (entry: (typeof solved)[number]) => entry.conservative.certificate?.maxImprovement ?? 0;
+      const slack = (entry: (typeof solved)[number]) =>
+        proven.has(entry) ? 0 : entry.conservative.certificate?.maxImprovement ?? 0;
       const passing = solved.filter((entry) => gain(entry) + slack(entry) > epsilon);
       const undecided = solved.filter((entry) => {
-        if (!entry.conservative.certificate) return false;
+        if (!entry.conservative.certificate || proven.has(entry)) return false;
         const low = gain(entry);
         const high = low + slack(entry);
         if (low <= epsilon) return high > epsilon;
@@ -233,11 +240,14 @@ export class KvUnifiedStrategy implements FoldingSolver {
             { ...this.options, hysteresisCertificate: false }, budget.totalBudget,
           );
           this.demandSolves++;
-          if (full.feasible) entry.conservative = full;
-          else solved.splice(solved.indexOf(entry), 1);
+          // The certified pool is a real layout, so its gain is a floor. The
+          // uncertified solve prunes and can come back worse: keep the better.
+          if (!full.feasible) solved.splice(solved.indexOf(entry), 1);
+          else if (best(full) <= best(entry.conservative)) entry.conservative = full;
+          else proven.add(entry);
         }
         // The frame may have moved with the new pools; rank everything again
-        // (each pass replaces or removes a certified entry, so this ends).
+        // (each pass settles or removes a certified entry, so this ends).
         return rank(base, withExpected);
       }
       const evaluations: LatentDemandEvaluation[] = [];
@@ -450,7 +460,8 @@ function solveWithLatentCandidate(
   // certificate.maxImprovement above the what-if's best cut, so the merge's
   // improvement is understated by up to that much. That settles a clear
   // rejection; rankLatentDemand solves again without the certificate where
-  // the slack could decide the gate or the order of the requests.
+  // the slack could decide the gate or the order of the requests, and keeps
+  // whichever of the two pools scores better.
   return new ParetoKvUnifiedPolicySolver(candidateInputs, forest).solve({
     ...options,
     maxTokens,

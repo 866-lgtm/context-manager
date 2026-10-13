@@ -2666,7 +2666,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (frontierEnd === -1) return false; // no ladder yet — nothing stable to cache
     // A capped ladder front-evicts on every mint, so the pair seams shift and
     // writing them is waste. The head seam does not: tools, system prompt and
-    // head window precede the ladder and are the same request after request.
+    // head window precede the ladder and are the same request after request,
+    // unless image shedding (one byte budget, spent newest-first) replaces a
+    // head image for one payload and not for the next.
     let placed = false;
     for (const idx of new Set(capped ? [headEnd] : [headEnd, deepEnd, frontierEnd])) {
       if (idx < 0) continue;
