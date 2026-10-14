@@ -489,6 +489,7 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
           (args[0] as { setTokenCalibration?(factor: number): void }).setTokenCalibration?.(3);
           self._storeView = {};
           self._storeOrder = new Map();
+          self._storeOrderSource = [];
           self._cachedHeadStartIndex = { id: 'zz', msgCount: 1, result: 0 };
           if (this.throwAfter) throw new Error('zz-after-writing');
         }
@@ -509,7 +510,7 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
     const fields = [
       'chunks', 'compressionQueue', 'chunkRecordsOrphaned', '_orphanWarned', '_prevCacheKeys', 'lastFrontierTokens',
       'transitionBlocked', '_lastRenderStats', '_lastCompileEstimate', '_calibrationArmed', '_calibrationLoaded',
-      '_calibration', '_calibrationReset', '_storeView', '_storeOrder', '_cachedHeadStartIndex',
+      '_calibration', '_calibrationReset', '_storeView', '_storeOrder', '_storeOrderSource', '_cachedHeadStartIndex',
     ];
     const storeCalibration = () =>
       (manager as unknown as { messageStore: { getTokenCalibration(): number } }).messageStore.getTokenCalibration();
@@ -530,5 +531,32 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
     );
     assert.strictEqual(before(), expected);
     assertRestored('after a dry compile that throws');
+  });
+
+  it('leaves later compiles working when it is the first compile after a removal', async () => {
+    // The first compile after a middle message is removed builds the store
+    // order from the shorter listing. A dry one puts the order back, and must
+    // put back the listing it was built from too: an order from before the
+    // removal, beside the listing from after it, reads as current, and every
+    // later select positioned the last message past the end of the listing
+    // and refused it as dropped (UncoveredDropError).
+    for (const adaptiveResolution of [false, true]) {
+      for (const next of ['dry', 'commit'] as const) {
+        cleanup();
+        const strategy = new AutobiographicalStrategy({ recentWindowTokens: 30_000, adaptiveResolution });
+        const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+        const ids = ['m1', 'm2', 'm3'].map((text) => manager.addMessage('user', textBlock(text)));
+        manager.removeMessage(ids[1]);
+        const budget = { maxTokens: 100_000, reserveForResponse: 1_000 };
+        const label = `adaptiveResolution ${adaptiveResolution}, then a ${next} compile`;
+        const first = await manager.compile(budget, undefined, { dryRun: true });
+        assert.strictEqual(first.messages.length, 2, label);
+        for (let i = 0; i < 2; i++) {
+          const r = await manager.compile(budget, undefined, { dryRun: next === 'dry' });
+          assert.strictEqual(r.messages.length, 2, `${label} (${i + 1})`);
+        }
+        manager.close?.();
+      }
+    }
   });
 });

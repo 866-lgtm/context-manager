@@ -4868,9 +4868,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // multiplier, with the multiplier the store prices by (a dry select that
     // loads the multiplier first leaves it unloaded, so the next committing
     // select loads it again and persists what the load decides), the store
-    // order and the head-window memo stay as the last committing select left
-    // them. They are put back here, on every path out, throws included; each
-    // select path gates its own persistence and enqueueing. The dry run's own
+    // order with the listing it was built from, and the head-window memo stay
+    // as the last committing select left them. The order and its listing go
+    // back together: an order put back beside the dry run's listing would
+    // read as current for that listing, so after a removal every later select
+    // would position messages as they stood before it. They are put back
+    // here, on every path out, throws included; each select path gates its
+    // own persistence and enqueueing. The dry run's own
     // render stats are its output, as its plan is (_lastPreview), and
     // previewContext reads them from _lastPreviewStats.
     // Chunking runs dry too: a chunk the dry run closes gets no record, and
@@ -4902,6 +4906,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       storeCalibration: store.getTokenCalibration?.(),
       storeView: this._storeView,
       storeOrder: this._storeOrder,
+      storeOrderSource: this._storeOrderSource,
       headStartMemo: this._cachedHeadStartIndex,
     };
     this._lastPreviewStats = undefined;
@@ -4935,6 +4940,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (saved.storeCalibration !== undefined) store.setTokenCalibration?.(saved.storeCalibration);
       this._storeView = saved.storeView;
       this._storeOrder = saved.storeOrder;
+      this._storeOrderSource = saved.storeOrderSource;
       this._cachedHeadStartIndex = saved.headStartMemo;
     }
   }
