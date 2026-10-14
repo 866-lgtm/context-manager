@@ -77,7 +77,8 @@ import type { IngressChunkResult } from '../types/strategy.js';
 /** A persisted reset record is trusted only if it has the expected shape. */
 function isCalibrationReset(v: unknown): v is CalibrationReset {
   const r = v as CalibrationReset | null | undefined;
-  return !!r && Number.isFinite(r.discardedMultiplier) && Number.isFinite(r.fromEpoch) && Number.isFinite(r.at);
+  return !!r && Number.isFinite(r.discardedMultiplier) && (r.fromEpoch === null || Number.isFinite(r.fromEpoch)) &&
+    Number.isFinite(r.at);
 }
 
 /**
@@ -1800,6 +1801,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibrationEma = null;
     this._calibrationLoaded = false;
     this._calibrationReset = null;
+    this._calibrationProvisional = null;
     this._imageWatermark = undefined;
     this._imageWatermarkLoaded = false;
     this._lastKvStable = null;
@@ -4909,6 +4911,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       calibrationLoaded: this._calibrationLoaded,
       calibration: this._calibration,
       calibrationReset: this._calibrationReset,
+      calibrationProvisional: this._calibrationProvisional,
       storeCalibration: store.getTokenCalibration?.(),
       storeView: this._storeView,
       storeOrder: this._storeOrder,
@@ -4943,6 +4946,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._calibrationLoaded = saved.calibrationLoaded;
       this._calibration = saved.calibration;
       this._calibrationReset = saved.calibrationReset;
+      this._calibrationProvisional = saved.calibrationProvisional;
       if (saved.storeCalibration !== undefined) store.setTokenCalibration?.(saved.storeCalibration);
       this._storeView = saved.storeView;
       this._storeOrder = saved.storeOrder;
@@ -4956,7 +4960,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // markers), so the returned entries are already bounded — see
     // applyImageStripping.
     if (this.config.adaptiveResolution) {
-      return this.selectAdaptive(store, budget, opts);
+      try {
+        return this.selectAdaptive(store, budget, opts);
+      } catch (err) {
+        // A provisional multiplier above 1 that puts the compile over budget
+        // is dropped to 1 and the select runs again: with the refusal
+        // standing, no inference would run, so no sample could ever correct
+        // it (#179, the startup wedge). Any other refusal stands.
+        if (!(err instanceof OverBudgetError) || !this.dropProvisionalCalibration(err, opts?.dryRun === true)) throw err;
+        return this.selectAdaptive(store, budget, opts);
+      }
     }
     // selectHierarchical persists and enqueues nothing; what it leaves for
     // observers (render stats) select() restores for a dry run.
@@ -5537,6 +5550,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     r.calibration = {
       multiplier: this._calibration,
       pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+      ...(this._calibrationProvisional ? { provisional: true as const } : {}),
       ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
     };
     this._lastRenderStats = r;
@@ -8831,8 +8845,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // current raw plan feasible and must never authorize an inference.
     // A dry run reports infeasibility via `_lastPreview.fits` instead: the
     // whole point of previewing an aggressive budget is to learn it won't fit
-    // without taking the outage that learning it live would cause.
-    if (result.finalTokens > rejectionBudget && !dryRun) {
+    // without taking the outage that learning it live would cause. Except
+    // under a provisional multiplier above 1, which a committing select
+    // would drop and retry at (selectPath): the dry run throws the same
+    // refusal so it takes the same fallback, and its preview says what the
+    // real compile will do. If the retry at 1 is still over, it reports.
+    const dryFallback = dryRun && this._calibrationProvisional !== null && this._calibration > 1;
+    if (result.finalTokens > rejectionBudget && (!dryRun || dryFallback)) {
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: result.finalTokens,
@@ -9262,7 +9281,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const alpha = 0.2; // slow EMA: one wild request shouldn't yank the ruler
     const ema = this._calibrationEma ?? current;
-    const next = ema + alpha * (observed - ema);
+    // A provisional multiplier is a guess (see CALIBRATION_PRICING_EPOCH). This
+    // sample is the first evidence under this release's pricing, so it replaces
+    // the guess outright; the EMA steps from here on.
+    const provisional = this._calibrationProvisional;
+    this._calibrationProvisional = null;
+    const next = provisional ? observed : ema + alpha * (observed - ema);
     const clamped = Math.min(1.8, Math.max(0.6, next));
     this._calibrationEma = clamped;
     // DEAD BAND. The multiplier is applied only once the EMA has moved more
@@ -9273,13 +9297,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // made every compile a cold one.
     // ponytail: fixed 2% band, so estimates may lag the EMA by up to 2%;
     // make it a config value if a host needs a tighter ruler.
-    if (Math.abs(clamped - current) / current <= 0.02) return;
+    if (Math.abs(clamped - current) / current <= 0.02) {
+      // A provisional multiplier confirmed within the band gets its stamp
+      // now: the record it came from has none, or is the discard's.
+      if (provisional) {
+        console.error(
+          `[estimator-calibration] real/est=${ratio.toFixed(2)} confirms the provisional multiplier ` +
+            `${current.toFixed(2)} (est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k); stamped`,
+        );
+        this.persistCalibration();
+      }
+      return;
+    }
     console.error(
       `[estimator-calibration] real/est=${ratio.toFixed(2)} ` +
-        `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)} (est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k)`,
+        `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)}${provisional ? ' (provisional: replaced, not stepped)' : ''} ` +
+        `(est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k)`,
     );
     this._calibration = clamped;
     this.applyCalibration();
+    this.persistCalibration();
+  }
+
+  /** Write the multiplier in force under the current pricing stamp, with the
+   *  reset it carries and without the provisional flag a discard wrote: this
+   *  is the first sample's write, which is what ends the provisional state.
+   *  Best-effort, as every calibration write is. */
+  private persistCalibration(): void {
     try {
       this.store?.setStateJson(this.calibrationStateId, {
         multiplier: this._calibration,
@@ -9394,6 +9438,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _calibrationLoaded = false;
   /** Set when an older-epoch multiplier was discarded; persisted with the record. */
   private _calibrationReset: CalibrationReset | null = null;
+  /** Set while the multiplier is provisional (see CALIBRATION_PRICING_EPOCH):
+   *  the first sample the band accepts replaces it outright, and one above 1
+   *  that puts a compile over budget is dropped to 1. `fromEpoch` is the
+   *  record's it came from, null for one without a stamp. */
+  private _calibrationProvisional: { fromEpoch: number | null } | null = null;
 
   protected applyCalibration(): void {
     this._storeView?.setTokenCalibration?.(this._calibration);
@@ -9417,10 +9466,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *   2: membrane's XML-history carriers (tool_attempt, tool_notice) priced as
    *      the markup they replay as, where they had estimated as 0
    *
-   * A record without a stamp counts as epoch 1: the releases from 0.11.0 until
-   * this stamp shipped wrote their records without one, under epoch 1's
-   * pricing. A record last learned before 0.11.0 has no stamp either and can't
-   * be told apart from those; the changelog gives its one-time repair.
+   * A record without a stamp was written by 0.13.0 or earlier: by 0.11.0 to
+   * 0.13.0 under epoch 1's pricing, or by a release before 0.11.0, under
+   * epoch 0's pricing or any before it, which CALIBRATION_EPOCH_REPRICES
+   * doesn't model. Nothing in the record tells these apart (#179: five stores
+   * upgraded from pre-0.11 runtimes kept a 1.8 pinned under the flat
+   * signed-thinking price, folded to ~45% of the window or wedged). So such
+   * a multiplier is PROVISIONAL. It is discarded at load if the epochs since
+   * 1 repriced content the store holds, or if it sits at a clamp edge (a
+   * residual pinned at 1.8 or 0.6 corrected rates that were off by more than
+   * the clamp allows, and says nothing about this release's); otherwise it
+   * is kept, but not re-stamped. A provisional multiplier above 1 that puts
+   * the first compile over budget is dropped to 1 and the select runs again
+   * (dropProvisionalCalibration). The first sample the band accepts replaces
+   * a provisional multiplier outright, instead of stepping the EMA toward it,
+   * and writes the stamp (reportRealInputTokens). The 1 a discard restarts
+   * from is provisional too, so one sample sets it rather than about ten; it
+   * is persisted as such (`provisional: true`), so a restart before that
+   * sample doesn't turn the guess into a learned value. A dry run under a
+   * provisional multiplier above 1 takes the same fallback at the picker's
+   * refusal, which it otherwise only reports.
    *
    * A binary from before a bump still learns after a rollback, and its first
    * applied sample overwrites the newer epoch's record with its own stamp
@@ -9464,7 +9529,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Load the persisted multiplier once and push it into the store view.
    *  A multiplier from an older epoch is re-stamped if no content this store
    *  holds was repriced since, and otherwise discarded (start at 1). One from
-   *  a newer epoch is not used.
+   *  a record without a stamp is kept as provisional, or discarded when it
+   *  sits at a clamp edge (see CALIBRATION_PRICING_EPOCH). One from a newer
+   *  epoch is not used.
    *  A dry select's load decides the same way from the record and the store
    *  as they are, and the rest of its select prices by that decision (its
    *  chunking ran before the load, at the store's factor then, as a
@@ -9482,18 +9549,63 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // load of this branch may have left its own decision in these.
       this._calibration = 1;
       this._calibrationReset = null;
+      this._calibrationProvisional = null;
       try {
         const saved = this.store?.getStateJson(this.calibrationStateId) as
-          { multiplier?: number; pricing?: number; reset?: CalibrationReset } | null;
+          { multiplier?: number; pricing?: number; reset?: CalibrationReset; provisional?: boolean } | null;
         if (saved && Number.isFinite(saved.multiplier)) {
-          // No stamp: written by a release from 0.11.0 until the stamp shipped
-          // (see CALIBRATION_PRICING_EPOCH).
-          const epoch = saved.pricing ?? 1;
           const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+          const stamped = typeof saved.pricing === 'number' && Number.isFinite(saved.pricing);
+          // No stamp: written by 0.13.0 or earlier, under epoch 1's pricing or
+          // any before it (see CALIBRATION_PRICING_EPOCH). The reprice check
+          // can only be asked about the epochs since 1; the rest is what makes
+          // such a multiplier provisional.
+          const epoch = stamped ? saved.pricing! : 1;
+          const fromEpoch = stamped ? epoch : null;
+          const pinned = saved.multiplier! >= 1.8 || saved.multiplier! <= 0.6;
+          const repriced = epoch < current && this.calibrationRepricedSince(epoch, store.getAll());
           if (epoch === current) {
             this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
             this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
-          } else if (epoch < current && !this.calibrationRepricedSince(epoch, store.getAll())) {
+            // A discard's 1 that no sample has confirmed yet was persisted as
+            // provisional, and stays a guess across the restart: the first
+            // sample still sets it, instead of stepping toward it.
+            if (saved.provisional === true) {
+              this._calibrationProvisional = { fromEpoch: this._calibrationReset?.fromEpoch ?? null };
+            }
+          } else if (repriced || (epoch < current && !stamped && pinned)) {
+            const reset: CalibrationReset = { discardedMultiplier: saved.multiplier!, fromEpoch, at: Date.now() };
+            this._calibrationReset = reset;
+            // The 1 this restarts from is a guess too: the first sample sets it.
+            this._calibrationProvisional = { fromEpoch };
+            if (commit) {
+              const why = stamped
+                ? `learned under pricing epoch ${epoch} (current ${current})`
+                : !repriced
+                  ? `from a record with no pricing stamp (0.13.0 or earlier), pinned at the ` +
+                    `${saved.multiplier! >= 1.8 ? 'ceiling' : 'floor'} of its clamp: it corrected per-class rates ` +
+                    `that were off by more than the clamp allows, and says nothing about this release's`
+                  : `from a record with no pricing stamp (0.13.0 or earlier), in a store holding content ` +
+                    `repriced since (current epoch ${current})`;
+              console.warn(
+                `[estimator-calibration] DISCARDED multiplier ${saved.multiplier!.toFixed(2)} ${why}; ` +
+                  `restarting from 1.00. Every token estimate changes by ${(1 / saved.multiplier!).toFixed(2)}x, ` +
+                  `and the window refolds to match; the first provider sample sets the multiplier outright. ` +
+                  `If the old value is still accurate for this store (e.g. it mostly corrects for a ` +
+                  `non-Anthropic tokenizer), check it against provider-billed input tokens and re-stamp it: ` +
+                  `setStateJson('${this.calibrationStateId}', { multiplier, at, pricing: ${current} }). ` +
+                  `Shown as calibration.reset in render stats until then.`,
+              );
+              // Persist the reset, so a rollback to a binary that ignores the
+              // stamp can't reload the stale multiplier and re-arm the wedge,
+              // and the discard isn't re-logged on every restart. The 1 is
+              // persisted as provisional until the first sample's write.
+              try {
+                this.store?.setStateJson(this.calibrationStateId,
+                  { multiplier: 1, at: Date.now(), pricing: current, reset, provisional: true });
+              } catch { /* persistence is best-effort */ }
+            }
+          } else if (epoch < current && stamped) {
             // Nothing this store holds was repriced since that epoch, so the
             // residual is still valid: keep it and re-stamp it. A reset it
             // carries is this store's history and stays with it, as it does
@@ -9515,24 +9627,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               } catch { /* persistence is best-effort */ }
             }
           } else if (epoch < current) {
-            const reset: CalibrationReset = { discardedMultiplier: saved.multiplier!, fromEpoch: epoch, at: Date.now() };
-            this._calibrationReset = reset;
+            // No stamp, not pinned, and nothing the epochs since 1 repriced:
+            // the multiplier may be epoch 1's and still right, or older and
+            // stale, and the record can't say. Keep it as provisional, and
+            // write nothing: the stamp is the first sample's to give.
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+            this._calibrationProvisional = { fromEpoch: null };
             if (commit) {
               console.warn(
-                `[estimator-calibration] DISCARDED multiplier ${saved.multiplier!.toFixed(2)} learned under ` +
-                  `pricing epoch ${epoch} (current ${current}); restarting from 1.00. Every token estimate ` +
-                  `changes by ${(1 / saved.multiplier!).toFixed(2)}x, and the window refolds to match. If the ` +
-                  `old value is still accurate for this store (e.g. it mostly corrects for a non-Anthropic ` +
-                  `tokenizer), check it against provider-billed input tokens and re-stamp it: ` +
-                  `setStateJson('${this.calibrationStateId}', { multiplier, at, pricing: ${current} }). ` +
-                  `Shown as calibration.reset in render stats until then.`,
+                `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from a record with no ` +
+                  `pricing stamp (0.13.0 or earlier) as provisional: the first provider sample replaces it ` +
+                  `outright, and a compile it puts over budget drops it to 1.00 first. Stamped (epoch ` +
+                  `${current}) once a sample confirms it.`,
               );
-              // Persist the reset, so a rollback to a binary that ignores the
-              // stamp can't reload the stale multiplier and re-arm the wedge,
-              // and the discard isn't re-logged on every restart.
-              try {
-                this.store?.setStateJson(this.calibrationStateId, { multiplier: 1, at: Date.now(), pricing: current, reset });
-              } catch { /* persistence is best-effort */ }
             }
           }
           // A record from a NEWER epoch belongs to a later binary. The load
@@ -9552,6 +9660,37 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
     }
     this.applyCalibration();
+  }
+
+  /** The fallback for a provisional multiplier above 1 whose compile was
+   *  refused (see CALIBRATION_PRICING_EPOCH): discard it to 1, so the select
+   *  can run again, and record the reset; a committing select logs and
+   *  persists it, a dry one keeps it to itself (select() puts it back).
+   *  Returns false when there is nothing to drop: no provisional multiplier,
+   *  or one at or below 1, where raising estimates can't help, so the refusal
+   *  stands. The 1 stays provisional: the first sample sets it. */
+  protected dropProvisionalCalibration(err: OverBudgetError, dryRun: boolean): boolean {
+    const provisional = this._calibrationProvisional;
+    if (!provisional || this._calibration <= 1) return false;
+    const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const discarded = this._calibration;
+    const reset: CalibrationReset = { discardedMultiplier: discarded, fromEpoch: provisional.fromEpoch, at: Date.now() };
+    this._calibration = 1;
+    this._calibrationReset = reset;
+    this.applyCalibration();
+    if (dryRun) return true;
+    console.warn(
+      `[estimator-calibration] DISCARDED provisional multiplier ${discarded.toFixed(2)} ` +
+        `(${provisional.fromEpoch === null ? 'from a record with no pricing stamp' : `from pricing epoch ${provisional.fromEpoch}`}): ` +
+        `the compile priced by it was refused (${err.actual} tokens against a hard budget of ${err.budget}); ` +
+        `restarting from 1.00 and compiling again. The first provider sample sets the multiplier outright. ` +
+        `Shown as calibration.reset in render stats.`,
+    );
+    try {
+      this.store?.setStateJson(this.calibrationStateId,
+        { multiplier: 1, at: Date.now(), pricing: current, reset, provisional: true });
+    } catch { /* persistence is best-effort */ }
+    return true;
   }
 
   /**
