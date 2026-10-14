@@ -3898,7 +3898,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       while (i < prev.length && messages[i] === prev[i]) i++;
       if (i === prev.length) from = prev.length;
     }
-    const order = from > 0 ? this._storeOrder : new Map<MessageId, number>();
+    // A dry select puts back the order it found, by reference (select()), so
+    // it extends a copy instead of writing into that one.
+    const order = from === 0
+      ? new Map<MessageId, number>()
+      : this._dryRunSelect ? new Map(this._storeOrder) : this._storeOrder;
     for (let i = from; i < messages.length; i++) order.set(messages[i].id, i);
     this._storeOrder = order;
     this._storeOrderSource = messages;
@@ -4871,8 +4875,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // order with the listing it was built from, and the head-window memo stay
     // as the last committing select left them. The order and its listing go
     // back together: an order put back beside the dry run's listing would
-    // read as current for that listing, so after a removal every later select
-    // would position messages as they stood before it. They are put back
+    // read as current for that listing, so after a removal later selects
+    // would position messages as they stood before it until something
+    // rebuilt the order. A dry refresh extends a copy of the order rather
+    // than the one saved here (refreshStoreOrder). They are put back
     // here, on every path out, throws included; each select path gates its
     // own persistence and enqueueing. The dry run's own
     // render stats are its output, as its plan is (_lastPreview), and
