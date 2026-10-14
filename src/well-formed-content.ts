@@ -133,14 +133,27 @@ export function refuseMalformedBlock(block: unknown, what: string): void {
   throw new Error(`${what}: ${places.join('; ')}.`);
 }
 
-/** `content`'s blocks as a read gives them (wellFormedBlock), leaving out the ones it drops. */
+/**
+ * `content`'s blocks as a read gives them (wellFormedBlock), leaving out the
+ * ones it drops. Every block that shares a raw replay form with a block the
+ * read changed or left out gives that form up, as after any edit
+ * (raw-forms.ts), since replaying it would carry what was left out. A
+ * `tool_result`'s content is read through here too, so each level is
+ * reconciled on its own, and a block mended inside a `tool_result` gives up
+ * its form like one at the top.
+ */
 function wellFormedBlocks(content: readonly unknown[]): ContentBlock[] {
-  const blocks: ContentBlock[] = [];
+  const before: ContentBlock[] = [];
+  const after: ContentBlock[] = [];
   for (let i = 0; i < content.length; i++) {
-    const block = wellFormedBlock(content[i]);
-    if (block) blocks.push(block);
+    const block = content[i];
+    // A value that isn't an object carries no raw form; it is left out.
+    if (!isObject(block)) continue;
+    before.push(block as ContentBlock);
+    const read = wellFormedBlock(block);
+    if (read) after.push(read);
   }
-  return blocks;
+  return releaseEditedRawForms(before, after);
 }
 
 /**
@@ -168,11 +181,11 @@ function wellFormedBlock(block: unknown): ContentBlock | undefined {
  * Stored content as a read gives it: what doesn't match `ContentBlock` is
  * left out or made to match (wellFormedBlock), at any depth, and the store
  * keeps the content as written. Content that matches is returned as it is.
- * Otherwise every block of the message that shares a raw replay form with a
- * block the read changed or left out gives that form up, as after any edit
- * (raw-forms.ts), since replaying it would carry what was left out. The
- * first read of each record in `logged` logs one line naming what it leaves
- * out. `where` names the record ("message m-12", "context entry 3"), and keys
+ * Otherwise every block that shares a raw replay form with a block the read
+ * changed or left out gives that form up, in the message's content and in
+ * each `tool_result`'s content within it (wellFormedBlocks). The first read
+ * of each record in `logged` logs one line naming what it leaves out.
+ * `where` names the record ("message m-12", "context entry 3"), and keys
  * that line: a message by its id, a context entry by its index.
  */
 export function wellFormedContent(
@@ -188,14 +201,5 @@ export function wellFormedContent(
         'the store keeps it as written',
     );
   }
-  const before: ContentBlock[] = [];
-  const after: ContentBlock[] = [];
-  for (let i = 0; i < content.length; i++) {
-    const block = (content as readonly unknown[])[i];
-    if (!isObject(block)) continue;
-    before.push(block as ContentBlock);
-    const read = wellFormedBlock(block);
-    if (read) after.push(read);
-  }
-  return releaseEditedRawForms(before, after) as StoredContentBlock[];
+  return wellFormedBlocks(content) as StoredContentBlock[];
 }

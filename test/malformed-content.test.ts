@@ -252,6 +252,32 @@ describe("content that doesn't match ContentBlock", () => {
     });
   });
 
+  it("inside a tool_result's content, a block that shares a raw replay form with one a read mends or leaves out there gives the form up too", async () => {
+    await withStore(async (store) => {
+      MessageStore.register(store);
+      // The shared rawXml still carries n1's call as written, which the {} a read gives n1 no longer matches.
+      const sharedXml = '<function_calls><invoke name="probe"><parameter name="q">old</parameter></invoke><invoke name="probe"></invoke></function_calls>';
+      const ownXml = '<function_calls><invoke name="probe"></invoke></function_calls>';
+      const item = { type: 'message', id: 'msg_2', role: 'assistant', content: [] };
+      writeRaw(store, 'Claude', [toolUse('t1', {})]);
+      writeRaw(store, 'User', [
+        toolResult('t1', [
+          { ...toolUse('n1', 'old'), rawXml: sharedXml },
+          { ...toolUse('n2', {}), rawXml: sharedXml },
+          { ...toolUse('n3', {}), rawXml: ownXml },
+          { type: 'text', rawItem: item },
+          { ...t('kept part'), rawItem: item },
+        ]),
+      ]);
+      await errorLines(() => {
+        const [, results] = new MessageStore(store).getAll();
+        assert.deepEqual(results!.content, [
+          toolResult('t1', [toolUse('n1', {}), toolUse('n2', {}), { ...toolUse('n3', {}), rawXml: ownXml }, t('kept part')]),
+        ]);
+      });
+    });
+  });
+
   it('one line per message names what reads leave out', async () => {
     await withStore(async (store) => {
       MessageStore.register(store);
