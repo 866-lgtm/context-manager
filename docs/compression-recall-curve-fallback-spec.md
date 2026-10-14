@@ -104,10 +104,10 @@ usage exists, it uses a conservative UTF-8-byte bound over every input-bearing
 field of the complete normalized variant (head, recall, raw middle, chunk,
 tools, instruction, system/provider fields), a per-message formatter-envelope
 allowance, and the output reserve. After canonical refusal reports complete
-provider input usage, v2 admission uses `provider total input + positive
+provider input usage, admission uses `provider total input + positive
 serialized expansion delta + output reserve`; the complete-request bound
-remains the fail-closed path when usage is absent, zero/partial, or from an
-unknown accounting contract. The provider total is `inputTokens +
+remains the fail-closed path when usage is absent, has no input count, or
+totals zero. The provider total is `inputTokens +
 cacheCreationTokens + cacheReadTokens` for every provider: membrane (0.5.81
 and later) states each adapter's counts as disjoint, subtracting the cached
 span from `inputTokens` for adapters whose providers report it inside, such
