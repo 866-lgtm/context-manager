@@ -535,8 +535,9 @@ export function isSummaryOverviewStrategy(s: ContextStrategy): s is SummaryOverv
 export interface CalibrationReset {
   /** The multiplier that was discarded. */
   discardedMultiplier: number;
-  /** The pricing epoch it was learned under (a record without a stamp counts as 1). */
-  fromEpoch: number;
+  /** The pricing epoch it was learned under, or null for a record without a
+   *  stamp (written by 0.13.0 or earlier), whose epoch is unknown. */
+  fromEpoch: number | null;
   /** When it was discarded (ms since epoch). */
   at: number;
 }
@@ -574,8 +575,13 @@ export interface RenderStats {
   /**
    * Estimator calibration in force for this compile: the multiplier applied
    * to every token estimate and the pricing epoch it was learned under.
-   * `reset` is present once a multiplier from an older epoch (a record
-   * without a stamp counts as epoch 1) has been discarded on load. It is kept
+   * `provisional` is true while the multiplier is a guess rather than a value
+   * learned under this epoch's pricing: one kept from a record without a
+   * stamp, or the 1 a discard restarts from. The first provider sample
+   * replaces it outright (see `AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`).
+   * `reset` is present once a multiplier from an older or unknown epoch has
+   * been discarded, on load or when a provisional one above 1 put the first
+   * compile over budget. It is kept
    * in the persisted calibration state, so it stays visible across restarts,
    * learning and a later epoch's re-stamp until an operator re-stamps the
    * record without it; a later discard replaces it, and an older binary
@@ -586,6 +592,7 @@ export interface RenderStats {
   calibration?: {
     multiplier: number;
     pricingEpoch: number;
+    provisional?: true;
     reset?: CalibrationReset;
   };
 
