@@ -751,7 +751,12 @@ and re-introducing one via the objective notation would repeat it.
   not obtained by minimizing this function.
 - `perturbation(F, F_prev)` — exact, not modeled: rendered tokens from the
   earliest position where `F`'s layout diverges from `F_prev`'s to the end
-  (`kvCost` in `render-offsets.ts`) — precisely what the provider will re-read.
+  (`kvCost` in `render-offsets.ts`) — precisely what the provider will re-read
+  for the plan's own choices. `F_prev` here is the carried frontier: the
+  persisted one with this compile's protections applied first (the raw zone
+  raw, pins at their level, a tightened pin-max-level) and projected to a valid
+  cut (§13.6). A change every plan must make is in it already, so no plan's
+  perturbation counts it.
 - `P` (`reachTokens`, re-priced) — a **trust region on per-turn divergence**,
   not a spatial eligibility gate. It bounds how much perturbation an ordinary
   turn may take; it never determines *which* chunks may move.
@@ -976,6 +981,17 @@ mode, not a feature** — every exempted leaf means messages are semantically
 a covering recall also renders). The solve proceeding is the mitigation; the
 topology is the disease. `[kv-overlap]` warns on **every** affected compile
 until the store gets nesting repair.
+
+The validity projection decides the exemption by lineage: a leaf that a group
+lists, but whose own lineage at the group's level is another summary or none,
+never vetoes the group. Every projection applies it alike, the ideal cut's,
+the carried frontier's and each suffix-adoption candidate's, so a frontier the
+planner emitted projects to itself on unchanged inputs. Until 2026-10 only the
+ideal cut's projection exempted these leaves, through the solve's own exempt
+set. The next compile's carried frontier then un-folded the group around them,
+so on unchanged inputs the window re-laid while the plan reported a
+perturbation of 0, or reported a fold and a perturbation for a frontier it
+hadn't changed.
 
 **Fold→project fixpoint** (`b99fcc3`). The validity projection can only lower
 levels; on a non-nested tree its repairs *add* tokens after the phases stopped

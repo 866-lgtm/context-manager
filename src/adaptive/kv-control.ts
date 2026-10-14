@@ -476,11 +476,11 @@ function relevanceCut(
   // Hard-protected leaves (−1 caps) are exempt from group unanimity here too —
   // without this, the final projection undoes every boundary-cut fold the
   // phases just made (monotone-lowering the whole group back toward carried).
+  // Overlap-exempt leaves need no entry: the projection leaves out of a
+  // group's unanimity every leaf whose own lineage at that level isn't the
+  // group, the rule the carried frontier and suffix adoption are projected by.
   const projectionExempt = new Set<ChunkId>();
   for (const [id, cap] of caps) if (cap < 0) projectionExempt.add(id);
-  // Overlap-exempt leaves render beside their group's recall (ownership-wins)
-  // and must not veto unanimity — same exemption as the boundary-cut set.
-  for (const id of overlapExempt) projectionExempt.add(id);
   projectToValidCut(F, tree, ordered, frozen, fixedLevels, projectionExempt);
   if (_tp) console.error(`[kv-timing] cut-projection ${Date.now() - _tp}ms`);
   // One authoritative render at the end (the ledger tracks it exactly, but the
@@ -596,6 +596,14 @@ function suffixAdopt(
  * Pinned (`fixedLevels`) and frozen (locked) leaves are already made
  * group-consistent by the caller (pin-at-level fixes a whole node's leaves), so
  * they are held here rather than lowered.
+ *
+ * On a non-nested tree a node can list a leaf whose own lineage at the node's
+ * level is another summary, or none (§13.6 overlap tolerance). That leaf
+ * renders through its own lineage whatever the node does, so it never vetoes
+ * the node. The rule depends only on the tree, so every projection applies it
+ * alike: the ideal cut's, the carried frontier's and each suffix candidate's.
+ * A frontier the planner emitted therefore projects to itself on unchanged
+ * inputs, and the next compile starts from what this one rendered.
  */
 function projectToValidCut(
   F: Map<ChunkId, number>,
@@ -643,8 +651,10 @@ function projectToValidCut(
         } else {
           unanimous = true;
           for (const leafId of node.leafChunkIds) {
-            if (exempt.has(leafId)) continue;
-            if ((F.get(leafId) ?? 0) !== lvl) { unanimous = false; break; }
+            if (exempt.has(leafId) || (F.get(leafId) ?? 0) === lvl) continue;
+            // A leaf at another level vetoes the node only if it renders
+            // through it, i.e. its own lineage at this level is the node.
+            if (tree.ancestorAt(leafId, lvl)?.id === node.id) { unanimous = false; break; }
           }
           unanimityMemo.set(key, unanimous);
         }
@@ -776,7 +786,10 @@ export interface ControlPlan {
   /** Even full folding could not fit under W (terminal — production problem). */
   escalated: boolean;
   /** Exact prefix-invalidation cost of this plan vs the carried frontier:
-   *  tokens the provider will re-read (0 on a hold/pure-append turn). */
+   *  tokens the provider will re-read for this plan's choices (0 on a
+   *  hold/pure-append turn). A change every plan must make, such as a pin
+   *  tightened since the last compile, is in the carried frontier already,
+   *  so it isn't counted here. */
   perturbation: number;
   /** Set when the trust region P did not bind normally (§13.4). Callers should
    *  log these loudly (`[kv-escalation]`):
@@ -847,8 +860,11 @@ export function planControlledFrontier(
     }
   }
 
-  // Carried frontier (F_prev with the base enforced): what is actually
-  // rendered right now, and the reference for perturbation.
+  // Carried frontier: F_prev with the changes every plan must make applied
+  // first (the base, a pin-max-level tightened since, and the projection to a
+  // valid cut of this tree). On unchanged inputs it is what the last compile
+  // rendered. It is the reference for perturbation and the trust region, so
+  // neither counts a change no plan can avoid.
   const carried = new Map(base);
   let carriedNonEmpty = false;
   for (const c of ordered) {
@@ -867,7 +883,9 @@ export function planControlledFrontier(
   diagHist('carried(pre-projection)', carried, tree);
   // Hard-protected set for boundary-cut tolerance: raw zone + immovable
   // leaves render raw beside their group's recall and are exempt from
-  // group-unanimity everywhere.
+  // group-unanimity everywhere. A leaf whose lineage disagrees with a group
+  // (overlap tolerance) needs no entry: the projection leaves it out of that
+  // group's unanimity by its lineage, exactly as for the ideal cut.
   const boundaryExempt = new Set<ChunkId>();
   for (const c of ordered) {
     if (p.rawZone.has(c.id) || immovable.has(c.id)) boundaryExempt.add(c.id);
