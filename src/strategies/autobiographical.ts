@@ -2780,17 +2780,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const value = (usage as Record<string, unknown>)[key];
       return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
     };
-    // Since 0.5.81, membrane restates every adapter's usage in one
-    // convention: uncached input, cache writes and cache reads are disjoint
-    // counts, so the prompt's total is their sum whatever the provider. An
-    // adapter whose convention membrane can't establish, or a membrane
-    // before 0.5.81, can pass a cache-inclusive input count through, and the
-    // sum then counts the cached span twice: that only makes admission
-    // stricter, never looser.
+    // membrane (0.5.81 and later) states usage with uncached input, cache
+    // writes and cache reads as disjoint counts for every adapter whose
+    // convention it knows, so the prompt's total is their sum whatever the
+    // provider, and a full cache hit is a zero input count beside a positive
+    // cache read. An adapter whose convention membrane marks unknown keeps the
+    // counts its provider gives: of those, only Gemini reports cache reads, and
+    // until membrane counts Gemini's cache that way, the sum counts a cached
+    // Gemini prompt's cached span twice.
     const input = read('inputTokens');
-    // Usage without an input count, or with a zero total, is not an
-    // observation of the prompt: the complete normalized request bound
-    // stands instead.
+    // Usage without an input count, or with a zero total, is no observation
+    // of the prompt: the complete normalized request bound stands instead.
     if (input === undefined) return undefined;
     const total = input + (read('cacheCreationTokens') ?? 0) + (read('cacheReadTokens') ?? 0);
     return total > 0 ? total : undefined;

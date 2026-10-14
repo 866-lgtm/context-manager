@@ -961,6 +961,36 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
+  it('a full cache hit on a non-Anthropic provider is the provider\'s count of the prompt', async () => {
+    // No fresh input beside 180,000 cached tokens: in membrane's convention a
+    // 180,000-token prompt served whole from cache. It replaces the invariant
+    // UTF-8 floor, which the huge tool catalog puts past the budget.
+    const mock = flexibleMembrane([
+      { stop: 'refusal', inputTokens: 0, cacheReadTokens: 180_000, provider: 'openai-responses-api' },
+      { stop: 'end_turn', text: 'provider-counted fallback succeeded', inputTokens: 190_000 },
+    ]);
+    const fx = await fixture(mock.membrane, {
+      compressionContextBudgetTokens: 350_000,
+      compressionRefusalCurveFallbacks: 1,
+      headWindowTokens: 100_000,
+    });
+    fx.manager.setToolDefinitions([{
+      name: 'huge_invariant_tool_catalog',
+      description: 'schema inventory '.repeat(30_000),
+      inputSchema: {
+        type: 'object',
+        properties: { payload: { type: 'string', description: 'large field '.repeat(30_000) } },
+      },
+    }]);
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2, 'the cached count admits one fallback');
+    assert.equal(fx.target.compressed, true);
+    const requests = mock.calls.map((call) => Buffer.byteLength(JSON.stringify(call.request), 'utf8'));
+    assert.ok(requests[0]! > 350_000, 'invariant serialized request exceeds the token budget numerically');
+    fx.manager.close();
+  });
+
   it('zero usage, or usage without an input count, falls back to the complete request bound', async () => {
     // Cache counts with no input count beside them are no observation of the prompt.
     const withoutInputCount = response('refusal');

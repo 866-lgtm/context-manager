@@ -107,9 +107,14 @@ allowance, and the output reserve. After canonical refusal reports complete
 provider input usage, v2 admission uses `provider total input + positive
 serialized expansion delta + output reserve`; the complete-request bound
 remains the fail-closed path when usage is absent, zero/partial, or from an
-unknown accounting contract. Provider adapters whose cache counters are
-disjoint (Anthropic/Bedrock) include cache-write/read totals; adapters whose
-cache-read count is a subset use their positive total `inputTokens` once.
+unknown accounting contract. The provider total is `inputTokens +
+cacheCreationTokens + cacheReadTokens` for every provider: membrane (0.5.81
+and later) states each adapter's counts as disjoint, subtracting the cached
+span from `inputTokens` for adapters whose providers report it inside, such
+as OpenAI. An adapter whose convention membrane marks unknown keeps its
+provider's counts, so where that provider reports cache reads inside
+`inputTokens` (Gemini, until membrane counts its cache the same way), the
+total counts the cached span twice.
 Physical request-byte enforcement remains a separate provider/transport
 constraint. A positive complete provider total is authoritative even when it is
 smaller than the deterministic byte bound: canonical refusal proves that exact
