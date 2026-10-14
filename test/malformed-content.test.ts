@@ -1,12 +1,12 @@
 /**
  * Content that doesn't match ContentBlock where its readers read it (#184):
- * a block that isn't an object; a text block whose text, or a thinking block
- * whose thinking, isn't a string; a tool_use whose input isn't an object; a
- * tool_result whose content is neither a string nor an array of such blocks,
- * at any depth. A store written before writes refused it can hold it. Reads
- * leave it out or make it match, so every compile, compression pass and
- * reopen works, and the store keeps it as written. A write refuses it,
- * naming where it is.
+ * a block that isn't an object, is an array, or has no string type; a text
+ * block whose text, or a thinking block whose thinking, isn't a string; a
+ * tool_use whose input isn't an object; a tool_result whose content is
+ * neither a string nor an array of such blocks, at any depth. A store
+ * written before writes refused it can hold it. Reads leave it out or make
+ * it match, so every compile, compression pass and reopen works, and the
+ * store keeps it as written. A write refuses it, naming where it is.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -39,6 +39,8 @@ const MALFORMED_BLOCKS: unknown[][] = [
   [t('kept'), { type: 'text' }],
   [t('kept'), { type: 'text', text: null }],
   [t('kept'), { type: 'text', text: 42 }],
+  [t('kept'), [t('in an array')]],
+  [t('kept'), { text: 'without a type' }],
 ];
 /** Each assistant message whose thinking doesn't match. */
 const MALFORMED_ASSISTANT: unknown[][] = [
@@ -57,6 +59,7 @@ const MALFORMED_TOOL_CONTENT: unknown[] = [
   [t('ok'), { type: 'text' }],
   [t('outer'), toolResult('inner', [t('deep'), null])],
   null,
+  undefined,
   42,
   {},
 ];
@@ -74,7 +77,8 @@ function malformedIn(messages: ReadonlyArray<{ content: readonly unknown[] }>): 
     for (let i = 0; i < blocks.length; i++) {
       const block = blocks[i] as { type?: unknown; text?: unknown; thinking?: unknown; input?: unknown; content?: unknown } | null;
       const here = `${at}[${i}]`;
-      if (!isObject(block)) places.push(here);
+      if (!isObject(block) || Array.isArray(block)) places.push(here);
+      else if (typeof block!.type !== 'string') places.push(`${here}.type`);
       else if (block!.type === 'text' && typeof block!.text !== 'string') places.push(`${here}.text`);
       else if (block!.type === 'thinking' && typeof block!.thinking !== 'string') places.push(`${here}.thinking`);
       else if (block!.type === 'tool_use' && (!isObject(block!.input) || Array.isArray(block!.input))) places.push(`${here}.input`);
@@ -184,7 +188,7 @@ describe("content that doesn't match ContentBlock", () => {
   it('reads leave out or mend what doesn\'t match, at any depth, keep a string tool_result content, and the store keeps it as written', async () => {
     await withStore(async (store) => {
       MessageStore.register(store);
-      writeRaw(store, 'User', [t('a'), null, { type: 'text' }]);
+      writeRaw(store, 'User', [t('a'), null, { type: 'text' }, [t('in an array')], { text: 'without a type' }]);
       writeRaw(store, 'Claude', [{ type: 'thinking', thinking: 7 }, toolUse('t0'), ...['t1', 't2', 't3', 't4'].map((id) => toolUse(id, {}))]);
       writeRaw(store, 'User', [
         toolResult('t0', [t('done')]),
@@ -211,7 +215,7 @@ describe("content that doesn't match ContentBlock", () => {
         assert.deepEqual(viewed.map((message) => message.content), expected, 'a read without blob resolution gives the same');
       });
       const stored = store.getStateJson('messages') as Array<{ content: unknown[] }>;
-      assert.deepEqual(stored[0]!.content, [t('a'), null, { type: 'text' }], 'the store keeps it as written');
+      assert.deepEqual(stored[0]!.content, [t('a'), null, { type: 'text' }, [t('in an array')], { text: 'without a type' }], 'the store keeps it as written');
       assert.deepEqual(stored[1]!.content[1], toolUse('t0'));
       assert.deepEqual((stored[2]!.content[1] as { content: unknown[] }).content, [t('x'), null, 3]);
       assert.equal((stored[2]!.content[4] as { content: unknown }).content, null);
@@ -278,7 +282,7 @@ describe("content that doesn't match ContentBlock", () => {
     });
   });
 
-  it('one line per message names what reads leave out', async () => {
+  it('one line per message names what reads leave out or mend', async () => {
     await withStore(async (store) => {
       MessageStore.register(store);
       writeRaw(store, 'User', [t('a'), null]);
@@ -292,8 +296,8 @@ describe("content that doesn't match ContentBlock", () => {
         messages.getWindow(0, 3);
       })).filter((line) => line.startsWith('[context-manager]'));
       assert.deepEqual(lines, [
-        `[context-manager] message ${ids[0]}: reads leave out what doesn't match ContentBlock (content[1] is null, not a content block); the store keeps it as written`,
-        `[context-manager] message ${ids[2]}: reads leave out what doesn't match ContentBlock (content[0].content[0] is a string, not a content block; content[0].content[1].content[0] is a boolean, not a content block; content[0].content[1].content[1].text is undefined, not a string); the store keeps it as written`,
+        `[context-manager] message ${ids[0]}: reads leave out or mend what doesn't match ContentBlock (content[1] is null, not a content block); the store keeps it as written`,
+        `[context-manager] message ${ids[2]}: reads leave out or mend what doesn't match ContentBlock (content[0].content[0] is a string, not a content block; content[0].content[1].content[0] is a boolean, not a content block; content[0].content[1].content[1].text is undefined, not a string); the store keeps it as written`,
       ]);
     });
   });
@@ -330,7 +334,7 @@ describe("content that doesn't match ContentBlock", () => {
         log.getAll();
       })).filter((line) => line.startsWith('[context-manager]'));
       assert.deepEqual(lines, [
-        "[context-manager] context entry 0: reads leave out what doesn't match ContentBlock (content[1] is null, not a content block; content[2].content[0] is a number, not a content block); the store keeps it as written",
+        "[context-manager] context entry 0: reads leave out or mend what doesn't match ContentBlock (content[1] is null, not a content block; content[2].content[0] is a number, not a content block); the store keeps it as written",
       ]);
     });
   });
@@ -347,6 +351,9 @@ describe("content that doesn't match ContentBlock", () => {
           [['only a string'], 'content\\[0\\] is a string, not a content block'],
           [[t('kept'), 42], 'content\\[1\\] is a number, not a content block'],
           [[t('kept'), true], 'content\\[1\\] is a boolean, not a content block'],
+          [[t('kept'), [t('in an array')]], 'content\\[1\\] is an array, not a content block'],
+          [[{ text: 'without a type' }], 'content\\[0\\]\\.type is undefined, not a string'],
+          [[{ type: 7, text: 'a number for a type' }], 'content\\[0\\]\\.type is a number, not a string'],
           [[t('kept'), null], 'content\\[1\\] is null, not a content block'],
           [[t('kept'), undefined], 'content\\[1\\] is undefined, not a content block'],
           [[, t('kept')], 'content\\[0\\] is undefined, not a content block'],
@@ -376,7 +383,33 @@ describe("content that doesn't match ContentBlock", () => {
         assert.equal((manager as unknown as { holdingAdds: unknown }).holdingAdds, null);
         manager.addMessage('User', [toolResult('t1', 'a string') as ContentBlock]);
         manager.addMessage('Claude', [toolUse('u1', {}) as ContentBlock, { type: 'thinking', thinking: '' } as ContentBlock]);
-        assert.equal(manager.getAllMessages().length, 2, 'a string tool_result content, an object input and an empty thinking are stored');
+        manager.addMessage('User', [{ type: 'a_later_block', data: 1 } as unknown as ContentBlock]);
+        assert.equal(manager.getAllMessages().length, 3, 'a string tool_result content, an object input, an empty thinking and a block of a type the check names nowhere are stored');
+        assert.deepEqual(manager.getAllMessages()[2]!.content, [{ type: 'a_later_block', data: 1 }], 'and a read gives that block as it is');
+      } finally {
+        manager.close();
+      }
+    });
+  });
+
+  it('a refused add expires no compression hold that is due, and the next add does', async () => {
+    class CountsReleases extends PassthroughStrategy {
+      releases = 0;
+      onCompressionHoldsReleased() {
+        this.releases++;
+      }
+    }
+    await withStore(async (store) => {
+      const clock = { t: 0 };
+      const strategy = new CountsReleases();
+      const manager = await ContextManager.open({ store, strategy, now: () => clock.t });
+      try {
+        manager.addMessage('User', [t('held')], undefined, undefined, { holdCompression: { timeoutMs: 100 } });
+        clock.t = 200;
+        assert.throws(() => manager.addMessage('User', [null] as unknown as ContentBlock[]), { message: /^Message refused: / });
+        assert.equal(strategy.releases, 0, 'the refused add released no hold');
+        manager.addMessage('User', [t('next')]);
+        assert.equal(strategy.releases, 1, 'the hold was due, and the next add released it');
       } finally {
         manager.close();
       }
@@ -404,7 +437,7 @@ describe("content that doesn't match ContentBlock", () => {
         assert.equal(strategy.ingress, 0, 'the strategy never read it');
         assert.throws(
           () => manager.addMessage('User', [t('a'), t('bad shard')], undefined, undefined, { holdCompression: true }),
-          { message: /^Message refused: content\[0\] is null, not a content block\.$/ },
+          { message: /^Shard 2 of the message, as the strategy chunked it, refused: content\[0\] is null, not a content block\.$/ },
         );
         assert.equal(strategy.ingress, 1);
         assert.equal(manager.getAllMessages().length, 0, 'no shard of either was stored');

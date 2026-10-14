@@ -1,13 +1,16 @@
 /**
  * Content that matches `ContentBlock` where its readers read it. Every block
- * is an object, and the field that carries its content has its type:
+ * is an object, not an array, whose `type` is a string, and the field that
+ * carries its content has its type:
  *   - a `text` block's `text` and a `thinking` block's `thinking` are strings;
  *   - a `tool_use`'s `input` is an object, not null and not an array;
  *   - a `tool_result`'s `content` is a string, or an array of such blocks,
  *     at any depth.
  * Nothing else is checked: not ids, names or signatures, and not media
  * sources, whose readers guard them. A provider may still refuse a block
- * that is missing one of those.
+ * that is missing one of those. A block of a type none of these names
+ * passes as it is, since membrane adds types: whether a provider can take
+ * one is the provider's to say.
  *
  * Every reader of stored content, from the token estimators to compression
  * and the formatters, is written against `ContentBlock`, and a reader that
@@ -18,8 +21,8 @@
  * text or thinking, whose token estimate reads the field's length.
  *
  * So the stores refuse such content on write ({@link refuseMalformedContent}),
- * and a read leaves it out ({@link wellFormedContent}) for a store written
- * before the refusal, which keeps the content as written.
+ * and a read leaves it out or mends it ({@link wellFormedContent}) for a
+ * store written before the refusal, which keeps the content as written.
  *
  * Content is walked with index loops throughout: a hole in an array reads as
  * undefined, so it is named and refused like any other. (A stored record has
@@ -30,13 +33,9 @@ import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredContentBlock } from './types/index.js';
 import { releaseEditedRawForms } from './raw-forms.js';
 
-function isObject(value: unknown): value is object {
-  return typeof value === 'object' && value !== null;
-}
-
-/** An object that isn't an array: what a `tool_use`'s `input` must be. */
-function isRecord(value: unknown): boolean {
-  return isObject(value) && !Array.isArray(value);
+/** An object that isn't an array: what a block, and a `tool_use`'s `input`, must be. */
+function isRecord(value: unknown): value is object {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /** What a value is, for the line that names it: "null", "undefined", "an array", "a string", "an object". */
@@ -49,8 +48,9 @@ function kindOf(value: unknown): string {
 
 /** Whether a block matches `ContentBlock` where its readers read it, without allocating: the read path's common case. */
 function wellFormed(block: unknown): boolean {
-  if (!isObject(block)) return false;
+  if (!isRecord(block)) return false;
   const fields = block as { type?: unknown; text?: unknown; thinking?: unknown; input?: unknown; content?: unknown };
+  if (typeof fields.type !== 'string') return false;
   switch (fields.type) {
     case 'text':
       return typeof fields.text === 'string';
@@ -82,11 +82,15 @@ function allWellFormed(content: readonly unknown[]): boolean {
  * added to `places` in content order.
  */
 function placesIn(block: unknown, at: string, places: string[]): void {
-  if (!isObject(block)) {
+  if (!isRecord(block)) {
     places.push(`${at} is ${kindOf(block)}, not a content block`);
     return;
   }
   const fields = block as { type?: unknown; text?: unknown; thinking?: unknown; input?: unknown; content?: unknown };
+  if (typeof fields.type !== 'string') {
+    places.push(`${at}.type is ${kindOf(fields.type)}, not a string`);
+    return;
+  }
   switch (fields.type) {
     case 'text':
       if (typeof fields.text !== 'string') places.push(`${at}.text is ${kindOf(fields.text)}, not a string`);
@@ -147,8 +151,8 @@ function wellFormedBlocks(content: readonly unknown[]): ContentBlock[] {
   const after: ContentBlock[] = [];
   for (let i = 0; i < content.length; i++) {
     const block = content[i];
-    // A value that isn't an object carries no raw form; it is left out.
-    if (!isObject(block)) continue;
+    // A value that isn't an object, or is an array, carries no raw form; it is left out.
+    if (!isRecord(block)) continue;
     before.push(block as ContentBlock);
     const read = wellFormedBlock(block);
     if (read) after.push(read);
@@ -161,13 +165,13 @@ function wellFormedBlocks(content: readonly unknown[]): ContentBlock[] {
  * Otherwise a `tool_use` is copied with `{}` for its input, and a
  * `tool_result` with well-formed content (its well-formed blocks, or an empty
  * array in place of content that is neither a string nor an array), so that
- * the pair they make survives. Anything else, which is a value that isn't an
- * object or a text or thinking block without its string, is left out
- * (undefined).
+ * the pair they make survives. Anything else is left out (undefined): a value
+ * that isn't an object, an array, a block without a string `type`, and a text
+ * or thinking block without its string.
  */
 function wellFormedBlock(block: unknown): ContentBlock | undefined {
   if (wellFormed(block)) return block as ContentBlock;
-  if (!isObject(block)) return undefined;
+  if (!isRecord(block)) return undefined;
   const fields = block as { type?: unknown; content?: unknown };
   if (fields.type === 'tool_use') return { ...block, input: {} } as ContentBlock;
   if (fields.type === 'tool_result') {
@@ -197,7 +201,7 @@ export function wellFormedContent(
   if (!logged.has(where)) {
     logged.add(where);
     console.error(
-      `[context-manager] ${where}: reads leave out what doesn't match ContentBlock (${malformedPlaces(content).join('; ')}); ` +
+      `[context-manager] ${where}: reads leave out or mend what doesn't match ContentBlock (${malformedPlaces(content).join('; ')}); ` +
         'the store keeps it as written',
     );
   }

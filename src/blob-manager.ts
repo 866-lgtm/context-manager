@@ -134,11 +134,10 @@ function blockFromBlob(kind: BlobReference['originalType'], data: string, mediaT
  *
  * It throws for a block the store refuses on write, which has no stored form:
  * content that doesn't match `ContentBlock` where its readers read it
- * (well-formed-content.ts), inline media
- * whose data the store can't read as base64, or one without a media type (for
- * an image: none declared, and no recognized signature in its bytes). It also
- * throws for a `blob_ref`, which reads back as the media it references, and
- * that takes the store to know.
+ * (well-formed-content.ts), inline media whose data the store can't read as
+ * base64, or one without a media type (for an image: none declared, and no
+ * recognized signature in its bytes). It also throws for a `blob_ref`, which
+ * reads back as the media it references, and that takes the store to know.
  *
  * Pure and synchronous: no store and no I/O, so a body can be hashed as the
  * store will keep it before anything is written.

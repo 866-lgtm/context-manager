@@ -170,8 +170,10 @@ export class ContextLog {
     sourceRelation?: SourceRelation;
     cacheMarker?: boolean;
   }>): ContextEntry[] {
-    // Every entry is refused before the log is cleared, so a refusal leaves
-    // the log as it was rather than half replaced.
+    // An entry that doesn't match is refused before the log is cleared, so
+    // that refusal leaves the log as it was rather than half replaced. (The
+    // store's own refusal of media it can't store still comes from append,
+    // after the clear, as before.)
     entries.forEach((entry, i) => refuseMalformedContent(entry.content, `Context entry ${i} of the replacement refused`));
     // Clear existing entries
     const len = this.length();

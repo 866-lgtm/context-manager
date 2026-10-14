@@ -473,8 +473,8 @@ export class ContextManager {
     causedBy?: MessageId[],
     options?: AddMessageOptions
   ): MessageId {
-    // First, so a refused message changes nothing: no hold expires, no hold
-    // is placed, and the strategy's ingress chunking never reads it.
+    // First, so a message refused here changes nothing: no hold expires, no
+    // hold is placed, and the strategy's ingress chunking never reads it.
     refuseMalformedContent(content, 'Message refused');
     this.expireCompressionHolds();
     if (!options?.holdCompression) {
@@ -515,10 +515,13 @@ export class ContextManager {
     if (typeof strategyAny.chunkIngressMessage === 'function') {
       const decision = strategyAny.chunkIngressMessage(participant, content);
       if (decision && decision.shards.length > 1) {
-        // Every shard is refused before any is stored, as the message was:
-        // the store's own refusal would meet a shard only once the shards
-        // before it were stored.
-        for (const shard of decision.shards) refuseMalformedContent(shard.content, 'Message refused');
+        // A shard that doesn't match is refused before any shard is stored,
+        // as the message was: the store's own refusal would meet it only once
+        // the shards before it were stored. The error names the shard, since
+        // the message as given was refused by nothing.
+        for (const shard of decision.shards) {
+          refuseMalformedContent(shard.content, `Shard ${shard.shardIndex} of the message, as the strategy chunked it, refused`);
+        }
         let firstId: MessageId | null = null;
         // These appends must stay synchronous: one body's shards in one loop, in
         // shard order, with no await between them. The body-runs rule (body-runs.ts)
