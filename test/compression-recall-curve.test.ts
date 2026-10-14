@@ -1408,6 +1408,60 @@ describe('compression refusal recall curves', () => {
     manager.close();
   });
 
+  it('records written at accounting version 2, before every provider\'s cache reads counted, do not block the current version', async () => {
+    const path = freshPath();
+    const firstMock = scriptedMembrane(['refusal']);
+    const first = await fixture(firstMock.membrane, { compressionRefusalCurveFallbacks: 0 }, path);
+    const targetIds = first.target.messages.map((message) => message.id);
+    await first.strategy.run(first.target, managerContext(first.manager));
+    const exhausted = quarantineEvents(first.manager).find((event) => event.kind === 'exhausted')!;
+    const current = exhausted.record as Record<string, unknown>;
+    await first.strategy.clearCompressionRefusalQuarantine(String(current.key));
+    for (let i = 0; i < 3; i++) {
+      const legacyConfig = { ...(current.normalizedConfig as Record<string, unknown>) };
+      legacyConfig.accountingVersion = 2;
+      const legacy: Record<string, unknown> = {
+        ...structuredClone(current),
+        key: `legacy-key-${i}`,
+        familyKey: `legacy-family-${i}`,
+        accountingSource: 'provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v2',
+        normalizedConfig: legacyConfig,
+      };
+      first.manager.getStore().appendToStateJsonWithIdentity(
+        'default/autobio:compression-refusal-quarantine-events',
+        { kind: 'exhausted', key: legacy.key, record: legacy, created: Date.now() + i },
+        'eventId',
+        'sequence',
+      );
+    }
+    first.manager.close();
+
+    const retryMock = scriptedMembrane(['end_turn']);
+    const retried = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+    });
+    const manager = await ContextManager.open({ path, strategy: retried, membrane: retryMock.membrane });
+    const ctx = managerContext(manager);
+    const chunk: Chunk = {
+      index: 999,
+      startIndex: 10,
+      endIndex: 12,
+      messages: targetIds.map((id) => ctx.messageStore.get(id)!).filter(Boolean),
+      tokens: 100,
+      compressed: false,
+    };
+    await retried.run(chunk, ctx);
+    assert.equal(retryMock.calls.length, 1, 'the current accounting earns one fresh canonical attempt');
+    assert.equal(chunk.compressed, true);
+    manager.close();
+  });
+
   it('restart with fallback limit 1→3 invalidates the exhausted plan key', async () => {
     const path = freshPath();
     const firstMock = scriptedMembrane(['refusal']);

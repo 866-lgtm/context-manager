@@ -741,9 +741,13 @@ function sha256Json(value: unknown): string {
  */
 const compressionStateLocks = new WeakMap<JsStore, Map<string, Promise<void>>>();
 const compressionInFlight = new WeakMap<JsStore, Map<string, Promise<CompressionInFlightResult>>>();
-const COMPRESSION_BUDGET_ACCOUNTING_VERSION = 2;
+// 3: the provider total counts cache writes and reads for every provider
+// (#182). A record from an earlier version may hold a plan whose oversized
+// fallbacks used up the attempt limit before one that fits, so it doesn't
+// count toward the current version's shape cap.
+const COMPRESSION_BUDGET_ACCOUNTING_VERSION = 3;
 const COMPRESSION_BUDGET_ACCOUNTING_SOURCE =
-  'provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v2';
+  'provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v3';
 const COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS = 256;
 const COMPRESSION_QUARANTINE_MAX_ACTIVE = 1_024;
 
