@@ -48,6 +48,7 @@ import { isStateExistsFor } from './state-registration.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
+import { refuseMalformedContent } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
@@ -472,6 +473,9 @@ export class ContextManager {
     causedBy?: MessageId[],
     options?: AddMessageOptions
   ): MessageId {
+    // First, so a refused message changes nothing: no hold expires, no hold
+    // is placed, and the strategy's ingress chunking never reads it.
+    refuseMalformedContent(content, 'Message refused');
     this.expireCompressionHolds();
     if (!options?.holdCompression) {
       return this.appendMessage(participant, content, metadata, causedBy);
@@ -511,6 +515,10 @@ export class ContextManager {
     if (typeof strategyAny.chunkIngressMessage === 'function') {
       const decision = strategyAny.chunkIngressMessage(participant, content);
       if (decision && decision.shards.length > 1) {
+        // Every shard is refused before any is stored, as the message was:
+        // the store's own refusal would meet a shard only once the shards
+        // before it were stored.
+        for (const shard of decision.shards) refuseMalformedContent(shard.content, 'Message refused');
         let firstId: MessageId | null = null;
         // These appends must stay synchronous: one body's shards in one loop, in
         // shard order, with no await between them. The body-runs rule (body-runs.ts)

@@ -3,8 +3,10 @@
  * a block that isn't an object; a text block whose text, or a thinking block
  * whose thinking, isn't a string; a tool_use whose input isn't an object; a
  * tool_result whose content is neither a string nor an array of such blocks,
- * at any depth. Reads leave it out or make it match, so every compile,
- * compression pass and reopen works, and the store keeps it as written.
+ * at any depth. A store written before writes refused it can hold it. Reads
+ * leave it out or make it match, so every compile, compression pass and
+ * reopen works, and the store keeps it as written. A write refuses it,
+ * naming where it is.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,6 +17,7 @@ import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import {
   AutobiographicalStrategy,
+  blockAsStored,
   ContextLog,
   ContextManager,
   MessageStore,
@@ -303,6 +306,122 @@ describe("content that doesn't match ContentBlock", () => {
       assert.deepEqual(lines, [
         "[context-manager] context entry 0: reads leave out what doesn't match ContentBlock (content[1] is null, not a content block; content[2].content[0] is a number, not a content block); the store keeps it as written",
       ]);
+    });
+  });
+
+  it('addMessage refuses it, naming where it is, before anything changes', async () => {
+    await withStore(async (store) => {
+      const manager = await ContextManager.open({ store });
+      try {
+        const events: unknown[] = [];
+        manager.onMessage((event) => { events.push(event); });
+        const sequence = store.currentSequence();
+        const refusals: Array<[unknown[], string]> = [
+          [[t('kept'), 'a bare string'], 'content\\[1\\] is a string, not a content block'],
+          [['only a string'], 'content\\[0\\] is a string, not a content block'],
+          [[t('kept'), 42], 'content\\[1\\] is a number, not a content block'],
+          [[t('kept'), true], 'content\\[1\\] is a boolean, not a content block'],
+          [[t('kept'), null], 'content\\[1\\] is null, not a content block'],
+          [[t('kept'), undefined], 'content\\[1\\] is undefined, not a content block'],
+          [[, t('kept')], 'content\\[0\\] is undefined, not a content block'],
+          [[{ type: 'text' }], 'content\\[0\\]\\.text is undefined, not a string'],
+          [[{ type: 'text', text: 42 }], 'content\\[0\\]\\.text is a number, not a string'],
+          [[{ type: 'thinking', thinking: null }], 'content\\[0\\]\\.thinking is null, not a string'],
+          [[toolUse('u1')], 'content\\[0\\]\\.input is undefined, not an object'],
+          [[toolUse('u1', null)], 'content\\[0\\]\\.input is null, not an object'],
+          [[toolUse('u1', [1])], 'content\\[0\\]\\.input is an array, not an object'],
+          [[toolUse('u1', 'x')], 'content\\[0\\]\\.input is a string, not an object'],
+          [[toolResult('t1', [t('ok'), null, 'x'])],
+            'content\\[0\\]\\.content\\[1\\] is null, not a content block; content\\[0\\]\\.content\\[2\\] is a string, not a content block'],
+          [[toolResult('t1', [toolResult('t2', [null])])], 'content\\[0\\]\\.content\\[0\\]\\.content\\[0\\] is null, not a content block'],
+          [[toolResult('t1', [{ type: 'text' }])], 'content\\[0\\]\\.content\\[0\\]\\.text is undefined, not a string'],
+          [[toolResult('t1', 42)], 'content\\[0\\]\\.content is a number, not a string or an array of content blocks'],
+          [[toolResult('t1', {})], 'content\\[0\\]\\.content is an object, not a string or an array of content blocks'],
+          [[{ type: 'tool_result', toolUseId: 't1' }], 'content\\[0\\]\\.content is undefined, not a string or an array of content blocks'],
+        ];
+        for (const [content, places] of refusals) {
+          const message = new RegExp(`^Message refused: ${places}\\.$`);
+          assert.throws(() => manager.addMessage('User', content as ContentBlock[]), { message });
+          assert.throws(() => manager.addMessage('User', content as ContentBlock[], undefined, undefined, { holdCompression: true }), { message });
+        }
+        assert.equal(store.currentSequence(), sequence, 'nothing was stored');
+        assert.deepEqual(events, [], 'no event was emitted');
+        assert.equal(manager.getCompressionHolds().size, 0, 'no hold was placed');
+        assert.equal((manager as unknown as { holdingAdds: unknown }).holdingAdds, null);
+        manager.addMessage('User', [toolResult('t1', 'a string') as ContentBlock]);
+        manager.addMessage('Claude', [toolUse('u1', {}) as ContentBlock, { type: 'thinking', thinking: '' } as ContentBlock]);
+        assert.equal(manager.getAllMessages().length, 2, 'a string tool_result content, an object input and an empty thinking are stored');
+      } finally {
+        manager.close();
+      }
+    });
+  });
+
+  it("a message a strategy would shard is refused before the strategy reads it, and a strategy's malformed shard before any shard is stored", async () => {
+    class ShardEachBlock extends PassthroughStrategy {
+      ingress = 0;
+      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+        this.ingress++;
+        // A shard of each block, and one more the chunker makes up that doesn't match.
+        const shards = content.map((block, shardIndex) => ({ content: [block], shardIndex }));
+        if (content.some((block) => (block as { text?: string }).text === 'bad shard')) {
+          shards.push({ content: [null as unknown as ContentBlock], shardIndex: shards.length });
+        }
+        return { bodyGroupId: 'each-block', shards };
+      }
+    }
+    await withStore(async (store) => {
+      const strategy = new ShardEachBlock();
+      const manager = await ContextManager.open({ store, strategy });
+      try {
+        assert.throws(() => manager.addMessage('User', [t('a'), 'b'] as ContentBlock[]), { message: /^Message refused: content\[1\] is a string, not a content block\.$/ });
+        assert.equal(strategy.ingress, 0, 'the strategy never read it');
+        assert.throws(
+          () => manager.addMessage('User', [t('a'), t('bad shard')], undefined, undefined, { holdCompression: true }),
+          { message: /^Message refused: content\[0\] is null, not a content block\.$/ },
+        );
+        assert.equal(strategy.ingress, 1);
+        assert.equal(manager.getAllMessages().length, 0, 'no shard of either was stored');
+        assert.equal(manager.getCompressionHolds().size, 0, 'and no hold was placed');
+      } finally {
+        manager.close();
+      }
+    });
+  });
+
+  it('the stores refuse it at append and at edit, ContextLog.replaceAll before it clears, and blockAsStored as the store does', async () => {
+    await withStore(async (store) => {
+      MessageStore.register(store);
+      ContextLog.register(store);
+      assert.throws(() => new MessageStore(store).append('User', [t('a'), null] as ContentBlock[]), { message: /^Message refused: content\[1\] is null, not a content block\.$/ });
+      writeRaw(store, 'User', [t('a'), null]);
+      const messages = new MessageStore(store);
+      await errorLines(() => {
+        const [held] = messages.getAll();
+        assert.throws(
+          () => messages.edit(held!.id, [t('b'), 'x'] as ContentBlock[]),
+          { message: new RegExp(`^Edit of ${held!.id} refused: content\\[1\\] is a string, not a content block\\.$`) },
+        );
+        messages.edit(held!.id, [t('fixed')]);
+        assert.deepEqual(messages.get(held!.id)!.content, [t('fixed')]);
+      });
+      const log = new ContextLog(store);
+      assert.throws(() => log.append('User', [toolResult('t1', [null])] as ContentBlock[]), { message: /^Context entry refused: content\[0\]\.content\[0\] is null, not a content block\.$/ });
+      log.append('User', [t('entry')]);
+      assert.throws(() => log.edit(0, [{ type: 'text' }] as ContentBlock[]), { message: /^Edit of context entry 0 refused: content\[0\]\.text is undefined, not a string\.$/ });
+      assert.deepEqual(log.getAll().map((entry) => entry.content), [[t('entry')]], 'the context log stored nothing refused');
+      assert.throws(
+        () => log.replaceAll([
+          { participant: 'User', content: [t('new 1')] },
+          { participant: 'User', content: [null] as unknown as ContentBlock[] },
+        ]),
+        { message: /^Context entry 1 of the replacement refused: content\[0\] is null, not a content block\.$/ },
+      );
+      assert.deepEqual(log.getAll().map((entry) => entry.content), [[t('entry')]], 'a refused replacement leaves the log as it was');
+      assert.throws(() => blockAsStored(null as unknown as ContentBlock), { message: /^blockAsStored: block is null, not a content block\.$/ });
+      assert.throws(() => blockAsStored(toolResult('t1', [t('ok'), 'x']) as ContentBlock), { message: /^blockAsStored: block\.content\[1\] is a string, not a content block\.$/ });
+      assert.throws(() => blockAsStored(toolUse('u1') as ContentBlock), { message: /^blockAsStored: block\.input is undefined, not an object\.$/ });
+      assert.deepEqual(blockAsStored(toolResult('t1', 'fine') as ContentBlock), toolResult('t1', 'fine'));
     });
   });
 });

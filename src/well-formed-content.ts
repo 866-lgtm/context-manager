@@ -17,12 +17,13 @@
  * autobiographical strategy, so did a text or thinking block missing its
  * text or thinking, whose token estimate reads the field's length.
  *
- * So a read leaves it out or makes it match ({@link wellFormedContent}), and
- * the store keeps the content as written.
+ * So the stores refuse such content on write ({@link refuseMalformedContent}),
+ * and a read leaves it out ({@link wellFormedContent}) for a store written
+ * before the refusal, which keeps the content as written.
  *
  * Content is walked with index loops throughout: a hole in an array reads as
- * undefined, so it is named like any other. (A stored record has no holes,
- * since JSON writes a hole as null.)
+ * undefined, so it is named and refused like any other. (A stored record has
+ * no holes, since JSON writes a hole as null.)
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
@@ -113,6 +114,23 @@ function malformedPlaces(content: readonly unknown[]): string[] {
   const places: string[] = [];
   for (let i = 0; i < content.length; i++) placesIn(content[i], `content[${i}]`, places);
   return places;
+}
+
+/**
+ * Refuse content that doesn't match `ContentBlock`, before anything of it is
+ * stored. `what` opens the error ("Message refused", "Edit of m-12 refused").
+ */
+export function refuseMalformedContent(content: readonly unknown[], what: string): void {
+  if (allWellFormed(content)) return;
+  throw new Error(`${what}: ${malformedPlaces(content).join('; ')}.`);
+}
+
+/** As refuseMalformedContent, for one block, whose places are named from `block`. */
+export function refuseMalformedBlock(block: unknown, what: string): void {
+  if (wellFormed(block)) return;
+  const places: string[] = [];
+  placesIn(block, 'block', places);
+  throw new Error(`${what}: ${places.join('; ')}.`);
 }
 
 /** `content`'s blocks as a read gives them (wellFormedBlock), leaving out the ones it drops. */

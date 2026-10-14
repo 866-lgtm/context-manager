@@ -9,7 +9,7 @@ import type {
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
 import { MessageStore } from './message-store.js';
-import { wellFormedContent } from './well-formed-content.js';
+import { refuseMalformedContent, wellFormedContent } from './well-formed-content.js';
 
 const DEFAULT_CONTEXT_STATE_ID = 'context';
 
@@ -87,6 +87,7 @@ export class ContextLog {
     sourceRelation?: SourceRelation,
     cacheMarker?: boolean
   ): ContextEntry {
+    refuseMalformedContent(content, 'Context entry refused');
     const storedContent = this.blobManager.extractBlobs(content);
     const index = this.length();
 
@@ -122,6 +123,7 @@ export class ContextLog {
    * Edit an entry's content at a specific index.
    */
   edit(index: number, content: ContentBlock[]): void {
+    refuseMalformedContent(content, `Edit of context entry ${index} refused`);
     const internal = this.getInternal(index);
     if (!internal) {
       throw new Error(`Context entry not found at index: ${index}`);
@@ -168,6 +170,9 @@ export class ContextLog {
     sourceRelation?: SourceRelation;
     cacheMarker?: boolean;
   }>): ContextEntry[] {
+    // Every entry is refused before the log is cleared, so a refusal leaves
+    // the log as it was rather than half replaced.
+    entries.forEach((entry, i) => refuseMalformedContent(entry.content, `Context entry ${i} of the replacement refused`));
     // Clear existing entries
     const len = this.length();
     if (len > 0) {

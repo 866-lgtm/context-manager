@@ -8,6 +8,7 @@ import type {
   Base64Source,
 } from '@animalabs/membrane';
 import type { BlobReference, StoredContentBlock } from './types/index.js';
+import { refuseMalformedBlock } from './well-formed-content.js';
 
 /** Detect provider-supported raster image types from their byte signature.
  * Returns null for unknown/container types so callers can preserve the
@@ -132,15 +133,18 @@ function blockFromBlob(kind: BlobReference['originalType'], data: string, mediaT
  * holding part of its content, which this doesn't predict.
  *
  * It throws for a block the store refuses on write, which has no stored form:
- * inline media whose data the store can't read as base64, or one without a
- * media type (for an image: none declared, and no recognized signature in its
- * bytes). It also throws for a `blob_ref`, which reads back as the media it
- * references, and that takes the store to know.
+ * content that doesn't match `ContentBlock` where its readers read it
+ * (well-formed-content.ts), inline media
+ * whose data the store can't read as base64, or one without a media type (for
+ * an image: none declared, and no recognized signature in its bytes). It also
+ * throws for a `blob_ref`, which reads back as the media it references, and
+ * that takes the store to know.
  *
  * Pure and synchronous: no store and no I/O, so a body can be hashed as the
  * store will keep it before anything is written.
  */
 export function blockAsStored(block: ContentBlock): ContentBlock {
+  refuseMalformedBlock(block, 'blockAsStored');
   if ((block as { type: string }).type === 'blob_ref') {
     throw new Error('blockAsStored: a blob_ref reads back as the media it references, which takes the store to know');
   }
