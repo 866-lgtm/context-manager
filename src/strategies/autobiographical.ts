@@ -1801,6 +1801,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibrationEma = null;
     this._calibrationLoaded = false;
     this._calibrationReset = null;
+    this._calibrationProvisional = null;
     this._imageWatermark = undefined;
     this._imageWatermarkLoaded = false;
     this._lastKvStable = null;
@@ -8832,8 +8833,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // current raw plan feasible and must never authorize an inference.
     // A dry run reports infeasibility via `_lastPreview.fits` instead: the
     // whole point of previewing an aggressive budget is to learn it won't fit
-    // without taking the outage that learning it live would cause.
-    if (result.finalTokens > rejectionBudget && !dryRun) {
+    // without taking the outage that learning it live would cause. Except
+    // under a provisional multiplier above 1, which a committing select
+    // would drop and retry at (selectPath): the dry run throws the same
+    // refusal so it takes the same fallback, and its preview says what the
+    // real compile will do. If the retry at 1 is still over, it reports.
+    const dryFallback = dryRun && this._calibrationProvisional !== null && this._calibration > 1;
+    if (result.finalTokens > rejectionBudget && (!dryRun || dryFallback)) {
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: result.finalTokens,
@@ -9302,7 +9308,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /** Write the multiplier in force under the current pricing stamp, with the
-   *  reset it carries. Best-effort, as every calibration write is. */
+   *  reset it carries and without the provisional flag a discard wrote: this
+   *  is the first sample's write, which is what ends the provisional state.
+   *  Best-effort, as every calibration write is. */
   private persistCalibration(): void {
     try {
       this.store?.setStateJson(this.calibrationStateId, {
@@ -9461,7 +9469,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (dropProvisionalCalibration). The first sample the band accepts replaces
    * a provisional multiplier outright, instead of stepping the EMA toward it,
    * and writes the stamp (reportRealInputTokens). The 1 a discard restarts
-   * from is provisional too, so one sample sets it rather than about ten.
+   * from is provisional too, so one sample sets it rather than about ten; it
+   * is persisted as such (`provisional: true`), so a restart before that
+   * sample doesn't turn the guess into a learned value. A dry run under a
+   * provisional multiplier above 1 takes the same fallback at the picker's
+   * refusal, which it otherwise only reports.
    *
    * A binary from before a bump still learns after a rollback, and its first
    * applied sample overwrites the newer epoch's record with its own stamp
@@ -9528,7 +9540,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._calibrationProvisional = null;
       try {
         const saved = this.store?.getStateJson(this.calibrationStateId) as
-          { multiplier?: number; pricing?: number; reset?: CalibrationReset } | null;
+          { multiplier?: number; pricing?: number; reset?: CalibrationReset; provisional?: boolean } | null;
         if (saved && Number.isFinite(saved.multiplier)) {
           const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
           const stamped = typeof saved.pricing === 'number' && Number.isFinite(saved.pricing);
@@ -9543,6 +9555,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (epoch === current) {
             this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
             this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+            // A discard's 1 that no sample has confirmed yet was persisted as
+            // provisional, and stays a guess across the restart: the first
+            // sample still sets it, instead of stepping toward it.
+            if (saved.provisional === true) {
+              this._calibrationProvisional = { fromEpoch: this._calibrationReset?.fromEpoch ?? null };
+            }
           } else if (repriced || (epoch < current && !stamped && pinned)) {
             const reset: CalibrationReset = { discardedMultiplier: saved.multiplier!, fromEpoch, at: Date.now() };
             this._calibrationReset = reset;
@@ -9568,9 +9586,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               );
               // Persist the reset, so a rollback to a binary that ignores the
               // stamp can't reload the stale multiplier and re-arm the wedge,
-              // and the discard isn't re-logged on every restart.
+              // and the discard isn't re-logged on every restart. The 1 is
+              // persisted as provisional until the first sample's write.
               try {
-                this.store?.setStateJson(this.calibrationStateId, { multiplier: 1, at: Date.now(), pricing: current, reset });
+                this.store?.setStateJson(this.calibrationStateId,
+                  { multiplier: 1, at: Date.now(), pricing: current, reset, provisional: true });
               } catch { /* persistence is best-effort */ }
             }
           } else if (epoch < current && stamped) {
@@ -9655,7 +9675,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         `Shown as calibration.reset in render stats.`,
     );
     try {
-      this.store?.setStateJson(this.calibrationStateId, { multiplier: 1, at: Date.now(), pricing: current, reset });
+      this.store?.setStateJson(this.calibrationStateId,
+        { multiplier: 1, at: Date.now(), pricing: current, reset, provisional: true });
     } catch { /* persistence is best-effort */ }
     return true;
   }
