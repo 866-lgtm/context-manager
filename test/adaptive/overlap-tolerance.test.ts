@@ -237,30 +237,33 @@ test('a compile above foldAt that adopts the frontier it carried reports no fold
   assert.ok(!second.folded && !second.expanded);
 });
 
-test('a pin tightened since the last compile is in the carried frontier, so perturbation leaves it out', () => {
-  // A, B and C under G, nested. The first compile folds to G; the second caps
-  // m1 at L1, which no plan can render through G. The provider re-reads from
-  // G on, but that change is every plan's, so the carried frontier applies it
-  // first and the plan, which holds, reports a perturbation of 0.
-  const { inputs, tree } = store(
-    [message('m1', 1, 100, 'A'), message('m2', 2, 100, 'B'), message('m3', 3, 100, 'C')],
-    [
-      summary('A', 1, ['m1'], 30, 'G'),
-      summary('B', 1, ['m2'], 30, 'G'),
-      summary('C', 1, ['m3'], 30, 'G'),
-      summary('G', 2, ['A', 'B', 'C'], 40),
-    ],
-  );
-  const params = { ...trio, foldAtTokens: 150 };
-  const first = planControlledFrontier(inputs, tree, { ...params, previous: new Map() });
-  const second = planControlledFrontier(inputs, tree, { ...params, pinCaps: new Map([['m1', 1]]), previous: first.resolutions });
-  const before = renderLayout(inputs, tree, first.resolutions);
-  const after = renderLayout(inputs, tree, second.resolutions);
-  assert.deepEqual(unitsOf(before), ['recall:G']);
-  assert.deepEqual(unitsOf(after), ['recall:A', 'recall:B', 'recall:C']);
-  assert.ok(kvCost(before, after) > 0, 'the provider re-reads from G on');
-  assert.equal(second.perturbation, 0);
-});
+// A, B and C under G, nested. The first compile folds to G; the second caps
+// m1 at L1, which no plan can render through G. The provider re-reads from G
+// on, but that change is every plan's, so the carried frontier applies it
+// first and the plan reports a perturbation of 0: inside the hold band by
+// holding, and above foldAt by adopting an ideal cut that equals it.
+for (const [path, foldAtTokens] of [['holds', 150], ['adopts the ideal cut above foldAt', 60]] as const) {
+  test(`a pin tightened since the last compile is in the carried frontier, so a plan that ${path} leaves it out of perturbation`, () => {
+    const { inputs, tree } = store(
+      [message('m1', 1, 100, 'A'), message('m2', 2, 100, 'B'), message('m3', 3, 100, 'C')],
+      [
+        summary('A', 1, ['m1'], 30, 'G'),
+        summary('B', 1, ['m2'], 30, 'G'),
+        summary('C', 1, ['m3'], 30, 'G'),
+        summary('G', 2, ['A', 'B', 'C'], 40),
+      ],
+    );
+    const params = { ...trio, foldAtTokens };
+    const first = planControlledFrontier(inputs, tree, { ...params, previous: new Map() });
+    const second = planControlledFrontier(inputs, tree, { ...params, pinCaps: new Map([['m1', 1]]), previous: first.resolutions });
+    const before = renderLayout(inputs, tree, first.resolutions);
+    const after = renderLayout(inputs, tree, second.resolutions);
+    assert.deepEqual(unitsOf(before), ['recall:G']);
+    assert.deepEqual(unitsOf(after), ['recall:A', 'recall:B', 'recall:C']);
+    assert.ok(kvCost(before, after) > 0, 'the provider re-reads from G on');
+    assert.equal(second.perturbation, 0);
+  });
+}
 
 test('suffix adoption takes a summary beside a lineage-disagreeing leaf', () => {
   // The trio after m0, whose own L1 Z has no parent. From an all-raw carried
@@ -395,20 +398,34 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
       { reachTokens: Math.max(1, Math.floor(params.targetTokens / 2)), previous: new Map(inputs.chunks.map((c) => [c.id, 0])) },
     ];
     let ideal: ReadonlyMap<ChunkId, number> | null = null;
+    // The level a protection sets, which every plan must keep: the raw zone
+    // raw, a pinned leaf at its level (as deep as its summaries go), a locked
+    // leaf where it was.
+    const heldLevel = (c: PickerChunk): number | undefined => {
+      if (params.rawZone.has(c.id)) return 0;
+      const k = params.fixedLevels!.get(c.id);
+      if (k !== undefined) return k === 0 ? 0 : Math.min(k, tree.maxLevel(c.id));
+      if (params.frozen!.has(c.id)) return c.currentResolution;
+      return undefined;
+    };
     const { overlapWarnings } = quietOverlap(() => {
       for (const start of starts) {
         let previous: ReadonlyMap<ChunkId, number> = start.previous;
-        let before = renderLayout(inputs, tree, previous);
+        // The first plan's perturbation counts from the carried frontier,
+        // which applies those levels to where it starts.
+        let before = renderLayout(inputs, tree, new Map(inputs.chunks.map((c) => [c.id, heldLevel(c) ?? previous.get(c.id) ?? 0])));
         for (let turn = 1; turn <= 4; turn++) {
           const plan = planControlledFrontier(inputs, tree, { ...params, reachTokens: start.reachTokens, previous });
           const after = renderLayout(inputs, tree, plan.resolutions);
           ideal ??= plan.resolutions;
           const where = `tree ${t} (${corruptions.join('; ')}), turn ${turn}: ${unitsOf(before).join(' ')} → ${unitsOf(after).join(' ')}`;
-          // A first turn with leaves pinned at a level starts from a frontier
-          // the base changes, and perturbation counts from the carried
-          // frontier, which applies the base first.
-          if (turn > 1 || params.fixedLevels!.size === 0) {
-            assert.equal(plan.perturbation, kvCost(before, after), `perturbation is the change from the last plan's render, ${where}`);
+          assert.equal(plan.perturbation, kvCost(before, after), `perturbation is the change from the last plan's render, ${where}`);
+          for (const c of inputs.chunks) {
+            const level = plan.resolutions.get(c.id) ?? 0;
+            const held = heldLevel(c);
+            if (held !== undefined) assert.equal(level, held, `${c.id} keeps its protected level, ${where}`);
+            const cap = params.pinCaps!.get(c.id);
+            if (held === undefined && cap !== undefined) assert.ok(level <= cap, `${c.id} stays at or below its pin cap, ${where}`);
           }
           if (turn > 1 && sameLevels(previous, ideal)) {
             assert.ok(sameLevels(plan.resolutions, ideal), `the adopted ideal cut stays put, ${where}`);
@@ -423,6 +440,6 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
     });
     if (overlapWarnings > 0) warned++;
   }
-  // The trees exercise the exemption: over a third of them make some plan warn.
-  assert.ok(warned >= 100, `${warned} of 300 trees exempted a leaf`);
+  // The trees exercise the exemption: at least a third of them make some plan warn.
+  assert.ok(warned >= 100, `${warned} of 300 trees made some plan warn`);
 });

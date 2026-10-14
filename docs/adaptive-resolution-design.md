@@ -975,8 +975,9 @@ monotone-lowers the whole group around it — observed: one disagreeing leaf
 un-folded a 200-leaf group, 615 leaves cascaded (+24k tokens), and the solve
 returned an over-W frontier while a produced L4/L5 layer sat unused (opus4).
 Now leaves whose lineage disagrees are skipped by folds and exempted from
-unanimity: they render raw beside the covering recall. **This is a degraded
-mode, not a feature** — every exempted leaf means messages are semantically
+unanimity: they keep their own level, raw or through their own lineage,
+beside the covering recall. **This is a degraded mode, not a feature** —
+every exempted leaf means messages are semantically
 *double-represented* in the window (rendered raw or via their own chain while
 a covering recall also renders). The solve proceeding is the mitigation; the
 topology is the disease. `[kv-overlap]` warns on **every** affected compile
@@ -986,18 +987,21 @@ The validity projection decides the exemption by lineage: a leaf that a group
 lists, but whose own lineage at the group's level is another summary or none,
 never vetoes the group. Nor does a leaf folded above the group's level: it
 renders through a coarser summary of its own lineage, and that summary's
-unanimity decides it. On a nested tree the group's other leaves bring it down
-to theirs; where the coarser summary doesn't list them, the leaf renders in
-both recalls, overlap like the rest of this section's. Only a listed leaf of
-the group's own lineage rendered in more detail than the group vetoes it.
-Every projection applies the rule alike, the ideal cut's, the carried
-frontier's and each suffix-adoption candidate's, so a frontier the planner
-emitted projects to itself on unchanged inputs. Before this rule, only the
-ideal cut's projection exempted these leaves, through the solve's own exempt
-set. The next compile's carried frontier then un-folded the group around
-them, so on unchanged inputs the window re-laid while the plan reported a
-perturbation of 0, or reported a fold and a perturbation for a frontier it
-hadn't changed.
+unanimity decides whether it stays there. Where it stays and the group
+renders, the leaf is in both recalls. On a nested tree that can't last, since
+the coarser summary owns the group's leaves and those below its level veto
+it; on a non-nested tree it can, overlap like the rest of this section's.
+Only a listed leaf of the group's own lineage rendered in more detail than
+the group vetoes it, and a hard-protected leaf (raw zone, pinned or locked)
+never does. Every projection applies the rule alike, the ideal cut's, the
+carried frontier's and each suffix-adoption candidate's, so a frontier the
+planner emitted projects to itself on unchanged inputs. Before this rule,
+only the ideal cut's projection exempted these leaves, through the solve's
+own exempt set, and the carried frontier's and suffix candidates'
+projections didn't. The next compile's carried frontier then un-folded the
+group around them, so on unchanged inputs the window re-laid while the plan
+reported a perturbation of 0, or reported a fold and a perturbation for a
+frontier it hadn't changed.
 
 **Fold→project fixpoint** (`b99fcc3`). The validity projection can only lower
 levels; on a non-nested tree its repairs *add* tokens after the phases stopped

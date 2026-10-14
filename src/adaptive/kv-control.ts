@@ -604,21 +604,22 @@ function suffixAdopt(
  *
  * A leaf the node lists vetoes its unanimity only when it renders in more
  * detail than the node, below the node's level, and the node is its own
- * lineage at that level: the node's recall would then render over it. On a
- * non-nested tree a node can list a leaf whose own lineage at the node's level
- * is another summary, or none (§13.6 overlap tolerance). That leaf renders
- * through its own lineage whatever the node does, so it never vetoes the node.
- * A leaf folded above the node renders through a coarser summary of its own
- * lineage, and that summary's unanimity decides it (a held leaf is consistent
- * by construction). On a nested tree the coarser summary lists the node's
- * other leaves, which sit below its level and bring the leaf down to theirs.
- * On a non-nested tree whose coarser summary doesn't list them, the node's
- * recall renders beside it, and the leaf is in both recalls: the overlap
- * §13.6 tolerates. The rule depends only on the tree and the cut, so every
- * projection applies it alike: the ideal cut's, the carried frontier's and
- * each suffix candidate's. A frontier the planner emitted therefore projects
- * to itself on unchanged inputs, and the next compile starts from what this
- * one rendered.
+ * lineage at that level: the node's recall would then render over it. A
+ * hard-protected leaf (`exempt`) never vetoes. On a non-nested tree a node can
+ * list a leaf whose own lineage at the node's level is another summary, or
+ * none (§13.6 overlap tolerance). That leaf renders through its own lineage
+ * whatever the node does, so it never vetoes the node. A leaf folded above the
+ * node renders through a coarser summary of its own lineage, and that
+ * summary's unanimity decides whether it stays there (a held leaf stays: the
+ * caller has made it consistent with its group). Where it stays and the node
+ * renders, the leaf is in both recalls. On a nested tree that can't last: the
+ * coarser summary owns the node's leaves, and those below its level veto it,
+ * bringing the leaf down to theirs. On a non-nested tree it can, the overlap
+ * §13.6 tolerates. The rule depends only on the tree, the cut and the
+ * hard-protected leaves, which every projection is given alike: the ideal
+ * cut's, the carried frontier's and each suffix candidate's. A frontier the
+ * planner emitted therefore projects to itself on unchanged inputs, and the
+ * next compile starts from what this one rendered.
  */
 function projectToValidCut(
   F: Map<ChunkId, number>,
