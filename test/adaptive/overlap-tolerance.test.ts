@@ -168,7 +168,7 @@ function crossParentedTrio(): { inputs: PickerInputs; tree: SummaryTree } {
 }
 
 /** Two L2s list A: its own parent P, with C, and Q, with B. A pin caps C at
- *  L1, so P can't fold, and A stays at L1 beside Q (Andrew-2310's case). */
+ *  L1, so P can't fold, and A stays at L1 beside Q. */
 function twoParentsOneCapped(): { inputs: PickerInputs; tree: SummaryTree } {
   return store(
     [message('m1', 1, 100, 'A'), message('m2', 2, 100, 'B'), message('m3', 3, 100, 'C')],
@@ -182,12 +182,31 @@ function twoParentsOneCapped(): { inputs: PickerInputs; tree: SummaryTree } {
   );
 }
 
+/** A lists m0 and m1, and its parent is L2 P, which doesn't list A: P's one
+ *  source is C, which lists m2 and also m1. So m1 folds to L2 through P,
+ *  above A, while P doesn't cover m0. L2 Q lists A and D. Fully folded, the
+ *  window is A, P and Q beside raw m4 (170 tokens); with A un-folded because
+ *  m1 sits above it, m0 renders raw (240). */
+function ownLeafFoldedAbove(): { inputs: PickerInputs; tree: SummaryTree } {
+  return store(
+    [message('m0', 0, 100, 'A'), message('m1', 1, 100, 'A'), message('m2', 2, 100, 'C'), message('m3', 3, 100, 'D'), message('m4', 4, 100)],
+    [
+      summary('A', 1, ['m0', 'm1'], 30, 'P'),
+      summary('C', 1, ['m2', 'm1'], 30, 'P'),
+      summary('D', 1, ['m3'], 30, 'Q'),
+      summary('P', 2, ['C'], 20),
+      summary('Q', 2, ['A', 'D'], 20),
+    ],
+  );
+}
+
 const trio = { targetTokens: 50, windowTokens: 1_000, reachTokens: 1_000, rawZone: new Set<ChunkId>(), now: 1_000 };
 
 for (const [kind, build, foldAtTokens, folded, pinCaps] of [
   ['whose own lineage stops below the summary', disagreeingTrio, 100, ['recall:A', 'recall:G'], undefined],
   ['whose own lineage runs through another summary at its level', crossParentedTrio, 150, ['recall:H', 'recall:A', 'recall:G'], undefined],
   ['whose own parent is held back by a pin', twoParentsOneCapped, 150, ['recall:A', 'recall:Q', 'recall:C'], new Map([['m3', 1]])],
+  ['of its own that is folded above it', ownLeafFoldedAbove, 250, ['recall:A', 'recall:P', 'recall:Q', 'raw:m4'], undefined],
 ] as const) {
   test(`a held plan keeps the summary beside a leaf ${kind}`, () => {
     const { inputs, tree } = build();
