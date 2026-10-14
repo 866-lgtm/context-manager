@@ -9,6 +9,7 @@ import type {
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
 import { MessageStore } from './message-store.js';
+import { wellFormedContent } from './well-formed-content.js';
 
 const DEFAULT_CONTEXT_STATE_ID = 'context';
 
@@ -21,6 +22,8 @@ const DEFAULT_CONTEXT_STATE_ID = 'context';
  */
 export class ContextLog {
   private blobManager: BlobManager;
+  /** Entries whose malformed content a read has already logged (wellFormedContent). */
+  private malformedLogged = new Set<string>();
   private sourceToIndices: Map<MessageId, Set<number>> = new Map();
   private tokenEstimator: (text: string) => number;
   private stateId: string;
@@ -367,7 +370,9 @@ export class ContextLog {
       sourceMessageId: internal.sourceMessageId,
       sourceRelation: internal.sourceRelation,
       participant: internal.participant,
-      content: this.blobManager.resolveBlobs(internal.content),
+      content: this.blobManager.resolveBlobs(
+        wellFormedContent(internal.content, `context entry ${internal.index}`, this.malformedLogged),
+      ),
       cacheMarker: internal.cacheMarker,
     };
   }
