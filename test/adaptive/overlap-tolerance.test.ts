@@ -237,6 +237,31 @@ test('a compile above foldAt that adopts the frontier it carried reports no fold
   assert.ok(!second.folded && !second.expanded);
 });
 
+test('a pin tightened since the last compile is in the carried frontier, so perturbation leaves it out', () => {
+  // A, B and C under G, nested. The first compile folds to G; the second caps
+  // m1 at L1, which no plan can render through G. The provider re-reads from
+  // G on, but that change is every plan's, so the carried frontier applies it
+  // first and the plan, which holds, reports a perturbation of 0.
+  const { inputs, tree } = store(
+    [message('m1', 1, 100, 'A'), message('m2', 2, 100, 'B'), message('m3', 3, 100, 'C')],
+    [
+      summary('A', 1, ['m1'], 30, 'G'),
+      summary('B', 1, ['m2'], 30, 'G'),
+      summary('C', 1, ['m3'], 30, 'G'),
+      summary('G', 2, ['A', 'B', 'C'], 40),
+    ],
+  );
+  const params = { ...trio, foldAtTokens: 150 };
+  const first = planControlledFrontier(inputs, tree, { ...params, previous: new Map() });
+  const second = planControlledFrontier(inputs, tree, { ...params, pinCaps: new Map([['m1', 1]]), previous: first.resolutions });
+  const before = renderLayout(inputs, tree, first.resolutions);
+  const after = renderLayout(inputs, tree, second.resolutions);
+  assert.deepEqual(unitsOf(before), ['recall:G']);
+  assert.deepEqual(unitsOf(after), ['recall:A', 'recall:B', 'recall:C']);
+  assert.ok(kvCost(before, after) > 0, 'the provider re-reads from G on');
+  assert.equal(second.perturbation, 0);
+});
+
 test('suffix adoption takes a summary beside a lineage-disagreeing leaf', () => {
   // The trio after m0, whose own L1 Z has no parent. From an all-raw carried
   // frontier the ideal cut (Z, A and G) rewrites all 100 tokens it renders;
@@ -273,7 +298,9 @@ function mulberry32(seed: number): () => number {
 /** A nested tree over 3 to 12 messages, with one or two corruptions of the
  *  kinds store surgery leaves: an L1 detached from the L2 that still lists
  *  it, an L1 re-pointed at an L2 that doesn't list it, or a message
- *  re-pointed at an unmerged L1 over it and its neighbour. */
+ *  re-pointed at an unmerged L1 over it and its neighbour. On some trees the
+ *  caller's protections too: a raw zone, pin-max-level caps, pin-at-level
+ *  over one summary's leaves, and a locked leaf. */
 function randomNonNested(rng: () => number): {
   inputs: PickerInputs; tree: SummaryTree; params: Omit<ControlPlanParams, 'previous'>; corruptions: string[];
 } {
@@ -326,6 +353,22 @@ function randomNonNested(rng: () => number): {
       corruptions.push(`${chunks[at].id} re-pointed at ${s.id}`);
     }
   }
+  const rawZone = new Set<ChunkId>(rng() < 0.3 ? [chunks[n - 1].id] : []);
+  const pinCaps = new Map<ChunkId, number>();
+  if (rng() < 0.4) for (let p = 1 + Math.floor(rng() * 2); p > 0; p--) pinCaps.set(pick(chunks).id, Math.floor(rng() * 3));
+  const fixedLevels = new Map<ChunkId, number>();
+  if (rng() < 0.2 && summaries.length > 0) {
+    const s = pick(summaries);
+    const byId = new Map(summaries.map((x) => [x.id, x] as const));
+    const leavesOf = (x: SummaryEntry): string[] =>
+      x.level === 1 ? x.sourceIds : x.sourceIds.flatMap((id) => { const y = byId.get(id); return y ? leavesOf(y) : []; });
+    for (const id of leavesOf(s)) if (!rawZone.has(id)) fixedLevels.set(id, s.level);
+  }
+  const frozen = new Set<ChunkId>();
+  if (rng() < 0.2) {
+    const c = pick(chunks);
+    if (!rawZone.has(c.id) && !fixedLevels.has(c.id)) frozen.add(c.id);
+  }
   const rawTotal = chunks.reduce((total, c) => total + c.rawTokens, 0);
   const targetTokens = Math.max(1, Math.floor(rawTotal * (0.05 + rng() * 0.6)));
   const { inputs, tree } = store(chunks, summaries);
@@ -333,7 +376,7 @@ function randomNonNested(rng: () => number): {
     inputs, tree, corruptions,
     params: {
       targetTokens, foldAtTokens: Math.floor(targetTokens * (1 + rng())), windowTokens: rawTotal * 2,
-      rawZone: new Set(rng() < 0.3 ? [chunks[n - 1].id] : []), now: n,
+      rawZone, pinCaps, fixedLevels, frozen, now: n,
     },
   };
 }
@@ -361,7 +404,12 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
           const after = renderLayout(inputs, tree, plan.resolutions);
           ideal ??= plan.resolutions;
           const where = `tree ${t} (${corruptions.join('; ')}), turn ${turn}: ${unitsOf(before).join(' ')} → ${unitsOf(after).join(' ')}`;
-          assert.equal(plan.perturbation, kvCost(before, after), `perturbation is the change from the last plan's render, ${where}`);
+          // A first turn with leaves pinned at a level starts from a frontier
+          // the base changes, and perturbation counts from the carried
+          // frontier, which applies the base first.
+          if (turn > 1 || params.fixedLevels!.size === 0) {
+            assert.equal(plan.perturbation, kvCost(before, after), `perturbation is the change from the last plan's render, ${where}`);
+          }
           if (turn > 1 && sameLevels(previous, ideal)) {
             assert.ok(sameLevels(plan.resolutions, ideal), `the adopted ideal cut stays put, ${where}`);
           }

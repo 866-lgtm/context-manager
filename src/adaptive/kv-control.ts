@@ -290,9 +290,11 @@ function relevanceCut(
   // whole group around it — one disagreeing leaf un-folded a 200-leaf group,
   // 615 leaves cascaded (+24k tokens) and the solve returned an over-W
   // frontier while a produced L4/L5 layer sat unused. Leaves whose lineage
-  // disagrees are skipped by folds and exempted from unanimity: they render
-  // raw beside the recall — exactly the renderer's existing ownership-wins
-  // semantics for boundary-cut members.
+  // disagrees are skipped by folds and stay at their own level beside the
+  // recall — exactly the renderer's existing ownership-wins semantics for
+  // boundary-cut members. This set records them for phase C, which leaves
+  // them out of its un-folds, and for the [kv-overlap] warning; the validity
+  // projection exempts them by lineage on its own (projectToValidCut).
   const overlapExempt = new Set<ChunkId>();
   // Fold priority: cheapest information first — ascending salience, then oldest.
   const priority = [...ordered].sort((a, b) => {
@@ -361,7 +363,7 @@ function relevanceCut(
           if ((caps.get(leafId) ?? 0) < 0) continue; // protected: stays raw beside the recall
           // Overlap tolerance: only mark leaves whose own lineage renders as
           // part of THIS node at this level. Disagreeing leaves keep their
-          // level and become unanimity-exempt (see declaration above).
+          // level and are recorded (see declaration above).
           const own = tree.ancestorAt(leafId, level);
           if (!own || own.id !== ancestor.id) {
             overlapExempt.add(leafId);
@@ -479,7 +481,9 @@ function relevanceCut(
   // Overlap-exempt leaves need no entry: the projection leaves out of a
   // group's unanimity every leaf whose own lineage at that level isn't the
   // group, and every leaf above the group's level, the rule the carried
-  // frontier and suffix adoption are projected by.
+  // frontier and suffix adoption are projected by. A leaf in overlapExempt
+  // was met at a level where its lineage disagreed, so the rule exempts it
+  // there; a fold of its own summary at another level moves it with the rest.
   const projectionExempt = new Set<ChunkId>();
   for (const [id, cap] of caps) if (cap < 0) projectionExempt.add(id);
   projectToValidCut(F, tree, ordered, frozen, fixedLevels, projectionExempt);
@@ -598,19 +602,23 @@ function suffixAdopt(
  * group-consistent by the caller (pin-at-level fixes a whole node's leaves), so
  * they are held here rather than lowered.
  *
- * A leaf vetoes its node's unanimity only when it renders in more detail than
- * the node, below the node's level, and the node is its own lineage at that
- * level: the node's recall would then render over it. On a non-nested tree a
- * node can list a leaf whose own lineage at the node's level is another
- * summary, or none (§13.6 overlap tolerance). That leaf renders through its
- * own lineage whatever the node does, so it never vetoes the node. A leaf
- * folded above the node renders through a coarser summary of its own lineage,
- * and that summary's unanimity decides it: on a nested tree, the node's other
- * leaves, below that level, bring it down to theirs. The rule depends only on
- * the tree and the cut, so every projection applies it alike: the ideal cut's,
- * the carried frontier's and each suffix candidate's. A frontier the planner
- * emitted therefore projects to itself on unchanged inputs, and the next
- * compile starts from what this one rendered.
+ * A leaf the node lists vetoes its unanimity only when it renders in more
+ * detail than the node, below the node's level, and the node is its own
+ * lineage at that level: the node's recall would then render over it. On a
+ * non-nested tree a node can list a leaf whose own lineage at the node's level
+ * is another summary, or none (§13.6 overlap tolerance). That leaf renders
+ * through its own lineage whatever the node does, so it never vetoes the node.
+ * A leaf folded above the node renders through a coarser summary of its own
+ * lineage, and that summary's unanimity decides it (a held leaf is consistent
+ * by construction). On a nested tree the coarser summary lists the node's
+ * other leaves, which sit below its level and bring the leaf down to theirs.
+ * On a non-nested tree whose coarser summary doesn't list them, the node's
+ * recall renders beside it, and the leaf is in both recalls: the overlap
+ * §13.6 tolerates. The rule depends only on the tree and the cut, so every
+ * projection applies it alike: the ideal cut's, the carried frontier's and
+ * each suffix candidate's. A frontier the planner emitted therefore projects
+ * to itself on unchanged inputs, and the next compile starts from what this
+ * one rendered.
  */
 function projectToValidCut(
   F: Map<ChunkId, number>,

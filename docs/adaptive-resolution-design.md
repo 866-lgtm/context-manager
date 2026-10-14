@@ -986,16 +986,18 @@ The validity projection decides the exemption by lineage: a leaf that a group
 lists, but whose own lineage at the group's level is another summary or none,
 never vetoes the group. Nor does a leaf folded above the group's level: it
 renders through a coarser summary of its own lineage, and that summary's
-unanimity decides it (on a nested tree, the group's other leaves bring it
-down to theirs). Only a leaf of the group's own lineage rendered in more
-detail than the group vetoes it. Every projection applies the rule alike, the
-ideal cut's, the carried frontier's and each suffix-adoption candidate's, so a
-frontier the planner emitted projects to itself on unchanged inputs. Until
-2026-10 only the ideal cut's projection exempted these leaves, through the
-solve's own exempt set. The next compile's carried frontier then un-folded the
-group around them, so on unchanged inputs the window re-laid while the plan
-reported a perturbation of 0, or reported a fold and a perturbation for a
-frontier it hadn't changed.
+unanimity decides it. On a nested tree the group's other leaves bring it down
+to theirs; where the coarser summary doesn't list them, the leaf renders in
+both recalls, overlap like the rest of this section's. Only a listed leaf of
+the group's own lineage rendered in more detail than the group vetoes it.
+Every projection applies the rule alike, the ideal cut's, the carried
+frontier's and each suffix-adoption candidate's, so a frontier the planner
+emitted projects to itself on unchanged inputs. Before this rule, only the
+ideal cut's projection exempted these leaves, through the solve's own exempt
+set. The next compile's carried frontier then un-folded the group around
+them, so on unchanged inputs the window re-laid while the plan reported a
+perturbation of 0, or reported a fold and a perturbation for a frontier it
+hadn't changed.
 
 **Fold→project fixpoint** (`b99fcc3`). The validity projection can only lower
 levels; on a non-nested tree its repairs *add* tokens after the phases stopped
