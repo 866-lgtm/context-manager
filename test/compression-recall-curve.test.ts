@@ -937,43 +937,63 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
-  it('does not double-count provider cache fields that are subsets of total input', async () => {
+  it('a cached non-Anthropic refusal counts its cache reads in the canonical total', async () => {
+    // membrane (0.5.81 and later) states every provider's usage with the
+    // cached span outside inputTokens: 200,000 fresh plus 150,000 read from
+    // cache is a 350,000-token prompt, on OpenAI as on Anthropic.
     const mock = flexibleMembrane([
       { stop: 'refusal', inputTokens: 200_000, cacheReadTokens: 150_000, provider: 'openai-responses-api' },
-      { stop: 'end_turn', text: 'subset-accounted fallback succeeded', inputTokens: 220_000 },
+      { stop: 'end_turn', text: 'must never be called' },
     ]);
     const fx = await fixture(mock.membrane, {
       compressionContextBudgetTokens: 350_000,
       compressionRefusalCurveFallbacks: 1,
     });
     await fx.strategy.run(fx.target, managerContext(fx.manager));
-    assert.equal(mock.calls.length, 2, 'OpenAI cached input is not added twice');
-    assert.equal(fx.target.compressed, true);
+    assert.equal(mock.calls.length, 1, 'the cached span counts, so no expansion fits the budget');
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+      .record as Record<string, unknown>;
+    assert.equal(record.canonicalProviderInputTokens, 350_000);
+    const plan = record.plan as Array<Record<string, unknown>>;
+    assert.ok(plan.length > 0);
+    assert.ok(plan.every((item) => item.accountingSource === 'canonical_provider_usage_plus_expansion'));
+    assert.ok(plan.every((item) => item.disposition === 'admission_rejected'));
     fx.manager.close();
   });
 
-  it('zero or partial non-Anthropic usage falls back to the complete request bound', async () => {
-    const mock = flexibleMembrane([
-      { stop: 'refusal', inputTokens: 0, cacheReadTokens: 5, provider: 'openai-responses-api' },
-    ]);
-    const fx = await fixture(mock.membrane, {
-      compressionContextBudgetTokens: 60_000,
-      compressionRefusalCurveFallbacks: 1,
-    });
-    fx.manager.setToolDefinitions([{
-      name: 'large_zero_usage_tool',
-      description: 'schema inventory '.repeat(20_000),
-      inputSchema: { type: 'object', properties: {} },
-    }]);
-    await fx.strategy.run(fx.target, managerContext(fx.manager));
-    assert.equal(mock.calls.length, 1, 'degenerate usage cannot bypass the deterministic floor');
-    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
-      .record as Record<string, unknown>;
-    assert.equal(record.canonicalProviderInputTokens, undefined);
-    assert.ok((record.plan as Array<Record<string, unknown>>).every(
-      (item) => item.accountingSource === 'complete_normalized_request_bound',
-    ));
-    fx.manager.close();
+  it('zero usage, or usage without an input count, falls back to the complete request bound', async () => {
+    // Cache counts with no input count beside them are no observation of the prompt.
+    const withoutInputCount = response('refusal');
+    (withoutInputCount as { usage: Record<string, number> }).usage = { outputTokens: 0 };
+    (withoutInputCount as unknown as { details: unknown }).details = {
+      usage: { outputTokens: 0, cacheReadTokens: 5 },
+      model: { provider: 'openai-responses-api' },
+    };
+    const cases: Array<[string, AttemptHandler]> = [
+      ['zero total', { stop: 'refusal', inputTokens: 0, provider: 'openai-responses-api' }],
+      ['no input count', { raw: withoutInputCount }],
+    ];
+    for (const [label, handler] of cases) {
+      const mock = flexibleMembrane([handler]);
+      const fx = await fixture(mock.membrane, {
+        compressionContextBudgetTokens: 60_000,
+        compressionRefusalCurveFallbacks: 1,
+      });
+      fx.manager.setToolDefinitions([{
+        name: 'large_zero_usage_tool',
+        description: 'schema inventory '.repeat(20_000),
+        inputSchema: { type: 'object', properties: {} },
+      }]);
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      assert.equal(mock.calls.length, 1, `${label}: degenerate usage cannot bypass the deterministic floor`);
+      const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+        .record as Record<string, unknown>;
+      assert.equal(record.canonicalProviderInputTokens, undefined, label);
+      assert.ok((record.plan as Array<Record<string, unknown>>).every(
+        (item) => item.accountingSource === 'complete_normalized_request_bound',
+      ), label);
+      fx.manager.close();
+    }
   });
 
   it('usage absence counts complete huge tools, head, raw input, and normalized config', async () => {
