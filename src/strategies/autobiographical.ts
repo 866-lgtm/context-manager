@@ -2699,13 +2699,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * The L1 written for a chunk, by its joined source ids. Another instance
    * sharing the store may have written it since this one loaded, perhaps
    * with summaries above it that this one doesn't hold, so a miss here reads
-   * the store too. When the store has it, this instance takes up the store's
-   * summaries as an open would, and as a compression that waited on another
-   * instance's does, keeping its kv-unified presentation in flight (#166).
-   * The L1 then comes with the summaries above it, repaired as the loader
-   * repairs them. Adopting the L1 alone left its parent pointer naming a
-   * summary this instance didn't hold, which kv-unified's canonical forest
-   * refuses on every compile.
+   * the store too. When the store has it, this instance reloads the store's
+   * summaries, as a compression that waited on another instance's does,
+   * keeping its kv-unified presentation in flight (#166). The L1 then comes
+   * with the summaries above it, repaired as the loader repairs them. The
+   * open's other steps, such as chunk-record migration, the chunk rebuild,
+   * the merge queue's sanitizing and the topology audit, don't run here.
+   * Adopting the L1 alone left its parent pointer naming a summary this
+   * instance didn't hold, which kv-unified's canonical forest refuses on
+   * every compile.
    */
   private findExactL1(chunkIdKey: string): SummaryEntry | undefined {
     const held = this.heldExactL1(chunkIdKey);
