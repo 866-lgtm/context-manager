@@ -395,6 +395,23 @@ test('phase C un-folds the leaves of a summary\'s own lineage: tree 228 settles 
   assert.equal(second.perturbation, 0);
 });
 
+// X lists m0, m1 and m2, but m0 has no L1 of its own, so it renders raw
+// whatever X does. Phase C's un-fold of X asks only X's own leaves to sit at
+// X's level: m0, raw beside it, doesn't keep X folded, and the plan spends
+// the headroom on X, 170 tokens against a target of 150 rather than 70
+// (R1-1).
+test('phase C un-folds a summary whose listed leaf of another lineage sits at another level', () => {
+  const { inputs, tree } = store(
+    [message('m0', 0, 50), message('m1', 1, 60, 'X'), message('m2', 2, 60, 'X')],
+    [summary('X', 1, ['m0', 'm1', 'm2'], 20)],
+  );
+  const { result: plan } = quietOverlap(() => planControlledFrontier(inputs, tree, {
+    ...trio, targetTokens: 150, foldAtTokens: 300, previous: new Map(),
+  }));
+  assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['raw:m0', 'raw:m1', 'raw:m2']);
+  assert.equal(plan.tokens, 170);
+});
+
 // [kv-overlap] reads the frontier the plan emits, not which folds the solve
 // made: a hold that keeps R and A, which both list m0 and m1, warns though the
 // ideal cut folds neither, and a hold that renders neither stays quiet though
