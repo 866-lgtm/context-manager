@@ -70,7 +70,7 @@ export interface WindowedPassthroughOptions {
 /** Text substituted for an image block once it leaves the live-image window
  *  (identical to the autobiographical strategy's placeholder, so a merged
  *  timeline reads the same in both agents' windows). */
-const IMAGE_PLACEHOLDER = '[image dropped from live context]';
+const IMAGE_PLACEHOLDER = '[image not shown: this context keeps only some images]';
 /** Mirrors `AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES` (protected there). */
 const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
 
@@ -490,7 +490,7 @@ function truncateContent(content: ContentBlock[], maxTokens: number): ContentBlo
       if (typeof block.content === 'string') {
         const text = block.content;
         if (remaining <= 0) {
-          result.push({ ...block, content: '[content omitted — context budget exceeded]' });
+          result.push({ ...block, content: '[content omitted: this message reached its token limit before this result]' });
         } else if (text.length > remaining) {
           result.push({
             ...block,
