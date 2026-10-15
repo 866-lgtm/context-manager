@@ -131,6 +131,29 @@ const COMPRESSION_MARKER =
 export const COMBINED_RECALL_SEPARATOR_TEXT = '\n\n---\n\n';
 
 /**
+ * The Context Manager's turn between a recall answer and the agent's own raw
+ * turn right after it, in a compression or merge prompt (#116 review, R3-1).
+ * A recall answer is the agent's turn, so the agent's next turn would join
+ * it: `collapseConsecutiveMessages` merges consecutive messages of one
+ * participant, and the formatter merges consecutive messages of one role at
+ * the wire. The summarizer would then read that turn as the end of the memory
+ * it had just recalled, and the answer would no longer be the exact body the
+ * recall-curve variants look for. This turn ends the recall, so the raw turn
+ * after it reads as the conversation going on. Only a request with that
+ * adjacency carries it (`separateRecallAnswers`).
+ */
+export const RECALL_RESUME_TEXT = '[CM] The conversation resumes.';
+
+/** The summary id a `[CM] Recall memory <id>.` header names, or undefined for
+ *  any other message. A recall pair is such a header and the answer after it. */
+function recallHeaderId(message: { participant: string; content: ContentBlock[] }): string | undefined {
+  if (message.participant !== 'Context Manager' || message.content.length !== 1) return undefined;
+  const block = message.content[0];
+  if (block?.type !== 'text') return undefined;
+  return /^\[CM\] Recall memory (.+)\.$/.exec(block.text)?.[1];
+}
+
+/**
  * Retry-only line for tool_use compression rejections. Summarizer requests
  * declare the agent's live tools (the labclaude reasoning_extraction
  * requirement), so a think-first model can answer a mint prompt on-pattern —
@@ -2845,7 +2868,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * point — observed empirically at ~chunk 118 in a 4000-message import.
    *
    * Per-summary +50 token overhead accounts for the "[CM] Recall memory
-   * <id>." question turn that wraps each recall body. Rough but defensive.
+   * <id>." question turn that wraps each recall body, and the resume turn
+   * after it where the agent's own turn follows (RECALL_RESUME_TEXT). Rough
+   * but defensive.
    *
    * Under `recallEnvelope: 'xml'` the answer body also carries the envelope
    * tags, so the estimate prices that summary's ACTUAL envelope string on top
@@ -2935,13 +2960,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let deepEnd = -1;
     let frontierEnd = -1;
     for (let i = 0; i < messages.length - 1; i++) {
-      const m = messages[i]!;
-      if (m.participant !== 'Context Manager' || m.content.length !== 1) continue;
-      const block = m.content[0];
-      if (block?.type !== 'text') continue;
-      const match = /^\[CM\] Recall memory (.+)\.$/.exec(block.text);
-      if (!match) continue;
-      const level = levelById.get(match[1]!);
+      const id = recallHeaderId(messages[i]!);
+      if (id === undefined) continue;
+      const level = levelById.get(id);
       if (level === undefined) continue;
       if (frontierEnd === -1 && i > 0) headEnd = i - 1;
       frontierEnd = i + 1;
@@ -6557,7 +6578,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // bundles (a tool_result in an assistant message rejects the request);
       // for fresh imports the conhost importer splits at ingest time, but
       // already-warmed sessions hit this path. See `normalize-tool-messages.ts`.
-      const split = splitMixedToolMessages(llmMessages);
+      // First each recall answer is kept apart from the agent's own raw turn
+      // after it (RECALL_RESUME_TEXT), so the collapse below can't join them.
+      const split = splitMixedToolMessages(this.separateRecallAnswers(llmMessages));
 
       // Collapse consecutive same-participant messages for API compliance
       const collapsed = this.collapseConsecutiveMessages(split);
@@ -8527,8 +8550,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }],
     });
 
-    // Same bundled-tool-cycle defense as compressChunkHierarchical.
-    const split = splitMixedToolMessages(llmMessages);
+    // Same bundled-tool-cycle defense as compressChunkHierarchical, after the
+    // same separation of recall answers from the agent's raw turns: an L2
+    // target, or the raw middle, follows the last ladder answer.
+    const split = splitMixedToolMessages(this.separateRecallAnswers(llmMessages));
     const collapsed = this.collapseConsecutiveMessages(split);
     const cleaned = stripUnpairedToolBlocks(collapsed);
 
@@ -13212,6 +13237,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     lines.push('</earlier_in_conversation>');
     return lines.join('\n');
+  }
+
+  /**
+   * Put the Context Manager's resume turn (RECALL_RESUME_TEXT) right after
+   * each recall answer that the agent's own raw turn follows: in the L1
+   * prompt, an opened chunk or the raw middle that starts with the agent's
+   * turn; in a merge prompt, an L2 target or the raw middle that does. A
+   * recall answer is the message after a `[CM] Recall memory <id>.` header
+   * (recallHeaderId), and it is the agent's, so a next message of the
+   * answer's participant is what the collapse below joins to it, and the
+   * formatter at the wire. The turn goes in when the message right after the
+   * answer is of that participant, or the first one after it that has any
+   * content is: the request drops a message with no content left once its
+   * unpaired tool blocks and empty text are stripped (stripUnpairedToolBlocks,
+   * stripEmptyTextBlocks and the filter after them), which would bring the
+   * two together. Splitting and collapsing don't change which tool blocks are
+   * paired, so they're stripped here as the request will strip them. Any
+   * other sequence comes back with the same messages.
+   */
+  protected separateRecallAnswers(
+    messages: Array<{ participant: string; content: ContentBlock[] }>,
+  ): Array<{ participant: string; content: ContentBlock[] }> {
+    const carried = stripUnpairedToolBlocks(messages);
+    const hasContent = (i: number): boolean => stripEmptyTextBlocks(carried[i]!.content).length > 0;
+    const separated: Array<{ participant: string; content: ContentBlock[] }> = [];
+    messages.forEach((message, i) => {
+      separated.push(message);
+      if (i === 0 || recallHeaderId(messages[i - 1]!) === undefined) return;
+      let withContent = i + 1;
+      while (withContent < messages.length && !hasContent(withContent)) withContent++;
+      if (messages[i + 1]?.participant === message.participant || messages[withContent]?.participant === message.participant) {
+        separated.push({ participant: 'Context Manager', content: [{ type: 'text', text: RECALL_RESUME_TEXT }] });
+      }
+    });
+    return separated;
   }
 
   /**
