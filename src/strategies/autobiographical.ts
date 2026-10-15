@@ -48,7 +48,7 @@ import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
-import { Picker, OverBudgetError, UncoveredDropError, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
+import { Picker, OverBudgetError, UncoveredDropError, type OverBudgetClearedBy, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { KvUnifiedStrategy, type KvUnifiedReuse } from '../adaptive/strategies/kv-unified.js';
@@ -4560,10 +4560,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       };
     }
 
-    const needsCompression = this.chunks.some(
-      (c) => !c.compressed && this.isChunkOldEnough(c)
-    );
-    const needsMerge = this.config.hierarchical && this.mergeQueue.length > 0;
+    const { needsCompression, needsMerge } = this.outstandingCompressionWork();
 
     if ((needsCompression && this.compressionQueue.length > 0) || needsMerge) {
       const parts: string[] = [];
@@ -8336,6 +8333,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return { deepestAvailableLevel, summaryCountsByLevel };
   }
 
+  /** The work checkReadiness waits on: chunks old enough to compress, and merges queued. */
+  protected outstandingCompressionWork(): { needsCompression: boolean; needsMerge: boolean } {
+    return {
+      needsCompression: this.chunks.some((c) => !c.compressed && this.isChunkOldEnough(c)),
+      needsMerge: !!this.config.hierarchical && this.mergeQueue.length > 0,
+    };
+  }
+
+  /**
+   * A hierarchical refusal of history past the head clears by compression
+   * while there is work checkReadiness waits on: compressing a chunk replaces
+   * its raw messages with a summary, and a merge folds summaries into one.
+   */
+  protected hierarchicalClearedBy(): OverBudgetClearedBy[] {
+    if (this.pendingCompression) return ['compression'];
+    const { needsCompression, needsMerge } = this.outstandingCompressionWork();
+    return (needsCompression && this.compressionQueue.length > 0) || needsMerge ? ['compression'] : [];
+  }
+
   /** Attach common metadata; each internal refusal must also declare its count/depth meanings. */
   protected overBudgetError(
     budget: TokenBudget,
@@ -8423,10 +8439,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     if (headTokens + tailTokens > rejectionBudget) {
+      // Compression never touches the raw windows. A smaller recent window
+      // moves history into the foldable middle, which clears this when the
+      // head and the newest body (the least any window keeps) fit together and
+      // no compression hold is what keeps the window this large.
+      const newestBody = messages.length > 0 ? bodyBoundsIn(messages, messages.length - 1) : null;
+      let newestBodyTokens = 0;
+      if (newestBody) {
+        for (let i = Math.max(newestBody.from, headEnd); i <= newestBody.to; i++) {
+          newestBodyTokens += msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+        }
+      }
+      const heldOpen = recentStart < this.getUnheldRecentWindowStart(store);
       throw this.overBudgetError(budget, {
         stage: 'Head/tail reservation exceeded budget',
         budget: rejectionBudget,
         actual: headTokens + tailTokens,
+        clearedBy: headTokens + newestBodyTokens <= rejectionBudget && !heldOpen ? ['smaller-recent-window'] : [],
         diagnostics: {
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'unplanned',
@@ -8851,10 +8880,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // refusal so it takes the same fallback, and its preview says what the
     // real compile will do. If the retry at 1 is still over, it reports.
     const dryFallback = dryRun && this._calibrationProvisional !== null && this._calibration > 1;
+    // The plan's produce ops name summaries it still wants: producing them is
+    // how compression makes room for a deeper fold.
+    const planClearedBy: OverBudgetClearedBy[] = result.produced.length > 0 ? ['compression'] : [];
     if (result.finalTokens > rejectionBudget && (!dryRun || dryFallback)) {
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: result.finalTokens,
+        clearedBy: planClearedBy,
         diagnostics: {
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'planned',
@@ -8890,6 +8923,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         stage: 'Emission overran the plan (planner/emitter estimator drift)',
         budget: rejectionBudget,
         actual: attempted + tailTokens,
+        clearedBy: planClearedBy,
         diagnostics: {
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'planned',
@@ -9115,6 +9149,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         stage: 'Tail emission dropped reserved recent-window messages',
         budget: rejectionBudget,
         actual: totalTokens + tailTokens,
+        clearedBy: planClearedBy,
         diagnostics: {
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'planned',
@@ -9169,6 +9204,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           stage: 'Structural repair did not retain the newest turn',
           budget: rejectionBudget,
           actual: totalTokens + tailTokens,
+          // The newest turn is what's missing, and nothing but room for it
+          // brings it back: a newer message leaves it raw in the middle.
+          clearedBy: [],
           diagnostics: {
             middleCountUnit: 'picker-chunks',
             deepestLevelKind: 'planned',
@@ -10377,6 +10415,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           stage: 'Hierarchical emission overran the budget',
           budget: graceLimit,
           actual: totalTokens + tokens,
+          // The head is verbatim by definition: nothing but a larger budget
+          // clears it.
+          clearedBy: [],
           diagnostics: {
             middleCountUnit: 'selection-items',
             deepestLevelKind: 'attempted',
@@ -10709,6 +10750,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 stage: 'Hierarchical emission overran the budget',
                 budget: graceLimit,
                 actual: totalTokens + pairTokens,
+                clearedBy: this.hierarchicalClearedBy(),
                 diagnostics: {
                   middleCountUnit: 'selection-items',
                   deepestLevelKind: 'attempted',
@@ -10735,6 +10777,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 stage: 'Hierarchical emission overran the budget',
                 budget: graceLimit,
                 actual: totalTokens + tokens,
+                clearedBy: this.hierarchicalClearedBy(),
                 diagnostics: {
                   middleCountUnit: 'selection-items',
                   deepestLevelKind: 'attempted',
@@ -10812,6 +10855,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               stage: 'Hierarchical emission overran the budget',
               budget: graceLimit,
               actual: totalTokens + tokens,
+              clearedBy: this.hierarchicalClearedBy(),
               diagnostics: {
                 middleCountUnit: 'raw-messages',
                 deepestLevelKind: 'attempted',

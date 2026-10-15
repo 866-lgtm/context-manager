@@ -53,6 +53,20 @@ export interface OverBudgetDiagnostics {
 }
 
 /**
+ * What clears an over-budget refusal besides a larger budget, which clears any
+ * of them. The strategy that refuses sets it, since it knows which part of the
+ * context is over and what can shrink that part:
+ * - `'compression'`: the strategy still has summaries to produce or merge for
+ *   this context, and folding them in is how its compression makes room.
+ * - `'newer-message'`: the newest message alone is over the budget, and a
+ *   newer message moves the window past it.
+ * - `'smaller-recent-window'`: the raw recent window, which compression never
+ *   touches, is what's over the budget, and a smaller `recentWindowTokens`
+ *   moves that history into the part the strategy can fold.
+ */
+export type OverBudgetClearedBy = 'compression' | 'newer-message' | 'smaller-recent-window';
+
+/**
  * Error raised when the picker has folded everything it can and the
  * resulting context still exceeds the hard token budget.
  *
@@ -74,11 +88,18 @@ export class OverBudgetError extends Error {
   readonly actual: number;
   /** Diagnostic snapshot of the picker's final state. */
   readonly diagnostics: OverBudgetDiagnostics;
+  /**
+   * What clears this refusal besides a larger budget (see
+   * {@link OverBudgetClearedBy}). Empty when nothing else is known to clear it.
+   */
+  readonly clearedBy: readonly OverBudgetClearedBy[];
 
   constructor(opts: {
     budget: number;
     actual: number;
     diagnostics: OverBudgetError['diagnostics'];
+    /** What clears the refusal besides a larger budget; empty when left out. */
+    clearedBy?: readonly OverBudgetClearedBy[];
     /** Which stage refused — defaults to the plan-stage wording. Emission
      *  sites pass their own so a planner/emitter drift refusal doesn't
      *  masquerade as picker exhaustion (it cost a debugging session once). */
@@ -122,6 +143,7 @@ export class OverBudgetError extends Error {
     this.budget = opts.budget;
     this.actual = opts.actual;
     this.diagnostics = opts.diagnostics;
+    this.clearedBy = Object.freeze([...(opts.clearedBy ?? [])]);
   }
 }
 

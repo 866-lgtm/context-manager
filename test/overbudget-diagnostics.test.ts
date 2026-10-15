@@ -12,6 +12,8 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   level = 1;
   drift = false;
   useRealPicker = false;
+  /** When set, the fixture solver asks for an L1 over the middle, as a plan with summaries still to produce does. */
+  produce = false;
 
   seedPyramid(ids: string[], depth: number): void {
     for (let level = 1; level <= depth; level++) {
@@ -34,6 +36,7 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   protected buildPicker(inputs: PickerInputs): Picker {
     if (this.useRealPicker) return super.buildPicker(inputs);
     const level = this.level;
+    const produce = this.produce;
     class DriftPicker extends Picker {
       run(inputs: PickerInputs, budget: FoldingBudget) {
         const result = super.run(inputs, budget);
@@ -45,7 +48,9 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
       name: 'diagnostic-fixture',
       solve: (inputs) => ({
         frontier: new Map(inputs.chunks.map(chunk => [chunk.id, chunk.pinned || !chunk.l1Id ? 0 : level])),
-        produced: [],
+        produced: produce && inputs.chunks.length > 0
+          ? [{ level: 1, range: { firstChunkId: inputs.chunks[0].id, lastChunkId: inputs.chunks[inputs.chunks.length - 1].id } }]
+          : [],
       }),
     });
   }
@@ -96,6 +101,7 @@ describe('OverBudgetError diagnostics', () => {
         manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(200) }]);
         const error = await refusal(manager);
         checkBudget(error);
+        assert.deepEqual(error.clearedBy, [], 'the head alone is over: only a larger budget clears it');
         assert.equal(Reflect.get(error.diagnostics, 'deepestAvailableLevel'), 0);
         assert.deepEqual(Reflect.get(error.diagnostics, 'summaryCountsByLevel'), {});
         assert.match(error.message, /summary inventory: empty/);
@@ -126,6 +132,7 @@ describe('OverBudgetError diagnostics', () => {
       strategy.resetHeadWindow(ids[4]);
       const error = await refusal(manager);
       assert.equal(error.diagnostics.middleChunkCount, 4, 'the four messages before the reset head are middle too');
+      assert.deepEqual(error.clearedBy, [], 'the head alone is over');
       assert.equal(Reflect.get(error.diagnostics, 'deepestLevelKind'), 'unplanned');
       assert.match(error.message, /middle picker chunks=4/);
       assert.match(error.message, /fold plan=not computed/);
@@ -151,6 +158,7 @@ describe('OverBudgetError diagnostics', () => {
         strategy.seedPyramid(positionedRecallPairs ? ids : ids.slice(1), 1);
         const error = await refusal(manager);
         assert.equal(error.diagnostics.middleChunkCount, 1);
+        assert.deepEqual(error.clearedBy, [], 'no closed chunk waits for compression');
         assert.equal(Reflect.get(error.diagnostics, 'deepestLevelKind'), 'attempted');
         assert.equal(Reflect.get(error.diagnostics, 'middleCountUnit'), positionedRecallPairs ? 'selection-items' : 'raw-messages');
         assert.match(error.message, positionedRecallPairs
@@ -181,6 +189,7 @@ describe('OverBudgetError diagnostics', () => {
         const error = await refusal(manager);
         checkBudget(error);
         assert.equal(error.diagnostics.deepestLevel, level);
+        assert.deepEqual(error.clearedBy, [], 'the plan has no summaries left to produce');
         assert.equal(Reflect.get(error.diagnostics, 'deepestAvailableLevel'), 5);
         assert.deepEqual(Reflect.get(error.diagnostics, 'summaryCountsByLevel'), { 1: 1, 2: 1, 3: 1, 4: 1, 5: 1 });
         assert.equal(error.diagnostics.middleChunkCount, 12);
@@ -211,6 +220,7 @@ describe('OverBudgetError diagnostics', () => {
       const error = await refusal(manager);
       assert.match(error.message, /^Emission overran the plan/);
       checkBudget(error);
+      assert.deepEqual(error.clearedBy, [], 'the plan has no summaries left to produce');
       assert.equal(error.diagnostics.deepestLevel, 5, 'the first raw emission fails, but the complete plan reaches L5');
       assert.equal(Reflect.get(error.diagnostics, 'deepestLevelKind'), 'planned');
       assert.match(error.message, /deepest planned level=L5/);
@@ -254,5 +264,94 @@ describe('OverBudgetError diagnostics', () => {
     assert.match(error.message, /deepest fold level=L0/);
     assert.doesNotMatch(error.message, /planned|attempted|picker chunks/);
     assert.doesNotMatch(error.message, /available|inventory|configured|undefined/);
+  });
+});
+
+describe('OverBudgetError.clearedBy', () => {
+  it('is empty and frozen when the thrower names nothing', () => {
+    const error = new OverBudgetError({
+      budget: 10,
+      actual: 20,
+      diagnostics: { headTokens: 0, tailTokens: 20, middleTokens: 0, middleChunkCount: 0, deepestLevel: 0 },
+    });
+    assert.deepEqual(error.clearedBy, []);
+    assert.ok(Object.isFrozen(error.clearedBy));
+  });
+
+  const recentOnly = (recentWindowTokens: number) => new AutobiographicalStrategy({
+    adaptiveResolution: true,
+    headWindowTokens: 0,
+    recentWindowTokens,
+    overBudgetGraceRatio: 0.25,
+    autoTickOnNewMessage: false,
+    speculativeProduction: false,
+  });
+
+  it('names a smaller recent window when the raw recent window is what is over and the newest message fits', async () => {
+    await withManager(recentOnly(100_000), async (manager) => {
+      for (let i = 0; i < 6; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+      assert.deepEqual(error.clearedBy, ['smaller-recent-window']);
+    });
+  });
+
+  it('names nothing when the newest message alone is over, since no window keeps less', async () => {
+    await withManager(recentOnly(100_000), async (manager) => {
+      manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(10) }]);
+      manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(200) }]);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+      assert.deepEqual(error.clearedBy, []);
+    });
+  });
+
+  it('names nothing when a compression hold is what keeps the recent window this large', async () => {
+    await withManager(recentOnly(60), async (manager) => {
+      const ids = Array.from({ length: 6 }, (_, i) =>
+        manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+      manager.holdCompression([ids[0]], { timeoutMs: 60_000 });
+      const error = await refusal(manager);
+      assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+      assert.deepEqual(error.clearedBy, []);
+      manager.releaseCompression([ids[0]]);
+    });
+  });
+
+  it('names compression when the plan still has summaries to produce', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: true,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    strategy.produce = true;
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Adaptive picker exhausted/);
+      assert.deepEqual(error.clearedBy, ['compression']);
+    });
+  });
+
+  it('names compression for a hierarchical refusal of history that chunks waiting for compression cover', async () => {
+    const strategy = new AutobiographicalStrategy({
+      adaptiveResolution: false,
+      targetChunkTokens: 40,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      assert.equal(strategy.checkReadiness().ready, false, 'chunks are waiting for compression');
+      const error = await refusal(manager);
+      assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assert.deepEqual(error.clearedBy, ['compression']);
+    });
   });
 });
