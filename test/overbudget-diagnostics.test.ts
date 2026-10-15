@@ -14,6 +14,22 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   useRealPicker = false;
   /** When set, the fixture solver asks for an L1 over the middle, as a plan with summaries still to produce does. */
   produce = false;
+  /** Holds the drain at the speculative cap, as unmerged L1s past maxSpeculativeL1s do. */
+  atCap = false;
+
+  protected isAtSpeculativeCap(): boolean {
+    return this.atCap || super.isAtSpeculativeCap();
+  }
+
+  /** Marks a compression as running, as tick does while one is in flight. */
+  startCompressing(): void {
+    this.pendingCompression = Promise.resolve();
+  }
+
+  /** Queues a merge, as a merge produce op or the merge threshold does. */
+  queueMerge(): void {
+    this.enqueueMerge({ level: 2, sourceIds: ['L1-queued-a', 'L1-queued-b'] });
+  }
 
   seedPyramid(ids: string[], depth: number): void {
     for (let level = 1; level <= depth; level++) {
@@ -67,9 +83,9 @@ async function withManager(strategy: AutobiographicalStrategy, run: (manager: Co
   }
 }
 
-async function refusal(manager: ContextManager): Promise<OverBudgetError> {
+async function refusal(manager: ContextManager, opts?: { dryRun?: boolean }): Promise<OverBudgetError> {
   try {
-    await manager.compile({ maxTokens: 100, reserveForResponse: 20 });
+    await manager.compile({ maxTokens: 100, reserveForResponse: 20 }, undefined, opts);
     assert.fail('compile should refuse');
   } catch (error) {
     assert.ok(error instanceof OverBudgetError);
@@ -250,6 +266,7 @@ describe('OverBudgetError diagnostics', () => {
       const error = await refusal(manager);
       const escalation = logs.find(line => line.startsWith('[kv-escalation]'));
       assert.ok(escalation, 'fixture must exercise an actual solver override');
+      assert.deepEqual(error.clearedBy, [], 'no closed chunk waits for compression');
       assert.match(escalation, new RegExp(`deepestPlannedLevel=L${error.diagnostics.deepestLevel}`));
       assert.match(escalation, /deepestAvailableLevel=L5/);
     });
@@ -296,7 +313,7 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
-  it('names nothing when the newest message alone is over, since no window keeps less', async () => {
+  it('names nothing when the newest message alone is over, since it stays raw whatever the window', async () => {
     await withManager(recentOnly(100_000), async (manager) => {
       manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(10) }]);
       manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(200) }]);
@@ -330,8 +347,34 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
-  for (const [closed, expected] of [[true, ['compression']], [false, []]] as const) {
-    it(`names compression for a plan with summaries to produce only when chunks are there to make them (${closed ? 'closed chunks' : 'the unclosed trailing span'})`, async () => {
+  it('prices the least raw tail as the cap prices it, and names a smaller window when the head and that tail just fit', async () => {
+    const strategy = new AutobiographicalStrategy({
+      adaptiveResolution: true,
+      headWindowTokens: 0,
+      recentWindowTokens: 100_000,
+      maxMessageTokens: 50,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    await withManager(strategy, async (manager) => {
+      // Each message is over the cap, so each costs exactly 50 + 50 tokens:
+      // the newest alone is the whole 100-token budget, and six are over it.
+      for (let i = 0; i < 6; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+      assert.equal(error.budget, 100);
+      assert.equal(error.diagnostics.tailTokens, 600);
+      assert.deepEqual(error.clearedBy, ['smaller-recent-window']);
+    });
+  });
+
+  for (const [closed, produce, expected] of [
+    [true, true, ['compression']],
+    [false, true, []],
+    [true, false, []],
+  ] as const) {
+    it(`names compression for the picker only when its plan has summaries to produce and chunks are there to make them (${closed ? 'closed chunks' : 'the unclosed trailing span'}, ${produce ? 'summaries to produce' : 'none to produce'})`, async () => {
       const strategy = new DiagnosticStrategy({
         adaptiveResolution: true,
         // Small chunks close as messages arrive; large ones leave every message
@@ -343,7 +386,7 @@ describe('OverBudgetError.clearedBy', () => {
         autoTickOnNewMessage: false,
         speculativeProduction: false,
       });
-      strategy.produce = true;
+      strategy.produce = produce;
       await withManager(strategy, async (manager) => {
         for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
         const error = await refusal(manager);
@@ -352,6 +395,54 @@ describe('OverBudgetError.clearedBy', () => {
       });
     });
   }
+
+  it('names compression at the emission refusal while its plan has summaries to produce and a compression runs', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: true,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    strategy.drift = true;
+    strategy.level = 5;
+    strategy.produce = true;
+    await withManager(strategy, async (manager) => {
+      manager.addMessage('user', [{ type: 'text', text: 'raw '.repeat(200) }]);
+      const id = manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(200) }]);
+      strategy.seedPyramid([id], 5);
+      strategy.startCompressing();
+      const error = await refusal(manager);
+      assert.match(error.message, /^Emission overran the plan/);
+      assert.deepEqual(error.clearedBy, ['compression']);
+    });
+  });
+
+  it('names compression in a dry run only for work queued without its plan\'s ops', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: true,
+      targetChunkTokens: 40,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    strategy.drift = true;
+    strategy.produce = true;
+    await withManager(strategy, async (manager) => {
+      // One closed chunk, which the holdback keeps out of the queue until a
+      // produce op demands it. A dry run never enqueues its plan's ops.
+      for (let i = 0; i < 6; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const dry = await refusal(manager, { dryRun: true });
+      assert.match(dry.message, /^Emission overran the plan/);
+      assert.deepEqual(dry.clearedBy, []);
+      const live = await refusal(manager);
+      assert.match(live.message, /^Emission overran the plan/);
+      assert.deepEqual(live.clearedBy, ['compression'], 'the live compile demands the chunk first');
+    });
+  });
 
   it('names compression for a hierarchical refusal of history that chunks waiting for compression cover', async () => {
     const strategy = new AutobiographicalStrategy({
@@ -371,4 +462,58 @@ describe('OverBudgetError.clearedBy', () => {
       assert.deepEqual(error.clearedBy, ['compression']);
     });
   });
+
+  for (const positionedRecallPairs of [true, false]) {
+    for (const work of ['running', 'merge'] as const) {
+      it(`names compression at the hierarchical ${positionedRecallPairs ? 'recall pair' : 'raw-message fallback'} refusal while ${work === 'running' ? 'a compression runs' : 'a merge is queued'}`, async () => {
+        const strategy = new DiagnosticStrategy({
+          adaptiveResolution: false,
+          hierarchical: true,
+          positionedRecallPairs,
+          targetChunkTokens: 100_000,
+          headWindowTokens: 0,
+          recentWindowTokens: 0,
+          overBudgetGraceRatio: 0.25,
+          autoTickOnNewMessage: false,
+          speculativeProduction: false,
+        });
+        await withManager(strategy, async (manager) => {
+          const ids = Array.from({ length: 2 }, (_, i) =>
+            manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+          strategy.seedPyramid(positionedRecallPairs ? ids : ids.slice(1), 1);
+          if (work === 'running') strategy.startCompressing();
+          else strategy.queueMerge();
+          const error = await refusal(manager);
+          assert.match(error.message, positionedRecallPairs
+            ? /selected middle representations=1, attempted representation level=L1/
+            : /middle raw messages=1, attempted representation level=L0/);
+          assert.deepEqual(error.clearedBy, ['compression']);
+        });
+      });
+    }
+  }
+
+  for (const merge of [false, true]) {
+    it(`names ${merge ? 'compression' : 'nothing'} for queued chunks the speculative cap holds ${merge ? 'when a merge is queued to relieve it' : 'with no merge queued'}`, async () => {
+      const strategy = new DiagnosticStrategy({
+        adaptiveResolution: false,
+        hierarchical: true,
+        targetChunkTokens: 40,
+        headWindowTokens: 0,
+        recentWindowTokens: 0,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+      });
+      strategy.atCap = true;
+      await withManager(strategy, async (manager) => {
+        for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+        if (merge) strategy.queueMerge();
+        assert.equal(strategy.checkReadiness().ready, false, 'chunks are queued');
+        const error = await refusal(manager);
+        assert.match(error.message, /^Hierarchical emission overran the budget/);
+        assert.deepEqual(error.clearedBy, merge ? ['compression'] : []);
+      });
+    });
+  }
 });

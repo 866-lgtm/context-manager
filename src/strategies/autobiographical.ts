@@ -8343,14 +8343,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Whether compression has work running or queued that would shrink the
-   * context: what checkReadiness waits on (a chunk to compress, a merge), or
-   * compression in flight. Compressing a chunk replaces its raw messages with
-   * a summary, and a merge folds summaries into one.
+   * context: compression in flight, a merge queued, or a chunk queued to
+   * compress while the speculative cap lets the drain take it. That's what
+   * checkReadiness waits on, less the chunks the cap holds: at the cap, tick
+   * runs only merges, and a merge is what relieves the cap. Compressing a
+   * chunk replaces its raw messages with a summary, and a merge folds
+   * summaries into one.
    */
   protected compressionWorkQueued(): boolean {
     if (this.pendingCompression) return true;
     const { needsCompression, needsMerge } = this.outstandingCompressionWork();
-    return (needsCompression && this.compressionQueue.length > 0) || needsMerge;
+    if (needsMerge) return true;
+    return needsCompression && this.compressionQueue.length > 0 && !this.isAtSpeculativeCap();
   }
 
   /** Attach common metadata; each internal refusal must also declare its count/depth meanings. */
@@ -8442,9 +8446,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (headTokens + tailTokens > rejectionBudget) {
       // Compression never touches the raw windows. A smaller recent window
       // moves history into the foldable middle, which clears this when the
-      // head fits beside the least tail a smaller window keeps: no window
+      // head fits beside the least raw tail any window leaves: no window
       // starts after a compression hold (getRecentWindowStart), and the newest
-      // body stays raw wherever it lands, so count from the earlier of the two.
+      // body stays raw whatever the window, so count from the earlier of the
+      // two, and never from inside the head.
       const newestBody = messages.length > 0 ? bodyBoundsIn(messages, messages.length - 1) : null;
       let floorTokens = 0;
       if (newestBody) {
@@ -8885,7 +8890,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The plan's produce ops name summaries it still wants, and producing them
     // is how compression makes room for a deeper fold, but only once there is
     // work to make them: an op over the unclosed trailing span enqueues
-    // nothing (enqueueL1ForRange), and a dry run enqueues nothing at all.
+    // nothing (enqueueL1ForRange). A dry run doesn't enqueue the ops at all.
+    // It still sees what's queued, the chunks its own rebuildChunks closed
+    // included, so it names compression as the live compile does, unless the
+    // work is only what the ops would add: the newest closed chunks, which the
+    // holdback (l1HoldbackChunks) keeps out of the queue until they're
+    // demanded, or a merge. There a dry run names nothing.
     const planClearedBy: OverBudgetClearedBy[] =
       result.produced.length > 0 && this.compressionWorkQueued() ? ['compression'] : [];
     if (result.finalTokens > rejectionBudget && (!dryRun || dryFallback)) {
@@ -10420,8 +10430,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           stage: 'Hierarchical emission overran the budget',
           budget: graceLimit,
           actual: totalTokens + tokens,
-          // The head is verbatim by definition: nothing but a larger budget
-          // clears it.
+          // The head is verbatim by definition, and its size is cold
+          // configuration (headWindowTokens isn't a hot setting): at run time
+          // nothing but a larger budget clears it.
           clearedBy: [],
           diagnostics: {
             middleCountUnit: 'selection-items',

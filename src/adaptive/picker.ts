@@ -53,16 +53,24 @@ export interface OverBudgetDiagnostics {
 }
 
 /**
- * What clears an over-budget refusal besides a larger budget, which clears any
- * of them. The strategy that refuses sets it, since it knows which part of the
- * context is over and what can shrink that part:
- * - `'compression'`: the strategy still has summaries to produce or merge for
- *   this context, and folding them in is how its compression makes room.
+ * What clears an over-budget refusal at run time besides a larger budget,
+ * which clears any of them: waiting, or a hot setting. Cold configuration,
+ * such as the head window's size, isn't named. The strategy that refuses sets
+ * it, since it knows which part of the context is over and what can shrink
+ * that part:
+ * - `'compression'`: compression work that would shrink this context is
+ *   running or queued: a compression in flight, a merge queued, or a chunk
+ *   queued that the speculative cap lets the drain take. For the adaptive
+ *   picker's refusals, its plan must also still have summaries to produce.
+ *   Whether that work is enough to fit isn't checked.
  * - `'newer-message'`: the newest message alone is over the budget, and a
- *   newer message moves the window past it.
+ *   newer message that fits moves the window past it.
  * - `'smaller-recent-window'`: the raw recent window, which compression never
- *   touches, is what's over the budget, and a smaller `recentWindowTokens`
- *   moves that history into the part the strategy can fold.
+ *   touches, is what's over the budget, and the head fits beside the least
+ *   raw tail any window leaves: from the newest message, or from a
+ *   compression hold if one starts earlier. A smaller `recentWindowTokens`
+ *   (the hot `tailTokens`) moves the rest into the part the strategy can
+ *   fold.
  *
  * Each list describes the refusal that was hit. Clearing it can bring the
  * next one: a smaller recent window can leave the picker waiting for
@@ -93,7 +101,7 @@ export class OverBudgetError extends Error {
   /** Diagnostic snapshot of the picker's final state. */
   readonly diagnostics: OverBudgetDiagnostics;
   /**
-   * What clears this refusal besides a larger budget (see
+   * What clears this refusal at run time besides a larger budget (see
    * {@link OverBudgetClearedBy}). Empty when nothing else is known to clear it.
    */
   readonly clearedBy: readonly OverBudgetClearedBy[];

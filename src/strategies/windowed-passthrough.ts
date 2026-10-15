@@ -310,7 +310,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         actual: total,
         stage: 'Windowed passthrough: the newest message alone',
         // No compression here: the window moves past this message once a
-        // newer one arrives (the progress clause above).
+        // newer one that fits arrives (the progress clause above).
         clearedBy: ['newer-message'],
         diagnostics: {
           headTokens: 0,

@@ -349,7 +349,7 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     manager.addMessage('u', text('x'.repeat(2000))); // ~500 tokens
     await assert.rejects(manager.compile(budget), (err: Error) => {
       assert.ok(err instanceof OverBudgetError);
-      // No compression here: only a newer message, or a larger budget, clears it.
+      // No compression here: only a newer message that fits, or a larger budget, clears it.
       assert.deepStrictEqual(err.clearedBy, ['newer-message']);
       return true;
     });
