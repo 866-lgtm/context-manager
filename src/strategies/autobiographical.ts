@@ -822,6 +822,10 @@ function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?
   return maxLevel !== undefined ? { maxLevel } : {};
 }
 
+/** The fold bound a pinned message position resolves to (the strategy's
+ *  `resolvedPinBounds`): raw, a fixed level, or a depth cap. */
+export type ResolvedPinBound = 'raw' | { level: number } | { maxLevel: number };
+
 /**
  * Drop empty text blocks (`{type:'text', text:''}` or whitespace-only). The
  * Anthropic API rejects them with 400 "text content blocks must be non-empty",
@@ -2280,9 +2284,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * V2 dynamic pin-at-level-k convenience: fix a range to render at EXACTLY
-   * fold level `level` (0 = raw). Honored only by `foldingStrategy: 'kv-stable'`;
-   * other strategies fall back to treating the range as raw. Equivalent to
-   * `pinRange(first, last, { level })`.
+   * fold level `level` (0 = raw). Honored by `foldingStrategy: 'kv-stable'`
+   * and `'kv-unified'` with adaptive resolution; under any other selector the
+   * range is raw (`resolvedPinBounds`), in the live view and in the canonical
+   * L1 compression prompt where its budgets allow (see
+   * `compressionRecallBudgetTokens`).
+   * Equivalent to `pinRange(first, last, { level })`.
    */
   pinAtLevel(firstMessageId: string, lastMessageId: string, level: number, opts?: { name?: string }): string {
     return this.pinRange(firstMessageId, lastMessageId, { name: opts?.name, level });
@@ -2492,12 +2499,60 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Resolve the V2 dynamic-pin fold-depth bounds (`ProtectedRange.level` /
-   * `maxLevel`) to message positions. Only pins that carry a bound appear; a
+   * The fold bound each pinned message position resolves to, decided once
+   * for compression and every selector: raw, a fixed level, or a depth cap.
+   * Bounds (`ProtectedRange.level` / `maxLevel`) are honored only by the
+   * folding strategies that read them, `kv-stable` and `kv-unified`. Under
+   * every other selector, and without adaptive resolution, a pinned position
+   * is raw, as `pinAtLevel` documents. Where pins overlap at one position,
+   * kv-stable's reading applies: a bound there takes the place of a classic
+   * pin, a fixed level takes the place of a cap, and within each kind the
+   * lowest wins (`pinLevelBounds`). A level or cap of 0 is raw
+   * (`isRawPinBound`).
+   */
+  protected resolvedPinBounds(messages: StoredMessage[]): Map<number, ResolvedPinBound> {
+    const out = new Map<number, ResolvedPinBound>();
+    const pinned = this.pinnedPositions(messages);
+    if (pinned.size === 0) return out;
+    const bounds = this.readsPinBounds() ? this.pinLevelBounds(messages) : undefined;
+    for (const position of pinned) {
+      const bound = bounds?.get(position);
+      if (bound?.level !== undefined) out.set(position, { level: bound.level });
+      else if (bound?.maxLevel !== undefined) out.set(position, { maxLevel: bound.maxLevel });
+      else out.set(position, 'raw');
+    }
+    return out;
+  }
+
+  /** Whether this selector reads pin bounds (`ProtectedRange.level` /
+   *  `maxLevel`): `kv-stable` and `kv-unified`, with adaptive resolution. */
+  protected readsPinBounds(): boolean {
+    return !!this.config.adaptiveResolution &&
+      (this.config.foldingStrategy === 'kv-stable' || this.config.foldingStrategy === 'kv-unified');
+  }
+
+  /** Whether a resolved pin bound keeps its message raw: a classic pin, or a
+   *  level or cap of 0. */
+  static isRawPinBound(bound: ResolvedPinBound): boolean {
+    if (bound === 'raw') return true;
+    return 'level' in bound ? bound.level === 0 : bound.maxLevel === 0;
+  }
+
+  /** Positions of the messages that pins keep raw (`resolvedPinBounds`). */
+  protected forceRawPinPositions(messages: StoredMessage[]): Set<number> {
+    const out = new Set<number>();
+    for (const [position, bound] of this.resolvedPinBounds(messages)) {
+      if (AutobiographicalStrategy.isRawPinBound(bound)) out.add(position);
+    }
+    return out;
+  }
+
+  /**
+   * The V2 dynamic-pin fold-depth bounds (`ProtectedRange.level` /
+   * `maxLevel`) by message position. Only pins that carry a bound appear; a
    * classic raw pin (no bound) is absent here and handled by `pinnedPositions`.
-   * When ranges overlap, the FINEST requirement wins (lowest effective level):
-   * a fixed `level` clamps both ends; a `maxLevel` only caps depth. Honored
-   * solely by the KV-stable controller — see `ProtectedRange`.
+   * Where bounded pins overlap, the lowest fixed level and the lowest cap are
+   * kept; `resolvedPinBounds` decides between them and a classic pin.
    */
   protected pinLevelBounds(messages: StoredMessage[]): Map<number, { level?: number; maxLevel?: number }> {
     const out = new Map<number, { level?: number; maxLevel?: number }>();
@@ -5978,8 +6033,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // There is intentionally NO tail_after_chunk: that would leak
     // future information into the model's KV state and corrupt the
     // as-of framing of memory formation.
-    const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
-
     const allMessages = ctx.messageStore.getAll();
     const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
     // Compression holds: provisional content never enters a prompt, not even
@@ -6006,212 +6059,368 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const messageOrder = new Map<MessageId, number>(
       allMessages.map((message, index) => [message.id, index]),
     );
-    const priorSummaries = this.summaries
-      // Skip empty-content summaries: emitting `{type:'text', text:''}` as a
-      // recall pair triggers Anthropic 400 "text content blocks must be
-      // non-empty", which stalls ALL compression (mirrors the render-path guard
-      // + load-drop). A single empty summary otherwise poisons every compression.
-      .filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0)
-      .sort((a, b) => {
-        const aOrder = messageOrder.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
-        const bOrder = messageOrder.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
-        return aOrder - bOrder || a.sourceRange.first.localeCompare(b.sourceRange.first);
-      });
-
-    // Leaf message coverage of every live summary — the rendering
-    // authority for the one-to-one invariant: a message covered by a
-    // live summary is represented by its recall pair, never raw. Uses
-    // the FULL priorSummaries set (not the budget-capped keptSummaries):
-    // a budget-dropped summary doesn't make its raw messages reappear.
-    // Expand summary sourceIds down to leaf message IDs — an L2's
-    // sourceIds are L1 IDs, not message IDs; a flat walk would miss
-    // every message it transitively covers (Bug 10). Also expand merged
-    // L1s as defense in depth.
+    // Pins in the canonical L1 prompt. The live view shows a message that a
+    // pin keeps raw (forceRawPinPositions) raw, so this prompt does too. A
+    // frontier summary that can't be shown as a recall pair (it covers such a
+    // message, or its content is empty) is DESCENDED, not dropped: its
+    // children take its place, so only the branch holding the pin opens,
+    // sibling branches stay recall pairs, and the raw a pin adds is its own
+    // L1 chunk. This mirrors the live selector (kv-control keeps protected
+    // raw leaves beside their group's recall). Dropping the whole frontier
+    // summary instead replayed an entire L3/L4 raw on every L1 while one pin
+    // existed.
+    //
+    // The L1s a pin opens are recorded (openedChunks). Their messages render
+    // raw wherever they lie before the chunk, including before the head
+    // window; the head window always comes first, and after it they go in
+    // source order with the recall pairs (section 2). Only they lose
+    // coverage, so a merged L1 the descent can't reach (a parent whose
+    // sourceIds miss it) stays covered, as on main, unless a pin opens it.
+    // The raw that pins add is spent from the recall budget (below).
+    //
+    // Scope: the canonical L1 prompt, and only pins before the chunk. Merge
+    // recall, L3+ merge inputs and transition summaries do not consult pins,
+    // and the source-only L1 shows no history for them to change.
     const summariesById = new Map<string, SummaryEntry>();
     for (const s of this.summaries) summariesById.set(s.id, s);
-    const priorSummaryMessageIds = new Set<MessageId>();
-    for (const s of this.summaries) {
-      if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
-    }
-    for (const s of priorSummaries) {
-      this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
-    }
+    // Priced as the store prices a message, images and tool blocks included,
+    // under every selector (the strategy's own estimator falls back to text
+    // alone outside adaptive selection).
+    const tokensOf = (content: ContentBlock[]): number =>
+      ctx.messageStore.estimateTokens({ content } as unknown as StoredMessage);
 
-    // ---- 1. Head window (raw, FIRST, ownership-capped) ----
-    //
-    // The head is the foundational identity anchor: the actual opening
-    // of the chronicle (the user's first message, the agent's first
-    // reply, the system context if any). It establishes WHO is speaking
-    // to WHOM. Without it, when the chunk content is heavily first-person
-    // from someone other than the agent (e.g., a user-shared document),
-    // the agent loses its first-person grounding and drifts into the
-    // content author's voice.
-    //
-    // The head is the configured head window — not "everything before
-    // the chunk." For doc-heavy chronicles, "everything before" would
-    // be hundreds of thousands of tokens; the recall pairs below
-    // represent that intermediate content. The head is just the
-    // permanent prefix that the original instance always saw.
-    //
-    // ONE-TO-ONE INVARIANT: chunk records (and the summaries over them)
-    // are the persistent authority over how a message is represented.
-    // The token-derived head boundary is only chunking *policy* — it is
-    // recomputed from the live estimator on every call and is NOT stable
-    // (estimator changes move it; transient headWindowTokens<=0 states
-    // let sweeps take ownership of head messages; store surgery can do
-    // the same — all observed in production, see issue #42). When the
-    // two authorities disagree, ownership wins: a head-range message
-    // covered by a live summary renders via its recall pair below, not
-    // raw. Rendering it both ways duplicated the seed in every payload.
     // Residence-scoped source-only L1 compression (see `compressionSourceOnly`
-    // in strategy config). When on, sections 1 (head), 2 (recall), and 3 (raw
-    // middle) below are skipped structurally — the summarizer receives ONLY the
-    // marker + exact target chunk + directive (sections 4–6). Tools stay
-    // declared (reasoning_extraction guard). L1 only; merge/transition paths do
-    // not consult this flag.
+    // in strategy config). When on, sections 1 (head) and 2 (recall pairs and
+    // raw middle) below are skipped structurally — the summarizer receives
+    // ONLY the marker + exact target chunk + directive (sections 4–6). Tools
+    // stay declared (reasoning_extraction guard). L1 only; merge/transition
+    // paths do not consult this flag.
     const sourceOnly = this.config.compressionSourceOnly === true;
-    let headCoveredSkipped = 0;
-    for (let i = headStartIdx; !sourceOnly && i < headEndIdx && i < allMessages.length; i++) {
-      const m = allMessages[i];
-      if (priorSummaryMessageIds.has(m.id)) {
-        headCoveredSkipped++;
-        continue;
-      }
-      llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
-    }
-    if (headCoveredSkipped > 0) {
-      console.warn(
-        `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries; ` +
-          `rendering them via recall pairs (ownership wins). The token-derived head boundary ` +
-          `disagrees with chunk ownership — likely store surgery or head-boundary drift.`,
-      );
-      logCompressionCall({
-        event: 'head-ownership-overlap',
-        site: 'compression',
-        skipped: headCoveredSkipped,
-        headStartIdx,
-        headEndIdx,
-      });
-    }
-
-    // ---- 2. Prior recall pairs (budget-capped) ----
-
-    // Token-budget cap (see capRecallPairs). Defense-in-depth: even with
-    // merged exclusion the unmerged frontier can be large at extreme scale.
-    // Source-only mode uses a zero recall budget: capRecallPairs returns an
-    // empty set, so no recall pair is emitted below AND buildRecallCurveVariants
-    // has no frontier to expand (canonical-only, one call).
-    const recallBudget = sourceOnly ? 0 : (this.config.compressionRecallBudgetTokens ?? 100_000);
-    const { kept: keptSummaries, keptTokens: recallTokens } = this.capRecallPairs(
-      priorSummaries,
-      recallBudget,
-    );
-    if (!sourceOnly && keptSummaries.length < priorSummaries.length) {
-      const dropped = priorSummaries.length - keptSummaries.length;
-      console.warn(
-        `autobio: compression recall-pair budget capped (${keptSummaries.length}/${priorSummaries.length} summaries kept, ` +
-          `~${recallTokens} tokens, budget ${recallBudget}; ${dropped} oldest dropped this compression).`,
-      );
-      logCompressionCall({
-        event: 'recall-budget-capped',
-        site: 'compression',
-        kept: keptSummaries.length,
-        total: priorSummaries.length,
-        tokens: recallTokens,
-        budgetTokens: recallBudget,
-      });
-    }
-
-    for (const s of keptSummaries) {
-      llmMessages.push({
-        participant: 'Context Manager',
-        content: [{ type: 'text', text: `[CM] Recall memory ${s.id}.` }],
-      });
-      // Recall answers carry the summary's verbatim reasoning carriers
-      // (signed thinking) when captured — validated 2026-07-16 on a
-      // deterministically-refusing mythos compress request: text-only →
-      // reasoning_extraction refusal; with carriers → end_turn. Replaying
-      // the model's own text WITH its encrypted reasoning reads as its own
-      // history rather than harvested output, the same KV-honesty argument
-      // as declaring tools. Raw message thinking is still stripped at
-      // insertion (unvalidated: the API rejects thinking blocks whose turn
-      // shape was modified, and split/collapse rewrites raw turns).
-      llmMessages.push({
-        participant: agentParticipant,
-        content: this.summaryAnswerContent(s),
-      });
-    }
-
-    // ---- 3. Raw middle ----
-    // Any raw messages between the head and the chunk that aren't yet
-    // represented by any summary — usually empty in adaptive-resolution
-    // mode, since chunking proceeds contiguously and summaries cover
-    // everything up to the chunk being processed. Same one-to-one rule
-    // as the head: coverage is judged against `priorSummaryMessageIds`
-    // (all live summaries, not the budget-capped keptSummaries).
     const chunkFirstId = chunk.messages[0]?.id;
-    if (chunkFirstId && !sourceOnly) {
-      const chunkStartIdx = allMessages.findIndex((m) => m.id === chunkFirstId);
-      for (let i = headEndIdx; i < chunkStartIdx && i < allMessages.length; i++) {
-        const m = allMessages[i];
-        if (priorSummaryMessageIds.has(m.id)) continue;
-        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+    const chunkStartIdx = chunkFirstId ? allMessages.findIndex((m) => m.id === chunkFirstId) : -1;
+
+    // History before the chunk, laid out for the messages that pins keep raw.
+    const layoutHistory = (forceRawMessageIds: ReadonlySet<MessageId>) => {
+      const holdsForceRaw = (summary: SummaryEntry): boolean => {
+        if (forceRawMessageIds.size === 0) return false;
+        const leaves = new Set<MessageId>();
+        this.expandSummaryToLeafMessageIds(summary, summariesById, leaves);
+        for (const id of leaves) if (forceRawMessageIds.has(id)) return true;
+        return false;
+      };
+      // Skip empty-content summaries as recall pairs: emitting `{type:'text',
+      // text:''}` triggers Anthropic 400 "text content blocks must be
+      // non-empty", which stalls ALL compression (mirrors the render-path
+      // guard + load-drop). They are descended like pinned ones, so their
+      // children still represent the span. An empty L1 that holds no pin
+      // stays covered.
+      const mixedFrontier: SummaryEntry[] = [];
+      const openedChunks: SummaryEntry[] = [];
+      // Each summary is visited once: a persisted cycle in sourceIds would
+      // otherwise recurse until the stack overflows.
+      const descended = new Set<string>();
+      const descend = (s: SummaryEntry): void => {
+        if (descended.has(s.id)) return;
+        descended.add(s.id);
+        const pinned = holdsForceRaw(s);
+        if (!pinned && !!s.content && s.content.trim().length > 0) {
+          mixedFrontier.push(s);
+          return;
+        }
+        if (s.level <= 1) {
+          if (pinned) openedChunks.push(s);
+          return;
+        }
+        for (const childId of s.sourceIds) {
+          const child = summariesById.get(childId);
+          if (child) descend(child);
+        }
+      };
+      for (const s of this.summaries) if (!s.mergedInto) descend(s);
+      // A pinned message the descent didn't reach (its L1's parent doesn't
+      // list it) opens that L1 too, so a pin holds whatever the linkage.
+      if (forceRawMessageIds.size > 0) {
+        const reached = new Set<MessageId>();
+        for (const s of mixedFrontier) this.expandSummaryToLeafMessageIds(s, summariesById, reached);
+        for (const s of openedChunks) this.expandSummaryToLeafMessageIds(s, summariesById, reached);
+        const unreached = new Set([...forceRawMessageIds].filter((id) => !reached.has(id)));
+        if (unreached.size > 0) {
+          for (const s of this.summaries) {
+            if (s.level === 1 && !openedChunks.includes(s) && s.sourceIds.some((id) => unreached.has(id))) {
+              openedChunks.push(s);
+            }
+          }
+        }
       }
-    }
+      const priorSummaries = mixedFrontier
+        .sort((a, b) => {
+          const aOrder = messageOrder.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+          const bOrder = messageOrder.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+          return aOrder - bOrder || a.sourceRange.first.localeCompare(b.sourceRange.first);
+        });
 
-    // ---- 4. In-band marker ----
-    // Structural start of the exact source-only shape. Never recover this by
-    // searching text: the target itself may quote the marker.
-    const sourceOnlyStartIndex = llmMessages.length;
-    llmMessages.push({
-      participant: 'Context Manager',
-      content: [{ type: 'text', text: COMPRESSION_MARKER }],
-    });
+      // Leaf message coverage — the rendering authority for the one-to-one
+      // invariant: a covered message is represented by its recall pair, never
+      // raw. Uses the FULL priorSummaries set (not the budget-capped
+      // keptSummaries): a budget-dropped summary doesn't make its raw
+      // messages reappear. Expand summary sourceIds down to leaf message IDs
+      // — an L2's sourceIds are L1 IDs, not message IDs; a flat walk would
+      // miss every message it transitively covers (Bug 10). Every L1 is
+      // expanded too, as defense in depth, except the chunks a pin opened.
+      const openedMessageIds = new Set<MessageId>();
+      for (const l1 of openedChunks) this.expandSummaryToLeafMessageIds(l1, summariesById, openedMessageIds);
+      const priorSummaryMessageIds = new Set<MessageId>();
+      for (const s of this.summaries) {
+        if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
+      }
+      for (const id of openedMessageIds) priorSummaryMessageIds.delete(id);
+      for (const s of priorSummaries) {
+        this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
+      }
 
-    // ---- 5. Chunk messages raw ----
-    for (const m of chunk.messages) {
-      llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
-    }
+      // Raw messages before the chunk outside the head window, by position.
+      // From the head window's end on, any message no summary represents yet
+      // (the raw middle: usually empty in adaptive-resolution mode, since
+      // chunking proceeds contiguously and summaries cover everything up to
+      // the chunk being processed). Before it, only what pins keep raw: the
+      // chunks a pin opened, and pinned messages no recall pair represents.
+      // Same one-to-one rule as the head: coverage is judged against
+      // `priorSummaryMessageIds`.
+      //
+      // The raw that pins add to this prompt (`pinnedRaw`) is what recalling
+      // their summaries would take out: the messages of opened chunks,
+      // wherever they render, and pinned messages before the head window,
+      // which no prompt showed before. It's spent from the recall budget
+      // before any recall pair. A pinned message from the head window on
+      // that no summary covers was never chunked, since the chunker skips
+      // what pins keep raw; it renders raw with or without the pins and has
+      // no summary to recall, so it isn't charged here. When pins are
+      // admitted, the request's price includes it.
+      const rawMiddle: Array<{ position: number; message: StoredMessage }> = [];
+      const pinnedRaw: number[] = [];
+      let pinnedRawTokens = 0;
+      if (!sourceOnly) {
+        const addPinnedRaw = (position: number, message: StoredMessage): void => {
+          pinnedRaw.push(position);
+          pinnedRawTokens += tokensOf(stripThinkingBlocks(message.content));
+        };
+        // The head window renders in section 1; an opened chunk there is raw
+        // that pins add.
+        for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
+          const m = allMessages[i];
+          if (openedMessageIds.has(m.id) && !priorSummaryMessageIds.has(m.id)) addPinnedRaw(i, m);
+        }
+        for (let i = 0; i < chunkStartIdx && i < allMessages.length; i++) {
+          if (i >= headStartIdx && i < headEndIdx) continue;
+          const m = allMessages[i];
+          if (priorSummaryMessageIds.has(m.id)) continue;
+          const addedByPin = openedMessageIds.has(m.id) || (i < headEndIdx && forceRawMessageIds.has(m.id));
+          if (!addedByPin && i < headEndIdx) continue;
+          if (addedByPin) addPinnedRaw(i, m);
+          rawMiddle.push({ position: i, message: m });
+        }
+      }
+      return { priorSummaries, priorSummaryMessageIds, rawMiddle, pinnedRaw, pinnedRawTokens };
+    };
 
-    // ---- 6. Instruction (reading-mode aware) ----
-    //
     // When the chunk is a portion of a substantially larger sharded message
-    // (≥ 2× chunk size), use the reading-mode instruction. It avoids the
-    // "form a memory of what this contained" framing — which, for content
-    // heavily first-person from someone other than the agent (a user-shared
-    // doc), leads the model to adopt the content author's voice. Instead,
-    // it asks what reading was like and what was learned, forcing the
-    // model to reflect from its own vantage point in agent-first-person.
+    // (≥ 2× chunk size), section 6 uses the reading-mode instruction. It
+    // avoids the "form a memory of what this contained" framing — which, for
+    // content heavily first-person from someone other than the agent (a
+    // user-shared doc), leads the model to adopt the content author's voice.
+    // Instead, it asks what reading was like and what was learned, forcing
+    // the model to reflect from its own vantage point in agent-first-person.
+    // Worked out here, before the layout, since admitting pins prices it.
     const docContext = this.detectDocContext(chunk, ctx);
     const instructionText = this.applyIdentityReminder(
       docContext
         ? this.getReadingChunkInstruction(chunk, docContext.totalTokens, targetTokens)
         : this.getCompressionInstruction(chunk, targetTokens),
     );
-    llmMessages.push({
-      participant: 'Context Manager',
-      content: [{ type: 'text', text: instructionText }],
-    });
+    // Generous output ceiling so a memory-write is never truncated mid-thought:
+    // targetTokens is a *target*, not a cap, and adaptive models routinely
+    // overshoot a ~2k target. Was `* 1.5` (=3000 at the 2k default), which cut
+    // off rich memories (stop=max_tokens).
+    const outputReserveTokens = this.capCompressionTokens(Math.max(16000, Math.round(targetTokens * 1.5)));
+
+    // Pins count only before the chunk being compressed: this prompt is the
+    // history the chunk follows. A summary after it (a chunk compressed out of
+    // order, after a head-window reset or an unpin) is recalled as on main.
+    const forceRawMessageIds = new Set<MessageId>();
+    for (const i of this.forceRawPinPositions(allMessages)) {
+      if (i < chunkStartIdx) forceRawMessageIds.add(allMessages[i].id);
+    }
+    const recallBudget = sourceOnly ? 0 : (this.config.compressionRecallBudgetTokens ?? 100_000);
+
+    // The canonical request's messages for one layout of history, sections 1
+    // to 6, shaped as they are sent. Admitting the pins prices this list.
+    const assemble = (
+      { priorSummaryMessageIds, rawMiddle }: ReturnType<typeof layoutHistory>,
+      keptSummaries: readonly SummaryEntry[],
+    ) => {
+      const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
+
+      // ---- 1. Head window (raw, FIRST, ownership-capped) ----
+      //
+      // The head is the foundational identity anchor: the actual opening
+      // of the chronicle (the user's first message, the agent's first
+      // reply, the system context if any). It establishes WHO is speaking
+      // to WHOM. Without it, when the chunk content is heavily first-person
+      // from someone other than the agent (e.g., a user-shared document),
+      // the agent loses its first-person grounding and drifts into the
+      // content author's voice.
+      //
+      // The head is the configured head window — not "everything before
+      // the chunk." For doc-heavy chronicles, "everything before" would
+      // be hundreds of thousands of tokens; the recall pairs below
+      // represent that intermediate content. The head is just the
+      // permanent prefix that the original instance always saw.
+      //
+      // ONE-TO-ONE INVARIANT: chunk records (and the summaries over them)
+      // are the persistent authority over how a message is represented.
+      // The token-derived head boundary is only chunking *policy* — it is
+      // recomputed from the live estimator on every call and is NOT stable
+      // (estimator changes move it; transient headWindowTokens<=0 states
+      // let sweeps take ownership of head messages; store surgery can do
+      // the same — all observed in production, see issue #42). When the
+      // two authorities disagree, ownership wins: a head-range message
+      // covered by a live summary renders via its recall pair below, not
+      // raw. Rendering it both ways duplicated the seed in every payload.
+      let headCoveredSkipped = 0;
+      for (let i = headStartIdx; !sourceOnly && i < headEndIdx && i < allMessages.length; i++) {
+        const m = allMessages[i];
+        if (priorSummaryMessageIds.has(m.id)) {
+          headCoveredSkipped++;
+          continue;
+        }
+        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+      }
+
+      // ---- 2. Prior recall pairs (budget-capped, above) and the raw middle ----
+
+      // One sequence by source position after the head window, which always
+      // comes first, so the summarizer never reads an older raw turn as coming
+      // after a later memory. Where the raw middle follows every recall pair,
+      // as it does when chunking runs contiguously, this is the order the
+      // prompt always had: recall pairs, then raw.
+      const middle: Array<{ position: number; summary?: SummaryEntry; message?: StoredMessage }> = [
+        ...keptSummaries.map((summary) => ({
+          position: messageOrder.get(summary.sourceRange.first) ?? Number.MAX_SAFE_INTEGER,
+          summary,
+        })),
+        ...rawMiddle,
+      ].sort((a, b) => a.position - b.position);
+      for (const { summary: s, message: m } of middle) {
+        if (m) {
+          llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+          continue;
+        }
+        llmMessages.push({
+          participant: 'Context Manager',
+          content: [{ type: 'text', text: `[CM] Recall memory ${s!.id}.` }],
+        });
+        // Recall answers carry the summary's verbatim reasoning carriers
+        // (signed thinking) when captured — validated 2026-07-16 on a
+        // deterministically-refusing mythos compress request: text-only →
+        // reasoning_extraction refusal; with carriers → end_turn. Replaying
+        // the model's own text WITH its encrypted reasoning reads as its own
+        // history rather than harvested output, the same KV-honesty argument
+        // as declaring tools. Raw message thinking is still stripped at
+        // insertion (unvalidated: the API rejects thinking blocks whose turn
+        // shape was modified, and split/collapse rewrites raw turns).
+        llmMessages.push({
+          participant: agentParticipant,
+          content: this.summaryAnswerContent(s!),
+        });
+      }
+
+      // ---- 4. In-band marker ----
+      // Structural start of the exact source-only shape. Never recover this by
+      // searching text: the target itself may quote the marker.
+      const sourceOnlyStartIndex = llmMessages.length;
+      llmMessages.push({
+        participant: 'Context Manager',
+        content: [{ type: 'text', text: COMPRESSION_MARKER }],
+      });
+
+      // ---- 5. Chunk messages raw ----
+      for (const m of chunk.messages) {
+        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+      }
+
+      // ---- 6. Instruction (reading-mode aware; worked out above) ----
+      llmMessages.push({
+        participant: 'Context Manager',
+        content: [{ type: 'text', text: instructionText }],
+      });
+
+      // Split any bundled tool_use+tool_result cycles in non-user turns into
+      // separate API-shape messages. claude.ai-imported sessions carry these
+      // bundles (a tool_result in an assistant message rejects the request);
+      // for fresh imports the conhost importer splits at ingest time, but
+      // already-warmed sessions hit this path. See `normalize-tool-messages.ts`.
+      const split = splitMixedToolMessages(llmMessages);
+
+      // Collapse consecutive same-participant messages for API compliance
+      const collapsed = this.collapseConsecutiveMessages(split);
+
+      // Defense in depth against chunk boundaries that cut a tool cycle
+      // (rebuildChunks tries to avoid this, but covers only the most common
+      // case). The API rejects any tool_use that isn't immediately followed
+      // by its tool_result, and any tool_result that doesn't follow a use.
+      const cleaned = stripUnpairedToolBlocks(collapsed);
+
+      return { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped };
+    };
+
+    // The store's price of a request: each message's content, the system
+    // prompt, the tools and the output reserve.
+    const priceRequest = (messages: ReadonlyArray<{ content: ContentBlock[] }>): number => {
+      let total = outputReserveTokens +
+        (ctx.systemPrompt ? tokensOf([{ type: 'text', text: ctx.systemPrompt }]) : 0) +
+        (ctx.tools && ctx.tools.length > 0 ? tokensOf([{ type: 'text', text: JSON.stringify(ctx.tools) }]) : 0);
+      for (const message of messages) total += tokensOf(message.content);
+      return total;
+    };
+
+    let history = layoutHistory(forceRawMessageIds);
+    // Token-budget cap (see capRecallPairs), after the raw that pins add.
+    // Defense-in-depth: even with merged exclusion the unmerged frontier can
+    // be large at extreme scale. Source-only mode uses a zero recall budget:
+    // capRecallPairs returns an empty set, so no recall pair is emitted below
+    // AND buildRecallCurveVariants has no frontier to expand (canonical-only,
+    // one call).
+    let recall = this.capRecallPairs(history.priorSummaries, recallBudget - history.pinnedRawTokens);
+    let built = assemble(history, recall.kept);
+    // Pins are honored here only if the raw they add fits the recall budget
+    // and the request with it fits compressionContextBudgetTokens, priced as
+    // the store prices the messages it would send (the image cap below only
+    // replaces images with placeholders), with the system prompt, tools and
+    // output reserve. A request without pins is always attempted, as before.
+    // Otherwise this compression lays history out as if no pin applied,
+    // recalling the summaries the pins override, and says so once it goes
+    // ahead. Waiting for the pins to fit would stall every later L1 too,
+    // since the pinned history precedes each of them, and with them the L1s
+    // the live selector needs when even its deepest fold is over budget. The
+    // live view still shows the pins raw.
+    let pinsOverBudget: { history: typeof history; requestTokens?: number; contextBudget: number } | undefined;
+    if (history.pinnedRawTokens > 0) {
+      const contextBudget = this.normalizedCompressionContextBudget();
+      const requestTokens = history.pinnedRawTokens <= recallBudget ? priceRequest(built.cleaned) : undefined;
+      if (requestTokens === undefined || requestTokens > contextBudget) {
+        pinsOverBudget = { history, requestTokens, contextBudget };
+        history = layoutHistory(new Set());
+        recall = this.capRecallPairs(history.priorSummaries, recallBudget);
+        built = assemble(history, recall.kept);
+      }
+    }
+    const { priorSummaries, pinnedRawTokens } = history;
+    const { kept: keptSummaries, keptTokens: recallTokens } = recall;
+    const { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped } = built;
 
     const sourceOnlyFallbackMessages = this.config.compressionSourceOnlyFallback === true && !sourceOnly
       ? structuredClone(llmMessages.slice(sourceOnlyStartIndex))
       : undefined;
-
-    // Split any bundled tool_use+tool_result cycles in non-user turns into
-    // separate API-shape messages. claude.ai-imported sessions carry these
-    // bundles (a tool_result in an assistant message rejects the request);
-    // for fresh imports the conhost importer splits at ingest time, but
-    // already-warmed sessions hit this path. See `normalize-tool-messages.ts`.
-    const split = splitMixedToolMessages(llmMessages);
-
-    // Collapse consecutive same-participant messages for API compliance
-    const collapsed = this.collapseConsecutiveMessages(split);
-
-    // Defense in depth against chunk boundaries that cut a tool cycle
-    // (rebuildChunks tries to avoid this, but covers only the most common
-    // case). The API rejects any tool_use that isn't immediately followed
-    // by its tool_result, and any tool_result that doesn't follow a use.
-    const cleaned = stripUnpairedToolBlocks(collapsed);
 
     // Without the agent's live tool definitions a summarizer request that
     // replays tool-block-bearing history is deterministically refused
@@ -6298,11 +6507,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ...(mintSeamed ? { cacheTtl: this.config.compressionCacheTtl } : {}),
       config: {
         model: this.requireCompressionModel(),
-        // Generous output ceiling so a memory-write is never truncated mid-thought:
-        // targetTokens is a *target*, not a cap, and adaptive models routinely
-        // overshoot a ~2k target. Was `* 1.5` (=3000 at the 2k default), which cut
-        // off rich memories (stop=max_tokens).
-        maxTokens: this.capCompressionTokens(Math.max(16000, Math.round(targetTokens * 1.5))),
+        maxTokens: outputReserveTokens, // generous, never truncating (above)
       },
       // Declare the agent's live tools. A summarizer request that replays
       // tool_use/tool_result history with NO tools param reads to Anthropic's
@@ -6459,6 +6664,87 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       return;
     }
+
+    // The warnings for the layout sent: section 1's ownership, the recall
+    // cap's, and the pins' fallback. Logged once the compression goes ahead,
+    // past the deferral, the quarantine skip and in-flight coalescing, and
+    // before it registers as in flight, which the finally below settles.
+    if (headCoveredSkipped > 0) {
+      console.warn(
+        `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries; ` +
+          `rendering them via recall pairs (ownership wins). The token-derived head boundary ` +
+          `disagrees with chunk ownership — likely store surgery or head-boundary drift.`,
+      );
+      logCompressionCall({
+        event: 'head-ownership-overlap',
+        site: 'compression',
+        skipped: headCoveredSkipped,
+        headStartIdx,
+        headEndIdx,
+      });
+    }
+
+    if (!sourceOnly && keptSummaries.length < priorSummaries.length) {
+      const dropped = priorSummaries.length - keptSummaries.length;
+      console.warn(
+        `autobio: compression recall-pair budget capped (${keptSummaries.length}/${priorSummaries.length} summaries kept, ` +
+          `~${recallTokens} tokens, budget ${recallBudget}` +
+          (pinnedRawTokens > 0 ? ` less ~${pinnedRawTokens} of pinned raw` : '') +
+          `; ${dropped} oldest dropped this compression).`,
+      );
+      logCompressionCall({
+        event: 'recall-budget-capped',
+        site: 'compression',
+        kept: keptSummaries.length,
+        total: priorSummaries.length,
+        tokens: recallTokens,
+        budgetTokens: recallBudget,
+        ...(pinnedRawTokens > 0 ? { pinnedRawTokens } : {}),
+      });
+    }
+
+    if (pinsOverBudget) {
+      const { history: pinned, requestTokens, contextBudget } = pinsOverBudget;
+      // The pins that keep one of those messages raw: a pin whose own bound
+      // reads as raw here, over a message the pins keep raw.
+      const pinnedRawSet = new Set(pinned.pinnedRaw);
+      const forceRawPositions = this.forceRawPinPositions(allMessages);
+      const readsBounds = this.readsPinBounds();
+      const positionOf = this.positionIndex(allMessages);
+      const pins = this.pins.filter((pin) => {
+        const own: ResolvedPinBound = pin.level !== undefined ? { level: pin.level }
+          : pin.maxLevel !== undefined ? { maxLevel: pin.maxLevel } : 'raw';
+        if (readsBounds && !AutobiographicalStrategy.isRawPinBound(own)) return false;
+        const first = positionOf.get(pin.firstMessageId);
+        const last = positionOf.get(pin.lastMessageId);
+        if (first === undefined || last === undefined) return false;
+        for (let i = Math.min(first, last); i <= Math.max(first, last); i++) {
+          if (pinnedRawSet.has(i) && forceRawPositions.has(i)) return true;
+        }
+        return false;
+      }).map((pin) => pin.name ?? pin.id);
+      const limit = requestTokens === undefined
+        ? `exceeds compressionRecallBudgetTokens (${recallBudget})`
+        : `would bring the request to ~${requestTokens} tokens, over compressionContextBudgetTokens (${contextBudget})`;
+      console.warn(
+        `autobio: L1 compression of ${chunk.messages.length} message(s) from ${chunkFirstId} recalls the summaries ` +
+          `its pins override: the pinned history it would show raw (~${pinned.pinnedRawTokens} tokens in ` +
+          `${pinned.pinnedRaw.length} message(s); pins: ${pins.join(', ') || 'none found'}) ${limit}. ` +
+          `Narrow the pins or raise that budget to show them raw here.`,
+      );
+      logCompressionCall({
+        event: 'compression:pinned-raw-over-budget',
+        site: 'compression',
+        pinnedRawTokens: pinned.pinnedRawTokens,
+        pinnedRawMessages: pinned.pinnedRaw.length,
+        pins,
+        chunk_message_ids: chunk.messages.map((message) => message.id),
+        ...(requestTokens === undefined
+          ? { limit: 'recall', budgetTokens: recallBudget }
+          : { limit: 'context', requestTokens, budgetTokens: contextBudget }),
+      });
+    }
+
     let settleInFlight!: (result: CompressionInFlightResult) => void;
     const inFlightCompletion = new Promise<CompressionInFlightResult>((resolve) => {
       settleInFlight = resolve;
@@ -8481,14 +8767,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       chunksByMessageId = byId;
     }
 
-    // Pinned-position set so the picker doesn't fold messages the user
-    // explicitly marked as keep-raw. Built once and reused.
-    const pinnedSet = this.pinnedPositions(messages);
-    // V2 dynamic-pin fold-depth bounds (level / maxLevel). A position with a
-    // bound is NOT a classic force-raw pin — the KV-stable controller must be
-    // able to move it to/within its bound — so it renders as `pinned: false`
-    // carrying `pinLevel` / `pinMaxLevel` instead.
-    const pinBounds = this.pinLevelBounds(messages);
+    // Each pinned position's fold bound, resolved once (resolvedPinBounds),
+    // so the picker doesn't fold what the user marked keep-raw and every
+    // selector reads a pin as compression does. A chunk carries at most one
+    // of `pinned` (raw: a classic pin, or a level or cap of 0), `pinLevel` or
+    // `pinMaxLevel`, so every reader of `pinned` agrees on what stays raw.
+    // The last two appear only under the strategies that honor them
+    // (kv-stable, kv-unified), which must be able to move the chunk to or
+    // within its bound; elsewhere a bounded pin resolves to `pinned`. Built
+    // once and reused.
+    const pinBounds = this.resolvedPinBounds(messages);
 
     // O(1) summary lookup for findAncestorAt — avoids O(summaries) find()
     // calls during emission.
@@ -8533,11 +8821,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         rawTokens: tokens,
         currentResolution: this.resolutions.get(msg.id) ?? 0,
         lockedByAgent: this.locked.has(msg.id),
-        // A classic pin (in pinnedSet with no level bound) stays force-raw. A
-        // leveled pin is not force-raw; it carries its bound instead.
-        pinned: pinnedSet.size > 0 && pinnedSet.has(i) && bound === undefined,
-        pinLevel: bound?.level,
-        pinMaxLevel: bound?.maxLevel,
+        pinned: bound !== undefined && AutobiographicalStrategy.isRawPinBound(bound),
+        pinLevel: bound !== undefined && bound !== 'raw' && 'level' in bound && bound.level > 0 ? bound.level : undefined,
+        pinMaxLevel: bound !== undefined && bound !== 'raw' && 'maxLevel' in bound && bound.maxLevel > 0 ? bound.maxLevel : undefined,
         l1Id: ch?.summaryId ?? l1ByMessage.get(msg.id),
         salience: salience[i],
       });
@@ -10539,7 +10825,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Q/A pair between head and tail; pinned messages still emit raw, in
     // their chronological positions, after the combined recall pair.
     const positionOf = this.positionIndex(messages);
-    const pinnedPositionsSet = this.pinnedPositions(messages);
+    // Without adaptive resolution no selector reads a pin's level bound, so
+    // every pinned position resolves to raw (resolvedPinBounds).
+    const pinnedPositionsSet = this.forceRawPinPositions(messages);
     // Pinned messages between head and recent (head/recent pinned ones
     // already emit raw via Phase 0 / Phase 4).
     const pinnedInMiddle: { msg: StoredMessage; position: number }[] = [];
@@ -11200,16 +11488,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Get messages in the compressible zone: outside both head window and
-   * recent window AND not inside any pinned range. Returns messages from
-   * [0, headStart) ∪ [headEnd, recentStart) minus any positions covered
-   * by a pin or document mark.
+   * recent window AND not kept raw by a pin. Returns messages from
+   * [0, headStart) ∪ [headEnd, recentStart) minus any position a pin or
+   * document mark keeps raw (forceRawPinPositions). A pin with a positive
+   * level or cap, under the strategies that honor one, is compressible: it
+   * renders at a level, which only a summary can supply.
    */
   protected getCompressibleMessages(store: MessageStoreView, exclude?: Uint8Array): StoredMessage[] {
     const messages = store.getAll();
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     const recentStart = this.getRecentWindowStart(store);
-    const pinned = this.pinnedPositions(messages);
+    const pinned = this.forceRawPinPositions(messages);
     const out: StoredMessage[] = [];
     for (let i = 0; i < recentStart; i++) {
       if (i >= headStart && i < headEnd) continue;
