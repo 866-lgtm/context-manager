@@ -10,6 +10,7 @@
  *  - the run stops at the first raw entry or shallower pair; a shallower
  *    pair BEFORE the deepest level leaves no band (first marker = head);
  *  - kv-unified: band → {bandEnd, token-midpoint(band..historyEnd), historyEnd, tailEnd};
+ *    no legal boundary after the band / band reaching historyEnd → {bandEnd, tailEnd};
  *    no band → the 33/66/100 thirds as before.
  */
 
@@ -23,6 +24,9 @@ import type { SummaryEntry } from '../src/types/strategy.js';
 class Exposed extends AutobiographicalStrategy {
   place(entries: ContextEntry[], head: Set<string>, tail: Set<string>): void {
     this.placeCacheMarkers(entries, head, tail);
+  }
+  tok(e: ContextEntry): number {
+    return Math.max(1, this.estimateTokens(e.content));
   }
   withSummaries(levels: Record<string, number>): this {
     this.summaries = Object.entries(levels).map(([id, level]) => ({
@@ -89,17 +93,39 @@ test('legacy: the band is the LEADING run only — a shallower pair in front lea
   assert.deepEqual(marksOf(es), [0, 6, 8]); // head, historyEnd, end — unchanged from legacy
 });
 
-test('legacy: a raw middle entry ends the band; a merged raw shard with a layout key is raw', () => {
+test('legacy: a raw middle entry ends the band', () => {
   const s = new Exposed({}).withSummaries(LEVELS);
   const es = [
     raw('h0'),
     question(), answer('L3-a'),
-    { ...raw('m0'), cacheLayoutKey: 'm0' } as ContextEntry, // merged body shard: key is a message id
+    raw('m0'),
     question(), answer('L3-b'),
     raw('t0'),
   ];
   s.place(es, new Set(['h0']), new Set(['t0']));
   assert.deepEqual(marksOf(es), [2, 5, 6]);
+});
+
+test('legacy: a merged raw shard (no sourceMessageId, layout key = last shard id) is raw and ends the band', () => {
+  const s = new Exposed({}).withSummaries(LEVELS);
+  // A real merged body-group composite: no sourceMessageId, every shard in
+  // sourceMessageIds, cacheLayoutKey = the last shard's message id (which
+  // resolves to no summary). It sits directly before a max-level answer, so
+  // the only clause that keeps it from reading as that answer's question is
+  // its cacheLayoutKey.
+  const shard = {
+    participant: 'p', content: [{ type: 'text', text: 'shard a shard b' }], sourceRelation: 'copy',
+    sourceMessageIds: ['m0a', 'm0b'], cacheLayoutKey: 'm0b',
+  } as ContextEntry;
+  const es = [
+    raw('h0'),
+    question(), answer('L3-a'),
+    shard,
+    answer('L3-b'),
+    raw('t0'),
+  ];
+  s.place(es, new Set(['h0']), new Set(['t0']));
+  assert.deepEqual(marksOf(es), [2, 4, 5]); // band end 2, historyEnd 4, end 5
 });
 
 test('legacy: divergence inside the band keeps both the band and the measured marker', () => {
@@ -112,23 +138,58 @@ test('legacy: divergence inside the band keeps both the band and the measured ma
   b.es.splice(4, 2); // L3-b absorbed
   s.place(b.es, b.head, b.tail);
   // Band now = the single L4 pair (deepest level), end 3; measured stable prefix = index 2
-  // (the question before the changed answer), which is ≤ lastHead? no: lastHead=1, so 2 qualifies.
+  // (the question before the changed answer), past lastHead = 1.
   assert.deepEqual(marksOf(b.es), [2, 3, b.es.length - 1]);
 });
 
-test('kv-unified: band → {bandEnd, midpoint, historyEnd, tailEnd}; no band → thirds', () => {
+test('kv-unified: band → {bandEnd, token midpoint, historyEnd, tailEnd}; no band → thirds', () => {
   const s = new Exposed({ foldingStrategy: 'kv-unified' } as never).withSummaries(LEVELS);
   const { es, head, tail } = banded();
+  // Weight the stretch after the band so the token midpoint is far from the
+  // index midpoint: L2-a is heavy, everything after it light.
+  es[7] = answer('L2-a', 'x'.repeat(4000));
   s.place(es, head, tail);
   const marks = marksOf(es);
-  assert.equal(marks.length, 4);
-  assert.equal(marks[0], 5, 'first slot = deep band end');
-  assert.equal(marks[2], 12, 'historyEnd');
-  assert.equal(marks[3], 15, 'tail end');
-  assert.ok(marks[1] > 5 && marks[1] < 12, `mid marker between band and historyEnd: ${marks[1]}`);
+
+  // Expected mid: the legal boundary after the band end (5) and up to
+  // historyEnd (12) whose cumulative rendered tokens are nearest
+  // (cum(bandEnd) + cum(historyEnd)) / 2. Legal = carries a layout key or id.
+  const cum: number[] = [0];
+  for (let i = 0; i <= 12; i++) cum.push(cum[i]! + s.tok(es[i]!));
+  const target = (cum[6]! + cum[13]!) / 2;
+  const legalAfterBand = [7, 9, 11, 12];
+  const expectedMid = legalAfterBand.reduce((best, i) =>
+    Math.abs(cum[i + 1]! - target) < Math.abs(cum[best + 1]! - target) ? i : best);
+  assert.equal(expectedMid, 7, 'fixture: the heavy L2-a answer carries the midpoint');
+  assert.deepEqual(marks, [5, expectedMid, 12, 15]); // band end, token midpoint, historyEnd, tail end
 
   const t = new Exposed({ foldingStrategy: 'kv-unified' } as never);
   const es2 = Array.from({ length: 12 }, (_, i) => raw(`m${i}`, 'x'.repeat(i === 2 ? 400 : 40)));
   t.place(es2, new Set(['m0']), new Set(['m9', 'm10', 'm11']));
   assert.deepEqual(marksOf(es2), [1, 2, 8, 11]); // unchanged thirds contract
+});
+
+test('kv-unified: band reaching historyEnd → {bandEnd, tailEnd}, no mid, no thirds', () => {
+  const s = new Exposed({ foldingStrategy: 'kv-unified' } as never).withSummaries(LEVELS);
+  const es = [
+    raw('h0'),
+    question(), answer('L3-a'), question(), answer('L3-b'), // band = whole middle, ends at historyEnd
+    raw('t0'), raw('t1'),
+  ];
+  s.place(es, new Set(['h0']), new Set(['t0', 't1']));
+  assert.deepEqual(marksOf(es), [4, 6]);
+});
+
+test('kv-unified: no legal boundary after the band → {bandEnd, tailEnd}', () => {
+  const s = new Exposed({ foldingStrategy: 'kv-unified' } as never).withSummaries(LEVELS);
+  const es = [
+    raw('h0'),
+    question(), answer('L3-a'),
+    question(), // keyless, no source id: not a legal boundary, and no answer follows
+    raw('t0'), raw('t1'),
+  ];
+  s.place(es, new Set(['h0']), new Set(['t0', 't1']));
+  // historyEnd = 3 is not legal, so the last legal history boundary is the band end itself:
+  // mid and historyEnd slots collapse onto it.
+  assert.deepEqual(marksOf(es), [2, 5]);
 });

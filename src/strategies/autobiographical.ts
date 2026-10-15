@@ -9994,9 +9994,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * emitted in `[lastHead+1, historyEnd]`. A recall pair is its Context
    * Manager question (no source id, no layout key) followed by the answer
    * carrying `cacheLayoutKey = summary id`; a layout key that resolves to no
-   * summary (merged raw shards carry their last message id) is raw. Returns
-   * -1 when no summary is emitted or the run is empty (the first middle
-   * entry is raw or at a shallower level).
+   * summary (merged raw shards carry their last message id) is raw, and so
+   * stops the run. Returns -1 when no summary is emitted or the run is empty:
+   * the first middle entry is neither an answer at the deepest level nor a
+   * question entry immediately followed by one (a band's first entry is its
+   * question, which has no source id or layout key — the only keyless entry
+   * the run accepts).
+   *
+   * The level is the deepest over the whole middle, not the leading run's
+   * own. Deliberately conservative: when a shallower leading run sits in
+   * front of a deeper summary, the window is not in the canonical
+   * oldest-is-deepest shape — the older content is the part the solver has
+   * left shallower, so it is the part a merge or re-cut is still due to
+   * change — and the leading run is not a prefix nothing arrives to change.
+   * Then there is no band and the first slot falls back to the head, which
+   * is never worse than before this hook existed.
    */
   protected deepBandEnd(entries: readonly ContextEntry[], lastHead: number, historyEnd: number): number {
     const levelAt = (i: number): number | undefined => {
@@ -10027,10 +10039,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Place message-level `cache_control` breakpoints across the final ordered
-   * entries. `kv-unified` owns all four provider slots and uses rendered-token
-   * thirds of non-tail history plus the tail end. Other strategies retain the
-   * legacy three-slot contract: head/system, measured stable-prefix boundary,
-   * and end.
+   * entries. The first slot is the end of the deep band (`deepBandEnd`) when
+   * the compile emitted one, else the last head message.
+   *
+   * `kv-unified` owns all four provider slots. With a deep band they are
+   * {band end, the legal boundary nearest the token midpoint between the
+   * band end and `historyEnd`, `historyEnd`, tail end}; when no legal
+   * boundary lies after the band (or the band reaches `historyEnd`) the
+   * middle slots collapse and fewer markers are placed. Without a band they
+   * are the legal boundaries nearest the rendered-token thirds of non-tail
+   * history (33/66/100%) plus the tail end. Other strategies keep the
+   * three-slot contract: first slot (band end, else head), measured
+   * stable-prefix boundary, and end.
+   *
+   * The trade on membrane's native formatter: native puts a cache marker on
+   * the system block only when ZERO message markers arrive. So there the
+   * head marker was the one marker whose prefix (tools+system+head) stayed
+   * byte-identical turn to turn, and every turn read at least that from
+   * cache. With the first marker at the band's end instead, a turn whose
+   * band changes (a merge one level up, or the solver lowering the band's
+   * youngest group) has no marker matching an earlier request's prefix and
+   * reads NOTHING from cache on native — before, it read tools+system+head.
+   * On the XML formatter membrane marks the system block on every request,
+   * so a band change still reads tools+system there. The head marker bought
+   * little (244 tokens on Fable) against the band (~73k), so the trade is
+   * taken, but it pays off only where band changes are rare: land this
+   * after the change that stops the solver's raises (#156).
    *
    * The stable-prefix mark used to sit at the folded-history/tail seam
    * (`historyEnd`) on the assumption that the folded region is stable
@@ -10114,10 +10148,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     if (this.config.foldingStrategy === 'kv-unified') {
       // CM owns all four slots in kv-unified mode. With a deep band the
-      // layout is the design's v1 (unified-solve-design.md §5A.3):
+      // slots are the design's v1 layout (unified-solve-design.md §5A.3):
       // system+deep-band | mid-history | historyEnd | end — the first
-      // marker sits at the end of the deep band and the mid marker at the
-      // token midpoint of the stretch between it and historyEnd. Without
+      // marker sits at the end of the deep band. The mid marker does NOT
+      // follow §5A.4's placement rule (just before the earliest `pending`
+      // landing when there is one) — this placer has no pending labels — so
+      // it always takes that rule's fallback: the legal boundary nearest the
+      // token midpoint of the stretch between the band end and historyEnd. If no
+      // legal boundary follows the band, the mid and historyEnd slots
+      // collapse onto the band marker. Without
       // one (no summaries yet), three history breakpoints at the nearest
       // legal rendered-token boundaries to 33%/66%/100%, plus one at the
       // end of the tail. There is deliberately no separate early/system
@@ -10203,8 +10242,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const marks = new Set<number>();
     // First slot: the end of the deep band when there is one, else the head.
-    // The deep band contains the head, so this strictly extends the cached
-    // prefix the first slot buys; when the measured divergence falls inside
+    // The band starts right after the head, so the prefix through the band's
+    // end contains the head and strictly extends what the head marker
+    // cached — while the band is unchanged (see the native-formatter trade in
+    // the doc comment for what a band change costs); when the measured divergence falls inside
     // the band (a merge one level up landed), both markers are still placed —
     // the band entry is re-written once, the measured one covers what
     // survived.
