@@ -993,9 +993,12 @@ the coarser summary owns the group's leaves and those below its level veto
 it; on a non-nested tree it can, overlap like the rest of this section's.
 Only a listed leaf of the group's own lineage rendered in more detail than
 the group vetoes it, and a hard-protected leaf (raw zone, pinned or locked)
-never does. Every projection applies the rule alike, the ideal cut's, the
-carried frontier's and each suffix-adoption candidate's, so a frontier the
-planner emitted projects to itself on unchanged inputs. Before this rule,
+never does. A leaf also stays at its level only where its own lineage there
+lists it: a level carried from before the tree's links changed can point
+through a summary that no longer covers the leaf. Every projection applies
+the rule alike, the ideal cut's, the carried frontier's and each
+suffix-adoption candidate's, so a frontier the planner emitted projects to
+itself on unchanged inputs. Before this rule,
 only the ideal cut's projection exempted these leaves, through the solve's
 own exempt set, and the carried frontier's and suffix candidates'
 projections didn't. The next compile's carried frontier then un-folded the

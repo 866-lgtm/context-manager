@@ -602,6 +602,11 @@ function suffixAdopt(
  * group-consistent by the caller (pin-at-level fixes a whole node's leaves), so
  * they are held here rather than lowered.
  *
+ * A leaf renders at its level through its own lineage there, so it stays only
+ * where that node lists it. A level carried from before the tree's links
+ * changed can point through a summary that no longer lists the leaf, which
+ * would leave the leaf in no recall, so it is lowered.
+ *
  * A leaf the node lists vetoes its unanimity only when it renders in more
  * detail than the node, below the node's level, and the node is its own
  * lineage at that level: the node's recall would then render over it. A
@@ -634,6 +639,13 @@ function projectToValidCut(
   exempt: ReadonlySet<ChunkId> = new Set(),
 ): void {
   const maxPasses = (ordered.length + 1) * (maxAvailableLevel(tree) + 2);
+  // The leaves each node lists, as sets, built once per projection.
+  const listedBy = new Map<string, ReadonlySet<ChunkId>>();
+  const lists = (node: { id: string; leafChunkIds: ChunkId[] }, leafId: ChunkId): boolean => {
+    let listed = listedBy.get(node.id);
+    if (!listed) { listed = new Set(node.leafChunkIds); listedBy.set(node.id, listed); }
+    return listed.has(leafId);
+  };
   let changed = true;
   let pass = 0;
   while (changed && pass++ < maxPasses) {
@@ -659,7 +671,10 @@ function projectToValidCut(
       if (frozen.has(c.id) || fixedLevels.has(c.id)) continue; // held; consistent by construction
       const node = tree.ancestorAt(c.id, lvl);
       let unanimous = false;
-      if (node) {
+      // The leaf renders at this level through the node, so the node has to
+      // list it: a level carried from before the tree's links changed can
+      // point through a summary that no longer covers the leaf.
+      if (node && lists(node, c.id)) {
         const key = `${node.id}:${lvl}`;
         const hit = unanimityMemo.get(key);
         if (hit !== undefined) {

@@ -265,6 +265,36 @@ for (const [path, foldAtTokens] of [['holds', 150], ['adopts the ideal cut above
   });
 }
 
+// A leaf renders at its level through its own lineage there, so a carried
+// level holds only where that summary lists the leaf. Here A's parent pointer
+// reaches H, which lists only B's leaf, as when summary links change between
+// compiles, and m1 was carried at L2. Through H, m1 would be in no recall.
+for (const [kind, bParent, m2Level] of [
+  ['whose one leaf has no summary at its level', undefined, 1],
+  ['whose leaves sit at its level', 'H', 2],
+] as const) {
+  test(`a carried level is lowered where its summary no longer lists the leaf, beside a summary ${kind}`, () => {
+    const { inputs, tree } = store(
+      [message('m1', 1, 100, 'A'), message('m2', 2, 100, 'B')],
+      [
+        summary('A', 1, ['m1'], 30, 'H'),
+        summary('B', 1, ['m2'], 30, bParent),
+        summary('H', 2, ['B'], 40),
+      ],
+    );
+    const previous = new Map<ChunkId, number>([['m1', 2], ['m2', m2Level]]);
+    // Inside the hold band either way, so the plan holds the carried frontier.
+    const plan = planControlledFrontier(inputs, tree, { ...trio, targetTokens: 30, foldAtTokens: 1_000, previous });
+    for (const c of inputs.chunks) {
+      const level = plan.resolutions.get(c.id) ?? 0;
+      if (level > 0) {
+        assert.ok(tree.ancestorAt(c.id, level)?.leafChunkIds.includes(c.id), `${c.id} at L${level} renders through a summary that lists it`);
+      }
+    }
+    assert.equal(plan.resolutions.get('m1'), 1);
+  });
+}
+
 test('suffix adoption takes a summary beside a lineage-disagreeing leaf', () => {
   // The trio after m0, whose own L1 Z has no parent. From an all-raw carried
   // frontier the ideal cut (Z, A and G) rewrites all 100 tokens it renders;
@@ -426,6 +456,9 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
             if (held !== undefined) assert.equal(level, held, `${c.id} keeps its protected level, ${where}`);
             const cap = params.pinCaps!.get(c.id);
             if (held === undefined && cap !== undefined) assert.ok(level <= cap, `${c.id} stays at or below its pin cap, ${where}`);
+            if (held === undefined && level > 0) {
+              assert.ok(tree.ancestorAt(c.id, level)?.leafChunkIds.includes(c.id), `${c.id} at L${level} renders through a summary that lists it, ${where}`);
+            }
           }
           if (turn > 1 && sameLevels(previous, ideal)) {
             assert.ok(sameLevels(plan.resolutions, ideal), `the adopted ideal cut stays put, ${where}`);
