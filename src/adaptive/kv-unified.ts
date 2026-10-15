@@ -322,7 +322,7 @@ function sameLeafInputs(leaf: CanonicalLeaf, chunk: PickerChunk): boolean {
   let pinLevel: number | undefined, pinMaxLevel: number | undefined;
   for (const constraint of leaf.constraints) {
     switch (constraint.source) {
-      case 'classic-pin': pinned = true; break;
+      case 'raw-pin': pinned = true; break;
       case 'lockedByAgent': locked = true; break;
       case 'pin-level': pinLevel = constraint.level; break;
       case 'pin-max-level': pinMaxLevel = constraint.level; break;
@@ -1792,7 +1792,7 @@ export class CanonicalSummaryForest {
     if (inputs.tailChunkIds.has(chunk.id)) {
       constraints.push({ kind: 'raw', source: 'tail-zone' });
     }
-    if (chunk.pinned) constraints.push({ kind: 'raw', source: 'classic-pin' });
+    if (chunk.pinned) constraints.push({ kind: 'raw', source: 'raw-pin' });
     if (options.overlapExempt?.has(chunk.id)) {
       constraints.push({ kind: 'raw', source: 'overlap-exempt' });
     }

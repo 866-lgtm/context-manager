@@ -23,7 +23,14 @@ export interface MessageStoreView {
   length(): number;
   /** Estimate tokens for a message */
   estimateTokens(message: StoredMessage): number;
-  /** Closed-loop estimator calibration (optional — MessageStore provides it). */
+  /**
+   * Closed-loop estimator calibration (optional — MessageStore provides it).
+   * The strategy owns the factor (see MessageStore's tokenCalibration). A view
+   * supplies both of these or neither: a dry select reads the factor before
+   * its load changes it and puts it back afterwards, so it throws for a view
+   * with the setter alone rather than change a factor it can't restore. A
+   * view with neither is a fixed estimator.
+   */
   setTokenCalibration?(factor: number): void;
   getTokenCalibration?(): number;
   /**
@@ -524,6 +531,17 @@ export function isSummaryOverviewStrategy(s: ContextStrategy): s is SummaryOverv
   );
 }
 
+/** A calibration multiplier discarded on load (see `RenderStats.calibration`). */
+export interface CalibrationReset {
+  /** The multiplier that was discarded. */
+  discardedMultiplier: number;
+  /** The pricing epoch it was learned under, or null for a record without a
+   *  stamp (written by 0.13.0 or earlier), whose epoch is unknown. */
+  fromEpoch: number | null;
+  /** When it was discarded (ms since epoch). */
+  at: number;
+}
+
 /**
  * Per-render observability stats from a strategy. Counts and token sums for
  * head / tail / summaries / pending work, suitable for TUIs and dashboards
@@ -553,6 +571,30 @@ export interface RenderStats {
    * Q/A pair, so it counts as 2 messages here.
    */
   total: { messages: number; tokens: number };
+
+  /**
+   * Estimator calibration in force for this compile: the multiplier applied
+   * to every token estimate and the pricing epoch it was learned under.
+   * `provisional` is true while the multiplier is a guess rather than a value
+   * learned under this epoch's pricing: one kept from a record without a
+   * stamp, or the 1 a discard restarts from. The first provider sample
+   * replaces it outright (see `AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`).
+   * `reset` is present once a multiplier from an older or unknown epoch has
+   * been discarded, on load or when a provisional one above 1 put the first
+   * compile over budget. It is kept
+   * in the persisted calibration state, so it stays visible across restarts,
+   * learning and a later epoch's re-stamp until an operator re-stamps the
+   * record without it; a later discard replaces it, and an older binary
+   * after a rollback writes its own record, without it, over a newer one. A
+   * discard shrinks (or grows) the window by the old multiplier's ratio, so
+   * it should be seen, not only logged once.
+   */
+  calibration?: {
+    multiplier: number;
+    pricingEpoch: number;
+    provisional?: true;
+    reset?: CalibrationReset;
+  };
 
   /**
    * Planner/emitter reconciliation for this compile. `planned` is the picker's
@@ -1006,6 +1048,15 @@ export interface AutobiographicalConfig {
    *
    * Set to Infinity to disable the cap and surface overflow as a
    * 400 from the API rather than silently dropping oldest memories.
+   *
+   * In the L1 prompt, the raw that pins add (a chunk a pin opens, so its
+   * summary isn't recalled, and a pinned message before the head window) is
+   * spent from this budget first, and recall pairs get the rest. When that
+   * raw alone exceeds the budget, or the request with it exceeds
+   * `compressionContextBudgetTokens`, that compression lays history out as
+   * it would without pins: it recalls the summaries the pins override, and
+   * leaves out pinned history before the head window that no summary
+   * covers. It warns naming the pins; the live view still shows them raw.
    */
   compressionRecallBudgetTokens?: number;
 
@@ -1143,6 +1194,16 @@ export interface AutobiographicalConfig {
    * uses provider-total input plus a positive serialized expansion delta, then
    * adds the output reserve. Zero, partial, or unknown usage contracts retain
    * the conservative bound. Default: 200000.
+   *
+   * It also decides whether an L1 prompt shows pinned history raw: with the
+   * raw that pins add, the canonical request must fit it, priced as the
+   * message store prices the messages it would send (after splitting,
+   * collapsing and dropping unpaired tool blocks, before the image cap,
+   * which only replaces images), with the system prompt, tools and output
+   * reserve. Otherwise that compression lays
+   * history out as it would without pins (see
+   * `compressionRecallBudgetTokens`). A canonical request without pins is
+   * still always attempted.
    */
   compressionContextBudgetTokens?: number;
 
@@ -1524,11 +1585,23 @@ export interface ProtectedRange {
    * Pin-AT-level-k (V2 dynamic pins, `docs/best-fit-frontier-resolution.md` §7).
    * Fix the covered chunks to render at EXACTLY this fold level (0 = raw): the
    * frontier cut passes through the L_k node — neither folded deeper nor
-   * un-folded shallower. When set, this range is NOT a classic force-raw pin.
-   * Takes precedence over `maxLevel`. Omitted → not a fixed-level pin.
+   * un-folded shallower. Takes precedence over `maxLevel`. Omitted → not a
+   * fixed-level pin.
    *
-   * Honored only by the KV-stable controller (`foldingStrategy: 'kv-stable'`);
-   * other strategies fall back to treating the range as raw (a safe superset).
+   * Honored by the folding strategies that read level bounds
+   * (`foldingStrategy: 'kv-stable'` and `'kv-unified'`, with
+   * `adaptiveResolution`). There a level above 0 doesn't keep the range raw:
+   * it is still compressed, since only a summary can supply that level.
+   * Under kv-unified, a pinned level on a message between the head window
+   * and the recent window that no summary supplies yet is a constraint
+   * conflict, and every compile fails until one does. Under
+   * any other selector, and without adaptive resolution, the range is raw (a
+   * safe superset). The canonical L1 compression prompt shows raw what the
+   * configured selector keeps raw, where its budgets allow (see
+   * `compressionRecallBudgetTokens`); it doesn't hold a span at its pinned
+   * level. Where pins overlap at a message, a bound takes a classic pin's
+   * place there, `level` takes `maxLevel`'s, and the lowest of each kind
+   * wins.
    */
   level?: number;
   /**
@@ -1537,7 +1610,7 @@ export interface ProtectedRange {
    * under the window-pressure emergency. `maxLevel: 0` ≡ classic pin-raw.
    * Ignored when `level` is set. Omitted → this pin imposes no depth cap.
    *
-   * Honored only by the KV-stable controller; see `level`.
+   * Honored where `level` is; see `level`.
    */
   maxLevel?: number;
 }

@@ -24,6 +24,7 @@ import type {
   SearchResult,
   TimeRangeSummaryEntry,
   RenderStats,
+  CalibrationReset,
   HotContextSettingsUpdate,
   HotContextSettingsStatus,
   SelectOptions,
@@ -72,6 +73,13 @@ import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms } from '../raw-forms.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
+
+/** A persisted reset record is trusted only if it has the expected shape. */
+function isCalibrationReset(v: unknown): v is CalibrationReset {
+  const r = v as CalibrationReset | null | undefined;
+  return !!r && Number.isFinite(r.discardedMultiplier) && (r.fromEpoch === null || Number.isFinite(r.fromEpoch)) &&
+    Number.isFinite(r.at);
+}
 
 /**
  * Append a JSONL entry describing one compression LLM call to the path
@@ -691,6 +699,19 @@ interface CompressionInFlightResult {
   error?: unknown;
 }
 
+/** What preparing a compression request replaced in it. */
+interface PreparationCounts {
+  serializedMediaReplacements: number;
+  imageReplacements: number;
+  imageBudgetBytes: number;
+  imageBytesKept: number;
+}
+
+/** A compression request after preparation, with what preparation replaced. */
+interface CompressionPreparation extends PreparationCounts {
+  request: NormalizedRequest;
+}
+
 interface RecallCurveVariant {
   parent: SummaryEntry;
   children: SummaryEntry[];
@@ -841,6 +862,10 @@ function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?
   const maxLevel = clean(opts?.maxLevel);
   return maxLevel !== undefined ? { maxLevel } : {};
 }
+
+/** The fold bound a pinned message position resolves to (the strategy's
+ *  `resolvedPinBounds`): raw, a fixed level, or a depth cap. */
+export type ResolvedPinBound = 'raw' | { level: number } | { maxLevel: number };
 
 /**
  * Drop empty text blocks (`{type:'text', text:''}` or whitespace-only). The
@@ -1833,6 +1858,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibration = 1;
     this._calibrationEma = null;
     this._calibrationLoaded = false;
+    this._calibrationReset = null;
+    this._calibrationProvisional = null;
     this._imageWatermark = undefined;
     this._imageWatermarkLoaded = false;
     this._lastKvStable = null;
@@ -1848,6 +1875,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     delete this.kvUnifiedReuse.forest;
     delete this.kvUnifiedReuse.tree;
     delete this.kvUnifiedReuse.certificate;
+    delete this.kvUnifiedReuse.whatIf;
   }
 
   /**
@@ -2427,9 +2455,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * V2 dynamic pin-at-level-k convenience: fix a range to render at EXACTLY
-   * fold level `level` (0 = raw). Honored only by `foldingStrategy: 'kv-stable'`;
-   * other strategies fall back to treating the range as raw. Equivalent to
-   * `pinRange(first, last, { level })`.
+   * fold level `level` (0 = raw). Honored by `foldingStrategy: 'kv-stable'`
+   * and `'kv-unified'` with adaptive resolution; under any other selector the
+   * range is raw (`resolvedPinBounds`), in the live view and in the canonical
+   * L1 compression prompt where its budgets allow (see
+   * `compressionRecallBudgetTokens`).
+   * Equivalent to `pinRange(first, last, { level })`.
    */
   pinAtLevel(firstMessageId: string, lastMessageId: string, level: number, opts?: { name?: string }): string {
     return this.pinRange(firstMessageId, lastMessageId, { name: opts?.name, level });
@@ -2639,12 +2670,60 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Resolve the V2 dynamic-pin fold-depth bounds (`ProtectedRange.level` /
-   * `maxLevel`) to message positions. Only pins that carry a bound appear; a
+   * The fold bound each pinned message position resolves to, decided once
+   * for compression and every selector: raw, a fixed level, or a depth cap.
+   * Bounds (`ProtectedRange.level` / `maxLevel`) are honored only by the
+   * folding strategies that read them, `kv-stable` and `kv-unified`. Under
+   * every other selector, and without adaptive resolution, a pinned position
+   * is raw, as `pinAtLevel` documents. Where pins overlap at one position,
+   * kv-stable's reading applies: a bound there takes the place of a classic
+   * pin, a fixed level takes the place of a cap, and within each kind the
+   * lowest wins (`pinLevelBounds`). A level or cap of 0 is raw
+   * (`isRawPinBound`).
+   */
+  protected resolvedPinBounds(messages: StoredMessage[]): Map<number, ResolvedPinBound> {
+    const out = new Map<number, ResolvedPinBound>();
+    const pinned = this.pinnedPositions(messages);
+    if (pinned.size === 0) return out;
+    const bounds = this.readsPinBounds() ? this.pinLevelBounds(messages) : undefined;
+    for (const position of pinned) {
+      const bound = bounds?.get(position);
+      if (bound?.level !== undefined) out.set(position, { level: bound.level });
+      else if (bound?.maxLevel !== undefined) out.set(position, { maxLevel: bound.maxLevel });
+      else out.set(position, 'raw');
+    }
+    return out;
+  }
+
+  /** Whether this selector reads pin bounds (`ProtectedRange.level` /
+   *  `maxLevel`): `kv-stable` and `kv-unified`, with adaptive resolution. */
+  protected readsPinBounds(): boolean {
+    return !!this.config.adaptiveResolution &&
+      (this.config.foldingStrategy === 'kv-stable' || this.config.foldingStrategy === 'kv-unified');
+  }
+
+  /** Whether a resolved pin bound keeps its message raw: a classic pin, or a
+   *  level or cap of 0. */
+  static isRawPinBound(bound: ResolvedPinBound): boolean {
+    if (bound === 'raw') return true;
+    return 'level' in bound ? bound.level === 0 : bound.maxLevel === 0;
+  }
+
+  /** Positions of the messages that pins keep raw (`resolvedPinBounds`). */
+  protected forceRawPinPositions(messages: StoredMessage[]): Set<number> {
+    const out = new Set<number>();
+    for (const [position, bound] of this.resolvedPinBounds(messages)) {
+      if (AutobiographicalStrategy.isRawPinBound(bound)) out.add(position);
+    }
+    return out;
+  }
+
+  /**
+   * The V2 dynamic-pin fold-depth bounds (`ProtectedRange.level` /
+   * `maxLevel`) by message position. Only pins that carry a bound appear; a
    * classic raw pin (no bound) is absent here and handled by `pinnedPositions`.
-   * When ranges overlap, the FINEST requirement wins (lowest effective level):
-   * a fixed `level` clamps both ends; a `maxLevel` only caps depth. Honored
-   * solely by the KV-stable controller — see `ProtectedRange`.
+   * Where bounded pins overlap, the lowest fixed level and the lowest cap are
+   * kept; `resolvedPinBounds` decides between them and a classic pin.
    */
   protected pinLevelBounds(messages: StoredMessage[]): Map<number, { level?: number; maxLevel?: number }> {
     const out = new Map<number, { level?: number; maxLevel?: number }>();
@@ -2807,16 +2886,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * count as prefix: a merge's expanded SOURCE pairs are its volatile
    * payload, and marking them would cache-write content that never recurs.
    *
-   * `capped` requests get no markers: recall-budget front-eviction shifts
-   * the prefix on every subsequent mint, and cache writes on a shifting
-   * prefix are pure waste (measured up to +42% total cost at 1h TTL).
+   * `capped` requests get the head marker only: recall-budget front-eviction
+   * shifts the pairs on every subsequent mint, and cache writes on a shifting
+   * prefix are pure waste (measured up to +42% total cost at 1h TTL). The
+   * head boundary sits before the ladder, so eviction cannot move it; with
+   * no head window a capped request carries no marker at all.
    * Effective ladder reuse also requires the append-stable source order
    * fix (2026-08-19); on stores minted under the older lexical order the
    * markers are merely harmless.
    *
    * Returns true iff at least one breakpoint was placed — callers attach
    * `cacheTtl` only then, so every marker-less request (kill switch, capped
-   * ladder, no ladder yet) keeps the exact pre-seam request shape and its
+   * ladder with no head window, no ladder yet) keeps the exact pre-seam request shape and its
    * canonical hash / quarantine identity.
    */
   protected applyMintCacheSeams(
@@ -2844,7 +2925,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
       }
     }
-    if (capped) return false;
     const levelById = new Map(recallLadder.map((s) => [s.id, s.level]));
     let headEnd = -1;
     let deepEnd = -1;
@@ -2863,10 +2943,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (level >= 2) deepEnd = i + 1;
     }
     if (frontierEnd === -1) return false; // no ladder yet — nothing stable to cache
-    for (const idx of new Set([headEnd, deepEnd, frontierEnd])) {
-      if (idx >= 0) messages[idx]!.cacheBreakpoint = true;
+    // A capped ladder front-evicts on every mint, so the pair seams shift and
+    // writing them is waste. The head seam does not: tools, system prompt and
+    // head window precede the ladder and are the same request after request,
+    // unless image shedding (one byte budget, spent newest-first) replaces a
+    // head image for one payload and not for the next.
+    let placed = false;
+    for (const idx of new Set(capped ? [headEnd] : [headEnd, deepEnd, frontierEnd])) {
+      if (idx < 0) continue;
+      messages[idx]!.cacheBreakpoint = true;
+      placed = true;
     }
-    return true;
+    return placed;
   }
 
   private sameAuthoredSummary(a: SummaryEntry, b: SummaryEntry): boolean {
@@ -3264,13 +3352,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       const leafCoverageHash = sha256Json(childLeaves);
       try {
+        // Logged only if it's dispatched; see prepareCompressionAhead.
+        const preparedRequest = this.prepareCompressionAhead(request);
         variants.push({
           parent,
           children,
           leafCoverageHash,
-          request,
-          requestHash: sha256Json(request),
-          deterministicInputBoundTokens: this.compressionRequestInputBoundTokens(request),
+          request: preparedRequest,
+          requestHash: sha256Json(preparedRequest),
+          deterministicInputBoundTokens: this.compressionRequestInputBoundTokens(preparedRequest),
         });
       } catch {
         // One malformed/unsupported variant cannot suppress later candidates.
@@ -4072,7 +4162,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       while (i < prev.length && messages[i] === prev[i]) i++;
       if (i === prev.length) from = prev.length;
     }
-    const order = from > 0 ? this._storeOrder : new Map<MessageId, number>();
+    // A dry select puts back the order it found, by reference (select()), so
+    // it extends a copy instead of writing into that one.
+    const order = from === 0
+      ? new Map<MessageId, number>()
+      : this._dryRunSelect ? new Map(this._storeOrder) : this._storeOrder;
     for (let i = from; i < messages.length; i++) order.set(messages[i].id, i);
     this._storeOrder = order;
     this._storeOrderSource = messages;
@@ -5038,11 +5132,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the next one and for observers: the cache-marker baseline the next
     // compile measures its stable prefix against, the transition status
     // (getHotContextSettings), the render stats (getRenderStats, with its
-    // plan-vs-actual), calibration's estimate, arming and store view, the
-    // store order and the head-window memo stay as the last committing select
-    // left them. They are put back here, on every path out, throws included;
-    // each select path gates its own persistence and enqueueing. The dry run's
-    // own render stats are its output, as its plan is (_lastPreview), and
+    // plan-vs-actual), calibration's estimate, arming, store view, load and
+    // multiplier, with the multiplier the store prices by (a dry select that
+    // loads the multiplier first leaves it unloaded, so the next committing
+    // select loads it again and persists what the load decides), the store
+    // order with the listing it was built from, and the head-window memo stay
+    // as the last committing select left them. The order and its listing go
+    // back together: an order put back beside the dry run's listing would
+    // read as current for that listing, so after a removal later selects
+    // would position messages as they stood before it until something
+    // rebuilt the order. A dry refresh extends a copy of the order rather
+    // than the one saved here (refreshStoreOrder). They are put back
+    // here, on every path out, throws included; each select path gates its
+    // own persistence and enqueueing. The dry run's own
+    // render stats are its output, as its plan is (_lastPreview), and
     // previewContext reads them from _lastPreviewStats.
     // Chunking runs dry too: a chunk the dry run closes gets no record, and
     // the chunks, the compression queue and whether chunk records are trusted
@@ -5067,8 +5170,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       lastRenderStats: this._lastRenderStats,
       lastCompileEstimate: this._lastCompileEstimate,
       calibrationArmed: this._calibrationArmed,
+      calibrationLoaded: this._calibrationLoaded,
+      calibration: this._calibration,
+      calibrationReset: this._calibrationReset,
+      calibrationProvisional: this._calibrationProvisional,
+      storeCalibration: store.getTokenCalibration?.(),
       storeView: this._storeView,
       storeOrder: this._storeOrder,
+      storeOrderSource: this._storeOrderSource,
       headStartMemo: this._cachedHeadStartIndex,
     };
     this._lastPreviewStats = undefined;
@@ -5096,8 +5205,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._lastRenderStats = saved.lastRenderStats;
       this._lastCompileEstimate = saved.lastCompileEstimate;
       this._calibrationArmed = saved.calibrationArmed;
+      this._calibrationLoaded = saved.calibrationLoaded;
+      this._calibration = saved.calibration;
+      this._calibrationReset = saved.calibrationReset;
+      this._calibrationProvisional = saved.calibrationProvisional;
+      if (saved.storeCalibration !== undefined) store.setTokenCalibration?.(saved.storeCalibration);
       this._storeView = saved.storeView;
       this._storeOrder = saved.storeOrder;
+      this._storeOrderSource = saved.storeOrderSource;
       this._cachedHeadStartIndex = saved.headStartMemo;
     }
   }
@@ -5107,7 +5222,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // markers), so the returned entries are already bounded — see
     // applyImageStripping.
     if (this.config.adaptiveResolution) {
-      return this.selectAdaptive(store, budget, opts);
+      try {
+        return this.selectAdaptive(store, budget, opts);
+      } catch (err) {
+        // A provisional multiplier above 1 that puts the compile over budget
+        // is dropped to 1 and the select runs again: with the refusal
+        // standing, no inference would run, so no sample could ever correct
+        // it (#179, the startup wedge). Any other refusal stands.
+        if (!(err instanceof OverBudgetError) || !this.dropProvisionalCalibration(err, opts?.dryRun === true)) throw err;
+        return this.selectAdaptive(store, budget, opts);
+      }
     }
     // selectHierarchical persists and enqueues nothing; what it leaves for
     // observers (render stats) select() restores for a dry run.
@@ -5685,6 +5809,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (loud) console.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
       else console.error(line);
     }
+    r.calibration = {
+      multiplier: this._calibration,
+      pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+      ...(this._calibrationProvisional ? { provisional: true as const } : {}),
+      ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+    };
     this._lastRenderStats = r;
     this._rs = null;
   }
@@ -6095,8 +6225,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // There is intentionally NO tail_after_chunk: that would leak
     // future information into the model's KV state and corrupt the
     // as-of framing of memory formation.
-    const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
-
     const allMessages = ctx.messageStore.getAll();
     const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
     // Compression holds: provisional content never enters a prompt, not even
@@ -6123,212 +6251,368 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const messageOrder = new Map<MessageId, number>(
       allMessages.map((message, index) => [message.id, index]),
     );
-    const priorSummaries = this.summaries
-      // Skip empty-content summaries: emitting `{type:'text', text:''}` as a
-      // recall pair triggers Anthropic 400 "text content blocks must be
-      // non-empty", which stalls ALL compression (mirrors the render-path guard
-      // + load-drop). A single empty summary otherwise poisons every compression.
-      .filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0)
-      .sort((a, b) => {
-        const aOrder = messageOrder.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
-        const bOrder = messageOrder.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
-        return aOrder - bOrder || a.sourceRange.first.localeCompare(b.sourceRange.first);
-      });
-
-    // Leaf message coverage of every live summary — the rendering
-    // authority for the one-to-one invariant: a message covered by a
-    // live summary is represented by its recall pair, never raw. Uses
-    // the FULL priorSummaries set (not the budget-capped keptSummaries):
-    // a budget-dropped summary doesn't make its raw messages reappear.
-    // Expand summary sourceIds down to leaf message IDs — an L2's
-    // sourceIds are L1 IDs, not message IDs; a flat walk would miss
-    // every message it transitively covers (Bug 10). Also expand merged
-    // L1s as defense in depth.
+    // Pins in the canonical L1 prompt. The live view shows a message that a
+    // pin keeps raw (forceRawPinPositions) raw, so this prompt does too. A
+    // frontier summary that can't be shown as a recall pair (it covers such a
+    // message, or its content is empty) is DESCENDED, not dropped: its
+    // children take its place, so only the branch holding the pin opens,
+    // sibling branches stay recall pairs, and the raw a pin adds is its own
+    // L1 chunk. This mirrors the live selector (kv-control keeps protected
+    // raw leaves beside their group's recall). Dropping the whole frontier
+    // summary instead replayed an entire L3/L4 raw on every L1 while one pin
+    // existed.
+    //
+    // The L1s a pin opens are recorded (openedChunks). Their messages render
+    // raw wherever they lie before the chunk, including before the head
+    // window; the head window always comes first, and after it they go in
+    // source order with the recall pairs (section 2). Only they lose
+    // coverage, so a merged L1 the descent can't reach (a parent whose
+    // sourceIds miss it) stays covered, as on main, unless a pin opens it.
+    // The raw that pins add is spent from the recall budget (below).
+    //
+    // Scope: the canonical L1 prompt, and only pins before the chunk. Merge
+    // recall, L3+ merge inputs and transition summaries do not consult pins,
+    // and the source-only L1 shows no history for them to change.
     const summariesById = new Map<string, SummaryEntry>();
     for (const s of this.summaries) summariesById.set(s.id, s);
-    const priorSummaryMessageIds = new Set<MessageId>();
-    for (const s of this.summaries) {
-      if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
-    }
-    for (const s of priorSummaries) {
-      this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
-    }
+    // Priced as the store prices a message, images and tool blocks included,
+    // under every selector (the strategy's own estimator falls back to text
+    // alone outside adaptive selection).
+    const tokensOf = (content: ContentBlock[]): number =>
+      ctx.messageStore.estimateTokens({ content } as unknown as StoredMessage);
 
-    // ---- 1. Head window (raw, FIRST, ownership-capped) ----
-    //
-    // The head is the foundational identity anchor: the actual opening
-    // of the chronicle (the user's first message, the agent's first
-    // reply, the system context if any). It establishes WHO is speaking
-    // to WHOM. Without it, when the chunk content is heavily first-person
-    // from someone other than the agent (e.g., a user-shared document),
-    // the agent loses its first-person grounding and drifts into the
-    // content author's voice.
-    //
-    // The head is the configured head window — not "everything before
-    // the chunk." For doc-heavy chronicles, "everything before" would
-    // be hundreds of thousands of tokens; the recall pairs below
-    // represent that intermediate content. The head is just the
-    // permanent prefix that the original instance always saw.
-    //
-    // ONE-TO-ONE INVARIANT: chunk records (and the summaries over them)
-    // are the persistent authority over how a message is represented.
-    // The token-derived head boundary is only chunking *policy* — it is
-    // recomputed from the live estimator on every call and is NOT stable
-    // (estimator changes move it; transient headWindowTokens<=0 states
-    // let sweeps take ownership of head messages; store surgery can do
-    // the same — all observed in production, see issue #42). When the
-    // two authorities disagree, ownership wins: a head-range message
-    // covered by a live summary renders via its recall pair below, not
-    // raw. Rendering it both ways duplicated the seed in every payload.
     // Residence-scoped source-only L1 compression (see `compressionSourceOnly`
-    // in strategy config). When on, sections 1 (head), 2 (recall), and 3 (raw
-    // middle) below are skipped structurally — the summarizer receives ONLY the
-    // marker + exact target chunk + directive (sections 4–6). Tools stay
-    // declared (reasoning_extraction guard). L1 only; merge/transition paths do
-    // not consult this flag.
+    // in strategy config). When on, sections 1 (head) and 2 (recall pairs and
+    // raw middle) below are skipped structurally — the summarizer receives
+    // ONLY the marker + exact target chunk + directive (sections 4–6). Tools
+    // stay declared (reasoning_extraction guard). L1 only; merge/transition
+    // paths do not consult this flag.
     const sourceOnly = this.config.compressionSourceOnly === true;
-    let headCoveredSkipped = 0;
-    for (let i = headStartIdx; !sourceOnly && i < headEndIdx && i < allMessages.length; i++) {
-      const m = allMessages[i];
-      if (priorSummaryMessageIds.has(m.id)) {
-        headCoveredSkipped++;
-        continue;
-      }
-      llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
-    }
-    if (headCoveredSkipped > 0) {
-      console.warn(
-        `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries; ` +
-          `rendering them via recall pairs (ownership wins). The token-derived head boundary ` +
-          `disagrees with chunk ownership — likely store surgery or head-boundary drift.`,
-      );
-      logCompressionCall({
-        event: 'head-ownership-overlap',
-        site: 'compression',
-        skipped: headCoveredSkipped,
-        headStartIdx,
-        headEndIdx,
-      });
-    }
-
-    // ---- 2. Prior recall pairs (budget-capped) ----
-
-    // Token-budget cap (see capRecallPairs). Defense-in-depth: even with
-    // merged exclusion the unmerged frontier can be large at extreme scale.
-    // Source-only mode uses a zero recall budget: capRecallPairs returns an
-    // empty set, so no recall pair is emitted below AND buildRecallCurveVariants
-    // has no frontier to expand (canonical-only, one call).
-    const recallBudget = sourceOnly ? 0 : (this.config.compressionRecallBudgetTokens ?? 100_000);
-    const { kept: keptSummaries, keptTokens: recallTokens } = this.capRecallPairs(
-      priorSummaries,
-      recallBudget,
-    );
-    if (!sourceOnly && keptSummaries.length < priorSummaries.length) {
-      const dropped = priorSummaries.length - keptSummaries.length;
-      console.warn(
-        `autobio: compression recall-pair budget capped (${keptSummaries.length}/${priorSummaries.length} summaries kept, ` +
-          `~${recallTokens} tokens, budget ${recallBudget}; ${dropped} oldest dropped this compression).`,
-      );
-      logCompressionCall({
-        event: 'recall-budget-capped',
-        site: 'compression',
-        kept: keptSummaries.length,
-        total: priorSummaries.length,
-        tokens: recallTokens,
-        budgetTokens: recallBudget,
-      });
-    }
-
-    for (const s of keptSummaries) {
-      llmMessages.push({
-        participant: 'Context Manager',
-        content: [{ type: 'text', text: `[CM] Recall memory ${s.id}.` }],
-      });
-      // Recall answers carry the summary's verbatim reasoning carriers
-      // (signed thinking) when captured — validated 2026-07-16 on a
-      // deterministically-refusing mythos compress request: text-only →
-      // reasoning_extraction refusal; with carriers → end_turn. Replaying
-      // the model's own text WITH its encrypted reasoning reads as its own
-      // history rather than harvested output, the same KV-honesty argument
-      // as declaring tools. Raw message thinking is still stripped at
-      // insertion (unvalidated: the API rejects thinking blocks whose turn
-      // shape was modified, and split/collapse rewrites raw turns).
-      llmMessages.push({
-        participant: agentParticipant,
-        content: this.summaryAnswerContent(s),
-      });
-    }
-
-    // ---- 3. Raw middle ----
-    // Any raw messages between the head and the chunk that aren't yet
-    // represented by any summary — usually empty in adaptive-resolution
-    // mode, since chunking proceeds contiguously and summaries cover
-    // everything up to the chunk being processed. Same one-to-one rule
-    // as the head: coverage is judged against `priorSummaryMessageIds`
-    // (all live summaries, not the budget-capped keptSummaries).
     const chunkFirstId = chunk.messages[0]?.id;
-    if (chunkFirstId && !sourceOnly) {
-      const chunkStartIdx = allMessages.findIndex((m) => m.id === chunkFirstId);
-      for (let i = headEndIdx; i < chunkStartIdx && i < allMessages.length; i++) {
-        const m = allMessages[i];
-        if (priorSummaryMessageIds.has(m.id)) continue;
-        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+    const chunkStartIdx = chunkFirstId ? allMessages.findIndex((m) => m.id === chunkFirstId) : -1;
+
+    // History before the chunk, laid out for the messages that pins keep raw.
+    const layoutHistory = (forceRawMessageIds: ReadonlySet<MessageId>) => {
+      const holdsForceRaw = (summary: SummaryEntry): boolean => {
+        if (forceRawMessageIds.size === 0) return false;
+        const leaves = new Set<MessageId>();
+        this.expandSummaryToLeafMessageIds(summary, summariesById, leaves);
+        for (const id of leaves) if (forceRawMessageIds.has(id)) return true;
+        return false;
+      };
+      // Skip empty-content summaries as recall pairs: emitting `{type:'text',
+      // text:''}` triggers Anthropic 400 "text content blocks must be
+      // non-empty", which stalls ALL compression (mirrors the render-path
+      // guard + load-drop). They are descended like pinned ones, so their
+      // children still represent the span. An empty L1 that holds no pin
+      // stays covered.
+      const mixedFrontier: SummaryEntry[] = [];
+      const openedChunks: SummaryEntry[] = [];
+      // Each summary is visited once: a persisted cycle in sourceIds would
+      // otherwise recurse until the stack overflows.
+      const descended = new Set<string>();
+      const descend = (s: SummaryEntry): void => {
+        if (descended.has(s.id)) return;
+        descended.add(s.id);
+        const pinned = holdsForceRaw(s);
+        if (!pinned && !!s.content && s.content.trim().length > 0) {
+          mixedFrontier.push(s);
+          return;
+        }
+        if (s.level <= 1) {
+          if (pinned) openedChunks.push(s);
+          return;
+        }
+        for (const childId of s.sourceIds) {
+          const child = summariesById.get(childId);
+          if (child) descend(child);
+        }
+      };
+      for (const s of this.summaries) if (!s.mergedInto) descend(s);
+      // A pinned message the descent didn't reach (its L1's parent doesn't
+      // list it) opens that L1 too, so a pin holds whatever the linkage.
+      if (forceRawMessageIds.size > 0) {
+        const reached = new Set<MessageId>();
+        for (const s of mixedFrontier) this.expandSummaryToLeafMessageIds(s, summariesById, reached);
+        for (const s of openedChunks) this.expandSummaryToLeafMessageIds(s, summariesById, reached);
+        const unreached = new Set([...forceRawMessageIds].filter((id) => !reached.has(id)));
+        if (unreached.size > 0) {
+          for (const s of this.summaries) {
+            if (s.level === 1 && !openedChunks.includes(s) && s.sourceIds.some((id) => unreached.has(id))) {
+              openedChunks.push(s);
+            }
+          }
+        }
       }
-    }
+      const priorSummaries = mixedFrontier
+        .sort((a, b) => {
+          const aOrder = messageOrder.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+          const bOrder = messageOrder.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
+          return aOrder - bOrder || a.sourceRange.first.localeCompare(b.sourceRange.first);
+        });
 
-    // ---- 4. In-band marker ----
-    // Structural start of the exact source-only shape. Never recover this by
-    // searching text: the target itself may quote the marker.
-    const sourceOnlyStartIndex = llmMessages.length;
-    llmMessages.push({
-      participant: 'Context Manager',
-      content: [{ type: 'text', text: COMPRESSION_MARKER }],
-    });
+      // Leaf message coverage — the rendering authority for the one-to-one
+      // invariant: a covered message is represented by its recall pair, never
+      // raw. Uses the FULL priorSummaries set (not the budget-capped
+      // keptSummaries): a budget-dropped summary doesn't make its raw
+      // messages reappear. Expand summary sourceIds down to leaf message IDs
+      // — an L2's sourceIds are L1 IDs, not message IDs; a flat walk would
+      // miss every message it transitively covers (Bug 10). Every L1 is
+      // expanded too, as defense in depth, except the chunks a pin opened.
+      const openedMessageIds = new Set<MessageId>();
+      for (const l1 of openedChunks) this.expandSummaryToLeafMessageIds(l1, summariesById, openedMessageIds);
+      const priorSummaryMessageIds = new Set<MessageId>();
+      for (const s of this.summaries) {
+        if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
+      }
+      for (const id of openedMessageIds) priorSummaryMessageIds.delete(id);
+      for (const s of priorSummaries) {
+        this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
+      }
 
-    // ---- 5. Chunk messages raw ----
-    for (const m of chunk.messages) {
-      llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
-    }
+      // Raw messages before the chunk outside the head window, by position.
+      // From the head window's end on, any message no summary represents yet
+      // (the raw middle: usually empty in adaptive-resolution mode, since
+      // chunking proceeds contiguously and summaries cover everything up to
+      // the chunk being processed). Before it, only what pins keep raw: the
+      // chunks a pin opened, and pinned messages no recall pair represents.
+      // Same one-to-one rule as the head: coverage is judged against
+      // `priorSummaryMessageIds`.
+      //
+      // The raw that pins add to this prompt (`pinnedRaw`) is what recalling
+      // their summaries would take out: the messages of opened chunks,
+      // wherever they render, and pinned messages before the head window,
+      // which no prompt showed before. It's spent from the recall budget
+      // before any recall pair. A pinned message from the head window on
+      // that no summary covers was never chunked, since the chunker skips
+      // what pins keep raw; it renders raw with or without the pins and has
+      // no summary to recall, so it isn't charged here. When pins are
+      // admitted, the request's price includes it.
+      const rawMiddle: Array<{ position: number; message: StoredMessage }> = [];
+      const pinnedRaw: number[] = [];
+      let pinnedRawTokens = 0;
+      if (!sourceOnly) {
+        const addPinnedRaw = (position: number, message: StoredMessage): void => {
+          pinnedRaw.push(position);
+          pinnedRawTokens += tokensOf(stripThinkingBlocks(message.content));
+        };
+        // The head window renders in section 1; an opened chunk there is raw
+        // that pins add.
+        for (let i = headStartIdx; i < headEndIdx && i < allMessages.length; i++) {
+          const m = allMessages[i];
+          if (openedMessageIds.has(m.id) && !priorSummaryMessageIds.has(m.id)) addPinnedRaw(i, m);
+        }
+        for (let i = 0; i < chunkStartIdx && i < allMessages.length; i++) {
+          if (i >= headStartIdx && i < headEndIdx) continue;
+          const m = allMessages[i];
+          if (priorSummaryMessageIds.has(m.id)) continue;
+          const addedByPin = openedMessageIds.has(m.id) || (i < headEndIdx && forceRawMessageIds.has(m.id));
+          if (!addedByPin && i < headEndIdx) continue;
+          if (addedByPin) addPinnedRaw(i, m);
+          rawMiddle.push({ position: i, message: m });
+        }
+      }
+      return { priorSummaries, priorSummaryMessageIds, rawMiddle, pinnedRaw, pinnedRawTokens };
+    };
 
-    // ---- 6. Instruction (reading-mode aware) ----
-    //
     // When the chunk is a portion of a substantially larger sharded message
-    // (≥ 2× chunk size), use the reading-mode instruction. It avoids the
-    // "form a memory of what this contained" framing — which, for content
-    // heavily first-person from someone other than the agent (a user-shared
-    // doc), leads the model to adopt the content author's voice. Instead,
-    // it asks what reading was like and what was learned, forcing the
-    // model to reflect from its own vantage point in agent-first-person.
+    // (≥ 2× chunk size), section 6 uses the reading-mode instruction. It
+    // avoids the "form a memory of what this contained" framing — which, for
+    // content heavily first-person from someone other than the agent (a
+    // user-shared doc), leads the model to adopt the content author's voice.
+    // Instead, it asks what reading was like and what was learned, forcing
+    // the model to reflect from its own vantage point in agent-first-person.
+    // Worked out here, before the layout, since admitting pins prices it.
     const docContext = this.detectDocContext(chunk, ctx);
     const instructionText = this.applyIdentityReminder(
       docContext
         ? this.getReadingChunkInstruction(chunk, docContext.totalTokens, targetTokens)
         : this.getCompressionInstruction(chunk, targetTokens),
     );
-    llmMessages.push({
-      participant: 'Context Manager',
-      content: [{ type: 'text', text: instructionText }],
-    });
+    // Generous output ceiling so a memory-write is never truncated mid-thought:
+    // targetTokens is a *target*, not a cap, and adaptive models routinely
+    // overshoot a ~2k target. Was `* 1.5` (=3000 at the 2k default), which cut
+    // off rich memories (stop=max_tokens).
+    const outputReserveTokens = this.capCompressionTokens(Math.max(16000, Math.round(targetTokens * 1.5)));
+
+    // Pins count only before the chunk being compressed: this prompt is the
+    // history the chunk follows. A summary after it (a chunk compressed out of
+    // order, after a head-window reset or an unpin) is recalled as on main.
+    const forceRawMessageIds = new Set<MessageId>();
+    for (const i of this.forceRawPinPositions(allMessages)) {
+      if (i < chunkStartIdx) forceRawMessageIds.add(allMessages[i].id);
+    }
+    const recallBudget = sourceOnly ? 0 : (this.config.compressionRecallBudgetTokens ?? 100_000);
+
+    // The canonical request's messages for one layout of history, sections 1
+    // to 6, shaped as they are sent. Admitting the pins prices this list.
+    const assemble = (
+      { priorSummaryMessageIds, rawMiddle }: ReturnType<typeof layoutHistory>,
+      keptSummaries: readonly SummaryEntry[],
+    ) => {
+      const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
+
+      // ---- 1. Head window (raw, FIRST, ownership-capped) ----
+      //
+      // The head is the foundational identity anchor: the actual opening
+      // of the chronicle (the user's first message, the agent's first
+      // reply, the system context if any). It establishes WHO is speaking
+      // to WHOM. Without it, when the chunk content is heavily first-person
+      // from someone other than the agent (e.g., a user-shared document),
+      // the agent loses its first-person grounding and drifts into the
+      // content author's voice.
+      //
+      // The head is the configured head window — not "everything before
+      // the chunk." For doc-heavy chronicles, "everything before" would
+      // be hundreds of thousands of tokens; the recall pairs below
+      // represent that intermediate content. The head is just the
+      // permanent prefix that the original instance always saw.
+      //
+      // ONE-TO-ONE INVARIANT: chunk records (and the summaries over them)
+      // are the persistent authority over how a message is represented.
+      // The token-derived head boundary is only chunking *policy* — it is
+      // recomputed from the live estimator on every call and is NOT stable
+      // (estimator changes move it; transient headWindowTokens<=0 states
+      // let sweeps take ownership of head messages; store surgery can do
+      // the same — all observed in production, see issue #42). When the
+      // two authorities disagree, ownership wins: a head-range message
+      // covered by a live summary renders via its recall pair below, not
+      // raw. Rendering it both ways duplicated the seed in every payload.
+      let headCoveredSkipped = 0;
+      for (let i = headStartIdx; !sourceOnly && i < headEndIdx && i < allMessages.length; i++) {
+        const m = allMessages[i];
+        if (priorSummaryMessageIds.has(m.id)) {
+          headCoveredSkipped++;
+          continue;
+        }
+        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+      }
+
+      // ---- 2. Prior recall pairs (budget-capped, above) and the raw middle ----
+
+      // One sequence by source position after the head window, which always
+      // comes first, so the summarizer never reads an older raw turn as coming
+      // after a later memory. Where the raw middle follows every recall pair,
+      // as it does when chunking runs contiguously, this is the order the
+      // prompt always had: recall pairs, then raw.
+      const middle: Array<{ position: number; summary?: SummaryEntry; message?: StoredMessage }> = [
+        ...keptSummaries.map((summary) => ({
+          position: messageOrder.get(summary.sourceRange.first) ?? Number.MAX_SAFE_INTEGER,
+          summary,
+        })),
+        ...rawMiddle,
+      ].sort((a, b) => a.position - b.position);
+      for (const { summary: s, message: m } of middle) {
+        if (m) {
+          llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+          continue;
+        }
+        llmMessages.push({
+          participant: 'Context Manager',
+          content: [{ type: 'text', text: `[CM] Recall memory ${s!.id}.` }],
+        });
+        // Recall answers carry the summary's verbatim reasoning carriers
+        // (signed thinking) when captured — validated 2026-07-16 on a
+        // deterministically-refusing mythos compress request: text-only →
+        // reasoning_extraction refusal; with carriers → end_turn. Replaying
+        // the model's own text WITH its encrypted reasoning reads as its own
+        // history rather than harvested output, the same KV-honesty argument
+        // as declaring tools. Raw message thinking is still stripped at
+        // insertion (unvalidated: the API rejects thinking blocks whose turn
+        // shape was modified, and split/collapse rewrites raw turns).
+        llmMessages.push({
+          participant: agentParticipant,
+          content: this.summaryAnswerContent(s!),
+        });
+      }
+
+      // ---- 4. In-band marker ----
+      // Structural start of the exact source-only shape. Never recover this by
+      // searching text: the target itself may quote the marker.
+      const sourceOnlyStartIndex = llmMessages.length;
+      llmMessages.push({
+        participant: 'Context Manager',
+        content: [{ type: 'text', text: COMPRESSION_MARKER }],
+      });
+
+      // ---- 5. Chunk messages raw ----
+      for (const m of chunk.messages) {
+        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+      }
+
+      // ---- 6. Instruction (reading-mode aware; worked out above) ----
+      llmMessages.push({
+        participant: 'Context Manager',
+        content: [{ type: 'text', text: instructionText }],
+      });
+
+      // Split any bundled tool_use+tool_result cycles in non-user turns into
+      // separate API-shape messages. claude.ai-imported sessions carry these
+      // bundles (a tool_result in an assistant message rejects the request);
+      // for fresh imports the conhost importer splits at ingest time, but
+      // already-warmed sessions hit this path. See `normalize-tool-messages.ts`.
+      const split = splitMixedToolMessages(llmMessages);
+
+      // Collapse consecutive same-participant messages for API compliance
+      const collapsed = this.collapseConsecutiveMessages(split);
+
+      // Defense in depth against chunk boundaries that cut a tool cycle
+      // (rebuildChunks tries to avoid this, but covers only the most common
+      // case). The API rejects any tool_use that isn't immediately followed
+      // by its tool_result, and any tool_result that doesn't follow a use.
+      const cleaned = stripUnpairedToolBlocks(collapsed);
+
+      return { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped };
+    };
+
+    // The store's price of a request: each message's content, the system
+    // prompt, the tools and the output reserve.
+    const priceRequest = (messages: ReadonlyArray<{ content: ContentBlock[] }>): number => {
+      let total = outputReserveTokens +
+        (ctx.systemPrompt ? tokensOf([{ type: 'text', text: ctx.systemPrompt }]) : 0) +
+        (ctx.tools && ctx.tools.length > 0 ? tokensOf([{ type: 'text', text: JSON.stringify(ctx.tools) }]) : 0);
+      for (const message of messages) total += tokensOf(message.content);
+      return total;
+    };
+
+    let history = layoutHistory(forceRawMessageIds);
+    // Token-budget cap (see capRecallPairs), after the raw that pins add.
+    // Defense-in-depth: even with merged exclusion the unmerged frontier can
+    // be large at extreme scale. Source-only mode uses a zero recall budget:
+    // capRecallPairs returns an empty set, so no recall pair is emitted below
+    // AND buildRecallCurveVariants has no frontier to expand (canonical-only,
+    // one call).
+    let recall = this.capRecallPairs(history.priorSummaries, recallBudget - history.pinnedRawTokens);
+    let built = assemble(history, recall.kept);
+    // Pins are honored here only if the raw they add fits the recall budget
+    // and the request with it fits compressionContextBudgetTokens, priced as
+    // the store prices the messages it would send (the image cap below only
+    // replaces images with placeholders), with the system prompt, tools and
+    // output reserve. A request without pins is always attempted, as before.
+    // Otherwise this compression lays history out as if no pin applied,
+    // recalling the summaries the pins override, and says so once it goes
+    // ahead. Waiting for the pins to fit would stall every later L1 too,
+    // since the pinned history precedes each of them, and with them the L1s
+    // the live selector needs when even its deepest fold is over budget. The
+    // live view still shows the pins raw.
+    let pinsOverBudget: { history: typeof history; requestTokens?: number; contextBudget: number } | undefined;
+    if (history.pinnedRawTokens > 0) {
+      const contextBudget = this.normalizedCompressionContextBudget();
+      const requestTokens = history.pinnedRawTokens <= recallBudget ? priceRequest(built.cleaned) : undefined;
+      if (requestTokens === undefined || requestTokens > contextBudget) {
+        pinsOverBudget = { history, requestTokens, contextBudget };
+        history = layoutHistory(new Set());
+        recall = this.capRecallPairs(history.priorSummaries, recallBudget);
+        built = assemble(history, recall.kept);
+      }
+    }
+    const { priorSummaries, pinnedRawTokens } = history;
+    const { kept: keptSummaries, keptTokens: recallTokens } = recall;
+    const { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped } = built;
 
     const sourceOnlyFallbackMessages = this.config.compressionSourceOnlyFallback === true && !sourceOnly
       ? structuredClone(llmMessages.slice(sourceOnlyStartIndex))
       : undefined;
-
-    // Split any bundled tool_use+tool_result cycles in non-user turns into
-    // separate API-shape messages. claude.ai-imported sessions carry these
-    // bundles (a tool_result in an assistant message rejects the request);
-    // for fresh imports the conhost importer splits at ingest time, but
-    // already-warmed sessions hit this path. See `normalize-tool-messages.ts`.
-    const split = splitMixedToolMessages(llmMessages);
-
-    // Collapse consecutive same-participant messages for API compliance
-    const collapsed = this.collapseConsecutiveMessages(split);
-
-    // Defense in depth against chunk boundaries that cut a tool cycle
-    // (rebuildChunks tries to avoid this, but covers only the most common
-    // case). The API rejects any tool_use that isn't immediately followed
-    // by its tool_result, and any tool_result that doesn't follow a use.
-    const cleaned = stripUnpairedToolBlocks(collapsed);
 
     // Without the agent's live tool definitions a summarizer request that
     // replays tool-block-bearing history is deterministically refused
@@ -6377,25 +6661,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // code has no way to recover the older one. On either reading, omitting
     // it is what installs a competing (system-promptless) identity.
     // See ContextManager.setSystemPrompt.
-    // Own the byte wall here rather than delegating to membrane's shed: cap
-    // the prompt's inline image bytes newest-first before the request is built.
-    // A tighter budget than the live window's: a compression prompt also
-    // carries the head, the whole recall frontier and the raw chunk, so the
-    // image share must leave room for all of it under the API's 32MB cap.
-    //
-    // Cap `cleaned` — the list the wire messages are derived from — not
-    // `llmMessages`: splitMixedToolMessages/collapse REBUILD message objects,
-    // so a cap applied to the pre-split list logs its strips against copies
-    // the request never ships (field repro 2026-09-21: "replaced 1 older
-    // image ... kept 0MB" logged while the mint still 400'd on
-    // image_input_not_supported). The merge builder has always capped its
-    // post-split list; this aligns the L1 builder with it.
-    this.capCompressionImageBytes(
-      cleaned as Array<{ content: ContentBlock[] }>,
-      this.config.maxCompressionImageBytes ??
-        AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
-    );
-
     // Final wire-shape messages. Sanitize: strip empty text blocks and drop
     // any message left with no content (empty text reaches the API as a 400
     // that stalls ALL compression — see the twin note on the request below).
@@ -6408,7 +6673,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       keptSummaries.length < priorSummaries.length,
     );
 
-    const request: NormalizedRequest = {
+    const authoredRequest: NormalizedRequest = {
       // Served FIRST, ahead of the head — the live activation's own layout
       // (system prompt -> head -> middle). Conditionally spread rather than
       // assigned: an undeclared prompt must leave the request shape, its
@@ -6434,11 +6699,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ...(mintSeamed ? { cacheTtl: this.config.compressionCacheTtl } : {}),
       config: {
         model: this.requireCompressionModel(),
-        // Generous output ceiling so a memory-write is never truncated mid-thought:
-        // targetTokens is a *target*, not a cap, and adaptive models routinely
-        // overshoot a ~2k target. Was `* 1.5` (=3000 at the 2k default), which cut
-        // off rich memories (stop=max_tokens).
-        maxTokens: this.capCompressionTokens(Math.max(16000, Math.round(targetTokens * 1.5))),
+        maxTokens: outputReserveTokens, // generous, never truncating (above)
       },
       // Declare the agent's live tools. A summarizer request that replays
       // tool_use/tool_result history with NO tools param reads to Anthropic's
@@ -6453,12 +6714,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       tools: ctx.tools,
     };
 
+    // The canonical request is the authored one prepared. Recall-curve variants
+    // are built from the authored request, and each is prepared on its own:
+    // a variant is found by matching a recall pair's answer against the stored
+    // authored answer, which a prepared answer may no longer equal.
+    const request = this.prepareCompressionAhead(authoredRequest);
     let sourceOnlyFallbackRequest: NormalizedRequest | undefined;
     if (sourceOnlyFallbackMessages) {
-      this.capCompressionImageBytes(
-        sourceOnlyFallbackMessages as Array<{ content: ContentBlock[] }>,
-        this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
-      );
       const sourceOnlyCleaned = stripUnpairedToolBlocks(
         this.collapseConsecutiveMessages(splitMixedToolMessages(sourceOnlyFallbackMessages)),
       );
@@ -6479,7 +6741,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       };
     }
 
-    // Retain the exact normalized canonical request and frontier. Variants are
+    if (sourceOnlyFallbackRequest) {
+      sourceOnlyFallbackRequest = this.prepareCompressionAhead(sourceOnlyFallbackRequest);
+    }
+
+    // Retain the exact prepared canonical request and authored frontier. Variants are
     // derived solely by replacing one isolated recall pair; the canonical call
     // below is always issued first and is never rebuilt through fallback code.
     const canonicalRequestHash = sha256Json(request);
@@ -6487,7 +6753,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ? sha256Json(sourceOnlyFallbackRequest)
       : undefined;
     const variants = this.buildRecallCurveVariants(
-      request,
+      authoredRequest,
       keptSummaries,
       allMessages,
     );
@@ -6590,6 +6856,87 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       return;
     }
+
+    // The warnings for the layout sent: section 1's ownership, the recall
+    // cap's, and the pins' fallback. Logged once the compression goes ahead,
+    // past the deferral, the quarantine skip and in-flight coalescing, and
+    // before it registers as in flight, which the finally below settles.
+    if (headCoveredSkipped > 0) {
+      console.warn(
+        `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries; ` +
+          `rendering them via recall pairs (ownership wins). The token-derived head boundary ` +
+          `disagrees with chunk ownership — likely store surgery or head-boundary drift.`,
+      );
+      logCompressionCall({
+        event: 'head-ownership-overlap',
+        site: 'compression',
+        skipped: headCoveredSkipped,
+        headStartIdx,
+        headEndIdx,
+      });
+    }
+
+    if (!sourceOnly && keptSummaries.length < priorSummaries.length) {
+      const dropped = priorSummaries.length - keptSummaries.length;
+      console.warn(
+        `autobio: compression recall-pair budget capped (${keptSummaries.length}/${priorSummaries.length} summaries kept, ` +
+          `~${recallTokens} tokens, budget ${recallBudget}` +
+          (pinnedRawTokens > 0 ? ` less ~${pinnedRawTokens} of pinned raw` : '') +
+          `; ${dropped} oldest dropped this compression).`,
+      );
+      logCompressionCall({
+        event: 'recall-budget-capped',
+        site: 'compression',
+        kept: keptSummaries.length,
+        total: priorSummaries.length,
+        tokens: recallTokens,
+        budgetTokens: recallBudget,
+        ...(pinnedRawTokens > 0 ? { pinnedRawTokens } : {}),
+      });
+    }
+
+    if (pinsOverBudget) {
+      const { history: pinned, requestTokens, contextBudget } = pinsOverBudget;
+      // The pins that keep one of those messages raw: a pin whose own bound
+      // reads as raw here, over a message the pins keep raw.
+      const pinnedRawSet = new Set(pinned.pinnedRaw);
+      const forceRawPositions = this.forceRawPinPositions(allMessages);
+      const readsBounds = this.readsPinBounds();
+      const positionOf = this.positionIndex(allMessages);
+      const pins = this.pins.filter((pin) => {
+        const own: ResolvedPinBound = pin.level !== undefined ? { level: pin.level }
+          : pin.maxLevel !== undefined ? { maxLevel: pin.maxLevel } : 'raw';
+        if (readsBounds && !AutobiographicalStrategy.isRawPinBound(own)) return false;
+        const first = positionOf.get(pin.firstMessageId);
+        const last = positionOf.get(pin.lastMessageId);
+        if (first === undefined || last === undefined) return false;
+        for (let i = Math.min(first, last); i <= Math.max(first, last); i++) {
+          if (pinnedRawSet.has(i) && forceRawPositions.has(i)) return true;
+        }
+        return false;
+      }).map((pin) => pin.name ?? pin.id);
+      const limit = requestTokens === undefined
+        ? `exceeds compressionRecallBudgetTokens (${recallBudget})`
+        : `would bring the request to ~${requestTokens} tokens, over compressionContextBudgetTokens (${contextBudget})`;
+      console.warn(
+        `autobio: L1 compression of ${chunk.messages.length} message(s) from ${chunkFirstId} recalls the summaries ` +
+          `its pins override: the pinned history it would show raw (~${pinned.pinnedRawTokens} tokens in ` +
+          `${pinned.pinnedRaw.length} message(s); pins: ${pins.join(', ') || 'none found'}) ${limit}. ` +
+          `Narrow the pins or raise that budget to show them raw here.`,
+      );
+      logCompressionCall({
+        event: 'compression:pinned-raw-over-budget',
+        site: 'compression',
+        pinnedRawTokens: pinned.pinnedRawTokens,
+        pinnedRawMessages: pinned.pinnedRaw.length,
+        pins,
+        chunk_message_ids: chunk.messages.map((message) => message.id),
+        ...(requestTokens === undefined
+          ? { limit: 'recall', budgetTokens: recallBudget }
+          : { limit: 'context', requestTokens, budgetTokens: contextBudget }),
+      });
+    }
+
     let settleInFlight!: (result: CompressionInFlightResult) => void;
     const inFlightCompletion = new Promise<CompressionInFlightResult>((resolve) => {
       settleInFlight = resolve;
@@ -6630,6 +6977,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         expandedParentId?: string,
         expandedChildIds?: string[],
       ): Promise<unknown> => {
+        attemptRequest = this.prepareCompressionCandidate(attemptRequest, curveLabel);
         const started = Date.now();
         let response: unknown;
         // The request the transport ACCEPTED, which is the one that authored
@@ -6661,6 +7009,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             operation: 'compress_l1',
             metadata: { curveLabel, error: String(error).slice(0, 300) },
           });
+          // Stripping removes only blocks and the messages it empties, so the
+          // prepared request stays prepared.
           acceptedRequest = stripReasoningFromRequest(attemptRequest);
           response = await ctx.membrane!.complete(
             acceptedRequest,
@@ -6810,6 +7160,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           recallLevels: number[],
           coverageHash: string,
         ): Promise<void> => {
+          // Hashed as prepared; runAttempt logs what was replaced as it sends it.
+          hoistedRequest = this.prepareCompressionAhead(hoistedRequest);
           const requestHash = sha256Json(hoistedRequest);
           try {
             const rungResponse = await runAttempt(hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash);
@@ -7094,6 +7446,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               { participant: 'Context Manager', content: [{ type: 'text', text: this.applyIdentityReminder(this.getCompressionInstruction(chunk, target)) }] as ContentBlock[] },
             ];
             const cleaned = stripUnpairedToolBlocks(this.collapseConsecutiveMessages(splitMixedToolMessages(msgs)));
+            // runAttempt prepares this request before dispatch and trace hashing.
             return {
               ...(ctx.systemPrompt ? { system: ctx.systemPrompt } : {}),
               shedOversizeImages: true,
@@ -7496,15 +7849,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // round trip and that getter is live, so a host activation landing
         // mid-flight would make this receipt name a prompt the call never
         // sent. Every rung that can actually reach the wire from here
-        // (recall-curve variants, withAppendedInstruction, withoutToolsParam,
-        // stripReasoningFromRequest) derives from `request` by spread and
-        // leaves `system` untouched, so the canonical request's field is the
-        // sent value for all of them. Null when the request carried no
-        // system field, so the pre-threading log shape is preserved exactly;
-        // summarized (not verbatim) when it did, matching how `messages` is
-        // logged.
+        // (withAppendedInstruction, withoutToolsParam,
+        // stripReasoningFromRequest) derives from `request` by spread, and the
+        // recall-curve variants from `authoredRequest`, its unprepared form;
+        // each leaves `system` untouched, as preparation does, so the
+        // canonical request's field is the sent value for all of them. Null
+        // when the request carried no system field, so the pre-threading log
+        // shape is preserved exactly; summarized (not verbatim) when it did,
+        // matching how `messages` is logged. `messages` summarizes the
+        // prepared canonical request.
         system: request.system ? summarizeTelemetryText(request.system) : null,
-        messages: summarizeTelemetryMessages(cleaned),
+        messages: summarizeTelemetryMessages(request.messages),
         metadata: {
           chunk_message_ids: chunk.messages.map((m) => m.id),
           chunk_size: chunk.messages.length,
@@ -8171,17 +8526,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const collapsed = this.collapseConsecutiveMessages(split);
     const cleaned = stripUnpairedToolBlocks(collapsed);
 
-    // Byte wall on the MERGE prompt too (2026-07-12). A merge expands its
-    // sources ONE LEVEL DEEPER — an L2 merge therefore replays the RAW
-    // messages under its L1s, images and all (including screenshots nested in
-    // tool_results). This is the path that kept tripping membrane's transport
-    // shed at 27MB after the L1 site was already capped. Own it here.
-    this.capCompressionImageBytes(
-      cleaned as Array<{ content: ContentBlock[] }>,
-      this.config.maxCompressionImageBytes ??
-        AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
-    );
-
     // Final wire-shape messages. Sanitize: strip empty text blocks and drop
     // any message left with no content (empty text reaches the API as a 400
     // that stalls ALL compression — see the twin note on the request below).
@@ -8257,9 +8601,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // — same rationale as the L1 site's 'canonical-toolless' stage.
     const toollessEscalation =
       retryAfterToolUse && (this.mergeQueue[0]?.attempts ?? 0) >= 2;
-    const dispatchRequest = toollessEscalation
-      ? withoutToolsParam(request)
-      : request;
+    const dispatchRequest = this.prepareCompressionCandidate(
+      toollessEscalation ? withoutToolsParam(request) : request, `merge-l${targetLevel}`,
+    );
     if (toollessEscalation) {
       console.warn(
         `[autobiographical] L${targetLevel} merge retry ${this.mergeQueue[0]?.attempts} — escalating to tools-less request`,
@@ -8270,14 +8614,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let logResponse: string | undefined;
     let logError: string | undefined;
     let logNewSummaryId: string | undefined;
+    // The request last sent: `dispatchRequest`, or after a carrier
+    // rejection its copy with the reasoning stripped. When the call
+    // succeeds it is the request the transport accepted, which authored the
+    // merge. See the L1 ladder's `acceptedRequest` (sol review, 2026-08-24).
+    let acceptedRequest = dispatchRequest;
 
     try {
       let response: NormalizedResponse;
-      // The request the transport ACCEPTED — `dispatchRequest` unless the
-      // carrier fallback below fires, in which case the transport refused
-      // those bytes and the stripped copy is what authored the merge. See
-      // the L1 ladder's `acceptedRequest` (sol review, 2026-08-24).
-      let acceptedRequest = dispatchRequest;
       try {
         response = await ctx.membrane.complete(dispatchRequest, { formatter: this.nativeFormatter });
       } catch (error) {
@@ -8293,6 +8637,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           operation: `merge_l${targetLevel}`,
           metadata: { error: String(error).slice(0, 300) },
         });
+        // Stripping removes only blocks and the messages it empties, so the
+        // prepared request stays prepared.
         acceptedRequest = stripReasoningFromRequest(dispatchRequest);
         response = await ctx.membrane.complete(acceptedRequest, { formatter: this.nativeFormatter });
       }
@@ -8432,11 +8778,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         operation: `merge_l${targetLevel}`,
         // The DISPATCHED bytes — see the twin note at the compress_l1 site
         // for why this must not re-read ctx.systemPrompt after the await.
-        // `dispatchRequest` is what went on the wire: `request` itself, or
-        // its tools-less escalation, which drops the tools param and carries
-        // `system` through by spread.
-        system: dispatchRequest.system ? summarizeTelemetryText(dispatchRequest.system) : null,
-        messages: summarizeTelemetryMessages(cleaned),
+        // `acceptedRequest` is the request last sent: `request` prepared, or
+        // its tools-less escalation prepared, or, after a carrier rejection,
+        // either with its reasoning stripped, which the transport accepted
+        // unless that retry threw too. Each carries `system` through by
+        // spread, as preparation does.
+        system: acceptedRequest.system ? summarizeTelemetryText(acceptedRequest.system) : null,
+        messages: summarizeTelemetryMessages(acceptedRequest.messages),
         metadata: {
           target_level: targetLevel,
           source_ids: sourceIds,
@@ -8517,7 +8865,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // estimate is taken this compile.
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     let _t = _diag ? Date.now() : 0;
-    this.loadCalibration(store);
+    this.loadCalibration(store, { dryRun });
     const messages = store.getAll();
     this.refreshStoreOrder(messages);
     if (_diag) { console.error(`[cm-cache] selectAdaptive: calibration+getAll ${Date.now() - _t}ms`); _t = Date.now(); }
@@ -8611,14 +8959,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       chunksByMessageId = byId;
     }
 
-    // Pinned-position set so the picker doesn't fold messages the user
-    // explicitly marked as keep-raw. Built once and reused.
-    const pinnedSet = this.pinnedPositions(messages);
-    // V2 dynamic-pin fold-depth bounds (level / maxLevel). A position with a
-    // bound is NOT a classic force-raw pin — the KV-stable controller must be
-    // able to move it to/within its bound — so it renders as `pinned: false`
-    // carrying `pinLevel` / `pinMaxLevel` instead.
-    const pinBounds = this.pinLevelBounds(messages);
+    // Each pinned position's fold bound, resolved once (resolvedPinBounds),
+    // so the picker doesn't fold what the user marked keep-raw and every
+    // selector reads a pin as compression does. A chunk carries at most one
+    // of `pinned` (raw: a classic pin, or a level or cap of 0), `pinLevel` or
+    // `pinMaxLevel`, so every reader of `pinned` agrees on what stays raw.
+    // The last two appear only under the strategies that honor them
+    // (kv-stable, kv-unified), which must be able to move the chunk to or
+    // within its bound; elsewhere a bounded pin resolves to `pinned`. Built
+    // once and reused.
+    const pinBounds = this.resolvedPinBounds(messages);
 
     // O(1) summary lookup for findAncestorAt — avoids O(summaries) find()
     // calls during emission.
@@ -8664,11 +9014,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         rawTokens: tokens,
         currentResolution: reachableLevel(this.resolutions.get(msg.id) ?? 0, l1Id, summariesById),
         lockedByAgent: this.locked.has(msg.id),
-        // A classic pin (in pinnedSet with no level bound) stays force-raw. A
-        // leveled pin is not force-raw; it carries its bound instead.
-        pinned: pinnedSet.size > 0 && pinnedSet.has(i) && bound === undefined,
-        pinLevel: bound?.level,
-        pinMaxLevel: bound?.maxLevel,
+        pinned: bound !== undefined && AutobiographicalStrategy.isRawPinBound(bound),
+        pinLevel: bound !== undefined && bound !== 'raw' && 'level' in bound && bound.level > 0 ? bound.level : undefined,
+        pinMaxLevel: bound !== undefined && bound !== 'raw' && 'maxLevel' in bound && bound.maxLevel > 0 ? bound.maxLevel : undefined,
         l1Id,
         salience: salience[i],
       });
@@ -8981,8 +9329,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // current raw plan feasible and must never authorize an inference.
     // A dry run reports infeasibility via `_lastPreview.fits` instead: the
     // whole point of previewing an aggressive budget is to learn it won't fit
-    // without taking the outage that learning it live would cause.
-    if (result.finalTokens > rejectionBudget && !dryRun) {
+    // without taking the outage that learning it live would cause. Except
+    // under a provisional multiplier above 1, which a committing select
+    // would drop and retry at (selectPath): the dry run throws the same
+    // refusal so it takes the same fallback, and its preview says what the
+    // real compile will do. If the retry at 1 is still over, it reports.
+    const dryFallback = dryRun && this._calibrationProvisional !== null && this._calibration > 1;
+    if (result.finalTokens > rejectionBudget && (!dryRun || dryFallback)) {
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: result.finalTokens,
@@ -9412,7 +9765,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const alpha = 0.2; // slow EMA: one wild request shouldn't yank the ruler
     const ema = this._calibrationEma ?? current;
-    const next = ema + alpha * (observed - ema);
+    // A provisional multiplier is a guess (see CALIBRATION_PRICING_EPOCH). This
+    // sample is the first evidence under this release's pricing, so it replaces
+    // the guess outright; the EMA steps from here on.
+    const provisional = this._calibrationProvisional;
+    this._calibrationProvisional = null;
+    const next = provisional ? observed : ema + alpha * (observed - ema);
     const clamped = Math.min(1.8, Math.max(0.6, next));
     this._calibrationEma = clamped;
     // DEAD BAND. The multiplier is applied only once the EMA has moved more
@@ -9423,15 +9781,40 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // made every compile a cold one.
     // ponytail: fixed 2% band, so estimates may lag the EMA by up to 2%;
     // make it a config value if a host needs a tighter ruler.
-    if (Math.abs(clamped - current) / current <= 0.02) return;
+    if (Math.abs(clamped - current) / current <= 0.02) {
+      // A provisional multiplier confirmed within the band gets its stamp
+      // now: the record it came from has none, or is the discard's.
+      if (provisional) {
+        console.error(
+          `[estimator-calibration] real/est=${ratio.toFixed(2)} confirms the provisional multiplier ` +
+            `${current.toFixed(2)} (est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k); stamped`,
+        );
+        this.persistCalibration();
+      }
+      return;
+    }
     console.error(
       `[estimator-calibration] real/est=${ratio.toFixed(2)} ` +
-        `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)} (est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k)`,
+        `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)}${provisional ? ' (provisional: replaced, not stepped)' : ''} ` +
+        `(est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k)`,
     );
     this._calibration = clamped;
     this.applyCalibration();
+    this.persistCalibration();
+  }
+
+  /** Write the multiplier in force under the current pricing stamp, with the
+   *  reset it carries and without the provisional flag a discard wrote: this
+   *  is the first sample's write, which is what ends the provisional state.
+   *  Best-effort, as every calibration write is. */
+  private persistCalibration(): void {
     try {
-      this.store?.setStateJson(this.calibrationStateId, { multiplier: this._calibration, at: Date.now() });
+      this.store?.setStateJson(this.calibrationStateId, {
+        multiplier: this._calibration,
+        at: Date.now(),
+        pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+        ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+      });
     } catch { /* persistence is best-effort */ }
   }
 
@@ -9537,24 +9920,261 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** The EMA itself; `_calibration` is its last applied value (see the dead band). */
   private _calibrationEma: number | null = null;
   private _calibrationLoaded = false;
+  /** Set when an older-epoch multiplier was discarded; persisted with the record. */
+  private _calibrationReset: CalibrationReset | null = null;
+  /** Set while the multiplier is provisional (see CALIBRATION_PRICING_EPOCH):
+   *  the first sample the band accepts replaces it outright, and one above 1
+   *  that puts a compile over budget is dropped to 1. `fromEpoch` is the
+   *  record's it came from, null for one without a stamp. */
+  private _calibrationProvisional: { fromEpoch: number | null } | null = null;
 
   protected applyCalibration(): void {
     this._storeView?.setTokenCalibration?.(this._calibration);
   }
 
-  /** Load the persisted multiplier once and push it into the store view. */
-  protected loadCalibration(store: MessageStoreView): void {
+  /**
+   * Version of the per-class token pricing the persisted calibration
+   * multiplier was learned against. The multiplier is a residual over those
+   * rates, so it means nothing once they change: a store that pinned 1.8
+   * under the flat-600 signed-thinking price (epoch 0) comes back after the
+   * signature-priced fix estimating ~1.8x its real size. If that inflated
+   * plan is over the hard budget, the very first compile throws
+   * OverBudgetError, so no inference runs, no sample is ever reported, and
+   * the band fix in reportRealInputTokens never gets a chance to decay it: a
+   * permanent startup wedge. Bump this whenever MessageStore/ContextLog
+   * pricing changes shape, and give the new epoch an entry in
+   * CALIBRATION_EPOCH_REPRICES.
+   *
+   *   0: signed thinking at a flat HIDDEN_THINKING_TOKENS_DEFAULT (before 0.11.0)
+   *   1: signed thinking priced by signature length (0.11.0 on)
+   *   2: membrane's XML-history carriers (tool_attempt, tool_notice) priced as
+   *      the markup they replay as, where they had estimated as 0
+   *
+   * A record without a stamp was written by 0.13.0 or earlier: by 0.11.0 to
+   * 0.13.0 under epoch 1's pricing, or by a release before 0.11.0, under
+   * epoch 0's pricing or any before it, which CALIBRATION_EPOCH_REPRICES
+   * doesn't model. Nothing in the record tells these apart (#179: five stores
+   * upgraded from pre-0.11 runtimes kept a 1.8 pinned under the flat
+   * signed-thinking price, folded to ~45% of the window or wedged). So such
+   * a multiplier is PROVISIONAL. It is discarded at load if the epochs since
+   * 1 repriced content the store holds, or if it sits at a clamp edge (a
+   * residual pinned at 1.8 or 0.6 corrected rates that were off by more than
+   * the clamp allows, and says nothing about this release's); otherwise it
+   * is kept, but not re-stamped. A provisional multiplier above 1 that puts
+   * the first compile over budget is dropped to 1 and the select runs again
+   * (dropProvisionalCalibration). The first sample the band accepts replaces
+   * a provisional multiplier outright, instead of stepping the EMA toward it,
+   * and writes the stamp (reportRealInputTokens). The 1 a discard restarts
+   * from is provisional too, so one sample sets it rather than about ten; it
+   * is persisted as such (`provisional: true`), so a restart before that
+   * sample doesn't turn the guess into a learned value. A dry run under a
+   * provisional multiplier above 1 takes the same fallback at the picker's
+   * refusal, which it otherwise only reports.
+   *
+   * A binary from before a bump still learns after a rollback, and its first
+   * applied sample overwrites the newer epoch's record with its own stamp
+   * (reportRealInputTokens); rolling forward again treats that as an older
+   * record.
+   */
+  static readonly CALIBRATION_PRICING_EPOCH = 2;
+
+  /**
+   * For each pricing epoch, the content it repriced: a predicate over the
+   * store that is true when the store holds any. A multiplier from an older
+   * epoch is discarded only if some epoch since then repriced content this
+   * store actually holds. Otherwise its residual still means what it meant
+   * (e.g. a store on another provider's tokenizer, which never carries
+   * signed thinking), and it is re-stamped instead. An epoch without an
+   * entry here counts as repricing everything (discard, as before).
+   */
+  static readonly CALIBRATION_EPOCH_REPRICES: Readonly<Record<number, (messages: readonly StoredMessage[]) => boolean>> = {
+    // 1: signed thinking priced by signature length, not a flat 600. A block
+    // with a numeric `tokenEstimate` is priced by that stamp in both epochs
+    // (MessageStore and ContextLog read it first), so it wasn't repriced.
+    1: (messages) => messages.some((m) => m.content.some((b) => {
+      const block = b as { type?: string; signature?: unknown; tokenEstimate?: unknown };
+      return block.type === 'thinking' && typeof block.signature === 'string' && block.signature.length > 0 &&
+        typeof block.tokenEstimate !== 'number';
+    })),
+    // 2: XML-history carriers, which estimated as 0 before (an unknown block)
+    // and are now priced by MessageStore.xmlHistoryCarrierTokens.
+    2: (messages) => messages.some((m) => m.content.some((b) => MessageStore.xmlHistoryCarrierTokens(b) > 0)),
+  };
+
+  /** Whether any epoch in (fromEpoch, CALIBRATION_PRICING_EPOCH] repriced content in this store. */
+  protected calibrationRepricedSince(fromEpoch: number, messages: readonly StoredMessage[]): boolean {
+    for (let e = fromEpoch + 1; e <= AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH; e++) {
+      const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[e];
+      if (!reprices || reprices(messages)) return true;
+    }
+    return false;
+  }
+
+  /** Load the persisted multiplier once and push it into the store view.
+   *  A multiplier from an older epoch is re-stamped if no content this store
+   *  holds was repriced since, and otherwise discarded (start at 1). One from
+   *  a record without a stamp is kept as provisional, or discarded when it
+   *  sits at a clamp edge (see CALIBRATION_PRICING_EPOCH). One from a newer
+   *  epoch is not used.
+   *  A dry select's load decides the same way from the record and the store
+   *  as they are, and the rest of its select prices by that decision (its
+   *  chunking ran before the load, at the store's factor then, as a
+   *  committing select's does), but it writes and logs nothing. select()
+   *  then puts back everything the load changed, the multiplier the store
+   *  prices by included, so the first committing select loads again, from
+   *  the record and the store as they are by then, and logs and persists
+   *  what it decides. */
+  protected loadCalibration(store: MessageStoreView, opts: { dryRun: boolean }): void {
     this._storeView = store;
     if (!this._calibrationLoaded) {
       this._calibrationLoaded = true;
+      const commit = !opts.dryRun;
+      // A load decides from the record and the store alone: an earlier dry
+      // load of this branch may have left its own decision in these.
+      this._calibration = 1;
+      this._calibrationReset = null;
+      this._calibrationProvisional = null;
       try {
-        const saved = this.store?.getStateJson(this.calibrationStateId) as { multiplier?: number } | null;
+        const saved = this.store?.getStateJson(this.calibrationStateId) as
+          { multiplier?: number; pricing?: number; reset?: CalibrationReset; provisional?: boolean } | null;
         if (saved && Number.isFinite(saved.multiplier)) {
-          this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+          const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+          const stamped = typeof saved.pricing === 'number' && Number.isFinite(saved.pricing);
+          // No stamp: written by 0.13.0 or earlier, under epoch 1's pricing or
+          // any before it (see CALIBRATION_PRICING_EPOCH). The reprice check
+          // can only be asked about the epochs since 1; the rest is what makes
+          // such a multiplier provisional.
+          const epoch = stamped ? saved.pricing! : 1;
+          const fromEpoch = stamped ? epoch : null;
+          const pinned = saved.multiplier! >= 1.8 || saved.multiplier! <= 0.6;
+          const repriced = epoch < current && this.calibrationRepricedSince(epoch, store.getAll());
+          if (epoch === current) {
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+            // A discard's 1 that no sample has confirmed yet was persisted as
+            // provisional, and stays a guess across the restart: the first
+            // sample still sets it, instead of stepping toward it.
+            if (saved.provisional === true) {
+              this._calibrationProvisional = { fromEpoch: this._calibrationReset?.fromEpoch ?? null };
+            }
+          } else if (repriced || (epoch < current && !stamped && pinned)) {
+            const reset: CalibrationReset = { discardedMultiplier: saved.multiplier!, fromEpoch, at: Date.now() };
+            this._calibrationReset = reset;
+            // The 1 this restarts from is a guess too: the first sample sets it.
+            this._calibrationProvisional = { fromEpoch };
+            if (commit) {
+              const why = stamped
+                ? `learned under pricing epoch ${epoch} (current ${current})`
+                : !repriced
+                  ? `from a record with no pricing stamp (0.13.0 or earlier), pinned at the ` +
+                    `${saved.multiplier! >= 1.8 ? 'ceiling' : 'floor'} of its clamp: it corrected per-class rates ` +
+                    `that were off by more than the clamp allows, and says nothing about this release's`
+                  : `from a record with no pricing stamp (0.13.0 or earlier), in a store holding content ` +
+                    `repriced since (current epoch ${current})`;
+              console.warn(
+                `[estimator-calibration] DISCARDED multiplier ${saved.multiplier!.toFixed(2)} ${why}; ` +
+                  `restarting from 1.00. Every token estimate changes by ${(1 / saved.multiplier!).toFixed(2)}x, ` +
+                  `and the window refolds to match; the first provider sample sets the multiplier outright. ` +
+                  `If the old value is still accurate for this store (e.g. it mostly corrects for a ` +
+                  `non-Anthropic tokenizer), check it against provider-billed input tokens and re-stamp it: ` +
+                  `setStateJson('${this.calibrationStateId}', { multiplier, at, pricing: ${current} }). ` +
+                  `Shown as calibration.reset in render stats until then.`,
+              );
+              // Persist the reset, so a rollback to a binary that ignores the
+              // stamp can't reload the stale multiplier and re-arm the wedge,
+              // and the discard isn't re-logged on every restart. The 1 is
+              // persisted as provisional until the first sample's write.
+              try {
+                this.store?.setStateJson(this.calibrationStateId,
+                  { multiplier: 1, at: Date.now(), pricing: current, reset, provisional: true });
+              } catch { /* persistence is best-effort */ }
+            }
+          } else if (epoch < current && stamped) {
+            // Nothing this store holds was repriced since that epoch, so the
+            // residual is still valid: keep it and re-stamp it. A reset it
+            // carries is this store's history and stays with it, as it does
+            // through the learner's writes.
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+            if (commit) {
+              console.warn(
+                `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from pricing epoch ${epoch} ` +
+                  `(current ${current}): this store holds no content repriced since then; re-stamped`,
+              );
+              try {
+                this.store?.setStateJson(this.calibrationStateId, {
+                  multiplier: this._calibration,
+                  at: Date.now(),
+                  pricing: current,
+                  ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+                });
+              } catch { /* persistence is best-effort */ }
+            }
+          } else if (epoch < current) {
+            // No stamp, not pinned, and nothing the epochs since 1 repriced:
+            // the multiplier may be epoch 1's and still right, or older and
+            // stale, and the record can't say. Keep it as provisional, and
+            // write nothing: the stamp is the first sample's to give.
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+            this._calibrationProvisional = { fromEpoch: null };
+            if (commit) {
+              console.warn(
+                `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from a record with no ` +
+                  `pricing stamp (0.13.0 or earlier) as provisional: the first provider sample replaces it ` +
+                  `outright, and a compile it puts over budget drops it to 1.00 first. Stamped (epoch ` +
+                  `${current}) once a sample confirms it.`,
+              );
+            }
+          }
+          // A record from a NEWER epoch belongs to a later binary. The load
+          // leaves it on disk and doesn't use it, and logs nothing, since
+          // re-stamping it as the discard warning advises would destroy it.
+          // This binary's learner still writes its own record over it on its
+          // first applied sample (see CALIBRATION_PRICING_EPOCH).
         }
       } catch { /* absent slot is fine */ }
     }
+    // A dry select changes the store's multiplier only where select() read it
+    // first and can put it back (see MessageStoreView).
+    if (opts.dryRun && store.setTokenCalibration && !store.getTokenCalibration) {
+      throw new Error(
+        'A dry select needs a store view that reads its token calibration (getTokenCalibration) ' +
+          'as well as setting it, so the multiplier it applies can be put back afterwards.',
+      );
+    }
     this.applyCalibration();
+  }
+
+  /** The fallback for a provisional multiplier above 1 whose compile was
+   *  refused (see CALIBRATION_PRICING_EPOCH): discard it to 1, so the select
+   *  can run again, and record the reset; a committing select logs and
+   *  persists it, a dry one keeps it to itself (select() puts it back).
+   *  Returns false when there is nothing to drop: no provisional multiplier,
+   *  or one at or below 1, where raising estimates can't help, so the refusal
+   *  stands. The 1 stays provisional: the first sample sets it. */
+  protected dropProvisionalCalibration(err: OverBudgetError, dryRun: boolean): boolean {
+    const provisional = this._calibrationProvisional;
+    if (!provisional || this._calibration <= 1) return false;
+    const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const discarded = this._calibration;
+    const reset: CalibrationReset = { discardedMultiplier: discarded, fromEpoch: provisional.fromEpoch, at: Date.now() };
+    this._calibration = 1;
+    this._calibrationReset = reset;
+    this.applyCalibration();
+    if (dryRun) return true;
+    console.warn(
+      `[estimator-calibration] DISCARDED provisional multiplier ${discarded.toFixed(2)} ` +
+        `(${provisional.fromEpoch === null ? 'from a record with no pricing stamp' : `from pricing epoch ${provisional.fromEpoch}`}): ` +
+        `the compile priced by it was refused (${err.actual} tokens against a hard budget of ${err.budget}); ` +
+        `restarting from 1.00 and compiling again. The first provider sample sets the multiplier outright. ` +
+        `Shown as calibration.reset in render stats.`,
+    );
+    try {
+      this.store?.setStateJson(this.calibrationStateId,
+        { multiplier: 1, at: Date.now(), pricing: current, reset, provisional: true });
+    } catch { /* persistence is best-effort */ }
+    return true;
   }
 
   /**
@@ -10401,7 +11021,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Q/A pair between head and tail; pinned messages still emit raw, in
     // their chronological positions, after the combined recall pair.
     const positionOf = this.positionIndex(messages);
-    const pinnedPositionsSet = this.pinnedPositions(messages);
+    // Without adaptive resolution no selector reads a pin's level bound, so
+    // every pinned position resolves to raw (resolvedPinBounds).
+    const pinnedPositionsSet = this.forceRawPinPositions(messages);
     // Pinned messages between head and recent (head/recent pinned ones
     // already emit raw via Phase 0 / Phase 4).
     const pinnedInMiddle: { msg: StoredMessage; position: number }[] = [];
@@ -11024,7 +11646,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       },
     };
 
-    const response = await ctx.membrane.complete(request, { formatter: this.nativeFormatter });
+    const prepared = this.prepareCompressionCandidate(request, 'transition');
+    const response = await ctx.membrane.complete(prepared, { formatter: this.nativeFormatter });
     if (!this.isCompressionBranchCurrent(sourceBranch)) {
       throw new Error('Transition summary crossed a branch generation; reinitialize before retrying');
     }
@@ -11061,16 +11684,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Get messages in the compressible zone: outside both head window and
-   * recent window AND not inside any pinned range. Returns messages from
-   * [0, headStart) ∪ [headEnd, recentStart) minus any positions covered
-   * by a pin or document mark.
+   * recent window AND not kept raw by a pin. Returns messages from
+   * [0, headStart) ∪ [headEnd, recentStart) minus any position a pin or
+   * document mark keeps raw (forceRawPinPositions). A pin with a positive
+   * level or cap, under the strategies that honor one, is compressible: it
+   * renders at a level, which only a summary can supply.
    */
   protected getCompressibleMessages(store: MessageStoreView, exclude?: Uint8Array): StoredMessage[] {
     const messages = store.getAll();
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     const recentStart = this.getRecentWindowStart(store);
-    const pinned = this.pinnedPositions(messages);
+    const pinned = this.forceRawPinPositions(messages);
     const out: StoredMessage[] = [];
     for (let i = 0; i < recentStart; i++) {
       if (i >= headStart && i < headEnd) continue;
@@ -11669,18 +12294,255 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Inline payload characters of an image a compression prompt carries: a
+   * base64 source, a `data:` URL source, or a `data` field beside `mimeType`
+   * (MCP image blocks in tool results, generated images); 0 for a remote URL.
+   * The compression cap counts with this. The live window's image strip
+   * still counts with imageBlockBytes.
+   */
+  protected static compressionImageBytes(b: unknown): number {
+    const image = b as { data?: unknown; source?: { data?: unknown; url?: unknown } };
+    const src = image.source;
+    if (typeof src?.data === 'string') return src.data.length;
+    if (typeof src?.url === 'string' && src.url.slice(0, 5).toLowerCase() === 'data:') {
+      const comma = src.url.indexOf(',');
+      return comma < 0 ? src.url.length : src.url.length - comma - 1;
+    }
+    return typeof image.data === 'string' ? image.data.length : 0;
+  }
+
+  /** Requests prepared before they are sent, with what preparing them replaced. */
+  private readonly compressionPreparedAhead = new WeakMap<NormalizedRequest, PreparationCounts>();
+
+  /**
+   * Prepare a compression request: serialized data URLs become markers, then
+   * inline images are capped. The result owns its message wrappers and copies
+   * only what it changes, so stored messages and other requests are never
+   * edited, and preparing a prepared request changes nothing. It doesn't log.
+   */
+  protected prepareCompressionRequest(request: NormalizedRequest): CompressionPreparation {
+    const prepared = { ...request, messages: request.messages.map(message => ({ ...message })) };
+    const serializedMediaReplacements = this.stripSerializedCompressionMedia(prepared.messages);
+    const imageBudgetBytes =
+      this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES;
+    const cap = { keptBytes: 0 };
+    const imageReplacements = this.capCompressionImageBytes(prepared.messages, imageBudgetBytes, cap);
+    return {
+      request: prepared, serializedMediaReplacements, imageReplacements, imageBudgetBytes, imageBytesKept: cap.keptBytes,
+    };
+  }
+
+  /**
+   * Prepare a request that is hashed and priced before it is sent: the
+   * canonical and source-only L1 requests, the recall-curve variants and the
+   * tool-prose rewrite. Many are never sent, so what preparation replaced is
+   * logged only when one is, by prepareCompressionCandidate.
+   */
+  private prepareCompressionAhead(request: NormalizedRequest): NormalizedRequest {
+    const { request: prepared, ...counts } = this.prepareCompressionRequest(request);
+    this.compressionPreparedAhead.set(prepared, counts);
+    return prepared;
+  }
+
+  /**
+   * Prepare a request as it is sent, and log what preparation replaced in it,
+   * naming the request. A request prepared ahead is logged here, once.
+   */
+  private prepareCompressionCandidate(request: NormalizedRequest, label: string): NormalizedRequest {
+    const ahead = this.compressionPreparedAhead.get(request);
+    if (ahead) {
+      this.compressionPreparedAhead.delete(request);
+      this.logCompressionPreparation(ahead, label);
+      return request;
+    }
+    const prepared = this.prepareCompressionRequest(request);
+    this.logCompressionPreparation(prepared, label);
+    return prepared.request;
+  }
+
+  /** One line per kind of replacement, naming the request. */
+  private logCompressionPreparation(counts: PreparationCounts, label: string): void {
+    if (counts.serializedMediaReplacements > 0) {
+      console.error(
+        `[autobiographical] compression prompt: replaced ${counts.serializedMediaReplacements} ` +
+          `serialized data URL(s) with markers [${label}]`,
+      );
+    }
+    if (counts.imageReplacements > 0) {
+      const mib = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)}MiB`;
+      console.error(
+        `[autobiographical] compression prompt: replaced ${counts.imageReplacements} image(s) with placeholders ` +
+          `to stay under the ${mib(counts.imageBudgetBytes)} inline image budget ` +
+          `(kept ${mib(counts.imageBytesKept)}, newest messages first) [${label}]`,
+      );
+    }
+  }
+
+  /** Ignore short data-URL examples while catching actual serialized media. */
+  protected static readonly SERIALIZED_DATA_URL_MIN_CHARS = 4096;
+
+  /**
+   * Replace large base64 data URLs that a compression prompt carries as text:
+   * in text blocks, in tool results (string or block array), and in a tool
+   * call's input, its strings or the text of arguments that didn't parse. An imported tool result can carry a
+   * foreign harness's image JSON instead of a native image block; the image
+   * byte cap can't see those bytes, and they are priced as prose (a 1 MiB
+   * image is about 1.4 million base64 characters). It replaces each given
+   * message's content array and copies the blocks it changes, so a caller
+   * passes message wrappers it owns, as prepareCompressionRequest does, and
+   * stored Chronicle messages are never mutated. The marker keeps the media
+   * type and the payload's length.
+   */
+  protected stripSerializedCompressionMedia(messages: Array<{ content: ContentBlock[] }>): number {
+    const minChars = AutobiographicalStrategy.SERIALIZED_DATA_URL_MIN_CHARS;
+    // `+`, not `{minChars,}`: V8's irregexp overflows the stack on a counted
+    // quantifier once a MATCHING run reaches ~8M characters (node 22), which
+    // is exactly the media size this targets. The length floor is applied
+    // below instead.
+    // Also matches MIME parameters before `;base64` (`;charset=…`,
+    // `;name="a b.png"`) and the JSON escapes serializers emit, however many
+    // times the text was serialized: escaped slashes (`image\/png`,
+    // `image\\\/png`), `\u` escapes in the type (`image\u002Fsvg\u002Bxml`),
+    // and escapes inside the payload, such as `\n` where base64 was wrapped or
+    // `\u002F`. Any letter case matches (`DATA:`, `;BASE64,`), as URL schemes
+    // and the base64 token do. Bare base64 under a JSON key (Anthropic
+    // `"source":{"data":…}`) is out of scope. Every choice in the pattern is
+    // decided by the next character (a \u002F escape is only ever the type's
+    // slash, and a quoted parameter value holds no backslash or quote), so a
+    // string that almost matches fails in linear time: overlapping choices
+    // took time exponential in its number of parameters.
+    const dataUrl =
+      /data:((?:[A-Za-z0-9]|\\+u(?!002f)[0-9a-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u(?!002f)[0-9a-f]{4})*(?:\\*\/|\\+u002f)(?:[A-Za-z0-9]|\\+u(?!002f)[0-9a-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u(?!002f)[0-9a-f]{4})*)(?:;[A-Za-z0-9!#$&^_.+-]+=(?:\\*"(?:[^"\\]|\\+u[0-9a-f]{4})*\\*"|(?:[^;,:\s"\\]|\\+u[0-9a-f]{4})*))*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
+    let replaced = 0;
+    // Every backslash run in a matched type ends in `u` and four hex digits
+    // or in its slash, so one pass reads each run once.
+    const unescapeType = (type: string) => type.replace(
+      /\\+(?:u([0-9a-f]{4})|\/)/gi, (_, hex?: string) => (hex ? String.fromCharCode(parseInt(hex, 16)) : '/'),
+    );
+    // A data URL's head, matched in place, to tell a run that reaches the
+    // next data URL from one that runs into a word ending in `data`.
+    const dataUrlAt = new RegExp(dataUrl.source, 'iy');
+    const stripText = (text: string): string => {
+      let out = '';
+      let copied = 0;
+      dataUrl.lastIndex = 0;
+      for (let m = dataUrl.exec(text); m; m = dataUrl.exec(text)) {
+        const [match, mediaType, run] = m;
+        const payloadStart = m.index + match.length - run.length;
+        let payloadEnd = m.index + match.length;
+        // A run that reaches the next data URL (`…AAAAdata:`, or `…\ndata:`
+        // in JSON) ends before it. The scan resumes where the payload ends.
+        if (text[payloadEnd] === ':' && run.slice(-4).toLowerCase() === 'data') {
+          dataUrlAt.lastIndex = payloadEnd - 4;
+          if (dataUrlAt.test(text)) payloadEnd -= 4;
+        }
+        // A payload never ends in an escape of a character base64 doesn't
+        // use, such as a `\n` or `\u0026` after its last line, so such
+        // escapes are trimmed from the end of every run, and so are
+        // backslashes that escape the character after the run (`\"`). An
+        // escaped base64 character (`\/`, `\u002B`) is payload.
+        for (;;) {
+          const escape = /\\(?:[bfnrt]|u([0-9a-f]{4}))$/i.exec(text.slice(Math.max(payloadStart, payloadEnd - 6), payloadEnd));
+          if (escape && !(escape[1] && /[A-Za-z0-9+/=_-]/.test(String.fromCharCode(parseInt(escape[1], 16))))) {
+            payloadEnd -= escape[0].length;
+          } else if (payloadEnd > payloadStart && text[payloadEnd - 1] === '\\') {
+            payloadEnd--;
+          } else {
+            break;
+          }
+        }
+        const length = payloadEnd - payloadStart;
+        if (length >= minChars) {
+          out += text.slice(copied, m.index) +
+            `[embedded ${unescapeType(mediaType)} data URL omitted from compression prompt: ` +
+            `${length} serialized payload characters]`;
+          copied = payloadEnd;
+          replaced++;
+        }
+        dataUrl.lastIndex = payloadEnd;
+      }
+      return copied === 0 ? text : out + text.slice(copied);
+    };
+    // A tool call's input is any JSON value; only its strings can carry a
+    // data URL. The same value comes back when nothing in it changed.
+    const stripJson = (value: unknown): unknown => {
+      if (typeof value === 'string') return stripText(value);
+      if (Array.isArray(value)) {
+        let changed = false;
+        const items = value.map((item) => {
+          const next = stripJson(item);
+          if (next !== item) changed = true;
+          return next;
+        });
+        return changed ? items : value;
+      }
+      if (value !== null && typeof value === 'object') {
+        let changed = false;
+        const fields = Object.entries(value).map(([key, item]) => {
+          const next = stripJson(item);
+          if (next !== item) changed = true;
+          return [key, next] as const;
+        });
+        // fromEntries defines each key as the object's own, as JSON.parse
+        // does, so a `__proto__` member stays a member.
+        return changed ? Object.fromEntries(fields) : value;
+      }
+      return value;
+    };
+    const strip = (blocks: ContentBlock[]): ContentBlock[] => {
+      let changed = false;
+      const stripped = blocks.map((block) => {
+        let next = block;
+        if (block.type === 'text') {
+          const text = stripText(block.text);
+          if (text !== block.text) next = { ...block, text } as ContentBlock;
+        } else if (block.type === 'tool_result') {
+          const nested = block.content;
+          if (typeof nested === 'string') {
+            const text = stripText(nested);
+            if (text !== nested) next = { ...block, content: text } as ContentBlock;
+          } else if (Array.isArray(nested)) {
+            const inner = strip(nested);
+            if (inner !== nested) next = { ...block, content: inner } as ContentBlock;
+          }
+        } else if (block.type === 'tool_use') {
+          const input = (block as { input?: unknown }).input;
+          const strippedInput = stripJson(input);
+          if (strippedInput !== input) next = { ...block, input: strippedInput } as ContentBlock;
+          // Arguments that didn't parse are kept as their text.
+          const unparsed = (block as { unparseableInput?: unknown }).unparseableInput;
+          if (typeof unparsed === 'string') {
+            const strippedUnparsed = stripText(unparsed);
+            if (strippedUnparsed !== unparsed) next = { ...next, unparseableInput: strippedUnparsed } as ContentBlock;
+          }
+        }
+        if (next !== block) changed = true;
+        return next;
+      });
+      return changed ? releaseEditedRawForms(blocks, stripped) : blocks;
+    };
+    for (const message of messages) message.content = strip(message.content);
+    return replaced;
+  }
+
+  /**
    * Cap inline image bytes in a COMPRESSION prompt (2026-07-12). The main
    * window enforces `maxLiveImageBytes` through the strip policy; the
    * summarizer's raw-chunk replay had no such wall and leaned on membrane's
    * byte shed instead — which is a transport backstop, not a policy owner
-   * (it fired at 27MB on a live merge). Keep images newest-first within the
-   * budget; older ones become the same loud placeholder the window uses, so
-   * the summarizer is told plainly that it is not seeing them.
-   * Returns the number of images replaced.
+   * (it fired at 27MB on a live merge). Every inline image counts, whatever
+   * its shape (see compressionImageBytes), generated images included.
+   * Messages are walked newest-first, and the blocks within a message in
+   * order; each image is kept if it fits in what's left of the budget, and
+   * the others become the same loud placeholder the window uses, so the
+   * summarizer is told plainly that it is not seeing them.
+   * Returns the number of images replaced; `stats`, when given, receives the
+   * bytes kept.
    */
   protected capCompressionImageBytes(
     messages: Array<{ content: ContentBlock[] }>,
     capBytes: number,
+    stats?: { keptBytes: number },
   ): number {
     if (capBytes <= 0) return 0;
     let kept = 0;
@@ -11694,8 +12556,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const capBlocks = (blocks: ContentBlock[]): ContentBlock[] => {
       let changed = false;
       const capped = blocks.map((b) => {
-        if (b.type === 'image') {
-          const bytes = AutobiographicalStrategy.imageBlockBytes(b);
+        if (b.type === 'image' || b.type === 'generated_image') {
+          const bytes = AutobiographicalStrategy.compressionImageBytes(b);
           if (kept + bytes <= capBytes) {
             kept += bytes;
             return b;
@@ -11720,12 +12582,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!Array.isArray(m.content)) continue;
       m.content = capBlocks(m.content);
     }
-    if (dropped > 0) {
-      console.error(
-        `[autobiographical] compression prompt: replaced ${dropped} older image(s) with placeholders ` +
-          `to stay under the ${Math.round(capBytes / 1e6)}MB image-byte budget (kept ${Math.round(kept / 1e6)}MB, newest-first)`,
-      );
-    }
+    if (stats) stats.keptBytes = kept;
     return dropped;
   }
 
