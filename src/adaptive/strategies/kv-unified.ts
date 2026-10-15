@@ -15,6 +15,7 @@ import {
 } from '../kv-unified-pareto.js';
 import { normalizeContinuityMultiplier, normalizePolicy, policyScore } from '../kv-unified-policy.js';
 
+import type { KvUnifiedReuse } from '../kv-unified-reuse.js';
 export type { KvUnifiedReuse } from '../kv-unified-reuse.js';
 
 export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> {
@@ -155,18 +156,26 @@ export class KvUnifiedStrategy implements FoldingSolver {
     budget: FoldingBudget,
   ): ProduceRequest[] {
     const config = this.options.latentDemand!;
+    // Holders of candidates this compile does not score are dropped: their
+    // merge exists now, or is no longer producible.
+    const live = this.options.reuse;
+    const whatIf: WhatIfReuse = { base: forest, live, carried: live?.whatIf, kept: live ? new Map() : undefined };
+    if (live) live.whatIf = whatIf.kept;
     const candidates = latentHigherLevelCandidates(inputs, forest, config)
       .slice(0, Math.max(0, Math.floor(config.maxCandidates)));
     // Pass 1: one conservative (p80 recall-cost) what-if solve per candidate.
     const solved = candidates.flatMap((candidate) => {
       const conservative = solveWithLatentCandidate(
-        inputs, candidate, candidate.conservativeRecallTokens, this.options, budget.totalBudget,
+        inputs, whatIf, candidate, candidate.conservativeRecallTokens, this.options, budget.totalBudget,
       );
       this.demandSolves++;
       return conservative.feasible ? [{ candidate, conservative }] : [];
     });
     const policy = normalizePolicy(this.options.policy);
     const multiplier = normalizeContinuityMultiplier(this.options.continuityMultiplier);
+    // Certified entries whose uncertified re-solve scored worse than the
+    // certified pool: they stand at the gain that pool proves.
+    const proven = new Set<object>();
     // Merges worth less than adoptEpsilon are not demanded; that is the
     // hysteresis policy's own tolerance, applied here to best-vs-best.
     const epsilon = Number.isFinite(this.options.adoptEpsilon) && (this.options.adoptEpsilon ?? 0) > 0
@@ -185,39 +194,78 @@ export class KvUnifiedStrategy implements FoldingSolver {
         cacheFloor = Math.min(cacheFloor, conservative.cacheFloor);
         continuityFloor = Math.min(continuityFloor, conservative.continuityFloor);
       }
+      // The frame is fixed for this pass, so each pool is scanned once.
+      const scored = new Map<object, number>();
       const best = (result: Extract<ParetoPolicySolveResult, { feasible: true }>): number => {
-        if (result.bestScoreUnder) return result.bestScoreUnder(cacheFloor, continuityFloor);
-        let score = Infinity;
-        for (const c of result.candidates) {
-          score = Math.min(score, policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss,
-            cacheFloor, continuityFloor, policy, multiplier));
+        let score = scored.get(result);
+        if (score !== undefined) return score;
+        if (result.bestScoreUnder) {
+          score = result.bestScoreUnder(cacheFloor, continuityFloor);
+        } else {
+          score = Infinity;
+          for (const c of result.candidates) {
+            score = Math.min(score, policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss,
+              cacheFloor, continuityFloor, policy, multiplier));
+          }
         }
+        scored.set(result, score);
         return score;
       };
       const baseBest = best(base);
+      // A certified what-if exposes only the carried layout and its
+      // extensions, up to certificate.maxImprovement above the what-if's
+      // best cut, so its improvement is understated by that much. Before any
+      // expected-cost solve, no such interval may decide the gate or the
+      // order of the requests: a certified what-if is solved again without
+      // the certificate when its interval spans the gate, or when it passes
+      // the gate and another passing candidate's interval overlaps it.
+      // The requests are then ordered by proven gains. That is the order of
+      // an exact uncertified solve; a pruned one can score below a
+      // certified pool and order differently.
+      const gain = (entry: (typeof solved)[number]) => baseBest - best(entry.conservative);
+      const slack = (entry: (typeof solved)[number]) =>
+        proven.has(entry) ? 0 : entry.conservative.certificate?.maxImprovement ?? 0;
+      const passing = solved.filter((entry) => gain(entry) + slack(entry) > epsilon);
+      const undecided = solved.filter((entry) => {
+        if (!entry.conservative.certificate || proven.has(entry)) return false;
+        const low = gain(entry);
+        const high = low + slack(entry);
+        if (low <= epsilon) return high > epsilon;
+        return passing.some((other) => other !== entry && gain(other) <= high && gain(other) + slack(other) >= low);
+      });
+      if (undecided.length > 0) {
+        for (const entry of undecided) {
+          const full = solveWithLatentCandidate(
+            inputs, whatIf, entry.candidate, entry.candidate.conservativeRecallTokens,
+            { ...this.options, hysteresisCertificate: false }, budget.totalBudget,
+          );
+          this.demandSolves++;
+          // The certified pool is a real layout, so its gain is a floor. The
+          // uncertified solve prunes and can come back worse: keep the better.
+          if (!full.feasible) solved.splice(solved.indexOf(entry), 1);
+          else if (best(full) <= best(entry.conservative)) entry.conservative = full;
+          else proven.add(entry);
+        }
+        // The frame may have moved with the new pools; rank everything again
+        // (each pass settles or removes a certified entry, so this ends).
+        return rank(base, withExpected);
+      }
       const evaluations: LatentDemandEvaluation[] = [];
-      const undecided: typeof solved = [];
       for (const entry of solved) {
         const { candidate, conservative } = entry;
         const conservativeImprovement = baseBest - best(conservative);
-        // A certified what-if exposes only the carried layout and its
-        // extensions, up to certificate.maxImprovement above the what-if's
-        // best cut, so its improvement is understated by that much. When
-        // that gap spans the gate, the what-if is solved again without the
-        // certificate (see below); the pool is decided once that is done.
-        if (conservative.certificate && conservativeImprovement <= epsilon &&
-            conservativeImprovement + conservative.certificate.maxImprovement > epsilon) {
-          undecided.push(entry);
-          continue;
-        }
         let expectedImprovement = conservativeImprovement;
         // Pass 2: the expected (p50) solve only orders emitted requests among
         // themselves, so candidates the gate rejects never pay for it, and it
-        // runs once, against the base the gate is final on.
+        // runs once, against the base the gate is final on. It decides the
+        // order only between requests whose conservative gains tie; those
+        // are solved without the certificate, whose slack could hide a lead.
         if (withExpected && conservativeImprovement > epsilon &&
             candidate.expectedRecallTokens !== candidate.conservativeRecallTokens) {
+          const tied = passing.some((other) => other !== entry && gain(other) === conservativeImprovement);
           const expected = solveWithLatentCandidate(
-            inputs, candidate, candidate.expectedRecallTokens, this.options, budget.totalBudget,
+            inputs, whatIf, candidate, candidate.expectedRecallTokens,
+            tied ? { ...this.options, hysteresisCertificate: false } : this.options, budget.totalBudget,
           );
           this.demandSolves++;
           if (!expected.feasible) continue;
@@ -247,20 +295,6 @@ export class KvUnifiedStrategy implements FoldingSolver {
         a.request.level - b.request.level ||
         a.request.range.firstChunkId.localeCompare(b.request.range.firstChunkId),
       );
-      if (undecided.length > 0) {
-        for (const entry of undecided) {
-          const full = solveWithLatentCandidate(
-            inputs, entry.candidate, entry.candidate.conservativeRecallTokens,
-            { ...this.options, hysteresisCertificate: false }, budget.totalBudget,
-          );
-          this.demandSolves++;
-          if (full.feasible) entry.conservative = full;
-          else solved.splice(solved.indexOf(entry), 1);
-        }
-        // The frame may have moved with the new pools; rank everything again
-        // (no certified what-if is left undecided, so this ends).
-        return rank(base, withExpected);
-      }
       return evaluations;
     };
     let base = baseline;
@@ -363,8 +397,18 @@ function latentHigherLevelCandidates(
     );
 }
 
+/** What a what-if solve may reuse: the live forest it extends, the holders
+ * last compile's what-ifs left (`carried`) and the ones this compile keeps. */
+interface WhatIfReuse {
+  readonly base: CanonicalSummaryForest;
+  readonly live?: KvUnifiedReuse;
+  readonly carried?: ReadonlyMap<string, KvUnifiedReuse>;
+  readonly kept?: Map<string, KvUnifiedReuse>;
+}
+
 function solveWithLatentCandidate(
   inputs: PickerInputs,
+  whatIf: WhatIfReuse,
   candidate: LatentCandidate,
   recallTokens: number,
   options: KvUnifiedOptions,
@@ -391,19 +435,37 @@ function solveWithLatentCandidate(
   const recallPairTokens = new Map(inputs.recallPairTokens ?? []);
   recallPairTokens.set(candidate.id, recallTokens);
   const candidateInputs: PickerInputs = { ...inputs, summaries, recallPairTokens };
-  const forest = new CanonicalSummaryForest(candidateInputs, {
+  // The what-if forest is the base forest plus one parent over existing
+  // summaries, which is what a merge arriving between compiles looks like:
+  // derive it the same way instead of building every leaf again.
+  const forestOptions = {
     treeifyNonContiguousSummaries: options.treeifyNonContiguousSummaries,
     preserveGapBearingSummaries: options.preserveGapBearingSummaries,
-  });
-  // The certificate stays on for what-ifs: its bound is over the what-if
-  // forest (latent parent included), so certifying proves the merge cannot
-  // improve the selection by more than adoptEpsilon — a true "≈0" answer at
-  // ~0.4 s instead of a full solve. Merges worth less than epsilon are not
-  // demanded; that is the hysteresis policy's own tolerance.
+  };
+  // The same candidate comes back on every compile until its merge exists,
+  // so its forest and certificate graph are kept like the live ones: derived
+  // from last compile's what-if when only leaves were appended since. The
+  // first what-if borrows unchanged nodes from the live certificate graph.
+  const key = `${candidate.id}\0${recallTokens}`;
+  const holder: KvUnifiedReuse = whatIf.kept?.get(key) ?? whatIf.carried?.get(key) ??
+    { certificate: whatIf.live?.certificate };
+  whatIf.kept?.set(key, holder);
+  const forest = (holder.forest ? CanonicalSummaryForest.derive(holder.forest, candidateInputs, forestOptions) : null) ??
+    CanonicalSummaryForest.derive(whatIf.base, candidateInputs, forestOptions) ??
+    new CanonicalSummaryForest(candidateInputs, forestOptions);
+  holder.forest = forest;
+  // The certificate stays on for what-ifs: a certified solve answers in
+  // ~0.4 s instead of a full solve. Its pool is the carried layout and its
+  // extensions, which the certificate allows to score up to
+  // certificate.maxImprovement above the what-if's best cut, so the merge's
+  // improvement is understated by up to that much. That settles a clear
+  // rejection; rankLatentDemand solves again without the certificate where
+  // the slack could decide the gate or the order of the requests, and keeps
+  // whichever of the two pools scores better.
   return new ParetoKvUnifiedPolicySolver(candidateInputs, forest).solve({
     ...options,
     maxTokens,
-    reuse: undefined,
+    reuse: whatIf.kept ? holder : undefined,
   });
 }
 

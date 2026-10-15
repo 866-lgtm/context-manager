@@ -24,6 +24,7 @@ import type {
   SearchResult,
   TimeRangeSummaryEntry,
   RenderStats,
+  CalibrationReset,
   HotContextSettingsUpdate,
   HotContextSettingsStatus,
   SelectOptions,
@@ -72,6 +73,13 @@ import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms } from '../raw-forms.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
+
+/** A persisted reset record is trusted only if it has the expected shape. */
+function isCalibrationReset(v: unknown): v is CalibrationReset {
+  const r = v as CalibrationReset | null | undefined;
+  return !!r && Number.isFinite(r.discardedMultiplier) && (r.fromEpoch === null || Number.isFinite(r.fromEpoch)) &&
+    Number.isFinite(r.at);
+}
 
 /**
  * Append a JSONL entry describing one compression LLM call to the path
@@ -2051,7 +2059,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Lock a message so the adaptive picker won't change its resolution.
+   * Lock a message so the adaptive picker won't change its stored resolution.
+   * A classic pin (one without a `level` or `maxLevel`) still overrides the
+   * lock while it stands: under the greedy solvers and kv-stable, the pinned
+   * message renders raw, and its locked level stays stored and returns when
+   * the pin is removed. kv-unified treats a pin and a lock as constraints and
+   * reports a conflict when they are incompatible.
    * No-op when adaptiveResolution is false. Set-only programmatic API per
    * the design (no agent-facing tool in V1). Persisted to chronicle.
    */
@@ -2277,6 +2290,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibration = 1;
     this._calibrationEma = null;
     this._calibrationLoaded = false;
+    this._calibrationReset = null;
+    this._calibrationProvisional = null;
     this._imageWatermark = undefined;
     this._imageWatermarkLoaded = false;
     this._lastKvStable = null;
@@ -2292,6 +2307,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     delete this.kvUnifiedReuse.forest;
     delete this.kvUnifiedReuse.tree;
     delete this.kvUnifiedReuse.certificate;
+    delete this.kvUnifiedReuse.whatIf;
   }
 
   /**
@@ -2465,9 +2481,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Load summaries, counter, and pending merges from chronicle into the
    * in-memory mirrors. Called on every (re)initialize so branch switches
-   * pick up the new branch's state.
+   * pick up the new branch's state, and by a compression that waited on
+   * another instance's in-flight compression of its family, to take up that
+   * result (compressChunkHierarchical). That waiter passes
+   * `keepKvUnifiedPresentation`: a kv-unified strategy then keeps its own
+   * receipt chain, whose pending submission is never persisted, rather than
+   * replacing it from the store, and keeps its draft and pending layout (with
+   * the layout's marker indices and immutable prefix hash), which live only in
+   * memory, rather than clearing them (#166).
    */
-  protected loadPersistedState(): void {
+  protected loadPersistedState(options: { keepKvUnifiedPresentation?: boolean } = {}): void {
     if (!this.store) {
       this.summaries = [];
       this.summaryIdCounter = 0;
@@ -2623,14 +2646,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     if (this.config.foldingStrategy === 'kv-unified') {
-      const receiptState = this.store.getStateJson(this.kvUnifiedReceiptStateId);
-      this.kvUnifiedReceipts = receiptState && typeof receiptState === 'object'
-        ? KvUnifiedReceiptChain.deserialize(receiptState as unknown as SerializedReceiptChain)
-        : new KvUnifiedReceiptChain();
-      this.kvUnifiedDraft = null;
-      this.kvUnifiedPendingLayout = null;
-      this.kvUnifiedPendingMarkerUnitIndices = [];
-      this.kvUnifiedPendingImmutablePrefixHash = null;
+      if (!options.keepKvUnifiedPresentation) {
+        const receiptState = this.store.getStateJson(this.kvUnifiedReceiptStateId);
+        this.kvUnifiedReceipts = receiptState && typeof receiptState === 'object'
+          ? KvUnifiedReceiptChain.deserialize(receiptState as unknown as SerializedReceiptChain)
+          : new KvUnifiedReceiptChain();
+        this.kvUnifiedDraft = null;
+        this.kvUnifiedPendingLayout = null;
+        this.kvUnifiedPendingMarkerUnitIndices = [];
+        this.kvUnifiedPendingImmutablePrefixHash = null;
+      }
     } else {
       // A presentation receipt is kv-unified's record of the LAST accepted
       // presentation. Once another folding strategy PRESENTS from this store
@@ -3110,16 +3135,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * count as prefix: a merge's expanded SOURCE pairs are its volatile
    * payload, and marking them would cache-write content that never recurs.
    *
-   * `capped` requests get no markers: recall-budget front-eviction shifts
-   * the prefix on every subsequent mint, and cache writes on a shifting
-   * prefix are pure waste (measured up to +42% total cost at 1h TTL).
+   * `capped` requests get the head marker only: recall-budget front-eviction
+   * shifts the pairs on every subsequent mint, and cache writes on a shifting
+   * prefix are pure waste (measured up to +42% total cost at 1h TTL). The
+   * head boundary sits before the ladder, so eviction cannot move it; with
+   * no head window a capped request carries no marker at all.
    * Effective ladder reuse also requires the append-stable source order
    * fix (2026-08-19); on stores minted under the older lexical order the
    * markers are merely harmless.
    *
    * Returns true iff at least one breakpoint was placed — callers attach
    * `cacheTtl` only then, so every marker-less request (kill switch, capped
-   * ladder, no ladder yet) keeps the exact pre-seam request shape and its
+   * ladder with no head window, no ladder yet) keeps the exact pre-seam request shape and its
    * canonical hash / quarantine identity.
    */
   protected applyMintCacheSeams(
@@ -3147,7 +3174,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
       }
     }
-    if (capped) return false;
     const levelById = new Map(recallLadder.map((s) => [s.id, s.level]));
     let headEnd = -1;
     let deepEnd = -1;
@@ -3166,10 +3192,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (level >= 2) deepEnd = i + 1;
     }
     if (frontierEnd === -1) return false; // no ladder yet — nothing stable to cache
-    for (const idx of new Set([headEnd, deepEnd, frontierEnd])) {
-      if (idx >= 0) messages[idx]!.cacheBreakpoint = true;
+    // A capped ladder front-evicts on every mint, so the pair seams shift and
+    // writing them is waste. The head seam does not: tools, system prompt and
+    // head window precede the ladder and are the same request after request,
+    // unless image shedding (one byte budget, spent newest-first) replaces a
+    // head image for one payload and not for the next.
+    let placed = false;
+    for (const idx of new Set(capped ? [headEnd] : [headEnd, deepEnd, frontierEnd])) {
+      if (idx < 0) continue;
+      messages[idx]!.cacheBreakpoint = true;
+      placed = true;
     }
-    return true;
+    return placed;
   }
 
   private sameAuthoredSummary(a: SummaryEntry, b: SummaryEntry): boolean {
@@ -5064,7 +5098,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       while (i < prev.length && messages[i] === prev[i]) i++;
       if (i === prev.length) from = prev.length;
     }
-    const order = from > 0 ? this._storeOrder : new Map<MessageId, number>();
+    // A dry select puts back the order it found, by reference (select()), so
+    // it extends a copy instead of writing into that one.
+    const order = from === 0
+      ? new Map<MessageId, number>()
+      : this._dryRunSelect ? new Map(this._storeOrder) : this._storeOrder;
     for (let i = from; i < messages.length; i++) order.set(messages[i].id, i);
     this._storeOrder = order;
     this._storeOrderSource = messages;
@@ -6240,11 +6278,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the next one and for observers: the cache-marker baseline the next
     // compile measures its stable prefix against, the transition status
     // (getHotContextSettings), the render stats (getRenderStats, with its
-    // plan-vs-actual), calibration's estimate, arming and store view, the
-    // store order and the head-window memo stay as the last committing select
-    // left them. They are put back here, on every path out, throws included;
-    // each select path gates its own persistence and enqueueing. The dry run's
-    // own render stats are its output, as its plan is (_lastPreview), and
+    // plan-vs-actual), calibration's estimate, arming, store view, load and
+    // multiplier, with the multiplier the store prices by (a dry select that
+    // loads the multiplier first leaves it unloaded, so the next committing
+    // select loads it again and persists what the load decides), the store
+    // order with the listing it was built from, and the head-window memo stay
+    // as the last committing select left them. The order and its listing go
+    // back together: an order put back beside the dry run's listing would
+    // read as current for that listing, so after a removal later selects
+    // would position messages as they stood before it until something
+    // rebuilt the order. A dry refresh extends a copy of the order rather
+    // than the one saved here (refreshStoreOrder). They are put back
+    // here, on every path out, throws included; each select path gates its
+    // own persistence and enqueueing. The dry run's own
+    // render stats are its output, as its plan is (_lastPreview), and
     // previewContext reads them from _lastPreviewStats.
     // Chunking runs dry too: a chunk the dry run closes gets no record, and
     // the chunks, the compression queue and whether chunk records are trusted
@@ -6253,7 +6300,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // a dry run (or a preview's overridden chunk size) cut. So does the
     // queue's generation: a call in flight must not read the dry rebuild as
     // one that re-queued its chunk (requeuePendingChunk).
+    // The image watermark (imageStripHysteresisRatio) goes back too, with the
+    // post-strip estimates priced from it. The dry run advances it for its own
+    // render and writes nothing, so a preview can't strip images from the next
+    // live compile. It's loaded here, before it's saved, so the value put back
+    // is the loaded one.
     const saved = {
+      imageWatermark: this.imageWatermark(),
+      postStripMemo: this._postStripMemo,
       chunks: this.chunks,
       compressionQueue: this.compressionQueue,
       compressionQueueGeneration: this.compressionQueueGeneration,
@@ -6272,8 +6326,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       lastRenderStats: this._lastRenderStats,
       lastCompileEstimate: this._lastCompileEstimate,
       calibrationArmed: this._calibrationArmed,
+      calibrationLoaded: this._calibrationLoaded,
+      calibration: this._calibration,
+      calibrationReset: this._calibrationReset,
+      calibrationProvisional: this._calibrationProvisional,
+      storeCalibration: store.getTokenCalibration?.(),
       storeView: this._storeView,
       storeOrder: this._storeOrder,
+      storeOrderSource: this._storeOrderSource,
       headStartMemo: this._cachedHeadStartIndex,
     };
     this._lastPreviewStats = undefined;
@@ -6289,6 +6349,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this._lastRenderStats !== saved.lastRenderStats) {
         this._lastPreviewStats = this._lastRenderStats ?? undefined;
       }
+      this._imageWatermark = saved.imageWatermark;
+      this._postStripMemo = saved.postStripMemo;
       this.chunks = saved.chunks;
       this.compressionQueue = saved.compressionQueue;
       this.compressionQueueGeneration = saved.compressionQueueGeneration;
@@ -6303,8 +6365,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._lastRenderStats = saved.lastRenderStats;
       this._lastCompileEstimate = saved.lastCompileEstimate;
       this._calibrationArmed = saved.calibrationArmed;
+      this._calibrationLoaded = saved.calibrationLoaded;
+      this._calibration = saved.calibration;
+      this._calibrationReset = saved.calibrationReset;
+      this._calibrationProvisional = saved.calibrationProvisional;
+      if (saved.storeCalibration !== undefined) store.setTokenCalibration?.(saved.storeCalibration);
       this._storeView = saved.storeView;
       this._storeOrder = saved.storeOrder;
+      this._storeOrderSource = saved.storeOrderSource;
       this._cachedHeadStartIndex = saved.headStartMemo;
     }
   }
@@ -6314,7 +6382,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // markers), so the returned entries are already bounded — see
     // applyImageStripping.
     if (this.config.adaptiveResolution) {
-      return this.selectAdaptive(store, budget, opts);
+      try {
+        return this.selectAdaptive(store, budget, opts);
+      } catch (err) {
+        // A provisional multiplier above 1 that puts the compile over budget
+        // is dropped to 1 and the select runs again: with the refusal
+        // standing, no inference would run, so no sample could ever correct
+        // it (#179, the startup wedge). Any other refusal stands.
+        if (!(err instanceof OverBudgetError) || !this.dropProvisionalCalibration(err, opts?.dryRun === true)) throw err;
+        return this.selectAdaptive(store, budget, opts);
+      }
     }
     // selectHierarchical persists and enqueues nothing; what it leaves for
     // observers (render stats) select() restores for a dry run.
@@ -6892,6 +6969,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (loud) console.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
       else console.error(line);
     }
+    r.calibration = {
+      multiplier: this._calibration,
+      pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+      ...(this._calibrationProvisional ? { provisional: true as const } : {}),
+      ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+    };
     this._lastRenderStats = r;
     this._rs = null;
   }
@@ -6904,7 +6987,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   getRenderStats(store: MessageStoreView): RenderStats {
     this.requireLoadedBranch('getRenderStats');
-    return this._lastRenderStats ?? this.reconstructRenderStats(store);
+    if (this._lastRenderStats) return this._lastRenderStats;
+    // Reconstructing the recent window prices images and may advance the
+    // watermark. Like a dry select, this observer uses that advance locally
+    // and restores the watermark together with the estimates priced from it.
+    const savedWatermark = this.imageWatermark();
+    const savedMemo = this._postStripMemo;
+    const savedDryRun = this._dryRunSelect;
+    this._dryRunSelect = true;
+    try {
+      return this.reconstructRenderStats(store);
+    } finally {
+      this._dryRunSelect = savedDryRun;
+      this._imageWatermark = savedWatermark;
+      this._postStripMemo = savedMemo;
+    }
   }
 
   /**
@@ -7800,8 +7897,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The producer may belong to a different strategy instance. Reload the
       // same namespace's durable result so a successful waiter gets its L1 and
       // an exhausted waiter gets the quarantine projection rather than merely
-      // returning after somebody else's work.
-      this.loadPersistedState();
+      // returning after somebody else's work. This instance's kv-unified
+      // presentation in flight stays as it is (#166).
+      this.loadPersistedState({ keepKvUnifiedPresentation: true });
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       const coalescedSummary = this.findExactL1(chunkIdKey);
       if (coalescedSummary) {
@@ -10231,7 +10329,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // estimate is taken this compile.
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     let _t = _diag ? Date.now() : 0;
-    this.loadCalibration(store);
+    this.loadCalibration(store, { dryRun });
     const messages = store.getAll();
     this.refreshStoreOrder(messages);
     if (_diag) { console.error(`[cm-cache] selectAdaptive: calibration+getAll ${Date.now() - _t}ms`); _t = Date.now(); }
@@ -10691,8 +10789,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // current raw plan feasible and must never authorize an inference.
     // A dry run reports infeasibility via `_lastPreview.fits` instead: the
     // whole point of previewing an aggressive budget is to learn it won't fit
-    // without taking the outage that learning it live would cause.
-    if (result.finalTokens > rejectionBudget && !dryRun) {
+    // without taking the outage that learning it live would cause. Except
+    // under a provisional multiplier above 1, which a committing select
+    // would drop and retry at (selectPath): the dry run throws the same
+    // refusal so it takes the same fallback, and its preview says what the
+    // real compile will do. If the retry at 1 is still over, it reports.
+    const dryFallback = dryRun && this._calibrationProvisional !== null && this._calibration > 1;
+    if (result.finalTokens > rejectionBudget && (!dryRun || dryFallback)) {
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: result.finalTokens,
@@ -11122,7 +11225,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const alpha = 0.2; // slow EMA: one wild request shouldn't yank the ruler
     const ema = this._calibrationEma ?? current;
-    const next = ema + alpha * (observed - ema);
+    // A provisional multiplier is a guess (see CALIBRATION_PRICING_EPOCH). This
+    // sample is the first evidence under this release's pricing, so it replaces
+    // the guess outright; the EMA steps from here on.
+    const provisional = this._calibrationProvisional;
+    this._calibrationProvisional = null;
+    const next = provisional ? observed : ema + alpha * (observed - ema);
     const clamped = Math.min(1.8, Math.max(0.6, next));
     this._calibrationEma = clamped;
     // DEAD BAND. The multiplier is applied only once the EMA has moved more
@@ -11133,15 +11241,40 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // made every compile a cold one.
     // ponytail: fixed 2% band, so estimates may lag the EMA by up to 2%;
     // make it a config value if a host needs a tighter ruler.
-    if (Math.abs(clamped - current) / current <= 0.02) return;
+    if (Math.abs(clamped - current) / current <= 0.02) {
+      // A provisional multiplier confirmed within the band gets its stamp
+      // now: the record it came from has none, or is the discard's.
+      if (provisional) {
+        console.error(
+          `[estimator-calibration] real/est=${ratio.toFixed(2)} confirms the provisional multiplier ` +
+            `${current.toFixed(2)} (est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k); stamped`,
+        );
+        this.persistCalibration();
+      }
+      return;
+    }
     console.error(
       `[estimator-calibration] real/est=${ratio.toFixed(2)} ` +
-        `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)} (est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k)`,
+        `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)}${provisional ? ' (provisional: replaced, not stepped)' : ''} ` +
+        `(est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k)`,
     );
     this._calibration = clamped;
     this.applyCalibration();
+    this.persistCalibration();
+  }
+
+  /** Write the multiplier in force under the current pricing stamp, with the
+   *  reset it carries and without the provisional flag a discard wrote: this
+   *  is the first sample's write, which is what ends the provisional state.
+   *  Best-effort, as every calibration write is. */
+  private persistCalibration(): void {
     try {
-      this.store?.setStateJson(this.calibrationStateId, { multiplier: this._calibration, at: Date.now() });
+      this.store?.setStateJson(this.calibrationStateId, {
+        multiplier: this._calibration,
+        at: Date.now(),
+        pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+        ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+      });
     } catch { /* persistence is best-effort */ }
   }
 
@@ -11247,24 +11380,261 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** The EMA itself; `_calibration` is its last applied value (see the dead band). */
   private _calibrationEma: number | null = null;
   private _calibrationLoaded = false;
+  /** Set when an older-epoch multiplier was discarded; persisted with the record. */
+  private _calibrationReset: CalibrationReset | null = null;
+  /** Set while the multiplier is provisional (see CALIBRATION_PRICING_EPOCH):
+   *  the first sample the band accepts replaces it outright, and one above 1
+   *  that puts a compile over budget is dropped to 1. `fromEpoch` is the
+   *  record's it came from, null for one without a stamp. */
+  private _calibrationProvisional: { fromEpoch: number | null } | null = null;
 
   protected applyCalibration(): void {
     this._storeView?.setTokenCalibration?.(this._calibration);
   }
 
-  /** Load the persisted multiplier once and push it into the store view. */
-  protected loadCalibration(store: MessageStoreView): void {
+  /**
+   * Version of the per-class token pricing the persisted calibration
+   * multiplier was learned against. The multiplier is a residual over those
+   * rates, so it means nothing once they change: a store that pinned 1.8
+   * under the flat-600 signed-thinking price (epoch 0) comes back after the
+   * signature-priced fix estimating ~1.8x its real size. If that inflated
+   * plan is over the hard budget, the very first compile throws
+   * OverBudgetError, so no inference runs, no sample is ever reported, and
+   * the band fix in reportRealInputTokens never gets a chance to decay it: a
+   * permanent startup wedge. Bump this whenever MessageStore/ContextLog
+   * pricing changes shape, and give the new epoch an entry in
+   * CALIBRATION_EPOCH_REPRICES.
+   *
+   *   0: signed thinking at a flat HIDDEN_THINKING_TOKENS_DEFAULT (before 0.11.0)
+   *   1: signed thinking priced by signature length (0.11.0 on)
+   *   2: membrane's XML-history carriers (tool_attempt, tool_notice) priced as
+   *      the markup they replay as, where they had estimated as 0
+   *
+   * A record without a stamp was written by 0.13.0 or earlier: by 0.11.0 to
+   * 0.13.0 under epoch 1's pricing, or by a release before 0.11.0, under
+   * epoch 0's pricing or any before it, which CALIBRATION_EPOCH_REPRICES
+   * doesn't model. Nothing in the record tells these apart (#179: five stores
+   * upgraded from pre-0.11 runtimes kept a 1.8 pinned under the flat
+   * signed-thinking price, folded to ~45% of the window or wedged). So such
+   * a multiplier is PROVISIONAL. It is discarded at load if the epochs since
+   * 1 repriced content the store holds, or if it sits at a clamp edge (a
+   * residual pinned at 1.8 or 0.6 corrected rates that were off by more than
+   * the clamp allows, and says nothing about this release's); otherwise it
+   * is kept, but not re-stamped. A provisional multiplier above 1 that puts
+   * the first compile over budget is dropped to 1 and the select runs again
+   * (dropProvisionalCalibration). The first sample the band accepts replaces
+   * a provisional multiplier outright, instead of stepping the EMA toward it,
+   * and writes the stamp (reportRealInputTokens). The 1 a discard restarts
+   * from is provisional too, so one sample sets it rather than about ten; it
+   * is persisted as such (`provisional: true`), so a restart before that
+   * sample doesn't turn the guess into a learned value. A dry run under a
+   * provisional multiplier above 1 takes the same fallback at the picker's
+   * refusal, which it otherwise only reports.
+   *
+   * A binary from before a bump still learns after a rollback, and its first
+   * applied sample overwrites the newer epoch's record with its own stamp
+   * (reportRealInputTokens); rolling forward again treats that as an older
+   * record.
+   */
+  static readonly CALIBRATION_PRICING_EPOCH = 2;
+
+  /**
+   * For each pricing epoch, the content it repriced: a predicate over the
+   * store that is true when the store holds any. A multiplier from an older
+   * epoch is discarded only if some epoch since then repriced content this
+   * store actually holds. Otherwise its residual still means what it meant
+   * (e.g. a store on another provider's tokenizer, which never carries
+   * signed thinking), and it is re-stamped instead. An epoch without an
+   * entry here counts as repricing everything (discard, as before).
+   */
+  static readonly CALIBRATION_EPOCH_REPRICES: Readonly<Record<number, (messages: readonly StoredMessage[]) => boolean>> = {
+    // 1: signed thinking priced by signature length, not a flat 600. A block
+    // with a numeric `tokenEstimate` is priced by that stamp in both epochs
+    // (MessageStore and ContextLog read it first), so it wasn't repriced.
+    1: (messages) => messages.some((m) => m.content.some((b) => {
+      const block = b as { type?: string; signature?: unknown; tokenEstimate?: unknown };
+      return block.type === 'thinking' && typeof block.signature === 'string' && block.signature.length > 0 &&
+        typeof block.tokenEstimate !== 'number';
+    })),
+    // 2: XML-history carriers, which estimated as 0 before (an unknown block)
+    // and are now priced by MessageStore.xmlHistoryCarrierTokens.
+    2: (messages) => messages.some((m) => m.content.some((b) => MessageStore.xmlHistoryCarrierTokens(b) > 0)),
+  };
+
+  /** Whether any epoch in (fromEpoch, CALIBRATION_PRICING_EPOCH] repriced content in this store. */
+  protected calibrationRepricedSince(fromEpoch: number, messages: readonly StoredMessage[]): boolean {
+    for (let e = fromEpoch + 1; e <= AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH; e++) {
+      const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[e];
+      if (!reprices || reprices(messages)) return true;
+    }
+    return false;
+  }
+
+  /** Load the persisted multiplier once and push it into the store view.
+   *  A multiplier from an older epoch is re-stamped if no content this store
+   *  holds was repriced since, and otherwise discarded (start at 1). One from
+   *  a record without a stamp is kept as provisional, or discarded when it
+   *  sits at a clamp edge (see CALIBRATION_PRICING_EPOCH). One from a newer
+   *  epoch is not used.
+   *  A dry select's load decides the same way from the record and the store
+   *  as they are, and the rest of its select prices by that decision (its
+   *  chunking ran before the load, at the store's factor then, as a
+   *  committing select's does), but it writes and logs nothing. select()
+   *  then puts back everything the load changed, the multiplier the store
+   *  prices by included, so the first committing select loads again, from
+   *  the record and the store as they are by then, and logs and persists
+   *  what it decides. */
+  protected loadCalibration(store: MessageStoreView, opts: { dryRun: boolean }): void {
     this._storeView = store;
     if (!this._calibrationLoaded) {
       this._calibrationLoaded = true;
+      const commit = !opts.dryRun;
+      // A load decides from the record and the store alone: an earlier dry
+      // load of this branch may have left its own decision in these.
+      this._calibration = 1;
+      this._calibrationReset = null;
+      this._calibrationProvisional = null;
       try {
-        const saved = this.store?.getStateJson(this.calibrationStateId) as { multiplier?: number } | null;
+        const saved = this.store?.getStateJson(this.calibrationStateId) as
+          { multiplier?: number; pricing?: number; reset?: CalibrationReset; provisional?: boolean } | null;
         if (saved && Number.isFinite(saved.multiplier)) {
-          this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+          const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+          const stamped = typeof saved.pricing === 'number' && Number.isFinite(saved.pricing);
+          // No stamp: written by 0.13.0 or earlier, under epoch 1's pricing or
+          // any before it (see CALIBRATION_PRICING_EPOCH). The reprice check
+          // can only be asked about the epochs since 1; the rest is what makes
+          // such a multiplier provisional.
+          const epoch = stamped ? saved.pricing! : 1;
+          const fromEpoch = stamped ? epoch : null;
+          const pinned = saved.multiplier! >= 1.8 || saved.multiplier! <= 0.6;
+          const repriced = epoch < current && this.calibrationRepricedSince(epoch, store.getAll());
+          if (epoch === current) {
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+            // A discard's 1 that no sample has confirmed yet was persisted as
+            // provisional, and stays a guess across the restart: the first
+            // sample still sets it, instead of stepping toward it.
+            if (saved.provisional === true) {
+              this._calibrationProvisional = { fromEpoch: this._calibrationReset?.fromEpoch ?? null };
+            }
+          } else if (repriced || (epoch < current && !stamped && pinned)) {
+            const reset: CalibrationReset = { discardedMultiplier: saved.multiplier!, fromEpoch, at: Date.now() };
+            this._calibrationReset = reset;
+            // The 1 this restarts from is a guess too: the first sample sets it.
+            this._calibrationProvisional = { fromEpoch };
+            if (commit) {
+              const why = stamped
+                ? `learned under pricing epoch ${epoch} (current ${current})`
+                : !repriced
+                  ? `from a record with no pricing stamp (0.13.0 or earlier), pinned at the ` +
+                    `${saved.multiplier! >= 1.8 ? 'ceiling' : 'floor'} of its clamp: it corrected per-class rates ` +
+                    `that were off by more than the clamp allows, and says nothing about this release's`
+                  : `from a record with no pricing stamp (0.13.0 or earlier), in a store holding content ` +
+                    `repriced since (current epoch ${current})`;
+              console.warn(
+                `[estimator-calibration] DISCARDED multiplier ${saved.multiplier!.toFixed(2)} ${why}; ` +
+                  `restarting from 1.00. Every token estimate changes by ${(1 / saved.multiplier!).toFixed(2)}x, ` +
+                  `and the window refolds to match; the first provider sample sets the multiplier outright. ` +
+                  `If the old value is still accurate for this store (e.g. it mostly corrects for a ` +
+                  `non-Anthropic tokenizer), check it against provider-billed input tokens and re-stamp it: ` +
+                  `setStateJson('${this.calibrationStateId}', { multiplier, at, pricing: ${current} }). ` +
+                  `Shown as calibration.reset in render stats until then.`,
+              );
+              // Persist the reset, so a rollback to a binary that ignores the
+              // stamp can't reload the stale multiplier and re-arm the wedge,
+              // and the discard isn't re-logged on every restart. The 1 is
+              // persisted as provisional until the first sample's write.
+              try {
+                this.store?.setStateJson(this.calibrationStateId,
+                  { multiplier: 1, at: Date.now(), pricing: current, reset, provisional: true });
+              } catch { /* persistence is best-effort */ }
+            }
+          } else if (epoch < current && stamped) {
+            // Nothing this store holds was repriced since that epoch, so the
+            // residual is still valid: keep it and re-stamp it. A reset it
+            // carries is this store's history and stays with it, as it does
+            // through the learner's writes.
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+            if (commit) {
+              console.warn(
+                `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from pricing epoch ${epoch} ` +
+                  `(current ${current}): this store holds no content repriced since then; re-stamped`,
+              );
+              try {
+                this.store?.setStateJson(this.calibrationStateId, {
+                  multiplier: this._calibration,
+                  at: Date.now(),
+                  pricing: current,
+                  ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+                });
+              } catch { /* persistence is best-effort */ }
+            }
+          } else if (epoch < current) {
+            // No stamp, not pinned, and nothing the epochs since 1 repriced:
+            // the multiplier may be epoch 1's and still right, or older and
+            // stale, and the record can't say. Keep it as provisional, and
+            // write nothing: the stamp is the first sample's to give.
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+            this._calibrationProvisional = { fromEpoch: null };
+            if (commit) {
+              console.warn(
+                `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from a record with no ` +
+                  `pricing stamp (0.13.0 or earlier) as provisional: the first provider sample replaces it ` +
+                  `outright, and a compile it puts over budget drops it to 1.00 first. Stamped (epoch ` +
+                  `${current}) once a sample confirms it.`,
+              );
+            }
+          }
+          // A record from a NEWER epoch belongs to a later binary. The load
+          // leaves it on disk and doesn't use it, and logs nothing, since
+          // re-stamping it as the discard warning advises would destroy it.
+          // This binary's learner still writes its own record over it on its
+          // first applied sample (see CALIBRATION_PRICING_EPOCH).
         }
       } catch { /* absent slot is fine */ }
     }
+    // A dry select changes the store's multiplier only where select() read it
+    // first and can put it back (see MessageStoreView).
+    if (opts.dryRun && store.setTokenCalibration && !store.getTokenCalibration) {
+      throw new Error(
+        'A dry select needs a store view that reads its token calibration (getTokenCalibration) ' +
+          'as well as setting it, so the multiplier it applies can be put back afterwards.',
+      );
+    }
     this.applyCalibration();
+  }
+
+  /** The fallback for a provisional multiplier above 1 whose compile was
+   *  refused (see CALIBRATION_PRICING_EPOCH): discard it to 1, so the select
+   *  can run again, and record the reset; a committing select logs and
+   *  persists it, a dry one keeps it to itself (select() puts it back).
+   *  Returns false when there is nothing to drop: no provisional multiplier,
+   *  or one at or below 1, where raising estimates can't help, so the refusal
+   *  stands. The 1 stays provisional: the first sample sets it. */
+  protected dropProvisionalCalibration(err: OverBudgetError, dryRun: boolean): boolean {
+    const provisional = this._calibrationProvisional;
+    if (!provisional || this._calibration <= 1) return false;
+    const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const discarded = this._calibration;
+    const reset: CalibrationReset = { discardedMultiplier: discarded, fromEpoch: provisional.fromEpoch, at: Date.now() };
+    this._calibration = 1;
+    this._calibrationReset = reset;
+    this.applyCalibration();
+    if (dryRun) return true;
+    console.warn(
+      `[estimator-calibration] DISCARDED provisional multiplier ${discarded.toFixed(2)} ` +
+        `(${provisional.fromEpoch === null ? 'from a record with no pricing stamp' : `from pricing epoch ${provisional.fromEpoch}`}): ` +
+        `the compile priced by it was refused (${err.actual} tokens against a hard budget of ${err.budget}); ` +
+        `restarting from 1.00 and compiling again. The first provider sample sets the multiplier outright. ` +
+        `Shown as calibration.reset in render stats.`,
+    );
+    try {
+      this.store?.setStateJson(this.calibrationStateId,
+        { multiplier: 1, at: Date.now(), pricing: current, reset, provisional: true });
+    } catch { /* persistence is best-effort */ }
+    return true;
   }
 
   /**
@@ -13275,6 +13645,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
     if (next === undefined || (w !== undefined && next <= w)) return;
     this._imageWatermark = next;
+    // Dry selections and observer reconstructions advance it locally only;
+    // their finally blocks restore it together with the post-strip memo.
+    if (this._dryRunSelect) return;
     try {
       this.store?.setStateJson(this.imageWatermarkStateId, { sequence: next, at: Date.now() });
     } catch { /* persistence is best-effort */ }
@@ -13306,13 +13679,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
     // A compile asks for this pass more than once (recent-window scan, then
     // the picker inputs). The listing array is the store's own cached view,
-    // so its identity plus the knobs read here identify the answer. Callers
-    // treat the array as read-only.
+    // so its identity, calibration and the knobs key the memo, the
+    // hysteresis ratio among them: it decides whether and how the watermark
+    // strips. The watermark is not in the key: it advances only on a memo
+    // miss, and dry selections and observer reconstructions restore it with
+    // the memo. A branch reload clears both. Callers treat the array as read-only.
     const memoCalibration = store.getTokenCalibration?.() ?? 1;
+    const ratio = this.imageHysteresisRatio();
     const memo = this._postStripMemo;
     if (
       memo && memo.messages === messages && memo.calibration === memoCalibration &&
-      memo.stripDepth === stripDepth && memo.maxLive === maxLive && memo.maxLiveBytes === maxLiveBytes
+      memo.stripDepth === stripDepth && memo.maxLive === maxLive && memo.maxLiveBytes === maxLiveBytes &&
+      memo.ratio === ratio
     ) return memo.out;
     const out = new Array<number>(messages.length);
     const stripActive = stripDepth > 0 || maxLive > 0 || maxLiveBytes > 0;
@@ -13354,12 +13732,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Belt and braces: a message never costs less than nothing.
       out[i] = Math.max(0, est);
     }
-    this._postStripMemo = { messages, calibration: memoCalibration, stripDepth, maxLive, maxLiveBytes, out };
+    this._postStripMemo = { messages, calibration: memoCalibration, stripDepth, maxLive, maxLiveBytes, ratio, out };
     return out;
   }
 
   private _postStripMemo: {
-    messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; out: number[];
+    messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; ratio: number | undefined; out: number[];
   } | null = null;
 
   /** Byte wall default: 20MB of base64 (API total-request cap is 32MB). */
