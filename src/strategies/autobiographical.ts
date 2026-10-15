@@ -1472,6 +1472,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           budgetTokens: err.budget,
           fits: false,
           exhausted: true,
+          clearedBy: err.clearedBy,
           headTokens: err.diagnostics.headTokens,
           tailTokens: err.diagnostics.tailTokens,
           middleTokens: err.diagnostics.middleTokens,
@@ -8340,9 +8341,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Whether the drain has compression work it will take that would shrink the
    * context, as tick takes it: compression in flight; the first queued merge,
    * unless a compression hold blocks it (tick then stops until the release);
-   * or a queued chunk tick would compress (still uncompressed, with no held
-   * message) while the speculative cap lets the drain take one. At the cap,
-   * tick runs only merges, and a merge is what relieves the cap. A held chunk
+   * or a queued chunk tick would compress while it runs chunks at all (below
+   * the speculative cap). A chunk counts when it's still uncompressed, holds
+   * no held message, and has no message an L1 in memory already covers: its
+   * L1 shrinks the context on either path. An L1 only the store holds isn't
+   * in memory, so its chunk counts too, and adopting it gives the selector an
+   * L1 to fold through. A chunk with a covered message counts only on the
+   * hierarchical path, when an L1 matches it exactly and chunk persistence is
+   * on: selectHierarchical renders an uncompressed chunk's messages raw beside
+   * the L1s, and tick's adoption marks the chunk's record compressed, so the
+   * next rebuild drops that fallback. The adaptive picker already folds a
+   * covered message through its L1, so adoption changes nothing there. Tick
+   * drops a chunk covered under other boundaries without marking its record,
+   * so the next rebuild brings it back, and it refuses one partly covered, so
+   * neither counts on either path. shouldCompressPreflight isn't consulted:
+   * it gates only the speculative drain, and a host's tick (as a refusal's
+   * recovery runs it) takes a queued chunk whatever it says. At the cap, tick
+   * runs only merges, and a merge is what relieves the cap. A held chunk
    * can be queued: select's rebuild leaves one out, but a produce op queues
    * the chunks it demands, held or not, and tick skips a held one and moves
    * on. Like tick, this assumes the manager has a membrane to run it.
@@ -8350,15 +8365,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * a hold blocks. Compressing a chunk replaces its raw messages with a
    * summary, and a merge folds summaries into one.
    */
-  protected compressionWorkQueued(store: MessageStoreView): boolean {
+  protected compressionWorkQueued(store: MessageStoreView, path: 'adaptive' | 'hierarchical'): boolean {
     if (this.pendingCompression) return true;
     const merge = this.config.hierarchical ? this.mergeQueue[0] : undefined;
     if (merge && !this.mergeBlockedByHold(merge.sourceIds, store)) return true;
     if (this.compressionQueue.length === 0 || this.isAtSpeculativeCap()) return false;
     const held = this.holdBlockedIds(store);
+    const adoptionShrinks = path === 'hierarchical' && this.chunkPersistenceEnabled;
+    const coveredByL1 = new Set<string>();
+    const exactL1 = new Set<string>();
+    for (const summary of this.summaries) {
+      if (summary.level !== 1 || !Array.isArray(summary.sourceIds)) continue;
+      for (const id of summary.sourceIds) coveredByL1.add(id);
+      if (adoptionShrinks) exactL1.add(summary.sourceIds.join(':'));
+    }
     return this.compressionQueue.some((index) => {
       const chunk = this.chunks[index];
-      return chunk !== undefined && !chunk.compressed && !this.chunkHasHeldMessage(chunk, held);
+      if (chunk === undefined || chunk.compressed || this.chunkHasHeldMessage(chunk, held)) return false;
+      if (!chunk.messages.some((m) => coveredByL1.has(m.id))) return true;
+      return exactL1.has(this.chunkKey(chunk));
     });
   }
 
@@ -8450,17 +8475,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     if (headTokens + tailTokens > rejectionBudget) {
       // Compression never touches the raw windows. A smaller recent window
-      // moves history into the foldable middle, which clears this when the
-      // head fits beside the least raw tail any window leaves: no window
-      // starts after a compression hold (getRecentWindowStart), and the newest
-      // message stays raw whatever the window, since the newest turn is kept.
-      // For a message split into shards at ingress, that's its newest shard:
-      // under a smaller window its earlier shards can close into chunks and
-      // fold. So count from the earlier of the newest message and the hold
-      // boundary, and never from inside the head.
+      // moves history out of the tail into the middle, which clears this
+      // refusal when the head fits beside the least raw tail any window
+      // leaves. The middle then folds only once compression has closed and
+      // summarized it, so the next refusal can be the picker's. No window
+      // starts after a compression hold (getRecentWindowStart). The newest
+      // turn is rendered whatever the window, since the structural repair
+      // refuses a compile that leaves it out: the newest message, with the
+      // tool_use before it when it holds a tool_result, the pair
+      // getUnheldRecentWindowStart keeps together. For a message split into
+      // shards at ingress, that's its newest shard, since the earlier shards
+      // can close into chunks and fold. A hold inside the head leaves every
+      // window's tail starting at the head's end, so a floor counted from the
+      // hold covers at least the tail, and nothing is named, as it should be.
       let floorTokens = 0;
       if (messages.length > 0) {
-        const floorStart = Math.max(Math.min(messages.length - 1, this.holdBoundary(store)), headEnd);
+        let newestTurn = messages.length - 1;
+        if (newestTurn > 0 && this.hasToolResult(messages[newestTurn])) newestTurn--;
+        const floorStart = Math.min(newestTurn, this.holdBoundary(store));
         for (let i = floorStart; i < messages.length; i++) {
           floorTokens += msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
         }
@@ -8903,13 +8935,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // work is only what the ops would add: the newest closed chunks, which the
     // holdback (l1HoldbackChunks) keeps out of the queue until they're
     // demanded, or a merge. There a dry run names nothing.
-    const planClearedBy: OverBudgetClearedBy[] =
-      result.produced.length > 0 && this.compressionWorkQueued(store) ? ['compression'] : [];
+    // Taken only at a refusal, since a compile that fits needs no list.
+    const planClearedBy = (): OverBudgetClearedBy[] =>
+      result.produced.length > 0 && this.compressionWorkQueued(store, 'adaptive') ? ['compression'] : [];
     if (result.finalTokens > rejectionBudget && (!dryRun || dryFallback)) {
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: result.finalTokens,
-        clearedBy: planClearedBy,
+        clearedBy: planClearedBy(),
         diagnostics: {
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'planned',
@@ -8945,7 +8978,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         stage: 'Emission overran the plan (planner/emitter estimator drift)',
         budget: rejectionBudget,
         actual: attempted + tailTokens,
-        clearedBy: planClearedBy,
+        clearedBy: planClearedBy(),
         diagnostics: {
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'planned',
@@ -9171,7 +9204,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         stage: 'Tail emission dropped reserved recent-window messages',
         budget: rejectionBudget,
         actual: totalTokens + tailTokens,
-        clearedBy: planClearedBy,
+        clearedBy: planClearedBy(),
         diagnostics: {
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'planned',
@@ -9226,8 +9259,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           stage: 'Structural repair did not retain the newest turn',
           budget: rejectionBudget,
           actual: totalTokens + tailTokens,
-          // The newest turn is what's missing, and nothing but room for it
-          // brings it back: a newer message leaves it raw in the middle.
+          // The newest turn is what's missing, and only room for it brings it
+          // back. A newer message makes a different turn the newest, and this
+          // one then stays raw in the middle, so the context is no smaller.
           clearedBy: [],
           diagnostics: {
             middleCountUnit: 'picker-chunks',
@@ -10438,8 +10472,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           budget: graceLimit,
           actual: totalTokens + tokens,
           // The head is verbatim by definition, and its size is cold
-          // configuration (headWindowTokens isn't a hot setting): at run time
-          // nothing but a larger budget clears it.
+          // configuration (headWindowTokens isn't a hot setting). Besides a
+          // larger budget, only a head-window reset clears it, which starts a
+          // new topic and isn't a lever the list names (OverBudgetClearedBy).
           clearedBy: [],
           diagnostics: {
             middleCountUnit: 'selection-items',
@@ -10773,7 +10808,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 stage: 'Hierarchical emission overran the budget',
                 budget: graceLimit,
                 actual: totalTokens + pairTokens,
-                clearedBy: this.compressionWorkQueued(store) ? ['compression'] : [],
+                clearedBy: this.compressionWorkQueued(store, 'hierarchical') ? ['compression'] : [],
                 diagnostics: {
                   middleCountUnit: 'selection-items',
                   deepestLevelKind: 'attempted',
@@ -10800,7 +10835,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 stage: 'Hierarchical emission overran the budget',
                 budget: graceLimit,
                 actual: totalTokens + tokens,
-                clearedBy: this.compressionWorkQueued(store) ? ['compression'] : [],
+                clearedBy: this.compressionWorkQueued(store, 'hierarchical') ? ['compression'] : [],
                 diagnostics: {
                   middleCountUnit: 'selection-items',
                   deepestLevelKind: 'attempted',
@@ -10878,7 +10913,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               stage: 'Hierarchical emission overran the budget',
               budget: graceLimit,
               actual: totalTokens + tokens,
-              clearedBy: this.compressionWorkQueued(store) ? ['compression'] : [],
+              clearedBy: this.compressionWorkQueued(store, 'hierarchical') ? ['compression'] : [],
               diagnostics: {
                 middleCountUnit: 'raw-messages',
                 deepestLevelKind: 'attempted',

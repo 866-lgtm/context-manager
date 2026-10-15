@@ -55,25 +55,33 @@ export interface OverBudgetDiagnostics {
 /**
  * What clears an over-budget refusal at run time besides a larger budget,
  * which clears any of them: waiting, or a hot setting. Cold configuration,
- * such as the head window's size, isn't named. The strategy that refuses sets
- * it, since it knows which part of the context is over and what can shrink
- * that part:
+ * such as the head window's size, isn't named, and neither is a head-window
+ * reset (`resetHeadWindow`), which clears a head that's over but starts a new
+ * topic. The strategy that refuses sets it, since it knows which part of the
+ * context is over and what can shrink that part:
  * - `'compression'`: compression work that would shrink this context is
  *   running or queued for the drain to take: a compression in flight, the
  *   first queued merge unless a compression hold blocks it, or a queued
- *   chunk no hold covers while the speculative cap lets the drain take one.
- *   It assumes the manager has a membrane to run compression. For the
- *   adaptive picker's refusals, its plan must also still have summaries to
- *   produce. Whether that work is enough to fit isn't checked.
+ *   chunk the drain would compress while it runs chunks at all (below the
+ *   speculative cap). Such a chunk is still uncompressed, holds no held
+ *   message, and has no message an L1 in memory already covers, since the
+ *   adaptive picker already folds through that L1. For the hierarchical
+ *   selector, a chunk an L1 matches exactly counts too while chunk
+ *   persistence is on, since adopting that L1 ends the raw fallback the
+ *   selector renders for an uncompressed chunk. It assumes the
+ *   manager has a membrane to run compression. For the adaptive picker's
+ *   refusals, its plan must also still have summaries to produce. Whether
+ *   that work is enough to fit isn't checked.
  * - `'newer-message'`: the newest message alone is over the budget, and a
  *   newer message that fits moves the window past it.
  * - `'smaller-recent-window'`: the raw recent window, which compression never
  *   touches, is what's over the budget, and the head fits beside the least
- *   raw tail any window leaves: from the newest message (for a message split
- *   into shards, its newest shard, since the earlier shards can fold), or
- *   from a compression hold if one starts earlier. A smaller `recentWindowTokens`
- *   (the hot `tailTokens`) moves the rest into the part the strategy can
- *   fold.
+ *   raw tail any window leaves: from the newest message, with the tool_use
+ *   before it when it holds a tool_result (for a message split into shards,
+ *   its newest shard, since the earlier shards can fold), or from a
+ *   compression hold if one starts earlier. A smaller `recentWindowTokens`
+ *   (the hot `tailTokens`) moves the rest out of the raw window into the
+ *   middle, which folds once compression has closed and summarized it.
  *
  * Each list describes the refusal that was hit. Clearing it can bring the
  * next one: a smaller recent window can leave the picker waiting for

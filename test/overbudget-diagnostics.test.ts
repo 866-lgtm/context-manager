@@ -7,6 +7,7 @@ import { AutobiographicalStrategy, ContextManager, OverBudgetError } from '../sr
 import type { SummaryEntry, SummaryLevel } from '../src/types/index.js';
 import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
 import type { FoldingBudget } from '../src/adaptive/folding-strategy.js';
+import type { Membrane } from '@animalabs/membrane';
 
 class DiagnosticStrategy extends AutobiographicalStrategy {
   level = 1;
@@ -18,6 +19,15 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   atCap = false;
   /** Blocks every queued merge, as a hold on a message its sources cover does. */
   holdBlocksMerges = false;
+  /** When false, chunks keep no records, as a subclass with its own chunking does. */
+  persistChunks = true;
+  /** Each picker run's chunks, with the L1 each folds through. */
+  pickerL1s: (string | undefined)[][] = [];
+
+  protected get chunkPersistenceEnabled(): boolean {
+    // Read during construction too, before the field is set.
+    return this.persistChunks !== false;
+  }
 
   protected isAtSpeculativeCap(): boolean {
     return this.atCap || super.isAtSpeculativeCap();
@@ -35,6 +45,40 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   /** Queues a merge, as a merge produce op or the merge threshold does. */
   queueMerge(): void {
     this.enqueueMerge({ level: 2, sourceIds: ['L1-queued-a', 'L1-queued-b'] });
+  }
+
+  /** An L1 over the given messages, as a compression writes one. */
+  seedL1(id: string, sourceIds: string[]): void {
+    this.pushSummary({
+      id, level: 1, sourceLevel: 0, sourceIds,
+      sourceRange: { first: sourceIds[0], last: sourceIds[sourceIds.length - 1] },
+      content: 'summary '.repeat(100), tokens: 200, created: 0,
+    });
+  }
+
+  /** Queues a merge of real summaries. */
+  queueMergeOf(sourceIds: string[]): void {
+    this.enqueueMerge({ level: 2, sourceIds });
+  }
+
+  /** When set, the reserved tail's emission reports one message fewer, as an emission that ran out of room does. */
+  dropTailMessage = false;
+
+  /** When set, the compression preflight says no, as a host that schedules compression itself does. */
+  preflightNo = false;
+
+  protected shouldCompressPreflight(): boolean {
+    return !this.preflightNo && super.shouldCompressPreflight();
+  }
+
+  /** The message ids of each queued chunk, in queue order. */
+  queuedChunkIds(): string[][] {
+    return this.compressionQueue.map((index) => this.chunks[index]!.messages.map((m) => m.id));
+  }
+
+  protected emitRecentNewestFirst(...args: Parameters<AutobiographicalStrategy['emitRecentNewestFirst']>): ReturnType<AutobiographicalStrategy['emitRecentNewestFirst']> {
+    const stats = super.emitRecentNewestFirst(...args);
+    return this.dropTailMessage ? { ...stats, messages: stats.messages - 1 } : stats;
   }
 
   seedPyramid(ids: string[], depth: number): void {
@@ -56,6 +100,7 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   }
 
   protected buildPicker(inputs: PickerInputs): Picker {
+    this.pickerL1s.push(inputs.chunks.map((chunk) => chunk.l1Id));
     if (this.useRealPicker) return super.buildPicker(inputs);
     const level = this.level;
     const produce = this.produce;
@@ -78,9 +123,15 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   }
 }
 
-async function withManager(strategy: AutobiographicalStrategy, run: (manager: ContextManager) => Promise<void>) {
+async function withManager(
+  strategy: AutobiographicalStrategy,
+  run: (manager: ContextManager) => Promise<void>,
+  opts?: { membrane?: boolean },
+) {
   const directory = mkdtempSync(join(tmpdir(), 'cm-budget-diagnostics-'));
-  const manager = await ContextManager.open({ path: join(directory, 'store'), strategy });
+  // A stub is enough for tick to adopt an exact L1, which calls no model.
+  const membrane = opts?.membrane ? { membrane: {} as unknown as Membrane } : {};
+  const manager = await ContextManager.open({ path: join(directory, 'store'), strategy, ...membrane });
   try {
     await run(manager);
   } finally {
@@ -341,6 +392,74 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
+  const toolTurn = (manager: ContextManager, id: string, callWords: number, resultWords: number): void => {
+    manager.addMessage('agent', [
+      { type: 'text', text: 'calling ' + 'word '.repeat(callWords) },
+      { type: 'tool_use', id, name: 'read', input: {} },
+    ]);
+    manager.addMessage('user', [{ type: 'tool_result', toolUseId: id, content: 'result ' + 'word '.repeat(resultWords) }]);
+  };
+
+  it('counts a newest tool_result with the tool_use before it, since no window splits the pair', async () => {
+    await withManager(recentOnly(100_000), async (manager) => {
+      for (let i = 0; i < 2; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      // The result alone fits the budget, but its call and it together don't.
+      toolTurn(manager, 't1', 150, 5);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+      assert.deepEqual(error.clearedBy, [], 'the least tail any window leaves is the call and its result');
+    });
+  });
+
+  it('names a smaller window when the newest tool_result and its call fit together', async () => {
+    await withManager(recentOnly(100_000), async (manager) => {
+      for (let i = 0; i < 4; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      toolTurn(manager, 't1', 10, 5);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+      assert.deepEqual(error.clearedBy, ['smaller-recent-window']);
+    });
+  });
+
+  it('clears the head/tail refusal at the smaller window it names (the next refusal can be the picker\'s)', async () => {
+    const strategy = recentOnly(100_000);
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 6; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const first = await refusal(manager);
+      assert.deepEqual(first.clearedBy, ['smaller-recent-window']);
+      // The least raw tail is the newest message: a window that holds only it.
+      strategy.updateHotContextSettings({ tailTokens: 1 });
+      try {
+        await manager.compile({ maxTokens: 100, reserveForResponse: 20 });
+      } catch (error) {
+        assert.ok(error instanceof OverBudgetError);
+        assert.doesNotMatch(error.message, /^Head\/tail reservation exceeded budget/, 'the raw windows now fit');
+      }
+    });
+  });
+
+  it('names nothing when a hold inside the head leaves every window\'s tail at the head\'s end', async () => {
+    const strategy = new AutobiographicalStrategy({
+      adaptiveResolution: true,
+      headWindowTokens: 30,
+      recentWindowTokens: 100_000,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    await withManager(strategy, async (manager) => {
+      const ids = Array.from({ length: 6 }, (_, i) =>
+        manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(20) }]));
+      const unheld = await refusal(manager);
+      assert.deepEqual(unheld.clearedBy, ['smaller-recent-window'], 'the head and the newest message fit');
+      manager.holdCompression([ids[0]], { timeoutMs: 60_000 });
+      const held = await refusal(manager);
+      assert.match(held.message, /^Head\/tail reservation exceeded budget/);
+      assert.deepEqual(held.clearedBy, [], 'no window starts after the hold, so every tail starts at the head\'s end');
+      manager.releaseCompression([ids[0]]);
+    });
+  });
+
   it('names nothing when the newest message alone is over, since it stays raw whatever the window', async () => {
     await withManager(recentOnly(100_000), async (manager) => {
       manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(10) }]);
@@ -447,6 +566,41 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
+  it('names the plan\'s list at the tail-check refusal', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: true,
+      headWindowTokens: 0,
+      recentWindowTokens: 30,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    strategy.drift = true;
+    strategy.produce = true;
+    strategy.dropTailMessage = true;
+    await withManager(strategy, async (manager) => {
+      manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(10) }]);
+      strategy.startCompressing();
+      const error = await refusal(manager);
+      assert.match(error.message, /^Tail emission dropped reserved recent-window messages/);
+      assert.deepEqual(error.clearedBy, ['compression']);
+      strategy.produce = false;
+      const without = await refusal(manager);
+      assert.match(without.message, /^Tail emission dropped reserved recent-window messages/);
+      assert.deepEqual(without.clearedBy, [], 'a plan with nothing to produce names nothing');
+    });
+  });
+
+  it('carries the refusal\'s list into a preview that doesn\'t fit', async () => {
+    await withManager(recentOnly(100_000), async (manager) => {
+      for (let i = 0; i < 6; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const preview = manager.previewContext({ maxTokens: 100, reserveForResponse: 20 });
+      assert.ok(preview);
+      assert.equal(preview.fits, false);
+      assert.deepEqual(preview.clearedBy, ['smaller-recent-window']);
+    });
+  });
+
   it('names compression in a dry run only for work queued without its plan\'s ops', async () => {
     const strategy = new DiagnosticStrategy({
       adaptiveResolution: true,
@@ -490,6 +644,139 @@ describe('OverBudgetError.clearedBy', () => {
       assert.deepEqual(error.clearedBy, ['compression']);
     });
   });
+
+  const queuedChunks = () => new DiagnosticStrategy({
+    adaptiveResolution: false,
+    targetChunkTokens: 40,
+    headWindowTokens: 0,
+    recentWindowTokens: 0,
+    overBudgetGraceRatio: 0.25,
+    autoTickOnNewMessage: false,
+    speculativeProduction: false,
+  });
+
+  it('names nothing for queued chunks an L1 already covers under other boundaries, which tick drops without compressing', async () => {
+    const strategy = queuedChunks();
+    await withManager(strategy, async (manager) => {
+      const ids = Array.from({ length: 12 }, (_, i) =>
+        manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+      assert.ok(strategy.queuedChunkIds().length > 0, 'chunks are queued');
+      // One L1 over every message: each queued chunk is covered, none exactly.
+      strategy.seedL1('L1-covering', ids);
+      const error = await refusal(manager);
+      assert.deepEqual(error.clearedBy, []);
+    });
+  });
+
+  /** The queued chunks once a compile has closed every chunk the messages make. */
+  const settledQueue = async (manager: ContextManager, strategy: DiagnosticStrategy): Promise<string[][]> => {
+    await refusal(manager);
+    const queued = strategy.queuedChunkIds();
+    assert.ok(queued.length > 0, 'chunks are queued');
+    return queued;
+  };
+
+  /** Ticks until tick has taken every queued chunk; each adopts its exact L1 without a model call. */
+  const adoptAll = async (manager: ContextManager, strategy: DiagnosticStrategy): Promise<void> => {
+    for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+  };
+
+  for (const persistChunks of [true, false]) {
+    it(`names ${persistChunks ? 'compression' : 'nothing'} on the hierarchical path for queued chunks L1s match exactly${persistChunks ? ', since adoption ends their raw fallback' : ' when chunks keep no records, since adoption doesn\'t persist'}`, async () => {
+      const strategy = queuedChunks();
+      strategy.persistChunks = persistChunks;
+      await withManager(strategy, async (manager) => {
+        for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+        const queued = await settledQueue(manager, strategy);
+        queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids));
+        const error = await refusal(manager);
+        assert.match(error.message, /^Hierarchical emission overran the budget/);
+        assert.deepEqual(strategy.queuedChunkIds(), queued, 'the compile closed no new chunk');
+        assert.deepEqual(error.clearedBy, persistChunks ? ['compression'] : []);
+        if (!persistChunks) return;
+        // The premise: adopting the exact L1s makes the hierarchical render smaller.
+        const before = (await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 })).messages.length;
+        await adoptAll(manager, strategy);
+        const after = (await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 })).messages.length;
+        assert.deepEqual(strategy.queuedChunkIds(), [], 'the adoptions persisted, so the rebuild queued nothing');
+        assert.ok(after < before, `the render went from ${before} to ${after} messages`);
+      }, { membrane: true });
+    });
+  }
+
+  it('names nothing on the adaptive path for queued chunks L1s match exactly, since the picker already folds through them', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: true,
+      targetChunkTokens: 40,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    strategy.produce = true;
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids));
+      const error = await refusal(manager);
+      assert.match(error.message, /^Adaptive picker exhausted/);
+      assert.deepEqual(strategy.queuedChunkIds(), queued, 'the compile closed no new chunk');
+      assert.deepEqual(error.clearedBy, []);
+      // The premise: the picker folds each message through the same L1 before and after adoption.
+      const before = strategy.pickerL1s.at(-1);
+      await adoptAll(manager, strategy);
+      await refusal(manager);
+      assert.deepEqual(strategy.queuedChunkIds(), [], 'the adoptions persisted, so the rebuild queued nothing');
+      assert.deepEqual(strategy.pickerL1s.at(-1), before);
+      assert.ok(before?.some((id) => id !== undefined), 'the picker saw the L1s');
+    }, { membrane: true });
+  });
+
+  for (const merge of [false, true]) {
+    it(`names compression when the compression preflight says no${merge ? ', for the merge too' : ''}, since a host's tick takes the queue whatever it says`, async () => {
+      const strategy = queuedChunks();
+      strategy.preflightNo = true;
+      await withManager(strategy, async (manager) => {
+        const ids = Array.from({ length: 12 }, (_, i) =>
+          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+        if (merge) {
+          strategy.seedL1('L1-a', [ids[0]!]);
+          strategy.seedL1('L1-b', [ids[1]!]);
+          strategy.queueMergeOf(['L1-a', 'L1-b']);
+        }
+        const error = await refusal(manager);
+        assert.deepEqual(error.clearedBy, ['compression']);
+      });
+    });
+  }
+
+  for (const held of [false, true]) {
+    it(`names ${held ? 'nothing' : 'compression'} for a queued merge of real summaries ${held ? 'while a real hold covers one of its sources' : 'with no hold'}`, async () => {
+      const strategy = new DiagnosticStrategy({
+        adaptiveResolution: false,
+        hierarchical: true,
+        positionedRecallPairs: true,
+        targetChunkTokens: 100_000,
+        headWindowTokens: 0,
+        recentWindowTokens: 0,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+      });
+      await withManager(strategy, async (manager) => {
+        const ids = Array.from({ length: 2 }, (_, i) =>
+          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+        strategy.seedL1('L1-a', [ids[0]!]);
+        strategy.seedL1('L1-b', [ids[1]!]);
+        strategy.queueMergeOf(['L1-a', 'L1-b']);
+        if (held) manager.holdCompression([ids[1]!], { timeoutMs: 60_000 });
+        const error = await refusal(manager);
+        assert.deepEqual(error.clearedBy, held ? [] : ['compression']);
+        if (held) manager.releaseCompression([ids[1]!]);
+      });
+    });
+  }
 
   for (const positionedRecallPairs of [true, false]) {
     for (const work of ['running', 'merge'] as const) {

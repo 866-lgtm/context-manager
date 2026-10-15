@@ -6,6 +6,7 @@ import type {
   TokenBudget,
   PendingWork,
 } from './context.js';
+import type { OverBudgetClearedBy } from '../adaptive/picker.js';
 
 /**
  * Read-only view of the message store for strategies.
@@ -271,6 +272,13 @@ export interface PreviewResult {
   fits: boolean;
   /** True when the picker could not fold any further. */
   exhausted: boolean;
+  /**
+   * When the layout doesn't fit: what clears that refusal besides a larger
+   * budget, as the live compile's `OverBudgetError.clearedBy` names it. A dry
+   * run doesn't queue its plan's work, so it names compression only for work
+   * already queued.
+   */
+  clearedBy?: readonly OverBudgetClearedBy[];
   /** Verbatim head / tail cost, and the foldable middle. */
   headTokens: number;
   tailTokens: number;
