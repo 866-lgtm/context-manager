@@ -59,16 +59,19 @@ export interface OverBudgetDiagnostics {
  * it, since it knows which part of the context is over and what can shrink
  * that part:
  * - `'compression'`: compression work that would shrink this context is
- *   running or queued: a compression in flight, a merge queued, or a chunk
- *   queued that the speculative cap lets the drain take. For the adaptive
- *   picker's refusals, its plan must also still have summaries to produce.
- *   Whether that work is enough to fit isn't checked.
+ *   running or queued for the drain to take: a compression in flight, the
+ *   first queued merge unless a compression hold blocks it, or a queued
+ *   chunk no hold covers while the speculative cap lets the drain take one.
+ *   It assumes the manager has a membrane to run compression. For the
+ *   adaptive picker's refusals, its plan must also still have summaries to
+ *   produce. Whether that work is enough to fit isn't checked.
  * - `'newer-message'`: the newest message alone is over the budget, and a
  *   newer message that fits moves the window past it.
  * - `'smaller-recent-window'`: the raw recent window, which compression never
  *   touches, is what's over the budget, and the head fits beside the least
- *   raw tail any window leaves: from the newest message, or from a
- *   compression hold if one starts earlier. A smaller `recentWindowTokens`
+ *   raw tail any window leaves: from the newest message (for a message split
+ *   into shards, its newest shard, since the earlier shards can fold), or
+ *   from a compression hold if one starts earlier. A smaller `recentWindowTokens`
  *   (the hot `tailTokens`) moves the rest into the part the strategy can
  *   fold.
  *

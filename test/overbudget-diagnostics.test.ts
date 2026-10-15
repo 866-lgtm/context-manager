@@ -16,9 +16,15 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   produce = false;
   /** Holds the drain at the speculative cap, as unmerged L1s past maxSpeculativeL1s do. */
   atCap = false;
+  /** Blocks every queued merge, as a hold on a message its sources cover does. */
+  holdBlocksMerges = false;
 
   protected isAtSpeculativeCap(): boolean {
     return this.atCap || super.isAtSpeculativeCap();
+  }
+
+  protected mergeBlockedByHold(sourceIds: string[], store: Parameters<AutobiographicalStrategy['mergeBlockedByHold']>[1]): boolean {
+    return this.holdBlocksMerges || super.mergeBlockedByHold(sourceIds, store);
   }
 
   /** Marks a compression as running, as tick does while one is in flight. */
@@ -313,6 +319,28 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
+  it('names a smaller window when a message split into shards is over but its newest shard fits, since its earlier shards can fold', async () => {
+    const strategy = new AutobiographicalStrategy({
+      adaptiveResolution: true,
+      targetChunkTokens: 20,
+      headWindowTokens: 0,
+      recentWindowTokens: 100_000,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    await withManager(strategy, async (manager) => {
+      // Over twice targetChunkTokens, so ingress splits it into shards of about 20 tokens.
+      manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(200) }]);
+      const shards = manager.getAllMessages();
+      assert.ok(shards.length > 4, `the message is stored as shards (got ${shards.length})`);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+      assert.ok(error.diagnostics.tailTokens > error.budget, 'the whole body is over the budget');
+      assert.deepEqual(error.clearedBy, ['smaller-recent-window']);
+    });
+  });
+
   it('names nothing when the newest message alone is over, since it stays raw whatever the window', async () => {
     await withManager(recentOnly(100_000), async (manager) => {
       manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(10) }]);
@@ -491,6 +519,65 @@ describe('OverBudgetError.clearedBy', () => {
         });
       });
     }
+  }
+
+  for (const lateHold of [false, true]) {
+    it(`names ${lateHold ? 'nothing' : 'compression'} for the chunk the picker's plan demands ${lateHold ? 'when a hold placed after it closed covers it, since tick skips it' : 'with no hold'}`, async () => {
+      const strategy = new AutobiographicalStrategy({
+        adaptiveResolution: true,
+        targetChunkTokens: 40,
+        headWindowTokens: 0,
+        recentWindowTokens: 0,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+      });
+      await withManager(strategy, async (manager) => {
+        // Messages 0 to 3 close into one chunk, which the holdback keeps out of
+        // the queue until the plan's produce op demands it.
+        const ids = Array.from({ length: 5 }, (_, i) =>
+          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+        if (lateHold) manager.holdCompression([ids[3]], { timeoutMs: 60_000 });
+        let error: OverBudgetError | undefined;
+        try {
+          await manager.compile({ maxTokens: 200, reserveForResponse: 20 });
+        } catch (caught) {
+          if (!(caught instanceof OverBudgetError)) throw caught;
+          error = caught;
+        }
+        assert.ok(error, 'compile should refuse');
+        assert.match(error.message, /^Adaptive picker exhausted/);
+        assert.deepEqual(error.clearedBy, lateHold ? [] : ['compression']);
+        if (lateHold) manager.releaseCompression([ids[3]]);
+      });
+    });
+  }
+
+  for (const positionedRecallPairs of [true, false]) {
+    it(`names nothing at the hierarchical ${positionedRecallPairs ? 'recall pair' : 'raw-message fallback'} refusal while a hold blocks the only queued merge`, async () => {
+      const strategy = new DiagnosticStrategy({
+        adaptiveResolution: false,
+        hierarchical: true,
+        positionedRecallPairs,
+        targetChunkTokens: 100_000,
+        headWindowTokens: 0,
+        recentWindowTokens: 0,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+      });
+      strategy.holdBlocksMerges = true;
+      await withManager(strategy, async (manager) => {
+        const ids = Array.from({ length: 2 }, (_, i) =>
+          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+        strategy.seedPyramid(positionedRecallPairs ? ids : ids.slice(1), 1);
+        strategy.queueMerge();
+        assert.equal(strategy.checkReadiness().ready, false, 'the merge is queued');
+        const error = await refusal(manager);
+        assert.match(error.message, /^Hierarchical emission overran the budget/);
+        assert.deepEqual(error.clearedBy, [], 'tick stops at a blocked merge until the hold is released');
+      });
+    });
   }
 
   for (const merge of [false, true]) {

@@ -4560,7 +4560,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       };
     }
 
-    const { needsCompression, needsMerge } = this.outstandingCompressionWork();
+    const needsCompression = this.chunks.some(
+      (c) => !c.compressed && this.isChunkOldEnough(c)
+    );
+    const needsMerge = this.config.hierarchical && this.mergeQueue.length > 0;
 
     if ((needsCompression && this.compressionQueue.length > 0) || needsMerge) {
       const parts: string[] = [];
@@ -8333,28 +8336,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return { deepestAvailableLevel, summaryCountsByLevel };
   }
 
-  /** The work checkReadiness waits on: chunks old enough to compress, and merges queued. */
-  protected outstandingCompressionWork(): { needsCompression: boolean; needsMerge: boolean } {
-    return {
-      needsCompression: this.chunks.some((c) => !c.compressed && this.isChunkOldEnough(c)),
-      needsMerge: !!this.config.hierarchical && this.mergeQueue.length > 0,
-    };
-  }
-
   /**
-   * Whether compression has work running or queued that would shrink the
-   * context: compression in flight, a merge queued, or a chunk queued to
-   * compress while the speculative cap lets the drain take it. That's what
-   * checkReadiness waits on, less the chunks the cap holds: at the cap, tick
-   * runs only merges, and a merge is what relieves the cap. Compressing a
-   * chunk replaces its raw messages with a summary, and a merge folds
-   * summaries into one.
+   * Whether the drain has compression work it will take that would shrink the
+   * context, as tick takes it: compression in flight; the first queued merge,
+   * unless a compression hold blocks it (tick then stops until the release);
+   * or a queued chunk tick would compress (still uncompressed, with no held
+   * message) while the speculative cap lets the drain take one. At the cap,
+   * tick runs only merges, and a merge is what relieves the cap. A held chunk
+   * can be queued: select's rebuild leaves one out, but a produce op queues
+   * the chunks it demands, held or not, and tick skips a held one and moves
+   * on. Like tick, this assumes the manager has a membrane to run it.
+   * checkReadiness waits on more: chunks the cap or a hold keeps, and a merge
+   * a hold blocks. Compressing a chunk replaces its raw messages with a
+   * summary, and a merge folds summaries into one.
    */
-  protected compressionWorkQueued(): boolean {
+  protected compressionWorkQueued(store: MessageStoreView): boolean {
     if (this.pendingCompression) return true;
-    const { needsCompression, needsMerge } = this.outstandingCompressionWork();
-    if (needsMerge) return true;
-    return needsCompression && this.compressionQueue.length > 0 && !this.isAtSpeculativeCap();
+    const merge = this.config.hierarchical ? this.mergeQueue[0] : undefined;
+    if (merge && !this.mergeBlockedByHold(merge.sourceIds, store)) return true;
+    if (this.compressionQueue.length === 0 || this.isAtSpeculativeCap()) return false;
+    const held = this.holdBlockedIds(store);
+    return this.compressionQueue.some((index) => {
+      const chunk = this.chunks[index];
+      return chunk !== undefined && !chunk.compressed && !this.chunkHasHeldMessage(chunk, held);
+    });
   }
 
   /** Attach common metadata; each internal refusal must also declare its count/depth meanings. */
@@ -8448,12 +8453,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // moves history into the foldable middle, which clears this when the
       // head fits beside the least raw tail any window leaves: no window
       // starts after a compression hold (getRecentWindowStart), and the newest
-      // body stays raw whatever the window, so count from the earlier of the
-      // two, and never from inside the head.
-      const newestBody = messages.length > 0 ? bodyBoundsIn(messages, messages.length - 1) : null;
+      // message stays raw whatever the window, since the newest turn is kept.
+      // For a message split into shards at ingress, that's its newest shard:
+      // under a smaller window its earlier shards can close into chunks and
+      // fold. So count from the earlier of the newest message and the hold
+      // boundary, and never from inside the head.
       let floorTokens = 0;
-      if (newestBody) {
-        const floorStart = Math.max(Math.min(newestBody.from, this.holdBoundary(store)), headEnd);
+      if (messages.length > 0) {
+        const floorStart = Math.max(Math.min(messages.length - 1, this.holdBoundary(store)), headEnd);
         for (let i = floorStart; i < messages.length; i++) {
           floorTokens += msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
         }
@@ -8897,7 +8904,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // holdback (l1HoldbackChunks) keeps out of the queue until they're
     // demanded, or a merge. There a dry run names nothing.
     const planClearedBy: OverBudgetClearedBy[] =
-      result.produced.length > 0 && this.compressionWorkQueued() ? ['compression'] : [];
+      result.produced.length > 0 && this.compressionWorkQueued(store) ? ['compression'] : [];
     if (result.finalTokens > rejectionBudget && (!dryRun || dryFallback)) {
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
@@ -10766,7 +10773,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 stage: 'Hierarchical emission overran the budget',
                 budget: graceLimit,
                 actual: totalTokens + pairTokens,
-                clearedBy: this.compressionWorkQueued() ? ['compression'] : [],
+                clearedBy: this.compressionWorkQueued(store) ? ['compression'] : [],
                 diagnostics: {
                   middleCountUnit: 'selection-items',
                   deepestLevelKind: 'attempted',
@@ -10793,7 +10800,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 stage: 'Hierarchical emission overran the budget',
                 budget: graceLimit,
                 actual: totalTokens + tokens,
-                clearedBy: this.compressionWorkQueued() ? ['compression'] : [],
+                clearedBy: this.compressionWorkQueued(store) ? ['compression'] : [],
                 diagnostics: {
                   middleCountUnit: 'selection-items',
                   deepestLevelKind: 'attempted',
@@ -10871,7 +10878,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               stage: 'Hierarchical emission overran the budget',
               budget: graceLimit,
               actual: totalTokens + tokens,
-              clearedBy: this.compressionWorkQueued() ? ['compression'] : [],
+              clearedBy: this.compressionWorkQueued(store) ? ['compression'] : [],
               diagnostics: {
                 middleCountUnit: 'raw-messages',
                 deepestLevelKind: 'attempted',
