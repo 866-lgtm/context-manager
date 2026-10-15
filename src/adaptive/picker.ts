@@ -63,6 +63,10 @@ export interface OverBudgetDiagnostics {
  * - `'smaller-recent-window'`: the raw recent window, which compression never
  *   touches, is what's over the budget, and a smaller `recentWindowTokens`
  *   moves that history into the part the strategy can fold.
+ *
+ * Each list describes the refusal that was hit. Clearing it can bring the
+ * next one: a smaller recent window can leave the picker waiting for
+ * compression.
  */
 export type OverBudgetClearedBy = 'compression' | 'newer-message' | 'smaller-recent-window';
 

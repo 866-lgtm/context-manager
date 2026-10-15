@@ -306,6 +306,18 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
+  it('names nothing when a hold inside the window would stop a smaller one short of fitting', async () => {
+    await withManager(recentOnly(100_000), async (manager) => {
+      const ids = Array.from({ length: 6 }, (_, i) =>
+        manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+      manager.holdCompression([ids[3]], { timeoutMs: 60_000 });
+      const error = await refusal(manager);
+      assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+      assert.deepEqual(error.clearedBy, [], 'no window starts after the hold, and messages 3 to 5 are over the budget');
+      manager.releaseCompression([ids[3]]);
+    });
+  });
+
   it('names nothing when a compression hold is what keeps the recent window this large', async () => {
     await withManager(recentOnly(60), async (manager) => {
       const ids = Array.from({ length: 6 }, (_, i) =>
@@ -318,23 +330,28 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
-  it('names compression when the plan still has summaries to produce', async () => {
-    const strategy = new DiagnosticStrategy({
-      adaptiveResolution: true,
-      headWindowTokens: 0,
-      recentWindowTokens: 0,
-      overBudgetGraceRatio: 0.25,
-      autoTickOnNewMessage: false,
-      speculativeProduction: false,
+  for (const [closed, expected] of [[true, ['compression']], [false, []]] as const) {
+    it(`names compression for a plan with summaries to produce only when chunks are there to make them (${closed ? 'closed chunks' : 'the unclosed trailing span'})`, async () => {
+      const strategy = new DiagnosticStrategy({
+        adaptiveResolution: true,
+        // Small chunks close as messages arrive; large ones leave every message
+        // in the unclosed span, where a produce op enqueues nothing.
+        targetChunkTokens: closed ? 40 : 100_000,
+        headWindowTokens: 0,
+        recentWindowTokens: 0,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+      });
+      strategy.produce = true;
+      await withManager(strategy, async (manager) => {
+        for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+        const error = await refusal(manager);
+        assert.match(error.message, /^Adaptive picker exhausted/);
+        assert.deepEqual(error.clearedBy, expected);
+      });
     });
-    strategy.produce = true;
-    await withManager(strategy, async (manager) => {
-      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
-      const error = await refusal(manager);
-      assert.match(error.message, /^Adaptive picker exhausted/);
-      assert.deepEqual(error.clearedBy, ['compression']);
-    });
-  });
+  }
 
   it('names compression for a hierarchical refusal of history that chunks waiting for compression cover', async () => {
     const strategy = new AutobiographicalStrategy({

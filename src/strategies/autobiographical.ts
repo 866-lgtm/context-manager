@@ -8342,14 +8342,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * A hierarchical refusal of history past the head clears by compression
-   * while there is work checkReadiness waits on: compressing a chunk replaces
-   * its raw messages with a summary, and a merge folds summaries into one.
+   * Whether compression has work running or queued that would shrink the
+   * context: what checkReadiness waits on (a chunk to compress, a merge), or
+   * compression in flight. Compressing a chunk replaces its raw messages with
+   * a summary, and a merge folds summaries into one.
    */
-  protected hierarchicalClearedBy(): OverBudgetClearedBy[] {
-    if (this.pendingCompression) return ['compression'];
+  protected compressionWorkQueued(): boolean {
+    if (this.pendingCompression) return true;
     const { needsCompression, needsMerge } = this.outstandingCompressionWork();
-    return (needsCompression && this.compressionQueue.length > 0) || needsMerge ? ['compression'] : [];
+    return (needsCompression && this.compressionQueue.length > 0) || needsMerge;
   }
 
   /** Attach common metadata; each internal refusal must also declare its count/depth meanings. */
@@ -8441,21 +8442,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (headTokens + tailTokens > rejectionBudget) {
       // Compression never touches the raw windows. A smaller recent window
       // moves history into the foldable middle, which clears this when the
-      // head and the newest body (the least any window keeps) fit together and
-      // no compression hold is what keeps the window this large.
+      // head fits beside the least tail a smaller window keeps: no window
+      // starts after a compression hold (getRecentWindowStart), and the newest
+      // body stays raw wherever it lands, so count from the earlier of the two.
       const newestBody = messages.length > 0 ? bodyBoundsIn(messages, messages.length - 1) : null;
-      let newestBodyTokens = 0;
+      let floorTokens = 0;
       if (newestBody) {
-        for (let i = Math.max(newestBody.from, headEnd); i <= newestBody.to; i++) {
-          newestBodyTokens += msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+        const floorStart = Math.max(Math.min(newestBody.from, this.holdBoundary(store)), headEnd);
+        for (let i = floorStart; i < messages.length; i++) {
+          floorTokens += msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
         }
       }
-      const heldOpen = recentStart < this.getUnheldRecentWindowStart(store);
       throw this.overBudgetError(budget, {
         stage: 'Head/tail reservation exceeded budget',
         budget: rejectionBudget,
         actual: headTokens + tailTokens,
-        clearedBy: headTokens + newestBodyTokens <= rejectionBudget && !heldOpen ? ['smaller-recent-window'] : [],
+        clearedBy: headTokens + floorTokens <= rejectionBudget ? ['smaller-recent-window'] : [],
         diagnostics: {
           middleCountUnit: 'picker-chunks',
           deepestLevelKind: 'unplanned',
@@ -8880,9 +8882,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // refusal so it takes the same fallback, and its preview says what the
     // real compile will do. If the retry at 1 is still over, it reports.
     const dryFallback = dryRun && this._calibrationProvisional !== null && this._calibration > 1;
-    // The plan's produce ops name summaries it still wants: producing them is
-    // how compression makes room for a deeper fold.
-    const planClearedBy: OverBudgetClearedBy[] = result.produced.length > 0 ? ['compression'] : [];
+    // The plan's produce ops name summaries it still wants, and producing them
+    // is how compression makes room for a deeper fold, but only once there is
+    // work to make them: an op over the unclosed trailing span enqueues
+    // nothing (enqueueL1ForRange), and a dry run enqueues nothing at all.
+    const planClearedBy: OverBudgetClearedBy[] =
+      result.produced.length > 0 && this.compressionWorkQueued() ? ['compression'] : [];
     if (result.finalTokens > rejectionBudget && (!dryRun || dryFallback)) {
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
@@ -10750,7 +10755,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 stage: 'Hierarchical emission overran the budget',
                 budget: graceLimit,
                 actual: totalTokens + pairTokens,
-                clearedBy: this.hierarchicalClearedBy(),
+                clearedBy: this.compressionWorkQueued() ? ['compression'] : [],
                 diagnostics: {
                   middleCountUnit: 'selection-items',
                   deepestLevelKind: 'attempted',
@@ -10777,7 +10782,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 stage: 'Hierarchical emission overran the budget',
                 budget: graceLimit,
                 actual: totalTokens + tokens,
-                clearedBy: this.hierarchicalClearedBy(),
+                clearedBy: this.compressionWorkQueued() ? ['compression'] : [],
                 diagnostics: {
                   middleCountUnit: 'selection-items',
                   deepestLevelKind: 'attempted',
@@ -10855,7 +10860,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               stage: 'Hierarchical emission overran the budget',
               budget: graceLimit,
               actual: totalTokens + tokens,
-              clearedBy: this.hierarchicalClearedBy(),
+              clearedBy: this.compressionWorkQueued() ? ['compression'] : [],
               diagnostics: {
                 middleCountUnit: 'raw-messages',
                 deepestLevelKind: 'attempted',
