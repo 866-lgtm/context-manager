@@ -155,6 +155,13 @@ function storedMergeQuarantine(manager: ContextManager): Array<Record<string, un
   return Array.isArray(value) ? (value as Array<Record<string, unknown>>) : [];
 }
 
+/** A queued merge's run of failures, which the lane keeps in memory by the merge's identity. */
+function mergeRun(strategy: unknown, merge: { level: number; sourceIds: readonly string[] } | undefined): { failures: number } | undefined {
+  if (!merge) return undefined;
+  return (strategy as { mergeFailureRuns: Map<string, { failures: number }> }).mergeFailureRuns
+    .get(`${merge.level}\u0000${merge.sourceIds.join('\u0000')}`);
+}
+
 describe('Merge terminal-disposition gate', () => {
   after(cleanup);
 
@@ -455,14 +462,14 @@ describe('Merge terminal-disposition gate', () => {
     };
     const land = () => lane.noteCompressionLanded(ctx(fx.manager).membrane, MODEL);
     const expire = () => { lane.compressionPause!.backoffUntil = 0; lane.compressionPause!.statedUntil = null; };
-    const streak = () => (fx.strategy.mergeQueueView()[0] as { failureStreak?: { failures: number; failureClass: string } }).failureStreak;
+    const streak = () => mergeRun(fx.strategy, fx.strategy.mergeQueueView()[0]);
     // An outage: nothing lands, so twelve failures count as one.
     for (let i = 0; i < 12; i++) {
       await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /500/, `tick ${i} rethrows`);
       expire();
     }
     assert.equal(fx.strategy.mergeQueueView()[0]?.attempts ?? 0, 0, 'no attempt burned in an outage');
-    assert.deepEqual([streak()?.failures, streak()?.failureClass], [1, 'server:500']);
+    assert.equal(streak()?.failures, 1);
     // Other work lands before each of the next failures: each counts.
     for (let i = 2; i < BOUND; i++) {
       land();
@@ -478,11 +485,9 @@ describe('Merge terminal-disposition gate', () => {
     await fx.strategy.tick(ctx(fx.manager)); // the bound: recorded, not thrown
     assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1, 'bounded policy engaged at the bound');
     // As in L1, the run is decided before any pause: the deciding failure is
-    // the merge's own, so it starts no stall clock and pauses nothing, and the
-    // bounded policy's smaller retry is asked at the next tick.
-    const clock = fx.manager.getStore().getStateJson('default/autobio:compression-stall') as { failingSince?: number | null } | null;
-    assert.equal(clock?.failingSince ?? null, null, 'the deciding failure starts no stall clock');
-    assert.equal(streak(), undefined, 'and the decided run is gone with its accounting');
+    // the merge's own, so it pauses nothing, and the bounded policy's smaller
+    // retry is asked at the next tick.
+    assert.equal(streak(), undefined, 'the decided run is gone with its accounting');
     const calls = mock.calls.length;
     await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /500/);
     assert.equal(mock.calls.length, calls + 1, 'and installs no pause: the retry is called at once');
@@ -493,9 +498,9 @@ describe('Merge terminal-disposition gate', () => {
     // executeMerge skips a stale entry (a source already parented) without a
     // call, writing nothing, and tick drops it from the queue. A skip says
     // nothing about the provider: it must not be a landing (in an outage,
-    // each stale entry would let a failing request's next failure count, and
-    // would end the stall clock) or end the pause (the next failure would back
-    // off from 30 s again instead of doubling from the genuine count).
+    // each stale entry would let a failing request's next failure count) or
+    // end the pause (the next failure would back off from 30 s again instead
+    // of doubling from the genuine count).
     const network = Object.assign(new Error('zz network down'), { type: 'network', retryable: true });
     const mock = scripted([{ error: network }]);
     const fx = await fixture(mock.membrane);
@@ -503,19 +508,20 @@ describe('Merge terminal-disposition gate', () => {
       compressionPause: { backoffUntil: number; failures: number } | null;
       noteCompressionLanded(membrane: unknown, model: string): void;
     };
-    const evidence = () => fx.manager.getStore().getStateJson('default/autobio:compression-stall');
     lane.noteCompressionLanded(ctx(fx.manager).membrane, MODEL); // other work landed once
     await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
     assert.equal(lane.compressionPause?.failures, 1);
     lane.compressionPause!.backoffUntil = 0; // the backoff has passed
     // Meanwhile another merge parented L1-100: the queued entry is stale.
     fx.strategy.summariesView().find((s) => s.id === 'L1-100')!.mergedInto = 'L2-900';
-    const before = evidence();
-    assert.equal(typeof (before as { failingSince?: unknown } | null)?.failingSince, 'number', 'the failure started the stall clock');
+    // Count the landings from here on.
+    let landings = 0;
+    const landed = lane.noteCompressionLanded.bind(fx.strategy);
+    lane.noteCompressionLanded = (membrane, model) => { landings++; landed(membrane, model); };
     await fx.strategy.tick(ctx(fx.manager));
     assert.equal(mock.calls.length, 1, 'skipped: no call');
     assert.equal(fx.strategy.mergeQueueView().length, 0, 'the stale entry is dropped');
-    assert.deepEqual(evidence(), before, 'no landing: the stall clock runs on');
+    assert.equal(landings, 0, 'no landing');
     assert.equal(lane.compressionPause?.failures, 1, 'and no answer: the pause and its failure count stand');
     await fx.manager.close();
   });
@@ -699,7 +705,7 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
   const network = () => Object.assign(new Error('zz network down'), { type: 'network', retryable: true });
   const lane = (fx: Fixture) => fx.strategy as unknown as {
     compressionPause: { backoffUntil: number; statedUntil: number | null; failures: number } | null;
-    mergeQueue: Array<{ level: number; sourceIds: string[]; failureStreak?: { failures: number } }>;
+    mergeQueue: Array<{ level: number; sourceIds: string[]; attempts?: number }>;
   };
   const answer = { stopReason: 'end_turn', content: [t('a merged parent')], usage: { inputTokens: 100, outputTokens: 20 } };
 
@@ -717,44 +723,41 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     } as never;
     fx = await fixture(membrane);
     await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
-    assert.equal(lane(fx).mergeQueue[0]?.failureStreak?.failures, 1, 'a run of one');
+    assert.equal(mergeRun(fx.strategy, lane(fx).mergeQueue[0])?.failures, 1, 'a run of one');
     lane(fx).compressionPause!.backoffUntil = 0;
     await fx.strategy.tick(ctx(fx.manager)); // answered, held: no throw
     assert.equal(calls.length, 2);
     assert.equal(lane(fx).compressionPause, null, 'the answer ended the pause, and the discard installed none');
     assert.equal(fx.strategy.mergeQueueView().length, 1, 'the entry stays queued for the release');
-    assert.equal(lane(fx).mergeQueue[0]?.failureStreak, undefined, 'its run ended: the request answered');
+    assert.equal(mergeRun(fx.strategy, lane(fx).mergeQueue[0]), undefined, 'its run ended: the request answered');
     assert.equal(fx.strategy.summariesView().some((s) => s.level === 2), false, 'nothing written');
     await fx.strategy.tick(ctx(fx.manager));
     assert.equal(calls.length, 2, 'the held merge waits for the release');
     await fx.manager.close();
   });
 
-  it('a refusal ends the run: the next failure starts a new one (I19), and the run write is synced (I9)', async () => {
+  it("a refusal ends the run: the next failure starts a new one (I19), and the refusal's attempt is synced (sheet I2)", async () => {
     const mock = scripted([{ error: network() }, { stop: 'refusal' }, { error: network() }]);
     const fx = await fixture(mock.membrane);
     const store = fx.manager.getStore();
     const sync = store.sync.bind(store);
-    // Each sync's view of the merge queue and of the stall clock.
-    const synced: Array<{ queue: unknown; clock: unknown }> = [];
+    // Each sync's view of the merge queue.
+    const synced: unknown[] = [];
     store.sync = () => {
-      synced.push({ queue: structuredClone(store.getStateJson('default/autobio:mergeQueue')), clock: store.getStateJson('default/autobio:compression-stall') });
+      synced.push(structuredClone(store.getStateJson('default/autobio:mergeQueue')));
       sync();
     };
     await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
-    const run = (queue: unknown) => (queue as Array<{ failureStreak?: { failures: number } }> | null)?.[0]?.failureStreak?.failures;
-    assert.ok(synced.some((at) => run(at.queue) === 1 && at.clock == null),
-      'the run is synced with its own write, before the pause starts the stall clock');
+    assert.equal(mergeRun(fx.strategy, lane(fx).mergeQueue[0])?.failures, 1, 'a run of one');
     lane(fx).compressionPause!.backoffUntil = 0;
     (fx.strategy as unknown as { noteCompressionLanded(membrane: unknown, model: string): void }).noteCompressionLanded(ctx(fx.manager).membrane, MODEL);
     const beforeRefusal = synced.length;
     await fx.strategy.tick(ctx(fx.manager)); // a refusal: an answer
-    assert.equal(lane(fx).mergeQueue[0]?.failureStreak, undefined, 'the answer ended the run');
-    const refusalSyncs = synced.slice(beforeRefusal).map((at) => (at.queue as Array<{ attempts?: number; failureStreak?: unknown }> | null)?.[0]);
-    assert.ok(refusalSyncs.some((entry) => entry?.attempts === 1 && entry.failureStreak === undefined),
-      "the refusal's write is synced: its attempt counted and its run ended (sheet I2)");
+    assert.equal(mergeRun(fx.strategy, lane(fx).mergeQueue[0]), undefined, 'the answer ended the run');
+    const refusalSyncs = synced.slice(beforeRefusal).map((queue) => (queue as Array<{ attempts?: number }> | null)?.[0]);
+    assert.ok(refusalSyncs.some((entry) => entry?.attempts === 1), "the refusal's write is synced: its attempt counted");
     await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
-    assert.equal(lane(fx).mergeQueue[0]?.failureStreak?.failures, 1, 'a new run, though work landed before the refusal');
+    assert.equal(mergeRun(fx.strategy, lane(fx).mergeQueue[0])?.failures, 1, 'a new run, though work landed before the refusal');
     await fx.manager.close();
   });
 
@@ -785,7 +788,7 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
     assert.equal(lane(fx).mergeQueue.length, 1);
     const entry = lane(fx).mergeQueue[0]!;
-    assert.equal(entry.failureStreak?.failures, 1, 'a run');
+    assert.equal(mergeRun(fx.strategy, entry)?.failures, 1, 'a run');
     lane(fx).compressionPause!.backoffUntil = 0;
     const tick = fx.strategy.tick(ctx(fx.manager));
     await calledAtLeast(calls, 2);
@@ -793,20 +796,20 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     lane(fx).mergeQueue.unshift({ level: entry.level, sourceIds: ['zz-other-a', 'zz-other-b'] } as never);
     release();
     await tick;
-    assert.equal(entry.failureStreak, undefined, 'the answer ended its run');
-    const stored = fx.manager.getStore().getStateJson('default/autobio:mergeQueue') as Array<{ sourceIds: string[]; failureStreak?: unknown }>;
-    const kept = stored.find((queued) => queued.sourceIds.join() === entry.sourceIds.join());
-    assert.ok(kept, 'the entry is still queued');
-    assert.equal(kept!.failureStreak, undefined, 'and its run ended durably');
+    assert.equal(mergeRun(fx.strategy, entry), undefined, 'the answer ended its run');
+    assert.ok(lane(fx).mergeQueue.includes(entry), 'the entry is still queued');
     await fx.manager.close();
   });
 
-  it('a merge no longer queued leaves the failure order (sheet I26)', async () => {
+  it('a merge no longer queued leaves the failure order and its run (sheet I26)', async () => {
     const fx = await fixture(scripted([{ stop: 'end_turn', text: 'unused' }]).membrane);
     const order = (fx.strategy as unknown as { mergeFailureOrder: Map<string, number> }).mergeFailureOrder;
+    const runs = (fx.strategy as unknown as { mergeFailureRuns: Map<string, unknown> }).mergeFailureRuns;
     order.set('zz-a merge that left the queue', 1);
+    runs.set('zz-a merge that left the queue', { key: 'zz', domain: 'zz', failures: 1, atLanded: 0 });
     (fx.strategy as unknown as { orderCompressionQueue(): void }).orderCompressionQueue();
     assert.equal(order.has('zz-a merge that left the queue'), false);
+    assert.equal(runs.has('zz-a merge that left the queue'), false);
     await fx.manager.close();
   });
 
@@ -858,31 +861,13 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     fx.strategy.qMerge(2, ['L1-100', 'L1-101']); // writes
     const failing = () => lane(fx).mergeQueue.find((entry) => (entry as unknown as { sourceIds: string[] }).sourceIds[0] === 'L1-102');
     await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
-    assert.equal(failing()?.failureStreak?.failures, 1);
+    assert.equal(mergeRun(fx.strategy, failing())?.failures, 1);
     lane(fx).compressionPause!.backoffUntil = 0;
     await fx.strategy.tick(ctx(fx.manager)); // the other merge writes its parent: a landing
     assert.ok(fx.strategy.summariesView().some((s) => s.level === 2), 'the other merge landed');
     await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
-    assert.equal(failing()?.failureStreak?.failures, 2, 'the landing made the next failure count');
+    assert.equal(mergeRun(fx.strategy, failing())?.failures, 2, 'the landing made the next failure count');
     await fx.manager.close();
-  });
-
-  it("a stored merge run that isn't well formed is read as none (cm138-r5 I13)", async () => {
-    const path = freshPath();
-    const fx = await fixture({ complete: async () => { throw network(); } } as never, {}, path);
-    await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
-    const stored = fx.manager.getStore().getStateJson('default/autobio:mergeQueue') as Array<{ failureStreak?: { failures: unknown } }>;
-    assert.equal(stored[0]?.failureStreak?.failures, 1);
-    stored[0]!.failureStreak!.failures = '7';
-    fx.manager.getStore().setStateJson('default/autobio:mergeQueue', stored);
-    fx.manager.getStore().sync();
-    await fx.manager.close();
-    const strategy = new Probe({ compressionModel: MODEL, hierarchical: true, targetChunkTokens: 100_000, recentWindowTokens: 0, headWindowTokens: 0, autoTickOnNewMessage: false, mergeThreshold: 99, quarantineAlarmIntervalMs: 0 });
-    const manager = await ContextManager.open({ path, strategy, membrane: { complete: async () => { throw network(); } } as never });
-    const queue = (strategy as unknown as { mergeQueue: Array<{ failureStreak?: unknown }> }).mergeQueue;
-    assert.equal(queue.length, 1, 'the entry is kept');
-    assert.equal(queue[0]!.failureStreak, undefined, "a count of '7' isn't counted on");
-    await manager.close();
   });
 
   it('a merge written as the branch switches is still a landing in its domain (cm138-r4 I6)', async () => {
@@ -903,7 +888,7 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     fx.strategy.qMerge(2, ['L1-100', 'L1-101']); // writes
     const failing = () => lane(fx).mergeQueue.find((entry) => entry.sourceIds[0] === 'L1-102');
     await assert.rejects(() => fx.strategy.tick(ctx(fx.manager)), /zz network down/);
-    assert.equal(failing()?.failureStreak?.failures, 1);
+    assert.equal(mergeRun(fx.strategy, failing())?.failures, 1);
     lane(fx).compressionPause!.backoffUntil = 0;
     const store = fx.manager.getStore();
     const main = fx.manager.currentBranch().name;
@@ -927,7 +912,7 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
       try {
         await fx.strategy.tick(ctx(fx.manager));
       } catch {
-        counted = failing()?.failureStreak?.failures;
+        counted = mergeRun(fx.strategy, failing())?.failures;
       }
     }
     assert.equal(counted, 2, "the merge written as the branch switched made the next failure count");

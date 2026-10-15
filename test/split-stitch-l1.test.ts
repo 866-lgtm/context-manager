@@ -220,6 +220,48 @@ describe('split-stitch L1 fallback', () => {
     assert.equal(fx.strategy.attempted()!.complete, true, 'the re-run is recorded as complete');
   });
 
+  it('a piece that fails after a branch switch counts nothing: the next failure on the new branch starts a run of one', async () => {
+    const inner = cumulativeMembrane({ refuseAt: 2, throwOn: 'raw-1' });
+    let gate: Promise<void> | null = null;
+    let held = false;
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        const targets = texts(request).filter((t) => /^raw-\d+ /.test(t));
+        if (gate && targets.length === 1 && targets[0]!.startsWith('raw-1')) {
+          const wait = gate;
+          gate = null;
+          held = true;
+          await wait;
+        }
+        return (inner.membrane as unknown as { complete(r: NormalizedRequest): Promise<unknown> }).complete(request);
+      },
+    };
+    const fx = await build(membrane, { split: true, placeholder: true });
+    const lane = fx.strategy as unknown as {
+      noteCompressionLanded(membrane: object, model: string | undefined): void;
+      compressionFailureRuns: Map<string, { run: { failures: number } }>;
+    };
+    const runs = () => [...lane.compressionFailureRuns.values()].map((entry) => entry.run.failures);
+    const store = fx.manager.getStore();
+    const fork = store.createBranchAt('zz-fork', fx.manager.currentBranch().name, store.currentSequence()).name;
+    // Other work has landed, so a counted failure would extend a run.
+    lane.noteCompressionLanded(membrane, 'same-model');
+    let release!: () => void;
+    gate = new Promise<void>((resolve) => { release = resolve; });
+    const abandoned = fx.strategy.run(fx.target, managerContext(fx.manager));
+    while (!held) await new Promise((resolve) => setTimeout(resolve, 1));
+    await fx.manager.switchBranch(fork);
+    release();
+    // The ladder abandons work that crossed a branch switch, quietly.
+    await abandoned.catch(() => undefined);
+    assert.deepEqual(runs(), [], 'the piece failed after the switch, so it counted nothing');
+    // On the new branch, with another landing first, the chunk's next failure is its first.
+    lane.noteCompressionLanded(membrane, 'same-model');
+    await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /transport-down/);
+    assert.deepEqual(runs(), [1], 'a run of one');
+    fx.manager.close();
+  });
+
   it('a deterministic rejection of a sub-request aborts the rung: nothing installed, family exhausted', async () => {
     const calls: NormalizedRequest[] = [];
     const base = cumulativeMembrane({ refuseAt: 2 }).membrane as unknown as { complete(request: NormalizedRequest): Promise<unknown> };

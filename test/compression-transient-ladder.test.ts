@@ -241,8 +241,7 @@ describe('compression ladder: transient failures never spend it', () => {
   it('a failure counts against its request only while other work lands on its route and model; the 8th decides it, and a restart starts the count again', async () => {
     const path = freshPath();
     const always503 = () => scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
-    const streak = (manager: ContextManager) =>
-      (progressSlot(manager) as Array<{ failureStreak?: { failures: number; failureClass: string } }>)[0]?.failureStreak;
+    const streak = (strategy: unknown) => l1RunsOf(strategy)[0];
     const first = always503();
     const a = await build(first.membrane, { path, sourceOnlyFallback: true });
     // An outage: nothing lands between the failures, so none adds to the run.
@@ -250,25 +249,24 @@ describe('compression ladder: transient failures never spend it', () => {
       await assert.rejects(a.strategy.run(a.target(), managerContext(a.manager)), /zz server failure/);
     }
     assert.equal(a.strategy.getCompressionQuarantineStatus().count, 0, 'an outage exhausts nothing');
-    assert.deepEqual([streak(a.manager)?.failures, streak(a.manager)?.failureClass], [1, 'server:503'],
+    assert.equal(streak(a.strategy)?.failures, 1,
       'twelve failures with nothing landing are a run of one');
     // Other work lands in the same domain before each of the next six, so each counts.
     for (let i = 0; i < 6; i++) {
       a.strategy.land(first.membrane);
       await assert.rejects(a.strategy.run(a.target(), managerContext(a.manager)), /zz server failure/);
     }
-    assert.equal(streak(a.manager)?.failures, 7);
+    assert.equal(streak(a.strategy)?.failures, 7);
     assert.equal(a.strategy.getCompressionQuarantineStatus().count, 0, 'seven is below the bound');
     a.manager.close();
 
-    // A restart: nothing can say the new process's route is the old one, so
-    // the stored run's count isn't carried, and the first failure here starts
-    // a run of one.
+    // A restart: runs live in the process, as their evidence does, so the
+    // first failure here starts a run of one.
     const second = always503();
     const b = await build(second.membrane, { path, sourceOnlyFallback: true });
     b.strategy.land(second.membrane);
     await assert.rejects(b.strategy.run(b.target(), managerContext(b.manager)), /zz server failure/);
-    assert.equal(streak(b.manager)?.failures, 1, 'the first failure after a restart starts a run of one');
+    assert.equal(streak(b.strategy)?.failures, 1, 'the first failure after a restart starts a run of one');
     for (let i = 0; i < 6; i++) {
       b.strategy.land(second.membrane);
       await assert.rejects(b.strategy.run(b.target(), managerContext(b.manager)), /zz server failure/);
@@ -299,18 +297,18 @@ describe('compression ladder: transient failures never spend it', () => {
       { throw: failure('timeout') },
     ]);
     const fx = await build(mock.membrane);
-    const streak = () => (progressSlot(fx.manager) as Array<{ failureStreak?: { failures: number; failureClass: string } }>)[0]!.failureStreak!;
+    const streak = () => l1RunsOf(fx.strategy)[0]!;
     for (let i = 0; i < 3; i++) {
       fx.strategy.land(mock.membrane);
       await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
     }
-    assert.deepEqual([streak().failures, streak().failureClass], [3, 'server:503']);
+    assert.equal(streak().failures, 3);
     fx.strategy.land(mock.membrane);
     await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /no call was made/);
-    assert.deepEqual([streak().failures, streak().failureClass], [3, 'server:503'], 'a deferral is no failure');
+    assert.equal(streak().failures, 3, 'a deferral is no failure');
     // The landing before the deferral wasn't spent: the timeout counts against it.
     await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz timeout failure/);
-    assert.deepEqual([streak().failures, streak().failureClass], [4, 'timeout'], 'another class extends the run (sheet I10)');
+    assert.equal(streak().failures, 4, 'another class extends the run (sheet I10)');
     fx.manager.close();
   });
 
@@ -367,7 +365,7 @@ describe('compression lane pacing', () => {
     assert.equal(mock.calls.length, 1, 'no call while paused');
     assert.deepEqual(fx.strategy.compressionQueueView(), queue, 'no queue item consumed while paused');
     const readiness = fx.strategy.checkReadiness();
-    assert.match(readiness.description ?? '', /compression paused until .+ \(the provider's stated wait, failure 1\)/);
+    assert.match(readiness.description ?? '', /compression paused until .+ \(the provider's stated wait, failure 1; latest: the chunk of 4 message\(s\) from \S+ failed \(rate_limit:429\)\)/);
 
     fx.strategy.expirePause();
     await fx.strategy.tick(managerContext(fx.manager));
@@ -700,10 +698,10 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
     assert.equal(first.calls.filter(carriesThinking).length, 1, 'the carrier request was sent once');
     assert.equal(first.calls.length, 8);
     const stripped = sha256(first.calls[1]!);
-    const progress = progressSlot(a.manager) as Array<{ failureStreak?: { key: string; failures: number; failureClass: string } }>;
+    const run = l1RunsOf(a.strategy)[0];
     assert.deepEqual(
-      [progress[0]!.failureStreak?.key, progress[0]!.failureStreak?.failures, progress[0]!.failureStreak?.failureClass],
-      [runKey(a.target().messages, 'canonical', true), 7, 'server:503'],
+      [run?.key, run?.failures],
+      [runKey(a.target().messages, 'canonical', true), 7],
       'counted against the stripped request, its own run',
     );
     a.strategy.land(first.membrane);
@@ -749,7 +747,7 @@ describe("a caller's admission deferral is an external wait, not a failed call (
       'the cached answer lasts 30 s from the deferral, not the admission\'s 120 s deadline');
     assert.match(fx.strategy.checkReadiness().description ?? '', /then the caller's provider admission is asked again, failure 0/);
     assert.equal(progressSlot(fx.manager).length, 1);
-    assert.deepEqual((progressSlot(fx.manager) as Array<{ outcomes: unknown[]; failureStreak?: unknown }>)[0]!.outcomes, [], 'no rung spent');
+    assert.deepEqual((progressSlot(fx.manager) as Array<{ outcomes: unknown[] }>)[0]!.outcomes, [], 'no rung spent');
 
     // The operator releases the wait through agent-framework 10 s later: no
     // invented 20 s of failure pacing remain.
@@ -918,13 +916,10 @@ describe('pending work stays discoverable after a transient failure or a deferra
 // Evidence, not streaks (room-203 #70846, #70922, #70929; room-383 #74877):
 // a failure counts against its request only while other compression lands on
 // its route and model; a failed request goes behind the work that hasn't
-// failed; the stall clock is durable; a stall alerts.
+// failed.
 // ---------------------------------------------------------------------------
 
 const HOUR = 60 * 60_000;
-const STALL_SLOT = 'default/autobio:compression-stall';
-interface StallClock { failingSince: number | null; activeAt: number | null; last: { subject: string; failureClass: string } | null; stall: { since: number; subject: string } | null }
-const stallClock = (manager: ContextManager): StallClock | null => manager.getStore().getStateJson(STALL_SLOT) as StallClock | null;
 
 /** Collect console.warn while `body` runs. */
 async function warningsOf(body: (warnings: string[]) => Promise<void>): Promise<void> {
@@ -1046,9 +1041,8 @@ describe('compression lane: failures are evidence only by the company they keep'
     const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }, OK('the second chunk'), { throw: failure('server', { httpStatus: 503 }) }]);
     const fx = await queued(mock.membrane);
     // The chunk's request family changes when another L1 lands (its frontier
-    // grows), and its run goes on in the newest family.
-    const runOf = () => (progressSlot(fx.manager) as Array<{ updated: number; failureStreak?: { failures: number } }>)
-      .filter((entry) => entry.failureStreak).map((entry) => entry.failureStreak!.failures);
+    // grows), and its run goes on.
+    const runOf = () => l1RunsOf(fx.strategy).map((run) => run.failures);
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz server failure/);
     assert.deepEqual(runOf(), [1]);
     fx.strategy.expirePause();
@@ -1056,139 +1050,6 @@ describe('compression lane: failures are evidence only by the company they keep'
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz server failure/);
     assert.deepEqual(runOf(), [2], 'the landing in between made it count, in one run for the chunk');
     fx.manager.close();
-  });
-
-  it('a landing ends the stall clock on the branch that compressed, though a branch switch crosses the payoff after it (sheet I3)', async () => {
-    const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }, OK('the second chunk')]);
-    const fx = await queued(mock.membrane);
-    const store = fx.manager.getStore();
-    const main = fx.manager.currentBranch().name;
-    const fork = store.createBranchAt('zz-fork', main, store.currentSequence()).name;
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz server failure/);
-    assert.equal(typeof stallClock(fx.manager)?.failingSince, 'number', 'the failure started the clock on main');
-    // The success path's payoff await is crossed by a switch to the fork.
-    const self = fx.strategy as unknown as { clearQuarantineForCompressedChunk(chunk: Chunk): Promise<void> };
-    const clear = self.clearQuarantineForCompressedChunk.bind(fx.strategy);
-    self.clearQuarantineForCompressedChunk = async (chunk: Chunk) => {
-      self.clearQuarantineForCompressedChunk = clear;
-      await fx.manager.switchBranch(fork);
-      return clear(chunk);
-    };
-    fx.strategy.expirePause();
-    await fx.strategy.tick(managerContext(fx.manager));
-    assert.equal(stallClock(fx.manager), null, 'the fork kept its own (empty) clock');
-    await fx.manager.switchBranch(main);
-    assert.ok(fx.strategy.summariesView().some((s) => s.content === 'the second chunk'), 'main holds the L1');
-    assert.equal(stallClock(fx.manager)?.failingSince ?? null, null, 'and main, which compressed, had its clock ended');
-    fx.manager.close();
-  });
-
-  /** The stall slot's value at each store sync: what a crash right after it would keep. */
-  function watchSyncedStall(manager: ContextManager): unknown[] {
-    const store = manager.getStore();
-    const sync = store.sync.bind(store);
-    const synced: unknown[] = [];
-    store.sync = () => {
-      synced.push(store.getStateJson(STALL_SLOT));
-      sync();
-    };
-    return synced;
-  }
-
-  it('failures for an hour with nothing landing alert once, through checkReadiness, until something lands', async () => {
-    const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
-    const fx = await queued(mock.membrane);
-    const synced = watchSyncedStall(fx.manager);
-    await warningsOf(async (warnings) => {
-      await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-      assert.equal(fx.strategy.checkReadiness().compressionStall, undefined, 'a failure is no stall');
-      // Stand for an hour of failures: the clock is the durable start of the failures since the last landing.
-      const store = fx.manager.getStore();
-      const clock = stallClock(fx.manager)!;
-      assert.equal(typeof clock.failingSince, 'number', 'the failures\' start is kept');
-      assert.deepEqual(synced.at(-1), clock, 'durably: synced, so a crash loop does not restart the clock');
-      store.setStateJson(STALL_SLOT, { ...clock, failingSince: Date.now() - 61 * 60_000 });
-      for (let i = 0; i < 2; i++) {
-        fx.strategy.expirePause();
-        await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-      }
-      const stall = fx.strategy.checkReadiness().compressionStall;
-      assert.ok(stall, 'the readiness report carries the stall');
-      assert.equal(stall!.failureClass, 'server:503');
-      assert.match(stall!.subject, /^the chunk of \d+ message\(s\) from /);
-      assert.match(fx.strategy.checkReadiness().description ?? '', /compression stalled since /);
-      assert.equal(warnings.filter((w) => w.includes('compression stalled')).length, 1, 'one alert per stall');
-      fx.strategy.land(mock.membrane);
-      assert.equal(fx.strategy.checkReadiness().compressionStall, undefined, 'a landed success ends it');
-    });
-    fx.manager.close();
-  });
-
-  it('an idle hour starts the stall clock again: the first failure after it is no stall (sheet I2)', async () => {
-    const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
-    const fx = await queued(mock.membrane);
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    // Failures began three hours ago, and the lane hasn't been seen failing or
-    // waiting for two: the pause its last failure installed ended then too.
-    fx.manager.getStore().setStateJson(STALL_SLOT, {
-      ...stallClock(fx.manager)!, failingSince: Date.now() - 3 * HOUR, activeAt: Date.now() - 2 * HOUR,
-    });
-    fx.strategy.expirePause();
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    assert.equal(fx.strategy.checkReadiness().compressionStall, undefined, 'no stall');
-    assert.ok(Date.now() - stallClock(fx.manager)!.failingSince! < 60_000, 'the clock starts again at this failure');
-    fx.manager.close();
-  });
-
-  it('a stated wait longer than the hour alerts during the wait, from a tick that finds the lane paused with work pending (sheet I11)', async () => {
-    const mock = scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 3 * HOUR }) }]);
-    const fx = await queued(mock.membrane);
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    assert.ok(fx.strategy.paused());
-    fx.manager.getStore().setStateJson(STALL_SLOT, { ...stallClock(fx.manager)!, failingSince: Date.now() - 61 * 60_000 });
-    await warningsOf(async (warnings) => {
-      await fx.strategy.tick(managerContext(fx.manager));
-      assert.equal(mock.calls.length, 1, 'no call while paused');
-      const stall = fx.strategy.checkReadiness().compressionStall;
-      assert.ok(stall, 'the stall shows while the lane waits');
-      assert.equal(stall!.failureClass, 'rate_limit:429');
-      assert.equal(warnings.filter((w) => w.includes('compression stalled')).length, 1);
-      await fx.strategy.tick(managerContext(fx.manager));
-      assert.equal(warnings.filter((w) => w.includes('compression stalled')).length, 1, 'once');
-    });
-    fx.manager.close();
-  });
-
-  it("the stall is the branch's and the store's: another branch shows its own clock, a restart keeps the one alert, and a sibling's landing ends it (sheet I6, I20, I25)", async () => {
-    const path = freshPath();
-    const first = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
-    const a = await queued(first.membrane, { path });
-    const store = a.manager.getStore();
-    const main = a.manager.currentBranch().name;
-    const fork = store.createBranchAt('zz-fork', main, store.currentSequence()).name;
-    await warningsOf(async (warnings) => {
-      await assert.rejects(a.strategy.tick(managerContext(a.manager)));
-      store.setStateJson(STALL_SLOT, { ...stallClock(a.manager)!, failingSince: Date.now() - 61 * 60_000 });
-      a.strategy.expirePause();
-      await assert.rejects(a.strategy.tick(managerContext(a.manager)));
-      assert.ok(a.strategy.checkReadiness().compressionStall, 'stalled on main');
-      await a.manager.switchBranch(fork);
-      assert.equal(a.strategy.checkReadiness().compressionStall, undefined, 'the fork has no stall');
-      await a.manager.switchBranch(main);
-      assert.ok(a.strategy.checkReadiness().compressionStall, 'main still has it');
-      a.manager.close();
-
-      const second = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
-      const b = await queued(second.membrane, { path });
-      assert.ok(b.strategy.checkReadiness().compressionStall, 'a restart keeps the stall');
-      await assert.rejects(b.strategy.tick(managerContext(b.manager)));
-      assert.equal(warnings.filter((w) => w.includes('compression stalled')).length, 1, 'and alerts no second time');
-
-      const sibling = await queued(scripted([OK('unused')]).membrane, { store: b.manager.getStore() });
-      sibling.strategy.land(managerContext(sibling.manager).membrane);
-      assert.equal(b.strategy.checkReadiness().compressionStall, undefined, "a sibling's landing ends it for every instance");
-      b.manager.close();
-    });
   });
 
   it('a NaN retryAfterMs states no wait: the pause ends with the lane\'s own backoff (sheet I17)', async () => {
@@ -1227,110 +1088,27 @@ describe('compression lane: failures are evidence only by the company they keep'
     for (const entry of unmerged) fx.strategy.seed(entry);
     assert.deepEqual(fx.strategy.mergeCandidates(unmerged, 4)?.map((s) => s.id), ['L1-a', 'L1-b'],
       'a stranded interior run consolidates at two');
-    const store = fx.manager.getStore();
-    const run = { key: 'zz-request', failureClass: 'server:503', failures: 1, atLanded: 0, firstFailedAt: Date.now() };
-    // A run left by a chunk a rebuild re-cut: its hash names no live chunk, and no retry will fill its span.
-    store.setStateJson(PROGRESS_SLOT, [{ familyKey: 'zz-stale', chunkSourceHash: 'zz-hash', sourceIds: ids.slice(4, 8), outcomes: [], failureStreak: run, updated: Date.now() }]);
-    assert.deepEqual(fx.strategy.mergeCandidates(unmerged, 4)?.map((s) => s.id), ['L1-a', 'L1-b'], 'a stale entry holds nothing');
+    const run = { key: 'zz-request', domain: 'zz', failures: 1, atLanded: 0 };
+    const l1Runs = (fx.strategy as unknown as { compressionFailureRuns: Map<string, { run: typeof run; chunkKey: string }> }).compressionFailureRuns;
+    // A run left by a chunk a rebuild re-cut: its key names no live chunk, and no retry will fill its span.
+    l1Runs.set('zz-stale', { run, chunkKey: ids.slice(4, 7).join(':') });
+    assert.deepEqual(fx.strategy.mergeCandidates(unmerged, 4)?.map((s) => s.id), ['L1-a', 'L1-b'], 'a stale run holds nothing');
     // The chunk over the hole failed and will be retried.
-    store.setStateJson(PROGRESS_SLOT, [{ familyKey: 'zz-family', chunkSourceHash: idsHash(hole!.messages.map((m) => m.id)), sourceIds: ids.slice(4, 8), outcomes: [], failureStreak: run, updated: Date.now() }]);
+    l1Runs.set('zz-subject', { run, chunkKey: hole!.messages.map((m) => m.id).join(':') });
     assert.equal(fx.strategy.mergeCandidates(unmerged, 4), null, 'the run waits for the retry, as the newest run does');
-    store.setStateJson(PROGRESS_SLOT, []);
+    l1Runs.clear();
     // One level up: a queued merge with a run will fill the hole with its parent.
     const level2 = [summary('L2-a', 2, 0, 1), summary('L2-b', 2, 2, 3), summary('L2-c', 2, 8, 8), summary('L2-d', 2, 9, 9)];
     for (const entry of level2) fx.strategy.seed(entry);
     fx.strategy.seed(summary('L1-x', 1, 4, 5));
     fx.strategy.seed(summary('L1-y', 1, 6, 7));
     assert.deepEqual(fx.strategy.mergeCandidates(level2, 4)?.map((s) => s.id), ['L2-a', 'L2-b']);
-    (fx.strategy as unknown as { mergeQueue: unknown[] }).mergeQueue.push({ level: 2, sourceIds: ['L1-x', 'L1-y'], failureStreak: run });
+    (fx.strategy as unknown as { mergeQueue: unknown[] }).mergeQueue.push({ level: 2, sourceIds: ['L1-x', 'L1-y'] });
+    (fx.strategy as unknown as { mergeFailureRuns: Map<string, typeof run> }).mergeFailureRuns.set(`2\u0000L1-x\u0000L1-y`, run);
     assert.equal(fx.strategy.mergeCandidates(level2, 4), null, 'a failing merge holds the hole its parent will fill');
     fx.manager.close();
   });
-
-  it("across the chunk's families: a sibling's longer run of the same rung is kept, and a run carried from a family dropped meanwhile doesn't come back (Basil-1007's review)", async () => {
-    let release: () => void = () => {};
-    let gate: Promise<void> = Promise.resolve();
-    const calls: NormalizedRequest[] = [];
-    const membrane = {
-      complete: async (request: NormalizedRequest) => {
-        calls.push(structuredClone(request));
-        await gate;
-        throw failure('server', { httpStatus: 503 });
-      },
-    };
-    const fx = await build(membrane);
-    const runs = () => (progressSlot(fx.manager) as Array<{ familyKey: string; failureStreak?: { failures: number } }>)
-      .filter((entry) => entry.failureStreak).map((entry) => [entry.familyKey, entry.failureStreak!.failures] as const);
-    const l1 = (id: string, first: number, last: number): SummaryEntry => ({
-      id, level: 1, content: `authored ${id}`, tokens: 20, sourceLevel: 0,
-      sourceIds: fx.ids.slice(first, last + 1), sourceRange: { first: fx.ids[first]!, last: fx.ids[last]! }, created: 1,
-    });
-    /** One failing attempt whose call is held until `during` has run. */
-    const heldFailure = async (during: () => void): Promise<void> => {
-      gate = new Promise<void>((resolve) => { release = resolve; });
-      const before = calls.length;
-      const running = fx.strategy.run(fx.target(), managerContext(fx.manager));
-      await firstCallAfter(calls, before);
-      during();
-      release();
-      await assert.rejects(running, /zz server failure/);
-      gate = Promise.resolve();
-    };
-    for (let i = 0; i < 3; i++) {
-      fx.strategy.land(membrane);
-      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
-    }
-    const [first] = runs();
-    assert.equal(first![1], 3, 'three counted failures in the first family');
-    // A new L1 grows the frontier, so the next attempt is a new family, carrying the run.
-    fx.strategy.seed(l1('L1-101', 2, 3));
-    fx.strategy.land(membrane);
-    await heldFailure(() => {
-      // Meanwhile a sibling counted further in the first family.
-      const slot = progressSlot(fx.manager) as Array<{ familyKey: string; failureStreak?: { failures: number } }>;
-      slot.find((entry) => entry.familyKey === first![0])!.failureStreak!.failures = 6;
-      fx.manager.getStore().setStateJson(PROGRESS_SLOT, slot);
-    });
-    assert.deepEqual(runs().map(([, failures]) => failures), [6], "the sibling's longer run is kept, and only one family holds it");
-    // Another new family; this time the chunk's progress is dropped during the call (minted, or exhausted, elsewhere).
-    fx.strategy.seed(l1('L1-102', 4, 5));
-    fx.strategy.land(membrane);
-    await heldFailure(() => { fx.manager.getStore().setStateJson(PROGRESS_SLOT, []); });
-    assert.deepEqual(runs().map(([, failures]) => failures), [1], 'the carried run ended with its family: the count starts again');
-    fx.manager.close();
-  });
-
-  it('a progress write keeps another writer\'s longer run for the same request in the same domain, and drops a run whose request answered', async () => {
-    const fx = await build(scripted([OK('unused')]).membrane);
-    const self = fx.strategy as unknown as {
-      captureCompressionBranch(): unknown;
-      recordCompressionFamilyProgress(
-        source: unknown, record: { familyKey: string; chunkSourceHash: string }, outcomes: unknown[],
-        tokens: number | undefined, streak: unknown, answered: ReadonlySet<string>, sourceIds: readonly string[],
-        runSubject: string,
-      ): void;
-    };
-    const record = { familyKey: 'zz-family', chunkSourceHash: 'zz-hash' };
-    const run = (failures: number, domain = 'zz-domain', key = 'zz-request') =>
-      ({ key, failureClass: 'server:503', domain, failures, atLanded: failures, firstFailedAt: 1 });
-    const stored = () => (progressSlot(fx.manager) as Array<{ failureStreak?: { failures: number; domain: string } }>)[0]!.failureStreak;
-    // Another writer counted further on the same request, in the same domain.
-    self.recordCompressionFamilyProgress(self.captureCompressionBranch(), record, [], undefined, run(5), new Set(), ['m1'], 'zz-subject');
-    self.recordCompressionFamilyProgress(self.captureCompressionBranch(), record, [], undefined, run(3), new Set(), ['m1'], 'zz-subject');
-    assert.equal(stored()?.failures, 5, 'the longer run is kept');
-    // A run in another domain doesn't take that one's count.
-    self.recordCompressionFamilyProgress(self.captureCompressionBranch(), record, [], undefined, run(1, 'zz-other'), new Set(), ['m1'], 'zz-subject');
-    assert.deepEqual([stored()?.failures, stored()?.domain], [1, 'zz-other'], "this writer's run stands");
-    // The request answered for this writer: the run ends durably.
-    self.recordCompressionFamilyProgress(self.captureCompressionBranch(), record, [], undefined, undefined, new Set(['zz-request']), ['m1'], 'zz-subject');
-    assert.equal(stored(), undefined, 'no stored run comes back for a request that answered');
-    fx.manager.close();
-  });
 });
-
-// ── The comparison domain: the route and the model (room-383 #74635, #74790,
-// #74877; Ethan-2263's probes cm138-model-evidence, -route-evidence,
-// -portability) ──────────────────────────────────────────────────────────────
 
 describe('a failure is evidence only against landings on its own route and model', () => {
   const sourceOnly = (strategy: ProbeStrategy): void => {
@@ -1466,6 +1244,10 @@ const runKey = (messages: ReadonlyArray<{ id: string; content: unknown }>, curve
 const families = (manager: ContextManager): string[] =>
   (progressSlot(manager) as Array<{ familyKey: string }>).map((entry) => entry.familyKey).sort();
 const PROGRESS_SLOT = 'default/autobio:compression-family-progress';
+/** The lane's L1 runs of failures, which it keeps in memory. */
+const l1RunsOf = (strategy: unknown): Array<{ key: string; failures: number }> =>
+  [...(strategy as { compressionFailureRuns: Map<string, { run: { key: string; failures: number } }> })
+    .compressionFailureRuns.values()].map((entry) => entry.run);
 const DAY = 24 * 60 * 60_000;
 
 describe('an abort is neither evidence nor a reason to pause (sw-cm138 I8)', () => {
@@ -1648,12 +1430,15 @@ describe('ladder progress goes when its debt is paid, and is swept on its own ca
     fx.manager.getStore().setStateJson(PROGRESS_SLOT, [
       { familyKey: 'fam-thin', chunkSourceHash: idsHash(messages.map((m) => m.id)), outcomes: [], updated: Date.now() },
     ]);
-    fx.manager.getStore().setStateJson(STALL_SLOT, { failingSince: Date.now() - 60_000, activeAt: Date.now(), last: { subject: 'zz', failureClass: 'network', lane: 'l1' }, stall: null });
+    let landings = 0;
+    const lane = fx.strategy as unknown as { noteCompressionLanded(membrane: object, model: string | undefined): void };
+    const landed = lane.noteCompressionLanded.bind(fx.strategy);
+    lane.noteCompressionLanded = (membrane, model) => { landings++; landed(membrane, model); };
     await fx.strategy.run(thin, managerContext(fx.manager));
     assert.equal(mock.calls.length, 0, 'stubbed, with no call');
     assert.equal(thin.compressed, true);
     assert.deepEqual(families(fx.manager), [], "the stubbed span's progress is gone");
-    assert.equal(typeof stallClock(fx.manager)?.failingSince, 'number', 'a stub made no call, so the stall clock runs on');
+    assert.equal(landings, 0, 'a stub made no call, so it is no landing');
     fx.manager.close();
   });
 
@@ -1742,10 +1527,8 @@ describe('the quarantine-skip warning is per branch (sw-cm138 I28)', () => {
 
 // ── Round 4 (cm138-r3's sheet; Andrew-2310's review, room-203 #78444) ─────────
 
-describe("a run's evidence belongs to the chunk's sources, and one family holds it", () => {
-  const runsOf = (manager: ContextManager): number[] =>
-    (progressSlot(manager) as Array<{ failureStreak?: { failures: number } }>)
-      .flatMap((entry) => (entry.failureStreak ? [entry.failureStreak.failures] : []));
+describe("a run's evidence belongs to the chunk's sources", () => {
+  const runsOf = (strategy: unknown): number[] => l1RunsOf(strategy).map((run) => run.failures);
   const l1 = (ids: string[], id: string, first: number, last: number): SummaryEntry => ({
     id, level: 1, content: `authored ${id}`, tokens: 20, sourceLevel: 0,
     sourceIds: ids.slice(first, last + 1), sourceRange: { first: ids[first]!, last: ids[last]! }, created: 1,
@@ -1758,12 +1541,12 @@ describe("a run's evidence belongs to the chunk's sources, and one family holds 
       fx.strategy.land(mock.membrane);
       await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
     }
-    assert.deepEqual(runsOf(fx.manager), [7]);
+    assert.deepEqual(runsOf(fx.strategy), [7]);
     fx.manager.editMessage(fx.ids[10]!, [text('raw-10 edited in place ' + 'substantive '.repeat(12))]);
     fx.strategy.land(mock.membrane);
     await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, "the old content's failures don't decide the new");
-    assert.deepEqual(runsOf(fx.manager).sort((a, b) => a - b), [1, 7],
+    assert.deepEqual(runsOf(fx.strategy).sort((a, b) => a - b), [1, 7],
       "the edited sources start a run of one; the old content's run stays with its family, which nothing of the new content takes");
     fx.manager.close();
   });
@@ -1786,7 +1569,7 @@ describe("a run's evidence belongs to the chunk's sources, and one family holds 
       fx.strategy.land(membrane);
       await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
     }
-    assert.deepEqual(runsOf(fx.manager), [3], "the old content's run");
+    assert.deepEqual(runsOf(fx.strategy), [3], "the old content's run");
     // The old content's next call is held.
     fx.strategy.land(membrane);
     hold = new Promise<void>((resolve) => { release = resolve; });
@@ -1802,21 +1585,23 @@ describe("a run's evidence belongs to the chunk's sources, and one family holds 
       strategy.land(membrane);
       await assert.rejects(strategy.run(fx.target(), managerContext(manager)), /zz server failure/);
     }
-    assert.ok(runsOf(fx.manager).includes(2), "the new content's run is two");
+    // Each strategy keeps its own runs, in memory.
+    assert.deepEqual(runsOf(strategy), [2], "the new content's run is two");
     release();
     await assert.rejects(late, /zz server failure/);
-    assert.deepEqual(runsOf(fx.manager).sort((a, b) => a - b), [2, 4], "the old content's late failure counts on its own run, and leaves the new content's");
-    // A new L1 grows the frontier: the new content's next family takes its own content's run, not the longer old one.
+    assert.deepEqual(runsOf(fx.strategy), [4], "the old content's late failure counts on its own run");
+    assert.deepEqual(runsOf(strategy), [2], "and leaves the new content's");
+    // A new L1 grows the frontier: the new content's next family takes its own content's run.
     strategy.seed(l1(fx.ids, 'L1-101', 2, 3));
     strategy.land(membrane);
     await assert.rejects(strategy.run(fx.target(), managerContext(manager)), /zz server failure/);
-    assert.ok(runsOf(fx.manager).includes(3), "the new content's next failure counts on");
+    assert.deepEqual(runsOf(strategy), [3], "the new content's next failure counts on");
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0);
     manager.close();
     fx.manager.close();
   });
 
-  it("a decision ends the chunk's run in every family: a later family starts again (Andrew-2310's boundary 2, sheet I13)", async () => {
+  it("a decision ends the chunk's run: a later family starts again (Andrew-2310's boundary 2, sheet I13)", async () => {
     const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
     const fx = await build(mock.membrane);
     for (let i = 0; i < 7; i++) {
@@ -1828,115 +1613,16 @@ describe("a run's evidence belongs to the chunk's sources, and one family holds 
     fx.strategy.land(mock.membrane);
     await fx.strategy.run(fx.target(), managerContext(fx.manager));
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'the eighth decides it');
-    assert.deepEqual(runsOf(fx.manager), [], 'and no family keeps the decided run');
+    assert.deepEqual(runsOf(fx.strategy), [], 'and the decided run is gone');
     // Another L1 grows the frontier again: the next family's first failure is a run of one.
     fx.strategy.seed(l1(fx.ids, 'L1-102', 4, 5));
     fx.strategy.land(mock.membrane);
     await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'no second decision from the old run');
-    assert.deepEqual(runsOf(fx.manager), [1]);
+    assert.deepEqual(runsOf(fx.strategy), [1]);
     fx.manager.close();
   });
 
-  it("a run ended elsewhere while a ladder ran isn't counted on: a sibling's decision gives no second one (Andrew-2310; cm138-r4 I2)", async () => {
-    let release: () => void = () => {};
-    let gate: Promise<void> = Promise.resolve();
-    const calls: NormalizedRequest[] = [];
-    const membrane = {
-      complete: async (request: NormalizedRequest) => {
-        calls.push(structuredClone(request));
-        await gate;
-        throw failure('server', { httpStatus: 503 });
-      },
-    };
-    const fx = await build(membrane);
-    for (let i = 0; i < 7; i++) {
-      fx.strategy.land(membrane);
-      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
-    }
-    assert.deepEqual(runsOf(fx.manager), [7]);
-    fx.strategy.land(membrane);
-    gate = new Promise<void>((resolve) => { release = resolve; });
-    const before = calls.length;
-    const running = fx.strategy.run(fx.target(), managerContext(fx.manager));
-    await firstCallAfter(calls, before);
-    // Meanwhile a sibling's decision strips the run from every family, which stays.
-    const slot = progressSlot(fx.manager) as Array<{ failureStreak?: unknown }>;
-    for (const entry of slot) delete entry.failureStreak;
-    fx.manager.getStore().setStateJson(PROGRESS_SLOT, slot);
-    release();
-    await assert.rejects(running, /zz server failure/);
-    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'no second decision');
-    assert.deepEqual(runsOf(fx.manager), [1], 'the count starts again');
-    fx.manager.close();
-  });
-
-  it('a stored null run is read as none, and the family is still read (Andrew-2310; cm138-r5 I8)', async () => {
-    const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
-    const fx = await build(mock.membrane);
-    fx.strategy.land(mock.membrane);
-    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
-    const slot = progressSlot(fx.manager) as Array<{ failureStreak?: unknown }>;
-    slot[0]!.failureStreak = null;
-    fx.manager.getStore().setStateJson(PROGRESS_SLOT, slot);
-    fx.strategy.land(mock.membrane);
-    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
-    assert.deepEqual(runsOf(fx.manager), [1], 'a run of one, not a TypeError');
-    fx.manager.close();
-  });
-
-  it("a stored run that isn't well formed is dropped, not counted on (cm138-r4 I22)", async () => {
-    const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
-    const fx = await build(mock.membrane);
-    fx.strategy.land(mock.membrane);
-    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
-    const slot = progressSlot(fx.manager) as Array<{ failureStreak?: { failures: unknown } }>;
-    slot[0]!.failureStreak!.failures = '7';
-    fx.manager.getStore().setStateJson(PROGRESS_SLOT, slot);
-    fx.strategy.land(mock.membrane);
-    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
-    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, "a count of '7' doesn't decide it");
-    assert.deepEqual(runsOf(fx.manager), [1]);
-    // A count at or past the deciding failure can't be stored by a run either (cm138-r6 I14).
-    const again = progressSlot(fx.manager) as Array<{ failureStreak?: { failures: unknown } }>;
-    again[0]!.failureStreak!.failures = 9;
-    fx.manager.getStore().setStateJson(PROGRESS_SLOT, again);
-    fx.strategy.land(mock.membrane);
-    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
-    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'a count of 9 is read as no run');
-    assert.deepEqual(runsOf(fx.manager), [1]);
-    fx.manager.close();
-  });
-
-  it("a family with progress but no run takes the chunk's run, and the run is the one a family holds, never the newest family's by time (Andrew-2310's boundary 3, sheet I12)", async () => {
-    const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
-    const fx = await build(mock.membrane);
-    const internals = fx.strategy as unknown as { summaries: SummaryEntry[] };
-    for (let i = 0; i < 2; i++) {
-      fx.strategy.land(mock.membrane);
-      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
-    }
-    assert.deepEqual(runsOf(fx.manager), [2]);
-    const [home] = families(fx.manager);
-    // A new L1: the run moves to the new family, and the first keeps its entry without a run.
-    fx.strategy.seed(l1(fx.ids, 'L1-101', 2, 3));
-    fx.strategy.land(mock.membrane);
-    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
-    assert.equal(families(fx.manager).length, 2);
-    assert.deepEqual(runsOf(fx.manager), [3]);
-    // The frontier returns (the L1 is gone again), and with it the first family, which holds no run now.
-    // Another of the chunk's families, newer by time, holds none either.
-    internals.summaries = internals.summaries.filter((summary) => summary.id !== 'L1-101');
-    const slot = progressSlot(fx.manager) as Array<{ familyKey: string; chunkSourceHash: string; updated: number }>;
-    for (const entry of slot) if (entry.familyKey === home) entry.updated = Date.now() + 60_000;
-    slot.push({ ...slot[0]!, familyKey: 'zz-newest-no-run', updated: Date.now() + 120_000 } as never);
-    delete (slot.at(-1) as { failureStreak?: unknown }).failureStreak;
-    fx.manager.getStore().setStateJson(PROGRESS_SLOT, slot);
-    fx.strategy.land(mock.membrane);
-    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
-    assert.deepEqual(runsOf(fx.manager), [4], "the first family takes the chunk's run, and counts on");
-    fx.manager.close();
-  });
 });
 
 describe("an answer resumes only its own route's pause (Andrew-2310's boundary 4)", () => {
@@ -1967,176 +1653,39 @@ describe("an answer resumes only its own route's pause (Andrew-2310's boundary 4
   });
 });
 
-describe("the stall clock's idle rule: failures, attempts and the waits they caused are activity", () => {
-  const clockAt = (manager: ContextManager, fields: Partial<StallClock>): void => {
-    manager.getStore().setStateJson(STALL_SLOT, { ...stallClock(manager)!, ...fields });
-  };
-
-  it("a hold placed after an idle hour doesn't revive the old stretch (Andrew-2310's boundary 5, sheet I22)", async () => {
-    const fx = await queued(scripted([{ throw: failure('server', { httpStatus: 503 }) }]).membrane);
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    // Two idle hours: the old pause has long ended.
-    clockAt(fx.manager, { failingSince: Date.now() - 3 * HOUR, activeAt: Date.now() - 2 * HOUR });
-    fx.strategy.expirePause();
-    const deferral = Object.assign(new Error('Provider wait: held, no call was made'), { type: 'rate_limit', retryable: true, providerAdmission: 'deferred', retryAfterMs: 2 * HOUR });
-    fx.strategy.notePause(deferral, managerContext(fx.manager));
-    await fx.strategy.tick(managerContext(fx.manager));
-    assert.equal(fx.strategy.checkReadiness().compressionStall, undefined, 'no stall without a new failure');
-    assert.equal(stallClock(fx.manager)!.failingSince, null, 'the idle stretch ended');
-    fx.manager.close();
-  });
-
-  it('a tick during a long stated wait keeps the stretch: the failure after the wait continues it and alerts (sheet I17)', async () => {
-    const fx = await queued(scripted([
-      { throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 2 * HOUR }) },
-      { throw: failure('server', { httpStatus: 503 }) },
-    ]).membrane);
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    // The failure was two hours ago, and a tick saw the lane waiting half an hour ago.
-    const since = Date.now() - 2 * HOUR - 60_000;
-    clockAt(fx.manager, { failingSince: since, activeAt: Date.now() - 30 * 60_000 });
-    fx.strategy.expirePause();
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    const stall = fx.strategy.checkReadiness().compressionStall;
-    assert.ok(stall, 'stalled');
-    assert.equal(stall!.since, new Date(since).toISOString(), 'since the first failure, before the wait');
-    fx.manager.close();
-  });
-
-  it("ticks less than an hour apart keep the stretch, though the heartbeat records at most one a minute (Andrew-2310's subhour-ticks-coalesced-heartbeat)", async () => {
-    const fx = await queued(scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: Number.POSITIVE_INFINITY }) }]).membrane);
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    // The failure was recorded 60m10s ago. A tick 20 seconds after it fell
-    // inside the heartbeat's minute and wasn't written; this one comes 59m50s later.
-    const since = Date.now() - (60 * 60_000 + 10_000);
-    clockAt(fx.manager, { failingSince: since, activeAt: since });
-    await fx.strategy.tick(managerContext(fx.manager));
-    assert.equal(fx.strategy.checkReadiness().compressionStall?.since, new Date(since).toISOString(), 'the stretch ran on and alerts');
-    fx.manager.close();
-  });
-
-  it('with no tick for two hours, a long wait reads as idle: the next failure starts a new stretch (the stated cost)', async () => {
-    const fx = await queued(scripted([
-      { throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 2 * HOUR }) },
-      { throw: failure('server', { httpStatus: 503 }) },
-    ]).membrane);
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    clockAt(fx.manager, { failingSince: Date.now() - 2 * HOUR - 60_000, activeAt: Date.now() - 2 * HOUR - 60_000 });
-    fx.strategy.expirePause();
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    assert.equal(fx.strategy.checkReadiness().compressionStall, undefined, 'a later alert, never a false one');
-    assert.ok(Date.now() - stallClock(fx.manager)!.failingSince! < 60_000, 'the stretch started again');
-    fx.manager.close();
-  });
-
-  it('an explicit hold seen by ticks keeps the stretch, and a paused tick alerts once it has run its hour (cm138-r4 I1)', async () => {
-    const fx = await queued(scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: Number.POSITIVE_INFINITY }) }]).membrane);
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    // 61 minutes held, and a tick saw the lane paused ten minutes ago.
-    const since = Date.now() - 61 * 60_000;
-    clockAt(fx.manager, { failingSince: since, activeAt: Date.now() - 10 * 60_000 });
-    await fx.strategy.tick(managerContext(fx.manager));
-    assert.equal(fx.strategy.checkReadiness().compressionStall?.since, new Date(since).toISOString(), 'stalled since the failure');
-    fx.manager.close();
-  });
-
-  it("a restart's down time counts as idle", async () => {
-    const path = freshPath();
-    const first = await queued(scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 3 * HOUR }) }]).membrane, { path });
-    await assert.rejects(first.strategy.tick(managerContext(first.manager)));
-    first.manager.close();
-    const fx = await queued(scripted([{ throw: failure('server', { httpStatus: 503 }) }]).membrane, { path });
-    // As if the process stopped two hours ago, inside the earlier one's three-hour wait.
-    clockAt(fx.manager, { failingSince: Date.now() - 3 * HOUR, activeAt: Date.now() - 2 * HOUR });
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    assert.ok(Date.now() - stallClock(fx.manager)!.failingSince! < 60_000, 'the stretch started again');
-    assert.equal(fx.strategy.checkReadiness().compressionStall, undefined);
-    fx.manager.close();
-  });
-
-  it("two unseen hours end the stretch at the next paused tick, wherever the wait was released (Andrew-2310's release-on-fork case)", async () => {
-    const fx = await queued(scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 3 * HOUR }) }]).membrane);
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    const store = fx.manager.getStore();
-    const main = fx.manager.currentBranch().name;
-    const fork = store.createBranchAt('zz-fork', main, store.currentSequence()).name;
-    await fx.manager.switchBranch(fork);
-    assert.equal(fx.strategy.releaseCompressionPause(), true, 'released on the fork');
-    fx.strategy.endPauseAt(Date.now() - 2 * HOUR); // its backoff ended two idle hours ago
-    await fx.manager.switchBranch(main);
-    clockAt(fx.manager, { failingSince: Date.now() - 3 * HOUR, activeAt: Date.now() - 2 * HOUR });
-    const deferral = Object.assign(new Error('Provider wait: held, no call was made'), { type: 'rate_limit', retryable: true, providerAdmission: 'deferred', retryAfterMs: 2 * HOUR });
-    fx.strategy.notePause(deferral, managerContext(fx.manager));
-    await fx.strategy.tick(managerContext(fx.manager));
-    assert.equal(fx.strategy.checkReadiness().compressionStall, undefined, "main's stretch doesn't revive the released wait");
-    assert.equal(stallClock(fx.manager)!.failingSince, null, 'the idle stretch ended');
-    fx.manager.close();
-  });
-
-  it('an attempt that runs over an hour is no idle time: its failure continues the stretch (sheet I45)', async () => {
-    let release: () => void = () => {};
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }, { gate, then: { throw: failure('server', { httpStatus: 503 }) } }]);
-    const fx = await queued(mock.membrane);
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    fx.strategy.expirePause();
-    const attempt = fx.strategy.tick(managerContext(fx.manager));
-    await firstCallAfter(mock.calls, 1);
-    // The attempt started two hours ago, three hours into the stretch.
-    const since = Date.now() - 3 * HOUR;
-    clockAt(fx.manager, { failingSince: since, activeAt: Date.now() - 2 * HOUR });
-    release();
-    await assert.rejects(attempt);
-    const stall = fx.strategy.checkReadiness().compressionStall;
-    assert.ok(stall, 'stalled');
-    assert.equal(stall!.since, new Date(since).toISOString());
-    fx.manager.close();
-  });
-
-  it('readiness shows the stall while an attempt is in flight, naming the failure that is latest now (sheet I5, I6)', async () => {
-    let release: () => void = () => {};
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const mock = scripted([
-      { throw: failure('server', { httpStatus: 503 }) },
-      { throw: failure('server', { httpStatus: 503 }) },
-      { throw: failure('overloaded', { httpStatus: 529 }) },
-      { gate, then: OK('landed at last') },
-    ]);
-    const fx = await queued(mock.membrane);
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    clockAt(fx.manager, { failingSince: Date.now() - 61 * 60_000 });
-    fx.strategy.expirePause();
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    assert.equal(fx.strategy.checkReadiness().compressionStall?.failureClass, 'server:503', 'raised');
-    fx.strategy.expirePause();
-    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
-    assert.equal(fx.strategy.checkReadiness().compressionStall?.failureClass, 'overloaded:529', 'the latest failure, not the one that raised it');
-    fx.strategy.expirePause();
-    const attempt = fx.strategy.tick(managerContext(fx.manager));
-    await firstCallAfter(mock.calls, 3);
-    const inFlight = fx.strategy.checkReadiness();
-    assert.ok(inFlight.pendingWork, 'an attempt is in flight');
-    assert.equal(inFlight.compressionStall?.failureClass, 'overloaded:529', 'and the stall still shows');
-    release();
-    await attempt;
-    assert.equal(fx.strategy.checkReadiness().compressionStall, undefined, 'the landing ends it');
+describe("a chunk no longer pending leaves its run", () => {
+  it('the next ordering drops it, with the failure orders', async () => {
+    const fx = await queued(scripted([OK('unused')]).membrane);
+    const runs = (fx.strategy as unknown as { compressionFailureRuns: Map<string, { run: unknown; chunkKey: string }> }).compressionFailureRuns;
+    const run = { key: 'zz', domain: 'zz', failures: 1, atLanded: 0 };
+    const pending = fx.strategy.chunksView().find((chunk) => !chunk.compressed)!;
+    runs.set('zz-gone', { run, chunkKey: 'zz-a chunk no longer cut' });
+    runs.set('zz-pending', { run, chunkKey: pending.messages.map((m) => m.id).join(':') });
+    (fx.strategy as unknown as { orderCompressionQueue(): void }).orderCompressionQueue();
+    assert.deepEqual([...runs.keys()], ['zz-pending']);
     fx.manager.close();
   });
 });
 
-describe("a preview keeps the lane's failure orders and window waits (cm138-r4 I3)", () => {
+describe("a preview keeps the lane's failure orders, runs and window waits (cm138-r4 I3)", () => {
   it('the dry rebuild prunes them against its own cut, and the select puts them back', async () => {
     const fx = await queued(scripted([OK('unused')]).membrane);
     const lane = fx.strategy as unknown as {
       compressionFailureOrder: Map<string, number>; compressionNotBefore: Map<string, number>; mergeFailureOrder: Map<string, number>;
+      compressionFailureRuns: Map<string, { run: unknown; chunkKey: string }>; mergeFailureRuns: Map<string, unknown>;
     };
+    const run = { key: 'zz', domain: 'zz', failures: 1, atLanded: 0 };
     lane.compressionFailureOrder.set('zz-a chunk the preview cuts otherwise', 1);
     lane.compressionNotBefore.set('zz-a chunk the preview cuts otherwise', Date.now() + 60_000);
+    lane.compressionFailureRuns.set('zz-subject', { run, chunkKey: 'zz-a chunk the preview cuts otherwise' });
     lane.mergeFailureOrder.set('zz-a queued merge', 2);
+    lane.mergeFailureRuns.set('zz-a queued merge', run);
     await fx.manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }, undefined, { dryRun: true });
     assert.equal(lane.compressionFailureOrder.get('zz-a chunk the preview cuts otherwise'), 1);
     assert.ok(lane.compressionNotBefore.has('zz-a chunk the preview cuts otherwise'));
+    assert.ok(lane.compressionFailureRuns.has('zz-subject'));
     assert.equal(lane.mergeFailureOrder.get('zz-a queued merge'), 2);
+    assert.ok(lane.mergeFailureRuns.has('zz-a queued merge'));
     fx.manager.close();
   });
 });
