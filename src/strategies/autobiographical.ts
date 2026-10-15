@@ -2449,8 +2449,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // ============================================================================
 
   /**
-   * Pin a range of messages so they aren't compressed and render raw at
-   * their original position. Returns the pin id.
+   * Pin a range of messages. A pin's bound is its `level`, or without one
+   * its `maxLevel` (`normalizePinLevels`). A raw pin, with no bound or a
+   * bound of 0, keeps the messages out of compression and renders them raw
+   * at their original position. A bound above 0 is read only under
+   * `foldingStrategy: 'kv-stable'` and `'kv-unified'` with
+   * `adaptiveResolution` (`readsPinBounds`): there the range is still
+   * compressed, since only a summary can supply its level, and is held at
+   * `level`, or no deeper than `maxLevel`, as `ProtectedRange` describes.
+   * Anywhere else the range is raw. Where bounds are read and pins overlap at
+   * a message, the bound `ProtectedRange` names holds it
+   * (`resolvedPinBounds`), which can compress a message a raw pin covers.
+   * Returns the pin id.
    */
   pinRange(firstMessageId: string, lastMessageId: string, opts?: PinLevelOptions): string {
     this.requireLoadedBranch('pinRange');
@@ -2470,8 +2480,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Mark a single message as a "document" — semantically a body of
-   * information the agent wants to retain in full. Functionally a
-   * single-message pin with `kind: 'document'`.
+   * information the agent wants to keep. Functionally a single-message pin
+   * with `kind: 'document'`, and `opts` reads as `pinRange`'s: without a
+   * `level` or `maxLevel` the message is kept raw, while `{ maxLevel }` lets
+   * it fold no deeper than that level where the selector reads level bounds.
    */
   markDocument(messageId: string, opts?: PinLevelOptions): string {
     this.requireLoadedBranch('markDocument');
@@ -11757,8 +11769,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * recent window AND not kept raw by a pin. Returns messages from
    * [0, headStart) ∪ [headEnd, recentStart) minus any position a pin or
    * document mark keeps raw (forceRawPinPositions). A pin with a positive
-   * level or cap, under the strategies that honor one, is compressible: it
-   * renders at a level, which only a summary can supply.
+   * level or cap is compressible where bounds are read (kv-stable and
+   * kv-unified, with adaptive resolution: readsPinBounds): it renders at a
+   * level, which only a summary can supply.
    */
   protected getCompressibleMessages(store: MessageStoreView, exclude?: Uint8Array): StoredMessage[] {
     const messages = store.getAll();

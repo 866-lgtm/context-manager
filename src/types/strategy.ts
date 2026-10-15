@@ -417,9 +417,15 @@ export function isResettableStrategy(s: ContextStrategy): s is ResettableStrateg
 }
 
 /**
- * Strategy that supports protected ranges (pins + documents).
- * Pinned ranges are excluded from compression and render raw at their
- * original chronological position. Implemented by AutobiographicalStrategy.
+ * Strategy that supports protected ranges (pins + documents). A pin's bound
+ * is its `level`, or without one its `maxLevel`. A range pinned raw, with no
+ * bound or a bound of 0, is excluded from compression and renders raw at its
+ * original chronological position. Where the selector reads level bounds
+ * (`foldingStrategy: 'kv-stable'` and `'kv-unified'`, with
+ * `adaptiveResolution`), a bound above 0 leaves the range compressible, and
+ * where pins overlap at a message, the bound `ProtectedRange` names holds
+ * it, so a raw pin there might not keep it raw. Implemented by
+ * AutobiographicalStrategy.
  */
 export interface PinnableStrategy extends ContextStrategy {
   pinRange(firstMessageId: string, lastMessageId: string, opts?: PinLevelOptions): string;
@@ -1599,13 +1605,17 @@ export function getSummaryParentId(s: SummaryEntry): string | undefined {
 }
 
 /**
- * A range of messages protected from compression. Pins keep a span of raw
- * messages visible at their original position in the rendered context.
+ * A range of messages a pin protects. A pin's bound is its `level`, or
+ * without one its `maxLevel`. A raw pin, with no bound or a bound of 0, keeps
+ * the span raw at its original position in the rendered context and out of
+ * compression. Where the selector reads level bounds, a bound above 0 sets
+ * how far the span folds instead, and where pins overlap at a message, one
+ * bound holds it (see `level`), so a raw pin there might not keep it raw.
  *
  * - `kind: 'pin'` — generic protected range (any first/last span).
  * - `kind: 'document'` — typically a single message containing a body of
- *   information the agent wants to retain in full; semantically identical
- *   to a single-message pin, distinguished by metadata for tooling.
+ *   information the agent wants to keep; semantically identical to a
+ *   single-message pin, distinguished by metadata for tooling.
  */
 export interface ProtectedRange {
   /** Stable id assigned at pin time. */
