@@ -292,10 +292,12 @@ function relevanceCut(
   // frontier while a produced L4/L5 layer sat unused. Leaves whose lineage
   // disagrees are skipped by folds and stay at their own level beside the
   // recall — exactly the renderer's existing ownership-wins semantics for
-  // boundary-cut members. This set records them for phase C, which leaves
-  // them out of its un-folds, and for the [kv-overlap] warning; the validity
-  // projection exempts them by lineage on its own (projectToValidCut).
-  const overlapExempt = new Set<ChunkId>();
+  // boundary-cut members. Every pass decides it the same way, by the leaf's
+  // own lineage at the node's level: folds and phase C's un-folds move only
+  // the leaves the node renders, and the validity projection exempts the rest
+  // (projectToValidCut). The [kv-overlap] warning reads the emitted frontier
+  // (reportOverlap), not which folds ran, so a plan built on carried folds
+  // reports them as a fresh one does.
   // Fold priority: cheapest information first — ascending salience, then oldest.
   const priority = [...ordered].sort((a, b) => {
     const sa = salienceOf(a);
@@ -363,12 +365,9 @@ function relevanceCut(
           if ((caps.get(leafId) ?? 0) < 0) continue; // protected: stays raw beside the recall
           // Overlap tolerance: only mark leaves whose own lineage renders as
           // part of THIS node at this level. Disagreeing leaves keep their
-          // level and are recorded (see declaration above).
+          // level (see the note above `priority`).
           const own = tree.ancestorAt(leafId, level);
-          if (!own || own.id !== ancestor.id) {
-            overlapExempt.add(leafId);
-            continue;
-          }
+          if (!own || own.id !== ancestor.id) continue;
           const leaf = byId.get(leafId);
           const from = F.get(leafId) ?? 0;
           if (from < level) {
@@ -414,7 +413,7 @@ function relevanceCut(
         if (ledger.tokens >= target) break;
         const c = ordered[oi]; // youngest-first
         if ((F.get(c.id) ?? 0) !== level) continue;
-        if (rawZone.has(c.id) || immovable.has(c.id) || overlapExempt.has(c.id)) continue;
+        if (rawZone.has(c.id) || immovable.has(c.id)) continue;
         const node = tree.ancestorAt(c.id, level);
         if (!node) continue;
         const attemptKey = `${node.id}:${level}`;
@@ -423,8 +422,10 @@ function relevanceCut(
         for (const leafId of node.leafChunkIds) {
           // Protected members sit at raw beside the recall (boundary-cut
           // tolerance) — they neither veto nor participate in the un-fold.
-          // Overlap-exempt members likewise (their lineage disagrees).
-          if (rawZone.has(leafId) || immovable.has(leafId) || overlapExempt.has(leafId)) continue;
+          // Nor does a member whose own lineage at this level is another
+          // node, or none: this node doesn't render it (§13.6 overlap).
+          if (rawZone.has(leafId) || immovable.has(leafId)) continue;
+          if (tree.ancestorAt(leafId, level)?.id !== node.id) continue;
           if ((F.get(leafId) ?? 0) !== level) {
             eligible = false;
             break;
@@ -440,7 +441,8 @@ function relevanceCut(
         // carried while its ledger believed it sat on target).
         const moved: Array<[ChunkId, number]> = [];
         for (const leafId of node.leafChunkIds) {
-          if (rawZone.has(leafId) || immovable.has(leafId) || overlapExempt.has(leafId)) continue; // protected: not part of the fold
+          if (rawZone.has(leafId) || immovable.has(leafId)) continue; // protected: not part of the fold
+          if (tree.ancestorAt(leafId, level)?.id !== node.id) continue; // rendered by another node
           const from = F.get(leafId) ?? 0;
           if (from <= level - 1) continue; // already at/below the destination
           const leaf = byId.get(leafId);
@@ -478,12 +480,10 @@ function relevanceCut(
   // Hard-protected leaves (−1 caps) are exempt from group unanimity here too —
   // without this, the final projection undoes every boundary-cut fold the
   // phases just made (monotone-lowering the whole group back toward carried).
-  // Overlap-exempt leaves need no entry: the projection leaves out of a
-  // group's unanimity every leaf whose own lineage at that level isn't the
-  // group, and every leaf above the group's level, the rule the carried
-  // frontier and suffix adoption are projected by. A leaf in overlapExempt
-  // was met at a level where its lineage disagreed, so the rule exempts it
-  // there; a fold of its own summary at another level moves it with the rest.
+  // A leaf whose lineage disagrees with a group needs no entry: the
+  // projection leaves out of a group's unanimity every leaf whose own lineage
+  // at that level isn't the group, and every leaf above the group's level,
+  // the rule the carried frontier and suffix adoption are projected by.
   const projectionExempt = new Set<ChunkId>();
   for (const [id, cap] of caps) if (cap < 0) projectionExempt.add(id);
   projectToValidCut(F, tree, ordered, frozen, fixedLevels, projectionExempt);
@@ -494,21 +494,6 @@ function relevanceCut(
   // Fits, or a full round made no progress, or round cap → done. Otherwise
   // re-fold on the projected frontier with a resynced ledger.
   if (tokens <= windowTokens || tokens >= projTokens || round >= 2) {
-    // NEVER QUIET (2026-08-03): overlap tolerance is a degraded mode, not a
-    // feature — every exempted leaf means the store's summary tree is
-    // NON-NESTED (two live lineages over one span), and its messages are
-    // now SEMANTICALLY DOUBLE-REPRESENTED in the window (rendered raw or
-    // via their own chain WHILE a covering recall also renders). The solve
-    // proceeding is the mitigation; the topology is the disease. Surface it
-    // on every affected compile until the store is repaired (nesting
-    // reconciler — see the 2026-08-03 opus4 incident).
-    if (overlapExempt.size > 0) {
-      console.error(
-        `[kv-overlap] ⚠️ non-nested summary tree: ${overlapExempt.size} leaf(s) with ` +
-          `conflicting lineage tolerated this compile (double-representation in window). ` +
-          `Store needs nesting repair. sample=${[...overlapExempt].slice(0, 5).join(',')}`,
-      );
-    }
     return { F, tokens };
   }
   projTokens = tokens;
@@ -883,6 +868,57 @@ export interface ControlPlan {
  * Pure and deterministic.
  */
 export function planControlledFrontier(
+  inputs: PickerInputs,
+  tree: SummaryTree,
+  p: ControlPlanParams,
+): ControlPlan {
+  const plan = planUnreported(inputs, tree, p);
+  reportOverlap(tree, inputs.chunks, plan.resolutions);
+  return plan;
+}
+
+/**
+ * NEVER QUIET (2026-08-03): overlap tolerance is a degraded mode, not a
+ * feature. A rendered summary that lists a leaf whose own lineage at that
+ * level is another summary, or none, means the store's summary tree is
+ * NON-NESTED (two live lineages over one span), and that leaf's message is
+ * SEMANTICALLY DOUBLE-REPRESENTED in the window: the summary's recall covers
+ * it while it renders raw or through its own chain. The solve proceeding is
+ * the mitigation; the topology is the disease. So every compile whose plan
+ * renders such a summary says so, until the store is repaired (nesting
+ * reconciler, see the 2026-08-03 opus4 incident). It reads the frontier the
+ * plan emits, so a plan that keeps carried folds reports them as one that
+ * makes them does.
+ */
+function reportOverlap(
+  tree: SummaryTree,
+  chunks: readonly PickerChunk[],
+  F: ReadonlyMap<ChunkId, number>,
+): void {
+  const rendered = new Set<string>();
+  const doubled: ChunkId[] = [];
+  const seen = new Set<ChunkId>();
+  for (const c of chunks) {
+    const level = F.get(c.id) ?? 0;
+    if (level < 1) continue;
+    const node = tree.ancestorAt(c.id, level);
+    if (!node || rendered.has(node.id)) continue;
+    rendered.add(node.id);
+    for (const leafId of node.leafChunkIds) {
+      if (seen.has(leafId)) continue;
+      if (tree.ancestorAt(leafId, level)?.id !== node.id) { seen.add(leafId); doubled.push(leafId); }
+    }
+  }
+  if (doubled.length > 0) {
+    console.error(
+      `[kv-overlap] ⚠️ non-nested summary tree: ${doubled.length} leaf(s) with ` +
+        `conflicting lineage tolerated this compile (double-representation in window). ` +
+        `Store needs nesting repair. sample=${doubled.slice(0, 5).join(',')}`,
+    );
+  }
+}
+
+function planUnreported(
   inputs: PickerInputs,
   tree: SummaryTree,
   p: ControlPlanParams,

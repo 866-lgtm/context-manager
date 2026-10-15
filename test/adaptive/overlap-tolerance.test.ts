@@ -353,6 +353,57 @@ test('suffix adoption takes a summary beside a lineage-disagreeing leaf', () => 
   assert.equal(plan.perturbation, 70);
 });
 
+const levelsOf = (inputs: PickerInputs, F: ReadonlyMap<ChunkId, number>): string =>
+  inputs.chunks.map((c) => F.get(c.id) ?? 0).join('');
+
+// The replan property's tree 228 (seed 1). L1-0 lists m0, m1 and m2, and m0 is
+// re-pointed at R-1, which lists m0 and m1. Phase C moves the leaves an
+// un-fold's summary renders, decided by each leaf's own lineage there, as the
+// projection decides: un-folding L1-0 moves m1 with m2, though R-1's fold met
+// m1 too. Skipping m1 because some fold had met it left the ledger counting
+// L1-0 as rendered, and the plan settled on R-1, m1 and m2, 148 tokens, above
+// foldAt on every compile (R1-1).
+test('phase C un-folds the leaves of a summary\'s own lineage: tree 228 settles inside the band', () => {
+  const { inputs, tree } = store(
+    [message('m0', 0, 48, 'R-1'), message('m1', 1, 94, 'L1-0'), message('m2', 2, 41, 'L1-0')],
+    [summary('L1-0', 1, ['m0', 'm1', 'm2'], 43), summary('R-1', 1, ['m0', 'm1'], 13)],
+  );
+  const params = { targetTokens: 80, foldAtTokens: 130, windowTokens: 366, reachTokens: 366, rawZone: new Set<ChunkId>(), now: 3 };
+  const { result: first } = quietOverlap(() => planControlledFrontier(inputs, tree, { ...params, previous: new Map() }));
+  assert.deepEqual(unitsOf(renderLayout(inputs, tree, first.resolutions)), ['raw:m0', 'recall:L1-0']);
+  assert.equal(first.tokens, 91);
+  const { result: second } = quietOverlap(() => planControlledFrontier(inputs, tree, { ...params, previous: first.resolutions }));
+  assert.equal(levelsOf(inputs, second.resolutions), levelsOf(inputs, first.resolutions));
+  assert.equal(second.perturbation, 0);
+});
+
+// [kv-overlap] reads the frontier the plan emits, not which folds the solve
+// made: a hold that keeps R and A, which both list m0 and m1, warns though the
+// ideal cut folds neither, and a hold that renders neither stays quiet though
+// the ideal cut folds both (R1-2). m0's lineage is R, m1's is A.
+const doubledPair = (): { inputs: PickerInputs; tree: SummaryTree } => {
+  const chunks = [message('m0', 0, 100, 'R'), message('m1', 1, 100, 'A'), message('m2', 2, 100, 'B')];
+  chunks[2].salience = 0.1; // folded first
+  return store(chunks, [summary('A', 1, ['m0', 'm1'], 20), summary('R', 1, ['m0', 'm1'], 30), summary('B', 1, ['m2'], 20)]);
+};
+for (const [kind, previousLevels, targetTokens, warnings, units] of [
+  ['a held frontier that renders two summaries over one pair warns, though the ideal cut folds neither',
+    [1, 1, 0], 220, 1, ['recall:R', 'recall:A', 'raw:m2']],
+  ['a held frontier that renders neither stays quiet, though the ideal cut folds both',
+    [0, 0, 1], 60, 0, ['raw:m0', 'raw:m1', 'recall:B']],
+] as const) {
+  test(`[kv-overlap] follows the emitted frontier: ${kind}`, () => {
+    const { inputs, tree } = doubledPair();
+    const previous = new Map<ChunkId, number>(inputs.chunks.map((c, i) => [c.id, previousLevels[i]!]));
+    const { result: plan, overlapWarnings } = quietOverlap(() => planControlledFrontier(inputs, tree, {
+      ...trio, targetTokens, expandAtTokens: 100, foldAtTokens: 300, previous,
+    }));
+    assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), [...units]);
+    assert.equal(plan.perturbation, 0);
+    assert.equal(overlapWarnings, warnings);
+  });
+}
+
 function mulberry32(seed: number): () => number {
   let a = seed;
   return () => {

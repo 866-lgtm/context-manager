@@ -981,7 +981,12 @@ every exempted leaf means messages are semantically
 *double-represented* in the window (rendered raw or via their own chain while
 a covering recall also renders). The solve proceeding is the mitigation; the
 topology is the disease. `[kv-overlap]` warns on **every** affected compile
-until the store gets nesting repair.
+until the store gets nesting repair. It reads the frontier the plan emits: a
+rendered summary that lists a leaf whose own lineage at that level is another
+summary, or none. So a plan that keeps carried folds reports them as one that
+makes them does. Folds, phase C's un-folds and the validity projection all
+decide which leaves a node renders by that same lineage rule, per node, so no
+pass depends on which folds ran in this compile.
 
 The validity projection decides the exemption by lineage: a leaf that a group
 lists, but whose own lineage at the group's level is another summary or none,
