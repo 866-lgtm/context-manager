@@ -12,3 +12,13 @@
   a store a plan can now also keep a summary folded where it used to render
   that summary's leaves raw, since the solve's own exemption covered only
   the leaves its folds had met. LariTesserae's #130 named the re-layout.
+- kv-stable: a compile no longer leaves a leaf at a level whose own-lineage
+  summary doesn't list it, on any store. A level carried from before a
+  summary was written again without one of its sources, a lock or a pin
+  could point there, and so could a fresh plan's passes on a store whose tree
+  isn't nested. The leaf's recall didn't hold it, and where no other recall
+  did, the turn was refused with `UncoveredDropError`. The projection now
+  lowers such a leaf, and the base lowers a locked or pinned leaf's level the
+  same way, so a lock or a pin can now render below the level it holds when
+  the summary there doesn't list the leaf. A held level with no summary at
+  all is kept, as before, and renders raw.

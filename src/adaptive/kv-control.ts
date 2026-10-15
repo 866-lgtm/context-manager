@@ -600,7 +600,8 @@ function suffixAdopt(
  *
  * Pinned (`fixedLevels`) and frozen (locked) leaves are held here rather than
  * lowered: pin-at-level fixes a whole node's leaves at its level, and a lock
- * keeps its carried level. The base sets both (renderableLevel).
+ * keeps its carried level. The base sets both, and lowers either where its
+ * own-lineage summary doesn't list it (renderableLevel).
  *
  * A leaf renders at its level through its own lineage there, so it stays only
  * where that node lists it. A level carried from before the tree's links
@@ -708,11 +709,19 @@ function projectToValidCut(
  * wouldn't hold it. A level with no such summary is kept, since the renderer
  * renders it raw.
  */
-function renderableLevel(tree: SummaryTree, chunkId: ChunkId, level: number): number {
+function renderableLevel(
+  tree: SummaryTree,
+  chunkId: ChunkId,
+  level: number,
+  listedBy: Map<string, ReadonlySet<ChunkId>>,
+): number {
   let k = level;
   while (k > 0) {
     const node = tree.ancestorAt(chunkId, k);
-    if (!node || node.leafChunkIds.includes(chunkId)) break;
+    if (!node) break;
+    let listed = listedBy.get(node.id);
+    if (!listed) { listed = new Set(node.leafChunkIds); listedBy.set(node.id, listed); }
+    if (listed.has(chunkId)) break;
     k--;
   }
   return k;
@@ -901,17 +910,21 @@ export function planControlledFrontier(
   // projection never lowers a held leaf, so a held level whose own-lineage
   // summary doesn't list the leaf (links changed since it was carried, or a
   // pin on a non-nested tree) is lowered here, by renderableLevel.
+  const listedBy = new Map<string, ReadonlySet<ChunkId>>();
   const base = new Map<ChunkId, number>();
   for (const c of ordered) {
     if (p.rawZone.has(c.id)) {
       base.set(c.id, 0);
     } else if (fixedLevels.has(c.id)) {
-      // Pin-at-k: fix to exactly k, clamped to the deepest produced level for
-      // this chunk (can't render at a level whose summary doesn't exist yet).
+      // Pin-at-k: fix to k, clamped to the deepest produced level for this
+      // chunk (can't render at a level whose summary doesn't exist yet), and
+      // lowered where its own-lineage summary there doesn't list it.
       const k = Math.max(0, fixedLevels.get(c.id)!);
-      base.set(c.id, k === 0 ? 0 : renderableLevel(tree, c.id, Math.min(k, tree.maxLevel(c.id))));
+      base.set(c.id, k === 0 ? 0 : renderableLevel(tree, c.id, Math.min(k, tree.maxLevel(c.id)), listedBy));
     } else if (frozen.has(c.id)) {
-      base.set(c.id, renderableLevel(tree, c.id, p.previous.get(c.id) ?? c.currentResolution));
+      // A lock keeps its carried level, lowered where its own-lineage summary
+      // there no longer lists it.
+      base.set(c.id, renderableLevel(tree, c.id, p.previous.get(c.id) ?? c.currentResolution, listedBy));
     } else {
       base.set(c.id, 0);
     }

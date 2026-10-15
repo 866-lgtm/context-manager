@@ -295,15 +295,17 @@ for (const [kind, bParent, m2Level] of [
   });
 }
 
-// The same store with m1 held at L2, locked there or pinned there. The
-// projection never lowers a held leaf, so the base clamps the held level to
-// the deepest one whose summary lists the leaf, rather than keep m1 in no
+// The same store with m1 held at L2, locked there or pinned there (or pinned
+// at L3, which the base first clamps to m1's deepest summary, L2). The
+// projection never lowers a held leaf, so the base lowers the held level
+// while its own-lineage summary doesn't list m1, rather than keep m1 in no
 // recall for as long as the hold lasts.
 for (const [kind, hold] of [
-  ['locked', { frozen: new Set<ChunkId>(['m1']) }],
-  ['pinned', { fixedLevels: new Map<ChunkId, number>([['m1', 2]]) }],
+  ['a locked leaf', { frozen: new Set<ChunkId>(['m1']) }],
+  ['a pinned leaf', { fixedLevels: new Map<ChunkId, number>([['m1', 2]]) }],
+  ['a leaf pinned above its deepest summary', { fixedLevels: new Map<ChunkId, number>([['m1', 3]]) }],
 ] as const) {
-  test(`a ${kind} leaf is held at the deepest level whose summary lists it`, () => {
+  test(`${kind} is lowered where its summary no longer lists it`, () => {
     const { inputs, tree } = store(
       [message('m1', 1, 100, 'A'), message('m2', 2, 100, 'B')],
       [summary('A', 1, ['m1'], 30, 'H'), summary('B', 1, ['m2'], 30), summary('H', 2, ['B'], 40)],
@@ -314,6 +316,19 @@ for (const [kind, hold] of [
     assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['recall:A', 'recall:B']);
   });
 }
+
+// A held level with no summary of the leaf's lineage at all is kept, as the
+// renderer renders it raw: m1 locked at L2, while its L1 A has no parent.
+test('a locked leaf carried at a level with no summary of its lineage is kept there, and renders raw', () => {
+  const { inputs, tree } = store(
+    [message('m1', 1, 100, 'A'), message('m2', 2, 100, 'B')],
+    [summary('A', 1, ['m1'], 30), summary('B', 1, ['m2'], 30)],
+  );
+  const previous = new Map<ChunkId, number>([['m1', 2], ['m2', 1]]);
+  const plan = planControlledFrontier(inputs, tree, { ...trio, targetTokens: 30, foldAtTokens: 1_000, previous, frozen: new Set<ChunkId>(['m1']) });
+  assert.equal(plan.resolutions.get('m1'), 2);
+  assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['raw:m1', 'recall:B']);
+});
 
 test('suffix adoption takes a summary beside a lineage-disagreeing leaf', () => {
   // The trio after m0, whose own L1 Z has no parent. From an all-raw carried
@@ -441,6 +456,7 @@ function randomNonNested(rng: () => number): {
 test('after a summary loses a source between compiles, every leaf renders through a summary that lists it', () => {
   const rng = mulberry32(2);
   let stale = 0;
+  let staleLocked = 0;
   for (let t = 0; t < 300; t++) {
     const { inputs, tree, params, corruptions } = randomNonNested(rng);
     const { result: first } = quietOverlap(() =>
@@ -453,18 +469,28 @@ test('after a summary loses a source between compiles, every leaf renders throug
     summaries.set(s.id, { ...s, sourceIds, sourceRange: { first: sourceIds[0], last: sourceIds[sourceIds.length - 1] } });
     const changed: PickerInputs = { ...inputs, summaries };
     const after = new SummaryTree(changed);
+    // Lock about a third of the leaves the first plan folded, at its levels.
+    const frozen = new Set(params.frozen);
+    for (const c of changed.chunks) {
+      if ((first.resolutions.get(c.id) ?? 0) > 0 && !params.fixedLevels!.has(c.id) && rng() < 0.34) frozen.add(c.id);
+    }
     // The first plan's levels on the changed tree: does one now point through
     // a summary that doesn't list its leaf? (The test needs such trees.)
-    if (changed.chunks.some((c) => {
+    const staleIds = changed.chunks.filter((c) => {
       const level = first.resolutions.get(c.id) ?? 0;
       const node = level > 0 ? after.ancestorAt(c.id, level) : null;
       return node !== null && !node.leafChunkIds.includes(c.id);
-    })) stale++;
+    }).map((c) => c.id);
+    if (staleIds.length > 0) stale++;
+    if (staleIds.some((id) => frozen.has(id))) staleLocked++;
     const { result: second } = quietOverlap(() =>
-      planControlledFrontier(changed, after, { ...params, reachTokens: params.windowTokens, previous: first.resolutions }));
+      planControlledFrontier(changed, after, { ...params, frozen, reachTokens: params.windowTokens, previous: first.resolutions }));
     for (const c of changed.chunks) {
       const level = second.resolutions.get(c.id) ?? 0;
       const node = level > 0 ? after.ancestorAt(c.id, level) : null;
+      if (level > 0 && !frozen.has(c.id) && !params.fixedLevels!.has(c.id)) {
+        assert.ok(node, `tree ${t}: ${c.id}, which no protection holds, at L${level} has a summary of its lineage there`);
+      }
       if (node) {
         assert.ok(node.leafChunkIds.includes(c.id),
           `tree ${t} (${corruptions.join('; ')}; ${s.id} lost ${s.sourceIds[s.sourceIds.length - 1]}): ${c.id} at L${level} renders through a summary that lists it`);
@@ -472,6 +498,7 @@ test('after a summary loses a source between compiles, every leaf renders throug
     }
   }
   assert.ok(stale >= 30, `${stale} of 300 trees carried a level through a summary that no longer lists its leaf`);
+  assert.ok(staleLocked >= 10, `${staleLocked} of 300 trees carried a locked leaf's level through such a summary`);
 });
 
 test('on unchanged inputs, each plan reports its change from the last plan, and an adopted ideal cut stays put', () => {
@@ -530,6 +557,7 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
             // A leaf renders through its own lineage at its level, which has to
             // list it; a level with no summary renders raw.
             const node = level > 0 ? tree.ancestorAt(c.id, level) : null;
+            if (held === undefined && level > 0) assert.ok(node, `${c.id}, which no protection holds, at L${level} has a summary of its lineage there, ${where}`);
             if (node) assert.ok(node.leafChunkIds.includes(c.id), `${c.id} at L${level} renders through a summary that lists it, ${where}`);
           }
           if (turn > 1 && sameLevels(previous, ideal)) {
