@@ -330,6 +330,24 @@ test('a locked leaf carried at a level with no summary of its lineage is kept th
   assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['raw:m1', 'recall:B']);
 });
 
+// kv-stable passes a chunk that is both capped and locked in pinCaps and in
+// frozen. The cap is hard, so the base takes the lock's carried level down to
+// it: m0, locked at L2 through P with cap 1, renders through its L1 A, and P
+// no longer renders over A and B (R1-3).
+test('a locked leaf carried deeper than its pin-max-level is lowered to the cap', () => {
+  const { inputs, tree } = store(
+    [message('m0', 0, 100, 'A'), message('m1', 1, 100, 'A'), message('m2', 2, 100, 'B')],
+    [summary('A', 1, ['m0', 'm1'], 30, 'P'), summary('B', 1, ['m2'], 30, 'P'), summary('P', 2, ['A', 'B'], 40)],
+  );
+  const previous = new Map<ChunkId, number>([['m0', 2], ['m1', 1], ['m2', 1]]);
+  const plan = planControlledFrontier(inputs, tree, {
+    ...trio, targetTokens: 60, foldAtTokens: 1_000, previous,
+    frozen: new Set<ChunkId>(['m0']), pinCaps: new Map<ChunkId, number>([['m0', 1]]),
+  });
+  assert.equal(plan.resolutions.get('m0'), 1);
+  assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['recall:A', 'recall:B']);
+});
+
 test('suffix adoption takes a summary beside a lineage-disagreeing leaf', () => {
   // The trio after m0, whose own L1 Z has no parent. From an all-raw carried
   // frontier the ideal cut (Z, A and G) rewrites all 100 tokens it renders;
@@ -584,7 +602,10 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
       if (params.rawZone.has(c.id)) return 0;
       const k = params.fixedLevels!.get(c.id);
       if (k !== undefined) return k === 0 ? 0 : renderable(c.id, Math.min(k, tree.maxLevel(c.id)));
-      if (params.frozen!.has(c.id)) return renderable(c.id, c.currentResolution);
+      if (params.frozen!.has(c.id)) {
+        const cap = params.pinCaps!.get(c.id);
+        return renderable(c.id, cap === undefined ? c.currentResolution : Math.min(c.currentResolution, cap));
+      }
       return undefined;
     };
     const { overlapWarnings } = quietOverlap(() => {
@@ -604,7 +625,7 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
             const held = heldLevel(c);
             if (held !== undefined) assert.equal(level, held, `${c.id} keeps its protected level, ${where}`);
             const cap = params.pinCaps!.get(c.id);
-            if (held === undefined && cap !== undefined) assert.ok(level <= cap, `${c.id} stays at or below its pin cap, ${where}`);
+            if (cap !== undefined && !params.fixedLevels!.has(c.id)) assert.ok(level <= cap, `${c.id} stays at or below its pin cap, ${where}`);
             // A leaf renders through its own lineage at its level, which has to
             // list it; a level with no summary renders raw.
             const node = level > 0 ? tree.ancestorAt(c.id, level) : null;

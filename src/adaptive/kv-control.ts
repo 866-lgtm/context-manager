@@ -603,12 +603,15 @@ function suffixAdopt(
  * none (§13.6 overlap tolerance). That leaf renders through its own lineage
  * whatever the node does, so it never vetoes the node. A leaf folded above the
  * node renders through a coarser summary of its own lineage, and that
- * summary's unanimity decides whether it stays there (a held leaf stays: the
- * caller has made it consistent with its group). Where it stays and the node
- * renders, the leaf is in both recalls. On a nested tree that can't last: the
- * coarser summary owns the node's leaves, and those below its level veto it,
- * bringing the leaf down to theirs. On a non-nested tree it can, the overlap
- * §13.6 tolerates. The rule depends only on the tree, the cut and the
+ * summary's unanimity decides whether it stays there. Where it stays and the
+ * node renders, the leaf is in both recalls. On a nested tree that can't last
+ * for a leaf no protection holds: the coarser summary owns the node's leaves,
+ * and those below its level veto it, bringing the leaf down to theirs. A held
+ * leaf stays where the base put it. A pin-at-level holds a whole node's leaves
+ * at one level, but a lock holds one chunk, so a lock above its group stays
+ * there with the group's recall beside it, boundary-cut tolerance extended to
+ * a lock. On a non-nested tree an unheld leaf can stay too, the overlap §13.6
+ * tolerates. The rule depends only on the tree, the cut and the
  * hard-protected leaves, which every projection is given alike: the ideal
  * cut's, the carried frontier's and each suffix candidate's. A frontier the
  * planner emitted therefore projects to itself on unchanged inputs, and the
@@ -802,20 +805,27 @@ export interface ControlPlanParams {
   qualityGapRatio?: number;
   /** Chunks forced to raw and never folded (flat zone / head / tail / pinned). */
   rawZone: ReadonlySet<ChunkId>;
-  /** Chunks kept at their carried resolution and never touched (locked). */
+  /**
+   * Chunks kept at their carried resolution (locked), never folded or
+   * un-folded by the solve. The base lowers a lock to its pin-max-level when
+   * that is shallower, and below a level whose own-lineage summary doesn't
+   * list the chunk, since that recall wouldn't render it.
+   */
   frozen?: ReadonlySet<ChunkId>;
   /**
-   * V2 pin-at-level-k: chunks fixed to render at EXACTLY the given fold level
+   * V2 pin-at-level-k: chunks fixed to render at the given fold level
    * (0 = raw). Held there and never folded or un-folded — the frontier cut
    * passes through that L_k node. A level deeper than the tree has produced is
-   * clamped to the deepest available. (`ProtectedRange.level`.)
+   * clamped to the deepest available, and a level whose own-lineage summary
+   * doesn't list the chunk is lowered until one does, or to raw.
+   * (`ProtectedRange.level`.)
    */
   fixedLevels?: ReadonlyMap<ChunkId, number>;
   /**
    * V2 pin-max-level: per-chunk HARD cap on fold depth — the chunk may fold no
    * deeper than this level, enforced in normal AND emergency shedding, and any
-   * carried resolution deeper than the cap is un-folded to it at plan start.
-   * (`ProtectedRange.maxLevel`.)
+   * carried resolution deeper than the cap, a locked chunk's included, is
+   * un-folded to it at plan start. (`ProtectedRange.maxLevel`.)
    */
   pinCaps?: ReadonlyMap<ChunkId, number>;
   /** Newest source sequence — the age reference for the log-age fold caps. */
@@ -958,9 +968,12 @@ function planUnreported(
       const k = Math.max(0, fixedLevels.get(c.id)!);
       base.set(c.id, k === 0 ? 0 : renderableLevel(tree, c.id, Math.min(k, tree.maxLevel(c.id)), listedBy));
     } else if (frozen.has(c.id)) {
-      // A lock keeps its carried level, lowered where its own-lineage summary
-      // there no longer lists it.
-      base.set(c.id, renderableLevel(tree, c.id, p.previous.get(c.id) ?? c.currentResolution, listedBy));
+      // A lock keeps its carried level, lowered to a pin-max-level below it
+      // (kv-stable passes both for a capped, locked chunk) and where its
+      // own-lineage summary there no longer lists it.
+      const held = p.previous.get(c.id) ?? c.currentResolution;
+      const cap = pinCaps.get(c.id);
+      base.set(c.id, renderableLevel(tree, c.id, cap === undefined ? held : Math.min(held, Math.max(0, cap)), listedBy));
     } else {
       base.set(c.id, 0);
     }

@@ -1555,10 +1555,13 @@ export interface ProtectedRange {
   created: number;
   /**
    * Pin-AT-level-k (V2 dynamic pins, `docs/best-fit-frontier-resolution.md` §7).
-   * Fix the covered chunks to render at EXACTLY this fold level (0 = raw): the
+   * Fix the covered chunks to render at this fold level (0 = raw): the
    * frontier cut passes through the L_k node — neither folded deeper nor
-   * un-folded shallower. When set, this range is NOT a classic force-raw pin.
-   * Takes precedence over `maxLevel`. Omitted → not a fixed-level pin.
+   * un-folded shallower. A chunk whose summaries stop below k renders at the
+   * deepest it has, and one whose own-lineage summary at k doesn't list it
+   * renders where one does, or raw. When set, this range is NOT a classic
+   * force-raw pin. Takes precedence over `maxLevel`. Omitted → not a
+   * fixed-level pin.
    *
    * Honored only by the KV-stable controller (`foldingStrategy: 'kv-stable'`);
    * other strategies fall back to treating the range as raw (a safe superset).

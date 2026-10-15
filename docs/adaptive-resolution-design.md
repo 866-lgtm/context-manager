@@ -754,8 +754,9 @@ and re-introducing one via the objective notation would repeat it.
   (`kvCost` in `render-offsets.ts`) — precisely what the provider will re-read
   for the plan's own choices. `F_prev` here is the carried frontier: the
   persisted one with this compile's protections applied first (the raw zone
-  raw, pins at their level, a tightened pin-max-level) and projected to a valid
-  cut (§13.6). A change every plan must make is in it already, so no plan's
+  raw, pins at their level and locks at theirs, each lowered where its
+  own-lineage summary doesn't list it, and a tightened pin-max-level, a
+  lock's included) and projected to a valid cut (§13.6). A change every plan must make is in it already, so no plan's
   perturbation counts it.
 - `P` (`reachTokens`, re-priced) — a **trust region on per-turn divergence**,
   not a spatial eligibility gate. It bounds how much perturbation an ordinary
@@ -993,9 +994,13 @@ lists, but whose own lineage at the group's level is another summary or none,
 never vetoes the group. Nor does a leaf folded above the group's level: it
 renders through a coarser summary of its own lineage, and that summary's
 unanimity decides whether it stays there. Where it stays and the group
-renders, the leaf is in both recalls. On a nested tree that can't last, since
-the coarser summary owns the group's leaves and those below its level veto
-it; on a non-nested tree it can, overlap like the rest of this section's.
+renders, the leaf is in both recalls. On a nested tree that can't last for a
+leaf no protection holds, since the coarser summary owns the group's leaves
+and those below its level veto it. A held leaf stays where the base put it: a
+pin-at-level holds a whole node's leaves at one level, but a lock holds one
+chunk, so a lock above its group stays there with the group's recall beside
+it, boundary-cut tolerance extended to a lock. On a non-nested tree an unheld
+leaf can stay too, overlap like the rest of this section's.
 Only a listed leaf of the group's own lineage rendered in more detail than
 the group vetoes it, and a hard-protected leaf (raw zone, pinned or locked)
 never does. A leaf also stays at its level only where its own lineage there
