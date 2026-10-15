@@ -1235,8 +1235,10 @@ export interface AutobiographicalConfig {
    * message store prices the messages it would send (after splitting,
    * collapsing and dropping unpaired tool blocks, before the image cap,
    * which only replaces images), with the system prompt, tools and output
-   * reserve. Otherwise that compression lays
-   * history out as it would without pins (see
+   * reserve, and with the longer of the lines the no-tools and plain-prose
+   * retries add to its instruction, so either retry fits too. The opt-in
+   * tool-prose rung isn't priced. Otherwise that compression lays history
+   * out as it would without pins (see
    * `compressionRecallBudgetTokens`). A canonical request without pins is
    * still always attempted.
    */

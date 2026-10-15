@@ -177,10 +177,11 @@ const NO_TOOLS_RETRY_LINE =
 const PLAIN_PROSE_RETRY_LINE =
   '\n\nWrite the memory directly as plain prose — do not wrap it in <thinking> or any other tags; begin immediately with the memory text itself.';
 
-/** Clone a compression request with `line` appended to the final instruction message. */
-function withAppendedInstruction(request: NormalizedRequest, line: string): NormalizedRequest {
-  const messages = request.messages.map((m, i) => {
-    if (i !== request.messages.length - 1) return m;
+/** Messages with `line` appended to the final message's last block, when that
+ *  block is text. */
+function withLineAppended<M extends { content: ContentBlock[] }>(messages: readonly M[], line: string): M[] {
+  return messages.map((m, i) => {
+    if (i !== messages.length - 1) return m;
     const content = m.content.map((block, j) =>
       j === m.content.length - 1 && block.type === 'text'
         ? { ...block, text: block.text + line }
@@ -188,8 +189,15 @@ function withAppendedInstruction(request: NormalizedRequest, line: string): Norm
     );
     return { ...m, content };
   });
-  return { ...request, messages };
 }
+
+/** Clone a compression request with `line` appended to the final instruction message. */
+function withAppendedInstruction(request: NormalizedRequest, line: string): NormalizedRequest {
+  return { ...request, messages: withLineAppended(request.messages, line) };
+}
+
+/** The lines a retry of an L1 compression appends to its instruction. */
+const L1_RETRY_LINES = [NO_TOOLS_RETRY_LINE, PLAIN_PROSE_RETRY_LINE] as const;
 
 const withNoToolsLine = (request: NormalizedRequest): NormalizedRequest =>
   withAppendedInstruction(request, NO_TOOLS_RETRY_LINE);
@@ -6617,7 +6625,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // and the request with it fits compressionContextBudgetTokens, priced as
     // the store prices the messages it would send (the image cap below only
     // replaces images with placeholders), with the system prompt, tools and
-    // output reserve. A request without pins is always attempted, as before.
+    // output reserve. It's priced with the longer of the lines a retry
+    // appends to the instruction (withNoToolsLine, withPlainProseLine), so a
+    // retry fits too. Recall-curve variants are admitted on their own
+    // (compressionRefusalPlan); the opt-in tool-prose rung, sent only after a
+    // refusal, isn't priced here. A request without pins is always
+    // attempted, as before.
     // Otherwise this compression lays history out as if no pin applied,
     // recalling the summaries the pins override, and says so once it goes
     // ahead. Waiting for the pins to fit would stall every later L1 too,
@@ -6627,7 +6640,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let pinsOverBudget: { history: typeof history; requestTokens?: number; contextBudget: number } | undefined;
     if (history.pinnedRawTokens > 0) {
       const contextBudget = this.normalizedCompressionContextBudget();
-      const requestTokens = history.pinnedRawTokens <= recallBudget ? priceRequest(built.cleaned) : undefined;
+      const requestTokens = history.pinnedRawTokens <= recallBudget
+        ? Math.max(...L1_RETRY_LINES.map((line) => priceRequest(withLineAppended(built.cleaned, line))))
+        : undefined;
       if (requestTokens === undefined || requestTokens > contextBudget) {
         pinsOverBudget = { history, requestTokens, contextBudget };
         history = layoutHistory(new Set());
@@ -6946,7 +6961,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }).map((pin) => pin.name ?? pin.id);
       const limit = requestTokens === undefined
         ? `exceeds compressionRecallBudgetTokens (${recallBudget})`
-        : `would bring the request to ~${requestTokens} tokens, over compressionContextBudgetTokens (${contextBudget})`;
+        : `would bring the request to ~${requestTokens} tokens, counting the line a retry adds, over compressionContextBudgetTokens (${contextBudget})`;
       console.warn(
         `autobio: L1 compression of ${chunk.messages.length} message(s) from ${chunkFirstId} recalls the summaries ` +
           `its pins override: the pinned history it would show raw (~${pinned.pinnedRawTokens} tokens in ` +
