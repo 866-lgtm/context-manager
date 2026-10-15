@@ -667,12 +667,16 @@ export interface CompressionQuarantineSpan {
   quarantinedAt: number;
   /** Its quarantine records, one per request shape it exhausted. */
   records: number;
-  /** Requests those records hold an answer for: each was paid for, and none gave a summary. */
+  /**
+   * Requests a provider answered for those records, none giving a summary. A
+   * recall variant planned over the compression's context budget, recorded
+   * as `admission_rejected` and never sent, isn't counted.
+   */
   answeredAttempts: number;
   /**
-   * The newest record's last answer: its outcome, with the error type after a
-   * colon when the provider refused the request (`refusal`, `incomplete`,
-   * `provider_error:invalid_request`); null when the record holds none.
+   * The newest record's last outcome, with its error type after a colon when
+   * it carries one (`refusal`, `incomplete`, `provider_error:invalid_request`,
+   * `admission_rejected`); null when that record holds none.
    */
   latestOutcome: string | null;
 }

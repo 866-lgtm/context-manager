@@ -128,9 +128,9 @@ function compressionErrorType(error: unknown): string | undefined {
 
 /**
  * A failure's class: membrane's error type and HTTP status, or the thrown
- * value's name for an untyped one. It names a run's latest failure and a
- * deciding outcome (`persistent-<class>`); it doesn't decide whether a
- * failure counts (see nextFailureStreak).
+ * value's name for an untyped one. It names the pause's latest failure (in
+ * checkReadiness()) and a deciding outcome (`persistent-<class>`); it
+ * doesn't decide whether a failure counts (see nextFailureStreak).
  */
 function compressionFailureClass(error: unknown): string {
   const type = compressionErrorType(error)
@@ -250,7 +250,8 @@ function chunkClosedAtMs(messages: readonly unknown[]): number | undefined {
   for (const message of messages) {
     const t = (message as { timestamp?: number | Date }).timestamp;
     const raw = t instanceof Date ? t.getTime() : typeof t === 'number' ? t : undefined;
-    if (raw === undefined) continue;
+    // An invalid Date's NaN would win no comparison and stick as the close time.
+    if (raw === undefined || Number.isNaN(raw)) continue;
     const ms = raw > 1e14 ? raw / 1000 : raw;
     if (newest === undefined || ms > newest) newest = ms;
   }
@@ -3873,9 +3874,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (projection.size === 0) return { count: 0, keys: [], spans: [] };
       // A span can hold one record per request shape it exhausted
       // (CHUNK_QUARANTINE_SHAPE_CAP), so records overstate how many spans are
-      // stuck. Each span is named by the current chunk with its message ids,
-      // and dated by its messages, so a span re-cut into a new chunk keeps
-      // its age.
+      // stuck. Each span is named by the current chunk whose message ids its
+      // records hash, and dated by those messages' timestamps, not by its
+      // records: a chunk re-cut into new records still shows how long its
+      // messages have stayed raw.
       const chunksByHash = new Map(
         this.chunks.map((chunk) => [sha256Json(chunk.messages.map((message) => message.id)), chunk] as const),
       );
@@ -3900,12 +3902,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           spans.set(hash, span);
         }
         span.records += 1;
-        span.answeredAttempts += active.outcomes.length;
+        // A recall variant planned over the compression's context budget is
+        // recorded as admission_rejected and never sent: count what a provider answered.
+        span.answeredAttempts += active.outcomes.filter((entry) => entry.outcome !== 'admission_rejected').length;
         span.quarantinedAt = Math.min(span.quarantinedAt, active.record.created);
-        const last = active.outcomes[active.outcomes.length - 1];
-        if (last && active.record.created >= (newest.get(hash) ?? -Infinity)) {
+        if (active.record.created >= (newest.get(hash) ?? -Infinity)) {
           newest.set(hash, active.record.created);
-          span.latestOutcome = last.errorType ? `${last.outcome}:${last.errorType}` : last.outcome;
+          const last = active.outcomes[active.outcomes.length - 1];
+          span.latestOutcome = !last ? null : last.errorType ? `${last.outcome}:${last.errorType}` : last.outcome;
         }
       }
       return {

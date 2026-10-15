@@ -325,6 +325,7 @@ describe('compression ladder: transient failures never spend it', () => {
     release();
     await run;
     assert.equal(fx.strategy.pause(), null, 'a discarded failure installs no pause');
+    assert.deepEqual(l1RunsOf(fx.strategy), [], 'and starts no run');
     assert.equal(progressSlot(fx.manager).length, 0);
     await fx.manager.switchBranch(main);
     assert.equal(progressSlot(fx.manager).length, 0);
@@ -1060,6 +1061,16 @@ describe('compression lane: failures are evidence only by the company they keep'
     assert.equal(pause.statedUntil, null, 'no stated wait');
     assert.equal(pause.source, 'backoff');
     assert.ok(pause.until - Date.now() <= 30_000, 'the 30 s backoff, not a hold');
+    fx.manager.close();
+  });
+
+  it('a negative retryAfterMs states no wait either', async () => {
+    const mock = scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: -60_000 }) }]);
+    const fx = await queued(mock.membrane);
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
+    const pause = fx.strategy.pause()!;
+    assert.equal(pause.statedUntil, null, 'no stated wait');
+    assert.equal(pause.source, 'backoff');
     fx.manager.close();
   });
 
@@ -1824,7 +1835,7 @@ describe('the quarantine names each stuck span once, with its messages and age',
     fx.manager.close();
   });
 
-  it('lists the span whose chunk closed first first', async () => {
+  it('lists the longest-waiting span first', async () => {
     const mock = scripted([{ throw: failure('invalid_request', { httpStatus: 400 }) }]);
     const fx = await build(mock.membrane);
     const recent = fx.target();
@@ -1855,6 +1866,94 @@ describe('the quarantine names each stuck span once, with its messages and age',
       status.spans.map((span) => [span.firstMessageId, span.lastMessageId, span.ageMs, span.records]),
       [[null, null, null, 1]],
     );
+    fx.manager.close();
+  });
+});
+
+describe('the span table, read from records the test writes', () => {
+  type Outcome = { outcome: string; errorType?: string };
+  const hashOf = (ids: readonly string[]): string => createHash('sha256').update(JSON.stringify(ids)).digest('hex');
+  /** The ledger as the status reads it, in the order given; the alarm's sweep leaves it alone. */
+  const writeLedger = (fx: Awaited<ReturnType<typeof build>>, records: Array<{ hash: string; created: number; outcomes: Outcome[] }>): void => {
+    const projection = new Map(records.map((record, i) => [
+      `zz-key-${i}`,
+      { record: { chunkSourceHash: record.hash, created: record.created }, outcomes: record.outcomes },
+    ]));
+    const lane = fx.strategy as unknown as { readCompressionQuarantineProjection(): unknown; sweepPaidOffQuarantineRecords(): Promise<void> };
+    lane.readCompressionQuarantineProjection = () => projection;
+    lane.sweepPaidOffQuarantineRecords = async () => {};
+  };
+  const chunkOf = (fx: Awaited<ReturnType<typeof build>>, ids: readonly string[], timestamps: Array<Date | number | undefined>): Chunk => {
+    const want = new Set(ids);
+    const messages = managerContext(fx.manager).messageStore.getAll().filter((m) => want.has(m.id))
+      .map((m, i) => ({ ...m, timestamp: timestamps[i] as Date }));
+    return { index: 900, startIndex: 0, endIndex: messages.length, tokens: 100, compressed: false, messages };
+  };
+
+  it("names the newest record's last outcome, error type and all, null when it holds none; counts only what a provider answered", async () => {
+    const fx = await build(scripted([]).membrane);
+    const recent = fx.ids.slice(10);
+    const older = fx.ids.slice(2, 5);
+    fx.strategy.adopt(fx.target());
+    fx.strategy.adopt(chunkOf(fx, older, [new Date(), new Date(), new Date()]));
+    writeLedger(fx, [
+      // The newest record comes first in the ledger, so the order read can't stand in for the newest.
+      { hash: hashOf(recent), created: 300, outcomes: [{ outcome: 'refusal' }, { outcome: 'provider_error', errorType: 'invalid_request' }] },
+      { hash: hashOf(recent), created: 100, outcomes: [{ outcome: 'incomplete' }, { outcome: 'admission_rejected' }] },
+      // An older record that answered, and a newer one that holds nothing yet.
+      { hash: hashOf(older), created: 200, outcomes: [{ outcome: 'refusal' }] },
+      { hash: hashOf(older), created: 400, outcomes: [] },
+    ]);
+    const spans = new Map(fx.strategy.getCompressionQuarantineStatus().spans.map((span) => [span.firstMessageId, span]));
+    assert.equal(spans.get(recent[0]!)!.latestOutcome, 'provider_error:invalid_request', "the newest record's last answer, with its error type");
+    assert.equal(spans.get(recent[0]!)!.answeredAttempts, 3, 'a recall variant planned over the context budget was never sent');
+    assert.equal(spans.get(recent[0]!)!.quarantinedAt, 100);
+    assert.equal(spans.get(older[0]!)!.latestOutcome, null, 'its newest record holds no answer');
+    assert.equal(spans.get(older[0]!)!.answeredAttempts, 1);
+    fx.manager.close();
+  });
+
+  it("dates a span from its messages' valid timestamps, skipping an invalid Date", async () => {
+    const fx = await build(scripted([]).membrane);
+    const ids = fx.ids.slice(2, 5);
+    const twoHoursAgo = Date.now() - 2 * 3_600_000;
+    // First, where a NaN would have stuck as the close time.
+    fx.strategy.adopt(chunkOf(fx, ids, [new Date(Number.NaN), new Date(twoHoursAgo - 60_000), new Date(twoHoursAgo)]));
+    writeLedger(fx, [{ hash: hashOf(ids), created: 100, outcomes: [] }]);
+    const [span] = fx.strategy.getCompressionQuarantineStatus().spans;
+    assert.ok(span!.ageMs !== null && Math.abs(span!.ageMs - 2 * 3_600_000) < 60_000, `aged from the newest valid timestamp: ${span!.ageMs}`);
+    fx.manager.close();
+  });
+
+  it('the alarm line: hours past an hour, close time unknown for an unnamed span (listed last), one record, and no last outcome when none answered', async () => {
+    const fx = await build(scripted([]).membrane);
+    const recent = fx.ids.slice(10);
+    const older = fx.ids.slice(2, 5);
+    const stamp = Date.now() - 2.5 * 3_600_000;
+    fx.strategy.adopt(fx.target());
+    fx.strategy.adopt(chunkOf(fx, older, [new Date(stamp - 60_000), new Date(stamp - 30_000), new Date(stamp)]));
+    writeLedger(fx, [
+      { hash: 'zz-no-current-chunk', created: 50, outcomes: [{ outcome: 'refusal' }] },
+      { hash: hashOf(recent), created: 100, outcomes: [{ outcome: 'provider_error', errorType: 'invalid_request' }] },
+      { hash: hashOf(older), created: 200, outcomes: [] },
+    ]);
+    (fx.strategy as unknown as { config: { quarantineAlarmIntervalMs: number } }).config.quarantineAlarmIntervalMs = 15 * 60_000;
+    const lines: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      await fx.strategy.klaxon();
+    } finally {
+      console.error = error;
+    }
+    const alarm = lines.find((line) => line.startsWith('[compression-quarantine] ⚠️'));
+    assert.ok(alarm, `the klaxon sounded: ${lines.join(' | ')}`);
+    const listed = alarm!.slice(alarm!.indexOf('spans: ') + 'spans: '.length, alarm!.indexOf('. keys='));
+    assert.equal(listed, [
+      `${older[0]}..${older[2]} (closed 2.5 h ago, 1 record, 0 answered)`,
+      `${recent[0]}..${recent[2]} (closed 0 min ago, 1 record, 1 answered, last provider_error:invalid_request)`,
+      '?..? (close time unknown, 1 record, 1 answered, last refusal)',
+    ].join('; '));
     fx.manager.close();
   });
 });
