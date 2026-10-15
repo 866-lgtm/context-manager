@@ -1814,7 +1814,7 @@ describe('the quarantine names each stuck span once, with its messages and age',
     assert.equal(span!.lastMessageId, fx.ids[12]);
     assert.equal(span!.records, 2);
     assert.equal(span!.answeredAttempts, 4, 'each record holds both of its answers');
-    assert.ok(span!.ageMs !== null && span!.ageMs >= 0 && span!.ageMs < 60_000, `aged from its messages: ${span!.ageMs}`);
+    assert.ok(span!.closedAgeMs !== null && span!.closedAgeMs >= 0 && span!.closedAgeMs < 60_000, `aged from its messages: ${span!.closedAgeMs}`);
     assert.equal(span!.latestOutcome, 'refusal', "the newest record's last answer, not the oldest's");
     assert.equal(span!.quarantinedAt, Math.min(...[...created.values()].map((active) => active.record.created)), 'refused since its earliest record');
 
@@ -1831,7 +1831,8 @@ describe('the quarantine names each stuck span once, with its messages and age',
     const alarm = lines.find((line) => line.startsWith('[compression-quarantine] ⚠️'));
     assert.ok(alarm, `the klaxon sounded: ${lines.join(' | ')}`);
     assert.match(alarm!, /⚠️ 1 span\(s\) in compression quarantine \(2 record\(s\)\)/);
-    assert.ok(alarm!.includes(`${fx.ids[10]}..${fx.ids[12]} (closed 0 min ago, 2 records, 4 answered, last refusal)`), alarm);
+    const since = new Date(span!.quarantinedAt).toISOString().slice(0, 16);
+    assert.ok(alarm!.includes(`${fx.ids[10]}..${fx.ids[12]} (closed 0 min ago, refusing since ${since}Z, 2 records, 4 answered, last refusal)`), alarm);
     fx.manager.close();
   });
 
@@ -1852,7 +1853,7 @@ describe('the quarantine names each stuck span once, with its messages and age',
     await fx.strategy.run(older, managerContext(fx.manager));
     const spans = fx.strategy.getCompressionQuarantineStatus().spans;
     assert.deepEqual(spans.map((span) => span.firstMessageId), [fx.ids[2], fx.ids[10]], 'the longest waiting first');
-    assert.ok(spans[0]!.ageMs! >= 3_600_000);
+    assert.ok(spans[0]!.closedAgeMs! >= 3_600_000);
     fx.manager.close();
   });
 
@@ -1863,9 +1864,90 @@ describe('the quarantine names each stuck span once, with its messages and age',
     const status = fx.strategy.getCompressionQuarantineStatus();
     assert.equal(status.count, 1);
     assert.deepEqual(
-      status.spans.map((span) => [span.firstMessageId, span.lastMessageId, span.ageMs, span.records]),
+      status.spans.map((span) => [span.firstMessageId, span.lastMessageId, span.closedAgeMs, span.records]),
       [[null, null, null, 1]],
     );
+    fx.manager.close();
+  });
+});
+
+describe('how a new stuck span reaches the operator', () => {
+  const capture = async (fn: () => Promise<unknown>): Promise<string[]> => {
+    const lines: string[] = [];
+    const error = console.error;
+    const warn = console.warn;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    console.warn = () => {};
+    try {
+      await fn();
+    } finally {
+      console.error = error;
+      console.warn = warn;
+    }
+    return lines;
+  };
+  const alerts = (lines: string[]): Array<Record<string, unknown>> => lines
+    .filter((line) => line.startsWith('{'))
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((payload) => payload.event === 'compression:quarantine-alert');
+  const alarms = (lines: string[]): string[] => lines.filter((line) => line.startsWith('[compression-quarantine] ⚠️'));
+  const turnKlaxonOn = (fx: Awaited<ReturnType<typeof build>>): void => {
+    (fx.strategy as unknown as { config: { quarantineAlarmIntervalMs: number } }).config.quarantineAlarmIntervalMs = 15 * 60_000;
+  };
+
+  it('entering quarantine emits its keyed alert at once, and once', async () => {
+    const mock = scripted([{ throw: failure('invalid_request', { httpStatus: 400 }) }]);
+    const fx = await build(mock.membrane);
+    const first = await capture(() => fx.strategy.run(fx.target(), managerContext(fx.manager)));
+    const status = fx.strategy.getCompressionQuarantineStatus();
+    assert.equal(status.count, 1, 'the family is exhausted');
+    const sent = alerts(first);
+    assert.equal(sent.length, 1, `one alert on entry: ${first.join(' | ')}`);
+    assert.equal(sent[0]!.quarantine_key, status.keys[0]);
+    assert.equal(sent[0]!.alert_key, status.keys[0]);
+    assert.equal(sent[0]!.chunk_hash, status.spans[0]!.chunkSourceHash);
+    const again = await capture(() => fx.strategy.run(fx.target(), managerContext(fx.manager)));
+    assert.equal(alerts(again).length, 0, 'a span already quarantined makes no new alert');
+    fx.manager.close();
+  });
+
+  it('the alarm repeats every interval while a span stays quarantined, and not within one', async () => {
+    const mock = scripted([{ throw: failure('invalid_request', { httpStatus: 400 }) }]);
+    const fx = await build(mock.membrane);
+    await capture(() => fx.strategy.run(fx.target(), managerContext(fx.manager)));
+    turnKlaxonOn(fx);
+    assert.equal(alarms(await capture(() => fx.strategy.klaxon())).length, 1, 'the first sound');
+    assert.equal(alarms(await capture(() => fx.strategy.klaxon())).length, 0, 'within the interval: quiet');
+    // Stand for an interval passing since the last sound.
+    (fx.strategy as unknown as { quarantineAlarmLastAt: number }).quarantineAlarmLastAt -= 15 * 60_000;
+    assert.equal(alarms(await capture(() => fx.strategy.klaxon())).length, 1, 'an interval later it sounds again');
+    fx.manager.close();
+  });
+
+  it("tick sounds the alarm, and the line lists a span quarantined after the last sound", async () => {
+    const mock = scripted([{ throw: failure('invalid_request', { httpStatus: 400 }) }]);
+    const fx = await build(mock.membrane);
+    turnKlaxonOn(fx);
+    // No membrane on the tick's context: it sounds the alarm, then stops before any compression.
+    const quiet = { ...managerContext(fx.manager), membrane: undefined } as unknown as StrategyContext;
+    await capture(() => fx.strategy.run(fx.target(), managerContext(fx.manager)));
+    const firstTick = alarms(await capture(() => fx.strategy.tick(quiet)));
+    assert.equal(firstTick.length, 1, 'the tick sounded it');
+    assert.match(firstTick[0]!, /⚠️ 1 span\(s\)/);
+    // A second span quarantines while the first is listed: no debt state need change.
+    const want = new Set(fx.ids.slice(2, 5));
+    const older: Chunk = {
+      index: 998, startIndex: 2, endIndex: 5, tokens: 100, compressed: false,
+      messages: managerContext(fx.manager).messageStore.getAll().filter((m) => want.has(m.id)),
+    };
+    fx.strategy.adopt(older);
+    const entry = await capture(() => fx.strategy.run(older, managerContext(fx.manager)));
+    assert.equal(alerts(entry).length, 1, 'its own keyed alert, at once');
+    (fx.strategy as unknown as { quarantineAlarmLastAt: number }).quarantineAlarmLastAt -= 15 * 60_000;
+    const nextTick = alarms(await capture(() => fx.strategy.tick(quiet)));
+    assert.equal(nextTick.length, 1, 'the next due tick sounded it again');
+    assert.match(nextTick[0]!, /⚠️ 2 span\(s\)/);
+    assert.ok(nextTick[0]!.includes(`${fx.ids[2]}..${fx.ids[4]} (`), nextTick[0]);
     fx.manager.close();
   });
 });
@@ -1921,7 +2003,27 @@ describe('the span table, read from records the test writes', () => {
     fx.strategy.adopt(chunkOf(fx, ids, [new Date(Number.NaN), new Date(twoHoursAgo - 60_000), new Date(twoHoursAgo)]));
     writeLedger(fx, [{ hash: hashOf(ids), created: 100, outcomes: [] }]);
     const [span] = fx.strategy.getCompressionQuarantineStatus().spans;
-    assert.ok(span!.ageMs !== null && Math.abs(span!.ageMs - 2 * 3_600_000) < 60_000, `aged from the newest valid timestamp: ${span!.ageMs}`);
+    assert.ok(span!.closedAgeMs !== null && Math.abs(span!.closedAgeMs - 2 * 3_600_000) < 60_000, `aged from the newest valid timestamp: ${span!.closedAgeMs}`);
+    fx.manager.close();
+  });
+
+  it("a record's created time that no Date can hold shows as unknown, and the alarm doesn't throw", async () => {
+    const fx = await build(scripted([]).membrane);
+    const ids = fx.ids.slice(2, 5);
+    fx.strategy.adopt(chunkOf(fx, ids, [new Date(), new Date(), new Date()]));
+    writeLedger(fx, [{ hash: hashOf(ids), created: 1e20, outcomes: [{ outcome: 'refusal' }] }]);
+    (fx.strategy as unknown as { config: { quarantineAlarmIntervalMs: number } }).config.quarantineAlarmIntervalMs = 15 * 60_000;
+    const lines: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      await fx.strategy.klaxon();
+    } finally {
+      console.error = error;
+    }
+    const alarm = lines.find((line) => line.startsWith('[compression-quarantine] ⚠️'));
+    assert.ok(alarm, `the klaxon sounded: ${lines.join(' | ')}`);
+    assert.ok(alarm!.includes(`${ids[0]}..${ids[2]} (closed 0 min ago, refusing since unknown, 1 record, 1 answered, last refusal)`), alarm);
     fx.manager.close();
   });
 
@@ -1932,10 +2034,11 @@ describe('the span table, read from records the test writes', () => {
     const stamp = Date.now() - 2.5 * 3_600_000;
     fx.strategy.adopt(fx.target());
     fx.strategy.adopt(chunkOf(fx, older, [new Date(stamp - 60_000), new Date(stamp - 30_000), new Date(stamp)]));
+    const at = (iso: string): number => Date.parse(iso);
     writeLedger(fx, [
-      { hash: 'zz-no-current-chunk', created: 50, outcomes: [{ outcome: 'refusal' }] },
-      { hash: hashOf(recent), created: 100, outcomes: [{ outcome: 'provider_error', errorType: 'invalid_request' }] },
-      { hash: hashOf(older), created: 200, outcomes: [] },
+      { hash: 'zz-no-current-chunk', created: at('2026-10-14T23:05:00Z'), outcomes: [{ outcome: 'refusal' }] },
+      { hash: hashOf(recent), created: at('2026-10-15T10:21:30Z'), outcomes: [{ outcome: 'provider_error', errorType: 'invalid_request' }] },
+      { hash: hashOf(older), created: at('2026-10-15T09:40:00Z'), outcomes: [] },
     ]);
     (fx.strategy as unknown as { config: { quarantineAlarmIntervalMs: number } }).config.quarantineAlarmIntervalMs = 15 * 60_000;
     const lines: string[] = [];
@@ -1950,9 +2053,9 @@ describe('the span table, read from records the test writes', () => {
     assert.ok(alarm, `the klaxon sounded: ${lines.join(' | ')}`);
     const listed = alarm!.slice(alarm!.indexOf('spans: ') + 'spans: '.length, alarm!.indexOf('. keys='));
     assert.equal(listed, [
-      `${older[0]}..${older[2]} (closed 2.5 h ago, 1 record, 0 answered)`,
-      `${recent[0]}..${recent[2]} (closed 0 min ago, 1 record, 1 answered, last provider_error:invalid_request)`,
-      '?..? (close time unknown, 1 record, 1 answered, last refusal)',
+      `${older[0]}..${older[2]} (closed 2.5 h ago, refusing since 2026-10-15T09:40Z, 1 record, 0 answered)`,
+      `${recent[0]}..${recent[2]} (closed 0 min ago, refusing since 2026-10-15T10:21Z, 1 record, 1 answered, last provider_error:invalid_request)`,
+      '?..? (close time unknown, refusing since 2026-10-14T23:05Z, 1 record, 1 answered, last refusal)',
     ].join('; '));
     fx.manager.close();
   });

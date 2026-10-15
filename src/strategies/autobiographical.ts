@@ -3893,7 +3893,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             chunkSourceHash: hash,
             firstMessageId: chunk?.messages[0]?.id ?? null,
             lastMessageId: chunk?.messages[chunk.messages.length - 1]?.id ?? null,
-            ageMs: closedAt === undefined ? null : Math.max(0, now - closedAt),
+            closedAgeMs: closedAt === undefined ? null : Math.max(0, now - closedAt),
             quarantinedAt: active.record.created,
             records: 0,
             answeredAttempts: 0,
@@ -3915,7 +3915,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return {
         count: projection.size,
         keys: [...projection.keys()],
-        spans: [...spans.values()].sort((a, b) => (b.ageMs ?? -1) - (a.ageMs ?? -1)),
+        spans: [...spans.values()].sort((a, b) => (b.closedAgeMs ?? -1) - (a.closedAgeMs ?? -1)),
       };
     } catch {
       // Health reads must never throw — a broken projection is itself a
@@ -3986,13 +3986,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
     this.quarantineAlarmActive = true;
     this.quarantineAlarmLastAt = now;
-    // The age is since the span's chunk closed, not since its first
-    // quarantine, so the line says which.
+    // Two clocks, each labelled: how long since the span's chunk closed (how
+    // long it has stayed raw), and when its earliest record was made (how
+    // long it has been refused).
     const age = (ms: number | null): string =>
       ms === null ? 'close time unknown'
         : `closed ${ms >= 3_600_000 ? `${(ms / 3_600_000).toFixed(1)} h` : `${Math.round(ms / 60_000)} min`} ago`;
+    // A record's created time is read from the ledger unchecked: a value no
+    // Date can hold (NaN, infinite, or past its range) shows as unknown
+    // rather than throwing at the top of every tick.
+    const since = (at: number): string => {
+      const date = new Date(at);
+      return Number.isNaN(date.getTime()) ? 'refusing since unknown' : `refusing since ${date.toISOString().slice(0, 16)}Z`;
+    };
     const spans = status.spans.map((span) =>
-      `${span.firstMessageId ?? '?'}..${span.lastMessageId ?? '?'} (${age(span.ageMs)}, ` +
+      `${span.firstMessageId ?? '?'}..${span.lastMessageId ?? '?'} (${age(span.closedAgeMs)}, ${since(span.quarantinedAt)}, ` +
         `${span.records} record${span.records === 1 ? '' : 's'}, ${span.answeredAttempts} answered` +
         `${span.latestOutcome ? `, last ${span.latestOutcome}` : ''})`,
     );

@@ -657,12 +657,16 @@ export interface CompressionQuarantineSpan {
   /** Its first and last message ids; null when no current chunk has this span. */
   firstMessageId: string | null;
   lastMessageId: string | null;
-  /** How long since its chunk closed, from the newest of its messages' timestamps; null when unknown. */
-  ageMs: number | null;
+  /**
+   * How long since its chunk closed, from the newest of its messages'
+   * timestamps: how long it has stayed raw. Null when unknown.
+   */
+  closedAgeMs: number | null;
   /**
    * When its earliest record was made (ms since the epoch): how long it has
-   * been refused, where `ageMs` is how long it has stayed raw. A re-cut
-   * chunk's records start over.
+   * been refused, where `closedAgeMs` is how long it has stayed raw. The
+   * alarm line shows it as "refusing since". A re-cut chunk's records start
+   * over.
    */
   quarantinedAt: number;
   /** Its quarantine records, one per request shape it exhausted. */
