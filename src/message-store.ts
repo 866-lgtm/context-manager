@@ -19,7 +19,7 @@ import type {
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
 import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from './body-runs.js';
-import { refuseMalformedContent, wellFormedContent } from './well-formed-content.js';
+import { contentForWrite, wellFormedContent } from './well-formed-content.js';
 
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
 
@@ -435,7 +435,7 @@ export class MessageStore {
       lockedByAgent?: boolean;
     }
   ): StoredMessage {
-    refuseMalformedContent(content, 'Message refused');
+    content = contentForWrite(content, 'Message refused');
     // Extract blobs from content
     const storedContent = this.blobManager.extractBlobs(content);
 
@@ -545,7 +545,7 @@ export class MessageStore {
    * message, remove the whole bodyGroup and re-append.
    */
   edit(messageId: MessageId, newContent: ContentBlock[]): void {
-    refuseMalformedContent(newContent, `Edit of ${messageId} refused`);
+    newContent = contentForWrite(newContent, `Edit of ${messageId} refused`);
     const index = this.lookupIndex(messageId);
     if (index === undefined) {
       throw new Error(`Message not found: ${messageId}`);

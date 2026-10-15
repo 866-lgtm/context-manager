@@ -8,7 +8,7 @@ import type {
   Base64Source,
 } from '@animalabs/membrane';
 import type { BlobReference, StoredContentBlock } from './types/index.js';
-import { refuseMalformedBlock } from './well-formed-content.js';
+import { blockForWrite } from './well-formed-content.js';
 
 /** Detect provider-supported raster image types from their byte signature.
  * Returns null for unknown/container types so callers can preserve the
@@ -100,8 +100,8 @@ function blockFromBlob(kind: BlobReference['originalType'], data: string, mediaT
 /**
  * A content block as the store hands it back once it is stored: what
  * `getMessage`, `getAllMessages` and `getMessageWindow` return for it with
- * blobs resolved (their default), live and after reopening. `append` and
- * `edit` return content as it was given, not this.
+ * blobs resolved (their default), live and after reopening. `append`
+ * returns content as it was given, with what a write mends mended, not this.
  *
  * Inline media is kept as a blob: an image whose source isn't a URL, and
  * every document, audio or video block. It comes back as
@@ -134,19 +134,20 @@ function blockFromBlob(kind: BlobReference['originalType'], data: string, mediaT
  *
  * It throws for a block the store refuses on write, which has no stored form:
  * content that doesn't match `ContentBlock` where its readers read it
- * (well-formed-content.ts), inline media whose data the store can't read as
- * base64, or one without a media type (for an image: none declared, and no
- * recognized signature in its bytes). It also throws for a `blob_ref`, which
- * reads back as the media it references, and that takes the store to know.
+ * (well-formed-content.ts), a `blob_ref`, which only the store writes (it
+ * reads back as the media it references, and that takes the store to know),
+ * inline media whose data the store can't read as base64, or one without a
+ * media type (for an image: none declared, and no recognized signature in its
+ * bytes). A `tool_use` whose input isn't an object comes back mended, as the
+ * store keeps it: `input: {}`, the value kept in `unparseableInput`, and its
+ * raw replay forms given up. In a message, blocks that share a form with it
+ * give that form up too, which one block can't show.
  *
  * Pure and synchronous: no store and no I/O, so a body can be hashed as the
  * store will keep it before anything is written.
  */
 export function blockAsStored(block: ContentBlock): ContentBlock {
-  refuseMalformedBlock(block, 'blockAsStored');
-  if ((block as { type: string }).type === 'blob_ref') {
-    throw new Error('blockAsStored: a blob_ref reads back as the media it references, which takes the store to know');
-  }
+  block = blockForWrite(block, 'blockAsStored');
   const kind = blobKindOf(block);
   if (!kind) return block;
   const { data, mediaType } = (block as { source: Base64Source }).source;

@@ -3,10 +3,13 @@
  * a block that isn't an object, is an array, or has no string type; a text
  * block whose text, or a thinking block whose thinking, isn't a string; a
  * tool_use whose input isn't an object; a tool_result whose content is
- * neither a string nor an array of such blocks, at any depth. A store
- * written before writes refused it can hold it. Reads leave it out or make
- * it match, so every compile, compression pass and reopen works, and the
- * store keeps it as written. A write refuses it, naming where it is.
+ * neither a string nor an array of such blocks, at any depth; media without
+ * an object source, a generated image without string data and media type,
+ * and a blob_ref, which only the store writes, whose ref has no string hash.
+ * A store written before writes refused it can hold it. Reads leave it out
+ * or make it match, so every compile, compression pass and reopen works,
+ * and the store keeps it as written. A write mends a tool_use's input, as a
+ * read does, and refuses the rest, naming where it is.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -20,6 +23,8 @@ import {
   blockAsStored,
   ContextLog,
   ContextManager,
+  MalformedContentError,
+  malformedContentPlaces,
   MessageStore,
   PassthroughStrategy,
   WindowedPassthroughStrategy,
@@ -41,11 +46,17 @@ const MALFORMED_BLOCKS: unknown[][] = [
   [t('kept'), { type: 'text', text: 42 }],
   [t('kept'), [t('in an array')]],
   [t('kept'), { text: 'without a type' }],
+  [t('kept'), { type: 'image' }],
+  [t('kept'), { type: 'document', source: null }],
+  [t('kept'), { type: 'generated_image', mimeType: 'image/png' }],
+  [t('kept'), { type: 'blob_ref' }],
+  [t('kept'), { type: 'blob_ref', ref: {} }],
 ];
-/** Each assistant message whose thinking doesn't match. */
+/** Each assistant message whose thinking doesn't match: unsigned, and signed with no text. */
 const MALFORMED_ASSISTANT: unknown[][] = [
   [{ type: 'thinking' }, t('kept')],
   [{ type: 'thinking', thinking: null }, t('kept')],
+  [{ type: 'thinking', signature: 'sig' }, t('kept')],
 ];
 /** Each tool_use input that doesn't match: missing, null, a string, an array. */
 const MALFORMED_INPUTS: unknown[] = [undefined, null, 'x', [1]];
@@ -62,6 +73,7 @@ const MALFORMED_TOOL_CONTENT: unknown[] = [
   undefined,
   42,
   {},
+  t('a lone block'),
 ];
 
 /** Write content to the message slot as a store can hold it, past MessageStore. */
@@ -75,13 +87,19 @@ function malformedIn(messages: ReadonlyArray<{ content: readonly unknown[] }>): 
   const isObject = (value: unknown) => typeof value === 'object' && value !== null;
   const walk = (blocks: readonly unknown[], at: string) => {
     for (let i = 0; i < blocks.length; i++) {
-      const block = blocks[i] as { type?: unknown; text?: unknown; thinking?: unknown; input?: unknown; content?: unknown } | null;
+      const block = blocks[i] as {
+        type?: unknown; text?: unknown; thinking?: unknown; input?: unknown; content?: unknown; source?: unknown; data?: unknown; mimeType?: unknown;
+      } | null;
       const here = `${at}[${i}]`;
       if (!isObject(block) || Array.isArray(block)) places.push(here);
       else if (typeof block!.type !== 'string') places.push(`${here}.type`);
       else if (block!.type === 'text' && typeof block!.text !== 'string') places.push(`${here}.text`);
       else if (block!.type === 'thinking' && typeof block!.thinking !== 'string') places.push(`${here}.thinking`);
       else if (block!.type === 'tool_use' && (!isObject(block!.input) || Array.isArray(block!.input))) places.push(`${here}.input`);
+      else if (['image', 'document', 'audio', 'video'].includes(block!.type as string) && (!isObject(block!.source) || Array.isArray(block!.source))) places.push(`${here}.source`);
+      else if (block!.type === 'generated_image' && (typeof block!.data !== 'string' || typeof block!.mimeType !== 'string')) places.push(`${here}.data`);
+      // A compile resolves every blob it reads, so none is left as a reference.
+      else if (block!.type === 'blob_ref') places.push(here);
       else if (block!.type === 'tool_result') {
         if (Array.isArray(block!.content)) walk(block!.content, `${here}.content`);
         else if (typeof block!.content !== 'string') places.push(`${here}.content`);
@@ -188,24 +206,42 @@ describe("content that doesn't match ContentBlock", () => {
   it('reads leave out or mend what doesn\'t match, at any depth, keep a string tool_result content, and the store keeps it as written', async () => {
     await withStore(async (store) => {
       MessageStore.register(store);
-      writeRaw(store, 'User', [t('a'), null, { type: 'text' }, [t('in an array')], { text: 'without a type' }]);
-      writeRaw(store, 'Claude', [{ type: 'thinking', thinking: 7 }, toolUse('t0'), ...['t1', 't2', 't3', 't4'].map((id) => toolUse(id, {}))]);
+      writeRaw(store, 'User', [
+        t('a'), null, { type: 'text' }, [t('in an array')], { text: 'without a type' },
+        { type: 'image' }, { type: 'audio', source: [] }, { type: 'generated_image', data: 'x' }, { type: 'blob_ref', ref: { mediaType: 'image/png' } },
+      ]);
+      writeRaw(store, 'Claude', [
+        { type: 'thinking', thinking: 7 }, { type: 'thinking', signature: 'sig' },
+        toolUse('t0'), toolUse('t5', null), toolUse('t6', [1]), toolUse('t7', 'x'),
+        ...['t1', 't2', 't3', 't4', 't8', 't9'].map((id) => toolUse(id, {})),
+      ]);
       writeRaw(store, 'User', [
         toolResult('t0', [t('done')]),
         toolResult('t1', [t('x'), null, 3]),
         toolResult('t2', 'a string'),
         toolResult('t3', [t('outer'), toolResult('inner', [t('deep'), null, { type: 'text', text: null }])]),
         toolResult('t4', null),
+        toolResult('t8', t('a lone block')),
+        toolResult('t9', 42),
       ]);
       const expected = [
         [t('a')],
-        [{ ...toolUse('t0'), input: {} }, ...['t1', 't2', 't3', 't4'].map((id) => toolUse(id, {}))],
+        [
+          { type: 'thinking', signature: 'sig', thinking: '' },
+          { ...toolUse('t0'), input: {} },
+          { ...toolUse('t5', {}), unparseableInput: 'null' },
+          { ...toolUse('t6', {}), unparseableInput: '[1]' },
+          { ...toolUse('t7', {}), unparseableInput: '"x"' },
+          ...['t1', 't2', 't3', 't4', 't8', 't9'].map((id) => toolUse(id, {})),
+        ],
         [
           toolResult('t0', [t('done')]),
           toolResult('t1', [t('x')]),
           toolResult('t2', 'a string'),
           toolResult('t3', [t('outer'), toolResult('inner', [t('deep')])]),
           toolResult('t4', []),
+          toolResult('t8', [t('a lone block')]),
+          toolResult('t9', '42'),
         ],
       ];
       await errorLines(() => {
@@ -215,10 +251,11 @@ describe("content that doesn't match ContentBlock", () => {
         assert.deepEqual(viewed.map((message) => message.content), expected, 'a read without blob resolution gives the same');
       });
       const stored = store.getStateJson('messages') as Array<{ content: unknown[] }>;
-      assert.deepEqual(stored[0]!.content, [t('a'), null, { type: 'text' }, [t('in an array')], { text: 'without a type' }], 'the store keeps it as written');
-      assert.deepEqual(stored[1]!.content[1], toolUse('t0'));
+      assert.deepEqual(stored[0]!.content.slice(0, 6), [t('a'), null, { type: 'text' }, [t('in an array')], { text: 'without a type' }, { type: 'image' }], 'the store keeps it as written');
+      assert.deepEqual(stored[1]!.content.slice(1, 4), [{ type: 'thinking', signature: 'sig' }, toolUse('t0'), toolUse('t5', null)]);
       assert.deepEqual((stored[2]!.content[1] as { content: unknown[] }).content, [t('x'), null, 3]);
       assert.equal((stored[2]!.content[4] as { content: unknown }).content, null);
+      assert.equal((stored[2]!.content[6] as { content: unknown }).content, 42);
     });
   });
 
@@ -276,7 +313,12 @@ describe("content that doesn't match ContentBlock", () => {
       await errorLines(() => {
         const [, results] = new MessageStore(store).getAll();
         assert.deepEqual(results!.content, [
-          toolResult('t1', [toolUse('n1', {}), toolUse('n2', {}), { ...toolUse('n3', {}), rawXml: ownXml }, t('kept part')]),
+          toolResult('t1', [
+            { ...toolUse('n1', {}), unparseableInput: '"old"' },
+            toolUse('n2', {}),
+            { ...toolUse('n3', {}), rawXml: ownXml },
+            t('kept part'),
+          ]),
         ]);
       });
     });
@@ -339,6 +381,23 @@ describe("content that doesn't match ContentBlock", () => {
     });
   });
 
+  it('an entry that comes to have another\'s index logs its own line', async () => {
+    await withStore(async (store) => {
+      ContextLog.register(store);
+      store.appendToStateJson('context', { index: 0, participant: 'User', content: [t('x'), null] });
+      const log = new ContextLog(store);
+      const read = async () => (await errorLines(() => { log.getAll(); })).filter((line) => line.startsWith('[context-manager]'));
+      assert.equal((await read()).length, 1);
+      assert.equal((await read()).length, 0, 'the same entry is logged once');
+      // Another entry at index 0, as a replacement written before writes refused it leaves one.
+      store.redactStateItems('context', 0, 1);
+      store.appendToStateJson('context', { index: 0, participant: 'User', content: [t('y'), 7] });
+      assert.deepEqual(await read(), [
+        "[context-manager] context entry 0: reads leave out or mend what doesn't match ContentBlock (content[1] is a number, not a content block); the store keeps it as written",
+      ]);
+    });
+  });
+
   it('addMessage refuses it, naming where it is, before anything changes', async () => {
     await withStore(async (store) => {
       const manager = await ContextManager.open({ store });
@@ -360,10 +419,13 @@ describe("content that doesn't match ContentBlock", () => {
           [[{ type: 'text' }], 'content\\[0\\]\\.text is undefined, not a string'],
           [[{ type: 'text', text: 42 }], 'content\\[0\\]\\.text is a number, not a string'],
           [[{ type: 'thinking', thinking: null }], 'content\\[0\\]\\.thinking is null, not a string'],
-          [[toolUse('u1')], 'content\\[0\\]\\.input is undefined, not an object'],
-          [[toolUse('u1', null)], 'content\\[0\\]\\.input is null, not an object'],
-          [[toolUse('u1', [1])], 'content\\[0\\]\\.input is an array, not an object'],
-          [[toolUse('u1', 'x')], 'content\\[0\\]\\.input is a string, not an object'],
+          [[{ type: 'thinking', signature: 'sig' }], 'content\\[0\\]\\.thinking is undefined, not a string'],
+          [[toolUse('u1', 10n)], 'content\\[0\\]\\.input is a bigint, not an object'],
+          [[{ type: 'image' }], 'content\\[0\\]\\.source is undefined, not an object'],
+          [[{ type: 'document', source: 'x' }], 'content\\[0\\]\\.source is a string, not an object'],
+          [[{ type: 'generated_image', data: 1 }],
+            'content\\[0\\]\\.data is a number, not a string; content\\[0\\]\\.mimeType is undefined, not a string'],
+          [[{ type: 'blob_ref', ref: { hash: 'h', mediaType: 'image/png', originalType: 'image' } }], 'content\\[0\\] is a blob_ref, which only the store writes'],
           [[toolResult('t1', [t('ok'), null, 'x'])],
             'content\\[0\\]\\.content\\[1\\] is null, not a content block; content\\[0\\]\\.content\\[2\\] is a string, not a content block'],
           [[toolResult('t1', [toolResult('t2', [null])])], 'content\\[0\\]\\.content\\[0\\]\\.content\\[0\\] is null, not a content block'],
@@ -479,8 +541,84 @@ describe("content that doesn't match ContentBlock", () => {
       assert.deepEqual(log.getAll().map((entry) => entry.content), [[t('entry')]], 'a refused replacement leaves the log as it was');
       assert.throws(() => blockAsStored(null as unknown as ContentBlock), { message: /^blockAsStored: block is null, not a content block\.$/ });
       assert.throws(() => blockAsStored(toolResult('t1', [t('ok'), 'x']) as ContentBlock), { message: /^blockAsStored: block\.content\[1\] is a string, not a content block\.$/ });
-      assert.throws(() => blockAsStored(toolUse('u1') as ContentBlock), { message: /^blockAsStored: block\.input is undefined, not an object\.$/ });
+      assert.throws(() => blockAsStored(toolUse('u1', 10n) as ContentBlock), { message: /^blockAsStored: block\.input is a bigint, not an object\.$/ });
+      assert.deepEqual(blockAsStored(toolUse('u1') as ContentBlock), toolUse('u1', {}), 'a call with no input is stored with {}, unmarked');
+      assert.deepEqual(
+        blockAsStored({ ...toolUse('u1', null), rawXml: '<function_calls>null</function_calls>' } as ContentBlock),
+        { ...toolUse('u1', {}), unparseableInput: 'null' },
+        'a mended call keeps its input in unparseableInput, and gives up its raw replay form',
+      );
       assert.deepEqual(blockAsStored(toolResult('t1', 'fine') as ContentBlock), toolResult('t1', 'fine'));
+    });
+  });
+
+  it('a write mends a tool_use whose input isn\'t an object, as membrane does, and stores what a read of it gives', async () => {
+    await withStore(async (store) => {
+      const sharedXml = '<function_calls><invoke name="probe">null</invoke><invoke name="probe"></invoke></function_calls>';
+      const ownXml = '<function_calls><invoke name="probe"></invoke></function_calls>';
+      const content = [
+        { ...toolUse('m1', null), rawXml: sharedXml },
+        { ...toolUse('m2', {}), rawXml: sharedXml },
+        { ...toolUse('m3', {}), rawXml: ownXml },
+        toolUse('m4'),
+        toolUse('m5', [1]),
+        toolUse('m6', 'x'),
+        // A marker the block already carries is kept.
+        { ...toolUse('m7', 7), unparseableInput: '{"q": ' },
+      ];
+      const mended = [
+        { ...toolUse('m1', {}), unparseableInput: 'null' },
+        toolUse('m2', {}),
+        { ...toolUse('m3', {}), rawXml: ownXml },
+        toolUse('m4', {}),
+        { ...toolUse('m5', {}), unparseableInput: '[1]' },
+        { ...toolUse('m6', {}), unparseableInput: '"x"' },
+        { ...toolUse('m7', {}), unparseableInput: '{"q": ' },
+      ];
+      const manager = await ContextManager.open({ store });
+      try {
+        const events: Array<{ type: string; message?: { content: unknown } }> = [];
+        manager.onMessage((event) => { events.push(event as never); });
+        manager.addMessage('Claude', content as ContentBlock[]);
+        assert.deepEqual(manager.getAllMessages()[0]!.content, mended, 'stored mended, and the shared raw form given up');
+        assert.deepEqual(events[0]!.message!.content, mended, 'and the add event carries what was stored');
+        assert.deepEqual((store.getStateJson('messages') as Array<{ content: unknown[] }>)[0]!.content, mended);
+        // A tool_use inside a tool_result's content is mended too.
+        manager.addMessage('User', [toolResult('m1', [toolUse('n1', null)]) as ContentBlock]);
+        assert.deepEqual(manager.getAllMessages()[1]!.content, [toolResult('m1', [{ ...toolUse('n1', {}), unparseableInput: 'null' }])]);
+      } finally {
+        manager.close();
+      }
+      // The same content written past the write, as an older store holds it, reads as the write stored it.
+      writeRaw(store, 'Claude', content);
+      await errorLines(() => {
+        assert.deepEqual(new MessageStore(store).getAll()[2]!.content, mended, 'a read gives what a write stores');
+      });
+    });
+  });
+
+  it('malformedContentPlaces names what a write refuses, without throwing, and the refusal carries its answer', async () => {
+    assert.deepEqual(malformedContentPlaces([t('fine'), toolUse('u1', {})]), []);
+    assert.deepEqual(malformedContentPlaces([toolUse('u1', null), toolUse('u2')]), [], 'a write mends these, so it refuses nothing');
+    const content = [t('ok'), null, toolResult('t1', [{ type: 'text' }]), { type: 'blob_ref', ref: { hash: 'h' } }];
+    const places = [
+      'content[1] is null, not a content block',
+      'content[2].content[0].text is undefined, not a string',
+      'content[3] is a blob_ref, which only the store writes',
+    ];
+    assert.deepEqual(malformedContentPlaces(content), places);
+    await withStore(async (store) => {
+      const manager = await ContextManager.open({ store });
+      try {
+        assert.throws(() => manager.addMessage('User', content as ContentBlock[]), (error: unknown) => {
+          assert.ok(error instanceof MalformedContentError);
+          assert.deepEqual(error.places, malformedContentPlaces(content));
+          assert.equal(error.message, `Message refused: ${places.join('; ')}.`);
+          return true;
+        });
+      } finally {
+        manager.close();
+      }
     });
   });
 });

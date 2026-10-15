@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
-import { BlobManager, ContextManager, PassthroughStrategy, blockAsStored } from '../src/index.js';
+import { BlobManager, ContextManager, MessageStore, PassthroughStrategy, blockAsStored } from '../src/index.js';
 
 const STORE = './test-block-as-stored';
 function cleanup(): void {
@@ -112,29 +112,29 @@ describe('blockAsStored', () => {
     assert.equal(raw.ref.originalType, 'image');
   });
 
-  it('relabels on read a reference an older release wrote under the wrong type', async () => {
-    // Older releases wrote the declared label into the reference. Build one by hand: the store keeps a
-    // blob_ref as given, and the read side relabels it from the bytes.
+  /** Store a message holding `ref` as an older release stored one, past the write, which refuses a blob_ref now. */
+  function storeLegacyReference(ref: (hash: string) => unknown, mediaType: string): void {
     const store = JsStore.openOrCreate({ path: STORE });
-    const hash = store.storeBlob(Buffer.from(PNG, 'hex'), 'image/jpeg');
+    const hash = store.storeBlob(Buffer.from(PNG, 'hex'), mediaType);
+    MessageStore.register(store);
+    store.appendToStateJsonWithIdentity('messages', { participant: 'user', content: [ref(hash)], timestamp: Date.now() }, 'id', 'sequence');
     store.close();
-    const legacy = { type: 'blob_ref', ref: { hash, mediaType: 'image/jpeg', originalType: 'image' } } as unknown as ContentBlock;
+  }
+
+  it('relabels on read a reference an older release wrote under the wrong type', async () => {
+    // Older releases wrote the declared label into the reference, and the read side relabels it from the bytes.
+    storeLegacyReference((hash) => ({ type: 'blob_ref', ref: { hash, mediaType: 'image/jpeg', originalType: 'image' } }), 'image/jpeg');
     const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
-    const id = manager.addMessage('user', [legacy]);
-    const back = manager.getMessage(id)!.content[0];
+    const back = manager.getAllMessages()[0]!.content[0];
     manager.close();
     assert.deepStrictEqual(back, { type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' } });
   });
 
   it('a reference of an unknown original type fails its read, naming the type', async () => {
-    const store = JsStore.openOrCreate({ path: STORE });
-    const hash = store.storeBlob(Buffer.from(PNG, 'hex'), 'image/png');
-    store.close();
-    const odd = { type: 'blob_ref', ref: { hash, mediaType: 'image/png', originalType: 'hologram' } } as unknown as ContentBlock;
+    storeLegacyReference((hash) => ({ type: 'blob_ref', ref: { hash, mediaType: 'image/png', originalType: 'hologram' } }), 'image/png');
     const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
     try {
-      const id = manager.addMessage('user', [odd]);
-      assert.throws(() => manager.getMessage(id), /Blob reference of unknown original type: "hologram"/);
+      assert.throws(() => manager.getAllMessages(), /Blob reference of unknown original type: "hologram"/);
     } finally {
       manager.close();
     }
@@ -148,11 +148,11 @@ describe('blockAsStored', () => {
     assert.throws(() => blockAsStored(untypedDocument), /document block without a media type has no stored form/);
     assert.throws(() => blockAsStored(untypedUnsniffable), /image block without a media type its bytes supply has no stored form/);
     assert.throws(() => blockAsStored(noData), /audio block whose data the store can't read as base64 has no stored form/);
-    assert.throws(() => blockAsStored(ref), /blob_ref reads back as the media it references/);
+    assert.throws(() => blockAsStored(ref), /block is a blob_ref, which only the store writes/);
     // The store refuses the same blocks on write.
     const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
     try {
-      for (const block of [untypedDocument, untypedUnsniffable, noData]) {
+      for (const block of [untypedDocument, untypedUnsniffable, noData, ref]) {
         assert.throws(() => manager.addMessage('user', [block]));
       }
     } finally {

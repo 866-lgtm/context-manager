@@ -48,7 +48,7 @@ import { isStateExistsFor } from './state-registration.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
-import { refuseMalformedContent } from './well-formed-content.js';
+import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
@@ -475,7 +475,9 @@ export class ContextManager {
   ): MessageId {
     // First, so a message refused here changes nothing: no hold expires, no
     // hold is placed, and the strategy's ingress chunking never reads it.
-    refuseMalformedContent(content, 'Message refused');
+    // What a write mends is mended here, so the strategy chunks what is
+    // stored (well-formed-content.ts).
+    content = contentForWrite(content, 'Message refused');
     this.expireCompressionHolds();
     if (!options?.holdCompression) {
       return this.appendMessage(participant, content, metadata, causedBy);
@@ -520,7 +522,10 @@ export class ContextManager {
         // the shards before it were stored. The error names the shard, since
         // the message as given was refused by nothing.
         for (const shard of decision.shards) {
-          refuseMalformedContent(shard.content, `Shard ${shard.shardIndex} of the message, as the strategy chunked it, refused`);
+          const places = malformedContentPlaces(shard.content);
+          if (places.length > 0) {
+            throw new MalformedContentError(`Shard ${shard.shardIndex} of the message, as the strategy chunked it, refused`, places);
+          }
         }
         let firstId: MessageId | null = null;
         // These appends must stay synchronous: one body's shards in one loop, in

@@ -1,13 +1,13 @@
-- `addMessage`, `editMessage`, `MessageStore.append` and `edit`,
-  `ContextLog.append`, `edit` and `replaceAll`, and `blockAsStored` now
-  refuse content that doesn't match `ContentBlock` where its readers read
-  it, and store nothing of it. The error names each place by its path, such
-  as `Message refused: content[1] is a string, not a content block.`
-  `addMessage` refuses such a message before anything else happens: no
-  compression hold expires or is placed, and the strategy's ingress
-  chunking never reads it. A shard of a strategy's chunking that doesn't
-  match is refused before any shard is stored, with an error naming the
-  shard, though by then expired holds have been released, as at any add;
-  and `ContextLog.replaceAll` refuses an entry holding such content before
-  it clears the log. Before, such content was stored, and a reader written
-  against `ContentBlock` could throw on it from then on.
+- A `tool_use` whose `input` isn't an object, as membrane 0.5.87's
+  adapters can give it, is now stored with `input: {}`, and
+  `unparseableInput` keeps the value as JSON, as membrane keeps arguments
+  that aren't an object. One with no `input` at all is stored with `{}` and
+  no marker, and a marker the block already carries is kept. A block that
+  shares a raw replay form (`rawXml`, `rawItem`) with a mended one gives
+  the form up, as after any edit, so a write stores what a read of the same
+  content gives. Before, such a block was stored as given. Reads mend it
+  the same way in a store written before. They also mend a signed thinking
+  block without its `thinking`, which keeps its signature with
+  `thinking: ''`, as membrane gives a signature-only block, and a
+  `tool_result` whose content is a lone block or a number, which reads as
+  an array of that block or as the number's text.
