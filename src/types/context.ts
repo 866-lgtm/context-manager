@@ -162,8 +162,9 @@ export interface CompileResult {
    * an ingestion). The view may merge auxiliary stores (another namespace's
    * slot), whose messages `getMessage` cannot resolve, so callers that need
    * a body's metadata or content read it here. The map is bound to this
-   * compile: a later edit doesn't show through it. It's transient and isn't
-   * part of the persisted provenance.
+   * compile: a later edit doesn't show through it. Its messages are the
+   * store's own objects, which later compiles read too, so treat them as
+   * read-only. It's transient and isn't part of the persisted provenance.
    */
   rawBodies?: ReadonlyMap<MessageId, readonly StoredMessage[]>;
 }
