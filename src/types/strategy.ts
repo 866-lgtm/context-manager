@@ -1039,6 +1039,15 @@ export interface AutobiographicalConfig {
    *
    * Set to Infinity to disable the cap and surface overflow as a
    * 400 from the API rather than silently dropping oldest memories.
+   *
+   * In the L1 prompt, the raw that pins add (a chunk a pin opens, so its
+   * summary isn't recalled, and a pinned message before the head window) is
+   * spent from this budget first, and recall pairs get the rest. When that
+   * raw alone exceeds the budget, or the request with it exceeds
+   * `compressionContextBudgetTokens`, that compression lays history out as
+   * it would without pins: it recalls the summaries the pins override, and
+   * leaves out pinned history before the head window that no summary
+   * covers. It warns naming the pins; the live view still shows them raw.
    */
   compressionRecallBudgetTokens?: number;
 
@@ -1176,6 +1185,16 @@ export interface AutobiographicalConfig {
    * uses provider-total input plus a positive serialized expansion delta, then
    * adds the output reserve. Zero, partial, or unknown usage contracts retain
    * the conservative bound. Default: 200000.
+   *
+   * It also decides whether an L1 prompt shows pinned history raw: with the
+   * raw that pins add, the canonical request must fit it, priced as the
+   * message store prices the messages it would send (after splitting,
+   * collapsing and dropping unpaired tool blocks, before the image cap,
+   * which only replaces images), with the system prompt, tools and output
+   * reserve. Otherwise that compression lays
+   * history out as it would without pins (see
+   * `compressionRecallBudgetTokens`). A canonical request without pins is
+   * still always attempted.
    */
   compressionContextBudgetTokens?: number;
 
@@ -1557,14 +1576,25 @@ export interface ProtectedRange {
    * Pin-AT-level-k (V2 dynamic pins, `docs/best-fit-frontier-resolution.md` §7).
    * Fix the covered chunks to render at this fold level (0 = raw): the
    * frontier cut passes through the L_k node — neither folded deeper nor
-   * un-folded shallower. A chunk whose summaries stop below k renders at the
-   * deepest it has, and one whose own-lineage summary at k doesn't list it
-   * renders where one does, or raw. When set, this range is NOT a classic
-   * force-raw pin. Takes precedence over `maxLevel`. Omitted → not a
-   * fixed-level pin.
+   * un-folded shallower. Under kv-stable, a chunk whose summaries stop below k
+   * renders at the deepest it has, and one whose own-lineage summary at k
+   * doesn't list it renders where one does, or raw. Takes precedence over
+   * `maxLevel`. Omitted → not a fixed-level pin.
    *
-   * Honored only by the KV-stable controller (`foldingStrategy: 'kv-stable'`);
-   * other strategies fall back to treating the range as raw (a safe superset).
+   * Honored by the folding strategies that read level bounds
+   * (`foldingStrategy: 'kv-stable'` and `'kv-unified'`, with
+   * `adaptiveResolution`). There a level above 0 doesn't keep the range raw:
+   * it is still compressed, since only a summary can supply that level.
+   * Under kv-unified, a pinned level on a message between the head window
+   * and the recent window that no summary supplies yet is a constraint
+   * conflict, and every compile fails until one does. Under
+   * any other selector, and without adaptive resolution, the range is raw (a
+   * safe superset). The canonical L1 compression prompt shows raw what the
+   * configured selector keeps raw, where its budgets allow (see
+   * `compressionRecallBudgetTokens`); it doesn't hold a span at its pinned
+   * level. Where pins overlap at a message, a bound takes a classic pin's
+   * place there, `level` takes `maxLevel`'s, and the lowest of each kind
+   * wins.
    */
   level?: number;
   /**
@@ -1573,7 +1603,7 @@ export interface ProtectedRange {
    * under the window-pressure emergency. `maxLevel: 0` ≡ classic pin-raw.
    * Ignored when `level` is set. Omitted → this pin imposes no depth cap.
    *
-   * Honored only by the KV-stable controller; see `level`.
+   * Honored where `level` is; see `level`.
    */
   maxLevel?: number;
 }

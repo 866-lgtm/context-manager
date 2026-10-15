@@ -194,22 +194,33 @@ export interface PickerChunk {
   currentResolution: number;
   lockedByAgent: boolean;
   bodyGroupId?: string;
+  /**
+   * A pin keeps this chunk raw: never folded. That's a classic pin, a level
+   * or cap of 0, and under a folding strategy that doesn't read level
+   * bounds, every pin. A chunk carries at most one of `pinned`, `pinLevel`
+   * and `pinMaxLevel`, as its pins resolve (the autobiographical strategy's
+   * `resolvedPinBounds`).
+   */
   pinned: boolean;
   /**
-   * V2 dynamic pin — fix this chunk at this fold level (0 = raw). Set from a
-   * `ProtectedRange.level`. Such a chunk is NOT `pinned` (the controller must
-   * be able to move it to its level), but the KV-stable controller holds it
-   * there and never folds/un-folds it. A level deeper than the chunk's summaries
-   * go is clamped to the deepest, and a level whose own-lineage summary doesn't
-   * list the chunk is lowered until one does, or to raw. Ignored by
-   * non-kv-stable solvers.
+   * V2 dynamic pin — fix this chunk at this fold level, above 0 (a level of 0
+   * arrives as `pinned`). Set from a `ProtectedRange.level`, only under the
+   * folding strategies that read it (kv-stable, kv-unified, with adaptive
+   * resolution). Such a chunk is NOT `pinned` (the controller must be able to
+   * move it to its level), but the controller holds it there and never
+   * folds/un-folds it. Under kv-stable, a level deeper than the chunk's
+   * summaries go is clamped to the deepest, and a level whose own-lineage
+   * summary doesn't list the chunk is lowered until one does, or to raw.
    */
   pinLevel?: number;
   /**
-   * V2 dynamic pin — this chunk may fold no deeper than this level (hard cap).
-   * Set from a `ProtectedRange.maxLevel`. Honored only by the KV-stable
-   * controller, throughout the solve — there is no emergency path (design
-   * §13). Ignored elsewhere.
+   * V2 dynamic pin — this chunk may fold no deeper than this level (hard cap),
+   * above 0 (a cap of 0 arrives as `pinned`). Set from a
+   * `ProtectedRange.maxLevel`, only under the folding strategies that read it
+   * (kv-stable, kv-unified, with adaptive resolution), and only when no
+   * `level` applies.
+   * The KV-stable controller honors it throughout the solve — there is no
+   * emergency path (design §13).
    */
   pinMaxLevel?: number;
   /**
