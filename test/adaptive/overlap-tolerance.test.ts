@@ -422,6 +422,21 @@ for (const [kind, previousLevels, targetTokens, warnings, units] of [
   });
 }
 
+// A level carried far above the tree's top: m0 carried at L8, while its only
+// summary is the L1 A. The projection bounds its passes by the deepest level
+// in the frontier as well as the tree's, so the first compile takes m0 all
+// the way to A, and the next compile renders what this one did. Bounded by
+// the tree alone, a strictReach hold emitted L2, which renders raw, and the
+// next compile rendered A with a perturbation of 0 (R1-6).
+test('a level carried far above the tree is projected to a renderable one in a single compile', () => {
+  const { inputs, tree } = store([message('m0', 0, 100, 'A')], [summary('A', 1, ['m0'], 30)]);
+  const params = { ...trio, targetTokens: 30, foldAtTokens: 200, strictReach: true };
+  const first = planControlledFrontier(inputs, tree, { ...params, previous: new Map<ChunkId, number>([['m0', 8]]) });
+  assert.equal(first.resolutions.get('m0'), 1);
+  const second = planControlledFrontier(inputs, tree, { ...params, previous: first.resolutions });
+  assert.deepEqual(unitsOf(renderLayout(inputs, tree, second.resolutions)), unitsOf(renderLayout(inputs, tree, first.resolutions)));
+});
+
 function mulberry32(seed: number): () => number {
   let a = seed;
   return () => {

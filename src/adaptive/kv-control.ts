@@ -279,6 +279,7 @@ function relevanceCut(
   target: number,
   windowTokens: number,
   maxFoldLevel: number,
+  listedBy: Map<string, ReadonlySet<ChunkId>>,
 ): { F: Map<ChunkId, number>; tokens: number } {
   const F = new Map(base);
   const byId = new Map(ordered.map((c) => [c.id, c] as const));
@@ -486,7 +487,7 @@ function relevanceCut(
   // the rule the carried frontier and suffix adoption are projected by.
   const projectionExempt = new Set<ChunkId>();
   for (const [id, cap] of caps) if (cap < 0) projectionExempt.add(id);
-  projectToValidCut(F, tree, ordered, frozen, fixedLevels, projectionExempt);
+  projectToValidCut(F, tree, ordered, frozen, fixedLevels, projectionExempt, listedBy);
   if (_tp) console.error(`[kv-timing] cut-projection ${Date.now() - _tp}ms`);
   // One authoritative render at the end (the ledger tracks it exactly, but the
   // projection may have moved leaves — recompute once, not per move).
@@ -520,7 +521,8 @@ function suffixAdopt(
   frozen: ReadonlySet<ChunkId>,
   fixedLevels: ReadonlyMap<ChunkId, number>,
   P: number,
-  exempt: ReadonlySet<ChunkId> = new Set(),
+  exempt: ReadonlySet<ChunkId>,
+  listedBy: Map<string, ReadonlySet<ChunkId>>,
 ): { F: Map<ChunkId, number>; tokens: number; perturbation: number } {
   const changedSeqs: number[] = [];
   for (const c of ordered) {
@@ -532,7 +534,7 @@ function suffixAdopt(
     for (const c of ordered) {
       if (c.sequence >= boundary) F.set(c.id, ideal.get(c.id) ?? 0);
     }
-    projectToValidCut(F, tree, ordered, frozen, fixedLevels, exempt);
+    projectToValidCut(F, tree, ordered, frozen, fixedLevels, exempt, listedBy);
     const layout = renderLayout(inputs, tree, F);
     return { F, layout, pert: kvCost(prevLayout, layout) };
   };
@@ -627,11 +629,17 @@ function projectToValidCut(
    *  their group's recall (ownership-wins), so they are exempt from the
    *  unanimity requirement — a boundary cutting through a group must not
    *  force the whole group back to raw (boundary-cut tolerance, 2026-07-27). */
-  exempt: ReadonlySet<ChunkId> = new Set(),
+  exempt: ReadonlySet<ChunkId>,
+  /** The leaves each node lists, as sets: the planner's cache, shared by every
+   *  projection of one compile. */
+  listedBy: Map<string, ReadonlySet<ChunkId>>,
 ): void {
-  const maxPasses = (ordered.length + 1) * (maxAvailableLevel(tree) + 2);
-  // The leaves each node lists, as sets, built once per projection.
-  const listedBy = new Map<string, ReadonlySet<ChunkId>>();
+  // Each pass that changes anything lowers some leaf one level, so the deepest
+  // level in F (not only in the tree: a carried level can sit above the
+  // tree's top) bounds the passes, and the result projects to itself.
+  let deepest = maxAvailableLevel(tree);
+  for (const level of F.values()) if (level > deepest) deepest = level;
+  const maxPasses = (ordered.length + 1) * (deepest + 2);
   const lists = (node: { id: string; leafChunkIds: ChunkId[] }, leafId: ChunkId): boolean => {
     let listed = listedBy.get(node.id);
     if (!listed) { listed = new Set(node.leafChunkIds); listedBy.set(node.id, listed); }
@@ -1009,7 +1017,7 @@ function planUnreported(
   for (const c of ordered) {
     if (p.rawZone.has(c.id) || immovable.has(c.id)) boundaryExempt.add(c.id);
   }
-  projectToValidCut(carried, tree, ordered, frozen, fixedLevels, boundaryExempt);
+  projectToValidCut(carried, tree, ordered, frozen, fixedLevels, boundaryExempt, listedBy);
   diagHist('carried(projected)', carried, tree);
   const carriedLayout = renderLayout(inputs, tree, carried);
   const carriedTokens = carriedLayout.totalTokens;
@@ -1034,7 +1042,7 @@ function planUnreported(
   const _t0 = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
   const ideal = relevanceCut(
     inputs, tree, ordered, base, caps, pinCaps, p.rawZone, immovable, frozen, fixedLevels,
-    p.targetTokens, p.windowTokens, maxFoldLevel,
+    p.targetTokens, p.windowTokens, maxFoldLevel, listedBy,
   );
   if (_t0) console.error(`[kv-timing] relevanceCut ${Date.now() - _t0}ms idealTokens=${ideal.tokens}`);
   diagHist('ideal', ideal.F, tree);
@@ -1091,7 +1099,7 @@ function planUnreported(
 
   // 5. Suffix adoption: the ideal's newest changes only, within P.
   const partial = suffixAdopt(
-    inputs, tree, ordered, carried, carriedLayout, ideal.F, frozen, fixedLevels, P, boundaryExempt,
+    inputs, tree, ordered, carried, carriedLayout, ideal.F, frozen, fixedLevels, P, boundaryExempt, listedBy,
   );
   const partialLoss = relevanceLoss(partial.F, ordered, p.rawZone, caps);
   // Progress guard: when a shed is REQUIRED (carried over foldAt), a partial
