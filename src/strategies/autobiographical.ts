@@ -904,6 +904,27 @@ function isContentFilterError(error: unknown): boolean {
   );
 }
 
+/**
+ * A provider failure that is transient at ACCOUNT scale: a rate limit, or
+ * credit/quota exhaustion (402 `insufficient_credits` from VoidAI/OpenRouter,
+ * 429 `insufficient_quota` from OpenAI). The identical request succeeds once
+ * the window resets or credits refill, so it must never spend a merge's
+ * bounded attempt budget or a chunk's fallback rungs — those budgets exist for
+ * answers that would come back the same every time. Read from membrane's
+ * classification (`rate_limit`) and, defensively, from the raw 402 shape:
+ * membranes without the 402 classification report it as `unknown,
+ * retryable: false` (2026-10-15: an L3 merge burned all five attempts
+ * inside one second and went to quarantine on a credit dip that cleared two
+ * minutes later).
+ */
+export function isTransientAccountError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const e = error as { type?: unknown; httpStatus?: unknown; message?: unknown };
+  if (e.type === 'rate_limit' || e.httpStatus === 402) return true;
+  const msg = typeof e.message === 'string' ? e.message.toLowerCase() : '';
+  return /insufficient[_ ](?:credits|quota)|payment[_ ]required|(?:^|error:\s*)402\b/.test(msg);
+}
+
 function isCarrierTransportRejection(error: unknown): boolean {
   const e = error as { httpStatus?: number; type?: string; message?: string };
   const msg = (e?.message ?? '').toLowerCase();
@@ -1196,7 +1217,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!canEscalate || !isContentFilterError(error)) throw error;
       try {
         return await escalate(`content_filter_error: ${String(error).slice(0, 160)}`);
-      } catch {
+      } catch (escalationError) {
+        // The escalation never got an answer: report THAT, not the original
+        // refusal, so the caller's retry policy sees a transient failure.
+        if (isTransientAccountError(escalationError)) throw escalationError;
         throw error;
       }
     }
@@ -4697,6 +4721,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.recordMergeRejection(merge, error);
           return;
         }
+        // Account-scale transients (rate limit, 402 credit exhaustion) take
+        // the rethrow path whatever retryable flag the membrane attached:
+        // the identical request succeeds once credits refill, so spending
+        // the attempt budget on them quarantines a healthy merge.
+        if (isTransientAccountError(error)) throw error;
         // A NON-RETRYABLE provider error (membrane retryable:false — e.g.
         // context_length, invalid_request) is deterministic: the identical
         // request fails identically on every tick, and the rethrow path
@@ -6534,6 +6563,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
           } catch (error) {
             if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+            // A rung that never got an answer (rate limit / 402 credits) is
+            // not a rung outcome: abort the family and let the next tick
+            // retry, rather than exhausting it into quarantine.
+            if (isTransientAccountError(error)) throw error;
             const errorType = error && typeof error === 'object' && 'type' in error
               ? String((error as { type: unknown }).type)
               : error instanceof Error ? error.name : typeof error;
@@ -6624,6 +6657,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             );
           } catch (error) {
             if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+            // Account-scale transient: abort the family, retry next tick.
+            if (isTransientAccountError(error)) throw error;
             if (!this.isCompressionBranchCurrent(sourceBranch)) {
               this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:error`, quarantineRecord);
               throw Object.assign(new Error('Compression error crossed a branch boundary'), {
@@ -6742,6 +6777,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
           } catch (error) {
             if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+            // Account-scale transient: abort the family, retry next tick.
+            if (isTransientAccountError(error)) throw error;
             const errorType = error && typeof error === 'object' && 'type' in error
               ? String((error as { type: unknown }).type)
               : error instanceof Error ? error.name : typeof error;
@@ -6844,6 +6881,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             } catch (error) {
               attempted.errors++;
               if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
+              // Account-scale transient: abort the family, retry next tick.
+              if (isTransientAccountError(error)) throw error;
               abortReason = `provider-error:${error instanceof Error ? error.name : typeof error}`;
               return false;
             }
