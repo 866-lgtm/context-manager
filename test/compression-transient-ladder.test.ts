@@ -1836,6 +1836,73 @@ describe('the quarantine names each stuck span once, with its messages and age',
     fx.manager.close();
   });
 
+  it('after a reopen the line shows the same "refusing since" and counts, and the exhausted span is not asked again', async () => {
+    const path = freshPath();
+    const hours = (n: number): number => n * 3_600_000;
+    // The canonical is rejected, then source-only-final is refused: the family exhausts with two answers.
+    const first = scripted([{ throw: failure('invalid_request', { httpStatus: 400 }) }, REFUSAL]);
+    const a = await build(first.membrane, { sourceOnlyFallback: true, path });
+    // The chunk closed four hours ago, and its family exhausted three hours ago.
+    const closedAt = new Date(Date.now() - hours(4));
+    const want = new Set(a.ids.slice(10));
+    const agedChunk = (fx: Awaited<ReturnType<typeof build>>): Chunk => ({
+      index: 999, startIndex: 10, endIndex: 13, tokens: 100, compressed: false,
+      messages: managerContext(fx.manager).messageStore.getAll().filter((m) => want.has(m.id)).map((m) => ({ ...m, timestamp: closedAt })),
+    });
+    const chunk = agedChunk(a);
+    a.strategy.adopt(chunk);
+    // A real chunk has a persisted raw record, and the paid-off sweep keeps a quarantine only against one.
+    (a.strategy as unknown as { appendChunkRecord(record: unknown): void })
+      .appendChunkRecord({ id: 'c-zz-reopen', sourceIds: chunk.messages.map((m) => m.id), compressed: false });
+    const realNow = Date.now;
+    const from = realNow() - hours(3);
+    Date.now = () => realNow() - hours(3);
+    try {
+      await a.strategy.run(chunk, managerContext(a.manager));
+    } finally {
+      Date.now = realNow;
+    }
+    const to = Date.now() - hours(3);
+    assert.equal(first.calls.length, 2);
+    const lineOf = async (fx: Awaited<ReturnType<typeof build>>): Promise<string> => {
+      (fx.strategy as unknown as { config: { quarantineAlarmIntervalMs: number } }).config.quarantineAlarmIntervalMs = 15 * 60_000;
+      const lines: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+      try {
+        await fx.strategy.klaxon();
+      } finally {
+        console.error = error;
+      }
+      const alarm = lines.find((line) => line.startsWith('[compression-quarantine] ⚠️'));
+      assert.ok(alarm, `the klaxon sounded: ${lines.join(' | ')}`);
+      return alarm!;
+    };
+    const before = a.strategy.getCompressionQuarantineStatus().spans;
+    assert.equal(before.length, 1);
+    assert.ok(before[0]!.quarantinedAt >= from && before[0]!.quarantinedAt <= to, 'refusing since its record was made, three hours ago, not since now');
+    const figures = `${a.ids[10]}..${a.ids[12]} (closed 4.0 h ago, refusing since ${new Date(before[0]!.quarantinedAt).toISOString().slice(0, 16)}Z, 1 record, 2 answered, last refusal)`;
+    const lineBefore = await lineOf(a);
+    assert.ok(lineBefore.includes(figures), lineBefore);
+    a.manager.close();
+
+    const second = scripted([OK('a summary nobody should ask for')]);
+    const b = await build(second.membrane, { sourceOnlyFallback: true, path });
+    b.strategy.adopt(agedChunk(b));
+    const after = b.strategy.getCompressionQuarantineStatus().spans;
+    assert.deepEqual(
+      after.map((span) => [span.chunkSourceHash, span.quarantinedAt, span.records, span.answeredAttempts, span.latestOutcome]),
+      before.map((span) => [span.chunkSourceHash, span.quarantinedAt, span.records, span.answeredAttempts, span.latestOutcome]),
+      'the durable figures read back unchanged',
+    );
+    const lineAfter = await lineOf(b);
+    assert.ok(lineAfter.includes(figures), lineAfter);
+    await b.strategy.run(agedChunk(b), managerContext(b.manager));
+    assert.equal(second.calls.length, 0, 'the exhausted span is not asked again after the reopen');
+    assert.equal(b.strategy.getCompressionQuarantineStatus().spans.length, 1, 'and it is still quarantined');
+    b.manager.close();
+  });
+
   it('lists the longest-waiting span first', async () => {
     const mock = scripted([{ throw: failure('invalid_request', { httpStatus: 400 }) }]);
     const fx = await build(mock.membrane);
