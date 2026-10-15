@@ -598,15 +598,16 @@ function suffixAdopt(
  * is unanimous. Monotone (only lowers) → terminates. Any budget breach from the
  * extra raw is re-folded whole-group by the shed pass that runs afterward.
  *
- * Pinned (`fixedLevels`) and frozen (locked) leaves are already made
- * group-consistent by the caller (pin-at-level fixes a whole node's leaves), so
- * they are held here rather than lowered.
+ * Pinned (`fixedLevels`) and frozen (locked) leaves are held here rather than
+ * lowered: pin-at-level fixes a whole node's leaves at its level, and a lock
+ * keeps its carried level. The base sets both (renderableLevel).
  *
  * A leaf renders at its level through its own lineage there, so it stays only
  * where that node lists it. A level carried from before the tree's links
- * changed can point through a summary that no longer lists the leaf, which
- * would leave the leaf in no recall, so it is lowered. A held leaf gets the
- * same clamp where the base sets its level (renderableLevel).
+ * changed can point through a summary that no longer lists the leaf, and on a
+ * non-nested tree a fresh plan's passes can leave a leaf at such a level too.
+ * The recall the leaf renders through there wouldn't hold it, so it is lowered.
+ * The base lowers a held leaf's level the same way.
  *
  * A leaf the node lists vetoes its unanimity only when it renders in more
  * detail than the node, below the node's level, and the node is its own
@@ -703,9 +704,9 @@ function projectToValidCut(
 
 /**
  * A held level, lowered while the summary of the chunk's own lineage there
- * exists but doesn't list the chunk: rendered through it, the chunk would be in
- * no recall. A level with no such summary is kept, since the renderer renders
- * it raw.
+ * exists but doesn't list the chunk: the recall the chunk renders through
+ * wouldn't hold it. A level with no such summary is kept, since the renderer
+ * renders it raw.
  */
 function renderableLevel(tree: SummaryTree, chunkId: ChunkId, level: number): number {
   let k = level;

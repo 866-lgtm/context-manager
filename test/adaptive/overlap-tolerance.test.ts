@@ -434,6 +434,46 @@ function randomNonNested(rng: () => number): {
   };
 }
 
+// A store's links can change between compiles, as when a summary is written
+// again without one of its sources while its children still point at it. On
+// each tree: plan, take one source from a summary that has two or more, and
+// plan again from the first plan's levels on the changed tree.
+test('after a summary loses a source between compiles, every leaf renders through a summary that lists it', () => {
+  const rng = mulberry32(2);
+  let stale = 0;
+  for (let t = 0; t < 300; t++) {
+    const { inputs, tree, params, corruptions } = randomNonNested(rng);
+    const { result: first } = quietOverlap(() =>
+      planControlledFrontier(inputs, tree, { ...params, reachTokens: params.windowTokens, previous: new Map() }));
+    const relinkable = [...inputs.summaries.values()].filter((s) => s.sourceIds.length >= 2);
+    if (relinkable.length === 0) continue;
+    const s = relinkable[Math.floor(rng() * relinkable.length)];
+    const sourceIds = s.sourceIds.slice(0, -1);
+    const summaries = new Map(inputs.summaries);
+    summaries.set(s.id, { ...s, sourceIds, sourceRange: { first: sourceIds[0], last: sourceIds[sourceIds.length - 1] } });
+    const changed: PickerInputs = { ...inputs, summaries };
+    const after = new SummaryTree(changed);
+    // The first plan's levels on the changed tree: does one now point through
+    // a summary that doesn't list its leaf? (The test needs such trees.)
+    if (changed.chunks.some((c) => {
+      const level = first.resolutions.get(c.id) ?? 0;
+      const node = level > 0 ? after.ancestorAt(c.id, level) : null;
+      return node !== null && !node.leafChunkIds.includes(c.id);
+    })) stale++;
+    const { result: second } = quietOverlap(() =>
+      planControlledFrontier(changed, after, { ...params, reachTokens: params.windowTokens, previous: first.resolutions }));
+    for (const c of changed.chunks) {
+      const level = second.resolutions.get(c.id) ?? 0;
+      const node = level > 0 ? after.ancestorAt(c.id, level) : null;
+      if (node) {
+        assert.ok(node.leafChunkIds.includes(c.id),
+          `tree ${t} (${corruptions.join('; ')}; ${s.id} lost ${s.sourceIds[s.sourceIds.length - 1]}): ${c.id} at L${level} renders through a summary that lists it`);
+      }
+    }
+  }
+  assert.ok(stale >= 30, `${stale} of 300 trees carried a level through a summary that no longer lists its leaf`);
+});
+
 test('on unchanged inputs, each plan reports its change from the last plan, and an adopted ideal cut stays put', () => {
   const sameLevels = (a: ReadonlyMap<ChunkId, number>, b: ReadonlyMap<ChunkId, number>): boolean =>
     a.size === b.size && [...a].every(([id, level]) => (b.get(id) ?? 0) === level);
