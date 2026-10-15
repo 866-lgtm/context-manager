@@ -16,6 +16,7 @@ import type {
   AutobiographicalConfig,
   AutobiographicalOptions,
   CompressionQuarantineStatus,
+  CompressionQuarantineSpan,
   SummaryLevel,
   SummaryEntry,
   ProtectedRange,
@@ -268,6 +269,23 @@ function nextFailureStreak(
  */
 function chunkRunKey(runSubject: string, curveLabel: string, stripped: boolean): string {
   return sha256Json({ runSubject, curveLabel, stripped });
+}
+
+/**
+ * When a chunk closed: the newest of its messages' timestamps, in ms. A live
+ * message carries a Date and a serialized one a number, which may be in µs.
+ * Undefined when no message carries a timestamp.
+ */
+function chunkClosedAtMs(messages: readonly unknown[]): number | undefined {
+  let newest: number | undefined;
+  for (const message of messages) {
+    const t = (message as { timestamp?: number | Date }).timestamp;
+    const raw = t instanceof Date ? t.getTime() : typeof t === 'number' ? t : undefined;
+    if (raw === undefined) continue;
+    const ms = raw > 1e14 ? raw / 1000 : raw;
+    if (newest === undefined || ms > newest) newest = ms;
+  }
+  return newest;
 }
 
 /**
@@ -3910,19 +3928,71 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.store.compactState(this.compressionRefusalQuarantineLedgerStateId);
   }
 
+  /** How many quarantine records exist, for a health read that needs only the count. Never throws. */
+  private compressionQuarantineRecordCount(): number {
+    if (!this.store) return 0;
+    try {
+      return this.readCompressionQuarantineProjection().size;
+    } catch {
+      return 0;
+    }
+  }
+
   /**
    * Public quarantine status for health surfaces (/healthz, fleet-watch,
    * connectome-doctor) and the repeating alarm below.
    */
-  getCompressionQuarantineStatus(): CompressionQuarantineStatus {
-    if (!this.store) return { count: 0, keys: [] };
+  getCompressionQuarantineStatus(now: number = Date.now()): CompressionQuarantineStatus {
+    if (!this.store) return { count: 0, keys: [], spans: [] };
     try {
       const projection = this.readCompressionQuarantineProjection();
-      return { count: projection.size, keys: [...projection.keys()] };
+      if (projection.size === 0) return { count: 0, keys: [], spans: [] };
+      // A span can hold one record per request shape it exhausted
+      // (CHUNK_QUARANTINE_SHAPE_CAP), so records overstate how many spans are
+      // stuck. Each span is named by the current chunk with its message ids,
+      // and dated by its messages, so a span re-cut into a new chunk keeps
+      // its age.
+      const chunksByHash = new Map(
+        this.chunks.map((chunk) => [sha256Json(chunk.messages.map((message) => message.id)), chunk] as const),
+      );
+      const spans = new Map<string, CompressionQuarantineSpan>();
+      const newest = new Map<string, number>();
+      for (const active of projection.values()) {
+        const hash = active.record.chunkSourceHash;
+        let span = spans.get(hash);
+        if (!span) {
+          const chunk = chunksByHash.get(hash);
+          const closedAt = chunk ? chunkClosedAtMs(chunk.messages) : undefined;
+          span = {
+            chunkSourceHash: hash,
+            firstMessageId: chunk?.messages[0]?.id ?? null,
+            lastMessageId: chunk?.messages[chunk.messages.length - 1]?.id ?? null,
+            ageMs: closedAt === undefined ? null : Math.max(0, now - closedAt),
+            quarantinedAt: active.record.created,
+            records: 0,
+            answeredAttempts: 0,
+            latestOutcome: null,
+          };
+          spans.set(hash, span);
+        }
+        span.records += 1;
+        span.answeredAttempts += active.outcomes.length;
+        span.quarantinedAt = Math.min(span.quarantinedAt, active.record.created);
+        const last = active.outcomes[active.outcomes.length - 1];
+        if (last && active.record.created >= (newest.get(hash) ?? -Infinity)) {
+          newest.set(hash, active.record.created);
+          span.latestOutcome = last.errorType ? `${last.outcome}:${last.errorType}` : last.outcome;
+        }
+      }
+      return {
+        count: projection.size,
+        keys: [...projection.keys()],
+        spans: [...spans.values()].sort((a, b) => (b.ageMs ?? -1) - (a.ageMs ?? -1)),
+      };
     } catch {
       // Health reads must never throw — a broken projection is itself a
       // problem, but not one to surface by crashing the caller.
-      return { count: 0, keys: [] };
+      return { count: 0, keys: [], spans: [] };
     }
   }
 
@@ -3988,11 +4058,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
     this.quarantineAlarmActive = true;
     this.quarantineAlarmLastAt = now;
+    // The age is since the span's chunk closed, not since its first
+    // quarantine, so the line says which.
+    const age = (ms: number | null): string =>
+      ms === null ? 'close time unknown'
+        : `closed ${ms >= 3_600_000 ? `${(ms / 3_600_000).toFixed(1)} h` : `${Math.round(ms / 60_000)} min`} ago`;
+    const spans = status.spans.map((span) =>
+      `${span.firstMessageId ?? '?'}..${span.lastMessageId ?? '?'} (${age(span.ageMs)}, ` +
+        `${span.records} record${span.records === 1 ? '' : 's'}, ${span.answeredAttempts} answered` +
+        `${span.latestOutcome ? `, last ${span.latestOutcome}` : ''})`,
+    );
     console.error(
-      `[compression-quarantine] ⚠️ ${status.count} chunk(s) in compression quarantine — ` +
-        `their spans stay raw and WILL eventually exhaust the context budget. ` +
+      `[compression-quarantine] ⚠️ ${status.spans.length} span(s) in compression quarantine ` +
+        `(${status.count} record(s)) — their spans stay raw and WILL eventually exhaust the context budget. ` +
         `Operator action required (inspect refusing content; branch, pin, or clear). ` +
-        `keys=${status.keys.map(k => k.slice(0, 12)).join(',')}`,
+        `spans: ${spans.join('; ')}. keys=${status.keys.map(k => k.slice(0, 12)).join(',')}`,
     );
     try {
       this.onQuarantineAlarm?.(status);
@@ -6483,20 +6563,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // chunks held Date timestamps — the staleness detector (degraded>1h,
         // critical>6h) was dead code in production and `healthy` was
         // unearned (production signature 2026-08-29: pendingChunks>0,
-        // age=null, state=healthy). Accept both shapes.
-        const ts = c.messages
-          .map((m) => {
-            const t = (m as unknown as { timestamp?: number | Date }).timestamp;
-            return t instanceof Date ? t.getTime() : typeof t === 'number' ? t : undefined;
-          })
-          .filter((t): t is number => typeof t === 'number');
-        if (!ts.length) continue;
-        const closedAt = toMs(Math.max(...ts));
+        // age=null, state=healthy). chunkClosedAtMs accepts both shapes.
+        const closedAt = chunkClosedAtMs(c.messages);
+        if (closedAt === undefined) continue;
         const age = now - closedAt;
         if (oldestPendingAgeMs === null || age > oldestPendingAgeMs) oldestPendingAgeMs = age;
       }
       const mergeQuarantineCount = this.mergeQuarantine.size;
-      const compressionQuarantineCount = this.getCompressionQuarantineStatus().count;
+      const compressionQuarantineCount = this.compressionQuarantineRecordCount();
       const quarantines = mergeQuarantineCount + compressionQuarantineCount;
       const mints = this.summaries
         .map((s) => s.created)

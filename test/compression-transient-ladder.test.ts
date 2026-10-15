@@ -62,6 +62,9 @@ class ProbeStrategy extends AutobiographicalStrategy {
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> { return this.compressChunkHierarchical(chunk, ctx); }
   summariesView(): SummaryEntry[] { return [...this.summaries]; }
   chunksView(): Chunk[] { return [...this.chunks]; }
+  /** Make a chunk the strategy's own, as its chunking would. */
+  adopt(chunk: Chunk): void { this.chunks.push(chunk); }
+  klaxon(): Promise<void> { return (this as unknown as { soundQuarantineAlarmIfNeeded(): Promise<void> }).soundQuarantineAlarmIfNeeded(); }
   compressionQueueView(): number[] { return [...this.compressionQueue]; }
   setCompressionModel(model: string): void { this.config.compressionModel = model; }
   private lanePause(): RawPause | null {
@@ -2222,6 +2225,87 @@ describe('a window wait after a branch switch ends the scan (cm138-r4 I14)', () 
     };
     await fx.strategy.tick(managerContext(fx.manager));
     assert.equal(attempts, 1, 'the scan ended at the switch');
+    fx.manager.close();
+  });
+});
+
+describe('the quarantine names each stuck span once, with its messages and age', () => {
+  it('two exhausted shapes of one chunk are one span: two records, its first and last message, its age and the answers paid for', async () => {
+    const rejected = { throw: failure('invalid_request', { httpStatus: 400 }) };
+    // Each shape pays its canonical, then its source-only rung: the first shape is rejected twice, the second refused twice.
+    const mock = scripted([rejected, rejected, REFUSAL, REFUSAL]);
+    const fx = await build(mock.membrane, { sourceOnlyFallback: true });
+    const chunk = fx.target();
+    fx.strategy.adopt(chunk);
+    await fx.strategy.run(chunk, managerContext(fx.manager));
+    // Another model is another request shape for the same span: it earns a fresh bounded family.
+    fx.strategy.setCompressionModel('zz-other-model');
+    await fx.strategy.run(chunk, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 4, 'two rungs per shape');
+
+    const status = fx.strategy.getCompressionQuarantineStatus();
+    const created = (fx.strategy as unknown as { readCompressionQuarantineProjection(): Map<string, { record: { created: number } }> })
+      .readCompressionQuarantineProjection();
+    assert.equal(status.count, 2, 'a record per shape');
+    assert.equal(status.spans.length, 1, 'one span');
+    const [span] = status.spans;
+    assert.equal(span!.chunkSourceHash, createHash('sha256').update(JSON.stringify(fx.ids.slice(10))).digest('hex'));
+    assert.equal(span!.firstMessageId, fx.ids[10]);
+    assert.equal(span!.lastMessageId, fx.ids[12]);
+    assert.equal(span!.records, 2);
+    assert.equal(span!.answeredAttempts, 4, 'each record holds both of its answers');
+    assert.ok(span!.ageMs !== null && span!.ageMs >= 0 && span!.ageMs < 60_000, `aged from its messages: ${span!.ageMs}`);
+    assert.equal(span!.latestOutcome, 'refusal', "the newest record's last answer, not the oldest's");
+    assert.equal(span!.quarantinedAt, Math.min(...[...created.values()].map((active) => active.record.created)), 'refused since its earliest record');
+
+    // The fixture turns the klaxon off; turn it on for this one sound.
+    (fx.strategy as unknown as { config: { quarantineAlarmIntervalMs: number } }).config.quarantineAlarmIntervalMs = 15 * 60_000;
+    const lines: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      await fx.strategy.klaxon();
+    } finally {
+      console.error = error;
+    }
+    const alarm = lines.find((line) => line.startsWith('[compression-quarantine] ⚠️'));
+    assert.ok(alarm, `the klaxon sounded: ${lines.join(' | ')}`);
+    assert.match(alarm!, /⚠️ 1 span\(s\) in compression quarantine \(2 record\(s\)\)/);
+    assert.ok(alarm!.includes(`${fx.ids[10]}..${fx.ids[12]} (closed 0 min ago, 2 records, 4 answered, last refusal)`), alarm);
+    fx.manager.close();
+  });
+
+  it('lists the span whose chunk closed first first', async () => {
+    const mock = scripted([{ throw: failure('invalid_request', { httpStatus: 400 }) }]);
+    const fx = await build(mock.membrane);
+    const recent = fx.target();
+    // An earlier chunk, closed an hour before: its messages carry older timestamps.
+    const hourAgo = new Date(Date.now() - 3_600_000);
+    const want = new Set(fx.ids.slice(2, 5));
+    const older: Chunk = {
+      index: 998, startIndex: 2, endIndex: 5, tokens: 100, compressed: false,
+      messages: managerContext(fx.manager).messageStore.getAll().filter((m) => want.has(m.id)).map((m) => ({ ...m, timestamp: hourAgo })),
+    };
+    fx.strategy.adopt(recent);
+    fx.strategy.adopt(older);
+    await fx.strategy.run(recent, managerContext(fx.manager));
+    await fx.strategy.run(older, managerContext(fx.manager));
+    const spans = fx.strategy.getCompressionQuarantineStatus().spans;
+    assert.deepEqual(spans.map((span) => span.firstMessageId), [fx.ids[2], fx.ids[10]], 'the longest waiting first');
+    assert.ok(spans[0]!.ageMs! >= 3_600_000);
+    fx.manager.close();
+  });
+
+  it('a span no current chunk has is still counted once, unnamed and undated', async () => {
+    const mock = scripted([{ throw: failure('invalid_request', { httpStatus: 400 }) }]);
+    const fx = await build(mock.membrane);
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    const status = fx.strategy.getCompressionQuarantineStatus();
+    assert.equal(status.count, 1);
+    assert.deepEqual(
+      status.spans.map((span) => [span.firstMessageId, span.lastMessageId, span.ageMs, span.records]),
+      [[null, null, null, 1]],
+    );
     fx.manager.close();
   });
 });

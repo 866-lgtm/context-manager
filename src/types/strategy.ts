@@ -671,8 +671,39 @@ export function isRenderStatsCapable(s: ContextStrategy): s is RenderStatsCapabl
  * Public quarantine status shape (health surfaces + the repeating alarm).
  */
 export interface CompressionQuarantineStatus {
+  /** Quarantine records: one per request shape a span exhausted, so a span can hold several. */
   count: number;
+  /** The records' keys, as `clearCompressionRefusalQuarantine()` takes them. */
   keys: string[];
+  /** The quarantined spans, each once however many records it holds, the longest waiting first. */
+  spans: CompressionQuarantineSpan[];
+}
+
+/** One quarantined span: a chunk's messages, which stay raw while it's quarantined. */
+export interface CompressionQuarantineSpan {
+  /** The span's identity: the hash of its chunk's message ids. */
+  chunkSourceHash: string;
+  /** Its first and last message ids; null when no current chunk has this span. */
+  firstMessageId: string | null;
+  lastMessageId: string | null;
+  /** How long since its chunk closed, from the newest of its messages' timestamps; null when unknown. */
+  ageMs: number | null;
+  /**
+   * When its earliest record was made (ms since the epoch): how long it has
+   * been refused, where `ageMs` is how long it has stayed raw. A re-cut
+   * chunk's records start over.
+   */
+  quarantinedAt: number;
+  /** Its quarantine records, one per request shape it exhausted. */
+  records: number;
+  /** Requests those records hold an answer for: each was paid for, and none gave a summary. */
+  answeredAttempts: number;
+  /**
+   * The newest record's last answer: its outcome, with the error type after a
+   * colon when the provider refused the request (`refusal`, `incomplete`,
+   * `provider_error:invalid_request`); null when the record holds none.
+   */
+  latestOutcome: string | null;
 }
 
 /** Delimiter convention applied to recall answer content. See `recallEnvelope`. */
