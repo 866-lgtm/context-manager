@@ -22,3 +22,21 @@
   same way, so a lock or a pin can now render below the level it holds when
   the summary there doesn't list the leaf. A held level with no summary at
   all is kept, as before, and renders raw.
+- kv-stable: on a store whose summary tree isn't nested, the solve's
+  un-fold pass now moves the leaves a summary renders, decided by each
+  leaf's own lineage as the projection decides. It used to leave out any
+  leaf that some fold in the same compile had met under another lineage,
+  and could then settle on a plan above `foldAt`, the same on every
+  compile.
+- kv-stable: `[kv-overlap]` now reports what the plan renders: it warns on
+  every compile whose plan renders a summary over a leaf of another
+  lineage, and only then. It used to report the folds the compile made, so
+  a plan that kept the carried folds could render the overlap without a
+  warning, and a plan that didn't render it could still warn.
+- kv-stable: a locked chunk with a pin-max-level is lowered to the cap at
+  plan start, as the cap promises. It used to keep its carried level above
+  the cap.
+- kv-stable: a level carried far above the summary tree's top is now
+  lowered in one compile to a level its summaries render. A plan that held
+  it could emit a level with no summary, which renders raw, and the next
+  compile then rendered the summary while reporting a perturbation of 0.
