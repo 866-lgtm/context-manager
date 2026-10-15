@@ -616,10 +616,10 @@ export interface RenderStats {
      *  'flat-profile'). Surfaces the policy actually in force — a config
      *  clobber that silently downgrades the solver is invisible without it. */
     solver?: string;
-    /** Which chunks moved between which levels and where in the carried
-     *  layout the first change landed (the prompt-cache re-read for the
-     *  turn). Present only when the adaptive picker changed at least one
-     *  resolution on a non-dry-run compile. */
+    /** Which chunks moved between which levels and where in the previous
+     *  request's layout the first change landed (the prompt-cache re-read
+     *  for the turn). Present only when the adaptive picker changed at least
+     *  one resolution on a non-dry-run compile that committed. */
     foldDiff?: FoldDiff;
   };
 }

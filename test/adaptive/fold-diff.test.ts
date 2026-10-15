@@ -165,3 +165,142 @@ test('fold-diff: a new layout that is a strict prefix of the carried one is repo
   assert.match(formatFoldDiff(d), /divergence@0k suffix=0k/);
   assert.doesNotMatch(formatFoldDiff(d), /layout unchanged/);
 });
+
+/** The same chronicle's inputs with some chunks pinned and/or locked. */
+function withFlags(
+  inputs: PickerInputs,
+  flags: { pinned?: ChunkId[]; locked?: ChunkId[] },
+): PickerInputs {
+  const pinned = new Set(flags.pinned ?? []);
+  const locked = new Set(flags.locked ?? []);
+  return {
+    ...inputs,
+    chunks: inputs.chunks.map((c) => ({
+      ...c,
+      pinned: c.pinned || pinned.has(c.id),
+      lockedByAgent: c.lockedByAgent || locked.has(c.id),
+    })),
+  };
+}
+
+test('fold-diff: a pinned chunk carried at L1 that the solver puts at 0 is not a move (review repro)', () => {
+  // The review's line: `moves=1 (deepened=0 raised=1) … layout unchanged
+  // runs=1: L1→L0×1@0k[c-0008]`. The pinned chunk renders raw on both sides,
+  // so from/to are both its effective level 0.
+  const ch = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
+  const pinnedId = ch.chunks[8].id;
+  const inputs = withFlags(inputsOf(ch), { pinned: [pinnedId] });
+  const tree = new SummaryTree(inputs);
+  const prev = new Map<ChunkId, number>([[pinnedId, 1]]);
+  const next = new Map<ChunkId, number>();
+  const d = describeFoldDiff(inputs, tree, prev, next);
+  assert.equal(d.moves, 0);
+  assert.equal(d.raised, 0);
+  assert.deepEqual(d.runs, []);
+  assert.equal(d.divergenceOffset, null);
+  const line = formatFoldDiff(d);
+  assert.match(line, /moves=0 .*layout unchanged/);
+  assert.doesNotMatch(line, /c-0008/);
+});
+
+test('fold-diff: a level whose summary is missing renders raw and is not a move', () => {
+  const ch = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
+  const inputs = inputsOf(ch);
+  const tree = new SummaryTree(inputs);
+  const orphan = ch.chunks[6].id;
+  assert.equal(tree.ancestorAt(orphan, 5), null, 'fixture: no L5 exists');
+  const d = describeFoldDiff(inputs, tree, new Map(), new Map([[orphan, 5]]));
+  assert.equal(d.moves, 0);
+  assert.equal(d.divergenceOffset, null);
+});
+
+test('fold-diff: locked chunks are skipped in counts and runs, as the commit loop skips them', () => {
+  const ch = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
+  const lockedId = ch.chunks[2].id;
+  const inputs = withFlags(inputsOf(ch), { locked: [lockedId] });
+  const tree = new SummaryTree(inputs);
+  // Everything raw → everything at L1. The locked chunk "moves" too in the
+  // solver's map, but its carried level is never committed.
+  const prev = new Map<ChunkId, number>();
+  const next = new Map<ChunkId, number>(ch.chunks.map((c) => [c.id, 1]));
+  const d = describeFoldDiff(inputs, tree, prev, next);
+  assert.equal(d.moves, 11);
+  assert.deepEqual(
+    d.runs.map((r) => [r.firstChunkId, r.lastChunkId, r.count]),
+    [
+      [ch.chunks[0].id, ch.chunks[1].id, 2],
+      [ch.chunks[3].id, ch.chunks[11].id, 9],
+    ],
+    'the locked chunk splits the run and is not counted',
+  );
+  // The layouts still diverge where they do: the solver's level renders.
+  assert.equal(d.divergenceOffset, 0);
+});
+
+test('fold-diff: a pinned AND locked chunk never reports a phantom move', () => {
+  const ch = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
+  const id = ch.chunks[8].id;
+  const inputs = withFlags(inputsOf(ch), { pinned: [id], locked: [id] });
+  const tree = new SummaryTree(inputs);
+  const d = describeFoldDiff(inputs, tree, new Map([[id, 1]]), new Map());
+  assert.equal(d.moves, 0);
+  assert.equal(d.divergenceOffset, null);
+});
+
+test('fold-diff: offsetBefore of a chunk inside a pair is the pair start, not the divergence', () => {
+  // All 36 at L1 (six pairs). Raise chunk 9 out of the second pair; its
+  // siblings stay folded, so the pair still renders and the layouts diverge
+  // after it.
+  const ch = buildChronicleWithChain({ chunkCount: 36, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
+  const inputs = inputsOf(ch);
+  const tree = new SummaryTree(inputs);
+  const prev = new Map<ChunkId, number>(ch.chunks.map((c) => [c.id, 1]));
+  const next = new Map<ChunkId, number>(prev);
+  next.set(ch.chunks[9].id, 0);
+  const d = describeFoldDiff(inputs, tree, prev, next);
+  assert.equal(d.runs.length, 1);
+  assert.equal(d.runs[0].offsetBefore, 200);
+  assert.equal(d.divergenceOffset, 400);
+});
+
+test('fold-diff: a kept previous layout shows a pin added since the last request', () => {
+  // Last request: chunk 8 unpinned at L1, rendered through its L1 pair.
+  // This compile: chunk 8 pinned (raw), solver puts it at 0. Re-rendering the
+  // carried frontier with THIS compile's pins sees raw on both sides; the
+  // kept layout shows where the cache prefix actually breaks.
+  const ch = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
+  const pinnedId = ch.chunks[8].id;
+  const before = inputsOf(ch);
+  const now = withFlags(before, { pinned: [pinnedId] });
+  const tree = new SummaryTree(now);
+  const carried = new Map<ChunkId, number>([[pinnedId, 1]]);
+  const sent = renderLayout(before, new SummaryTree(before), carried);
+
+  const reRendered = describeFoldDiff(now, tree, carried, new Map());
+  assert.equal(reRendered.divergenceOffset, null, 'fallback cannot see the pin change');
+
+  const d = describeFoldDiff(now, tree, carried, new Map(), { previousLayout: sent });
+  assert.equal(d.moves, 0, 'from/to are effective levels under this compile’s pins');
+  assert.equal(d.previousTokens, sent.totalTokens);
+  // Chunks 0..7 raw, then the L1 pair replaced chunk 8's raw unit.
+  assert.equal(d.divergenceOffset, 8 * 1000);
+  assert.equal(d.suffixTokens, 4 * 1000);
+});
+
+test('fold-diff: against a kept previous layout, appended messages diverge at the old end', () => {
+  // The last request held chunks 0..9, all raw. This compile has 0..11 and
+  // folds new chunk 11 straight to L1.
+  const ch = buildChronicleWithChain({ chunkCount: 12, tokensPerChunk: 1000, mergeThreshold: 6, recallPairTokens: 200 });
+  const older = { ...inputsOf(ch), chunks: ch.chunks.slice(0, 10) };
+  const sent = renderLayout(older, new SummaryTree(older), new Map());
+  const inputs = inputsOf(ch);
+  const next = new Map<ChunkId, number>([[ch.chunks[11].id, 1]]);
+  const d = describeFoldDiff(inputs, new SummaryTree(inputs), new Map(), next, { previousLayout: sent });
+  assert.equal(d.moves, 1);
+  assert.equal(d.previousTokens, 10 * 1000);
+  assert.equal(d.divergenceOffset, 10 * 1000, 'the old request is a cached prefix');
+  assert.equal(d.suffixTokens, 1000 + 200);
+  // The new chunk has no unit in the previous request.
+  assert.equal(d.runs[0].offsetBefore, null);
+  assert.match(formatFoldDiff(d), /runs=1: L0→L1×1\[c-0011\]$/, "no position for a run the previous request lacked");
+});

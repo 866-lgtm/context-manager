@@ -1807,6 +1807,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.pinIdCounter = 0;
     this.resolutions.clear();
     this.locked.clear();
+    this._committedFoldLayout = null;
     this._adaptivePicker = null;
     this.lastFrontierTokens = undefined;
     this.transitionBlocked = undefined;
@@ -2140,6 +2141,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.pinIdCounter = 0;
     }
 
+    // A reloaded frontier has no request of its own yet: the next fold diff
+    // re-renders the carried side.
+    this._committedFoldLayout = null;
     // Adaptive-resolution state — only present when flag was/is on
     if (this.config.adaptiveResolution) {
       const resState = this.store.getStateJson(this.resolutionsStateId);
@@ -5561,9 +5565,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** The picker's projected total for this compile (planner side). */
   private _plannedTokens: number | null = null;
   private _plannedMeta: { budgetMet: boolean; exhausted: boolean; moves: number; solver: string } | null = null;
-  /** Fold diff of the most recent non-dry-run adaptive compile that moved at
-   *  least one chunk; null after a quiet compile. */
+  /** Fold diff of THIS compile, for `planVsActual`: reset at the start of
+   *  every adaptive select (dry runs included) and set only when a
+   *  non-dry-run compile that moved at least one chunk commits. It describes
+   *  the compile it is attached to, so a quiet compile clears it. */
   private _lastFoldDiff: FoldDiff | null = null;
+  /** The layout the last COMMITTED adaptive compile sent, for the next fold
+   *  diff's previous side. A compile that moved keeps the layout it already
+   *  rendered; a quiet one keeps its inputs and frontier and is rendered only
+   *  if a later compile moves, so quiet compiles still cost nothing. Null
+   *  after a restart or a reset: the diff then re-renders the carried
+   *  frontier from the moving compile's own inputs. */
+  private _committedFoldLayout: (() => RenderLayout) | null = null;
 
   protected rsSummary(level: number, tokens: number, id?: string): void {
     if (id) this._emittedSummaryIds.add(id);
@@ -8939,6 +8952,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const levelAt: PickerResult['levelAt'] = typeof result.levelAt === 'function'
       ? result.levelAt
       : (_sequence, id) => result.finalResolutions.get(id) ?? 0;
+    // kv-unified's memoized tree and the layout its draft already holds, for
+    // the fold diff below — saves a second tree build and render.
+    let foldDiffTree: (() => SummaryTree) | null = null;
+    let foldDiffNextLayout: RenderLayout | null = null;
     if (this.config.foldingStrategy === 'kv-unified') {
       // The plan's check runs dry or not, so a dry select refuses what a real
       // compile would; only the draft it builds is a real compile's alone.
@@ -9001,6 +9018,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           markerUnitIndices: [],
         };
         if (tree) reuse.tree = tree;
+        foldDiffTree = summaryTree;
+        foldDiffNextLayout = this.kvUnifiedDraft.layout;
       }
     }
     if (_diag) { console.error(`[cm-cache] selectAdaptive: picker.run ${Date.now() - _t}ms`); _t = Date.now(); }
@@ -9050,29 +9069,36 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const prev = chunk.currentResolution;
       if (prev !== level && !dryRun) pendingResolutionChanges.push([id, level]);
     }
-    // What moved, between which levels, and how deep into the carried layout
-    // the first change lands — the figure that sets this turn's cache
-    // re-read. `[plan-vs-actual]` only counts moves. Computed from the picker
-    // inputs' carried resolutions (the frontier the previous request was
-    // rendered from), never from `this.resolutions`, which may already hold
-    // staged-but-uncommitted changes. STAGED here and LOGGED only at the
-    // commit point below: a plan that later fails the budget, coverage or
-    // emission checks is not a fold the resident experienced, and a retry
-    // would otherwise log the same moves twice (PR #157 review). Quiet
-    // compiles cost nothing here.
+    // What moved, between which levels, and how deep into the previous
+    // request's layout the first change lands — the figure that sets this
+    // turn's cache re-read. `[plan-vs-actual]` only counts moves. The carried
+    // frontier is the picker inputs' resolutions, the same values the commit
+    // loop above compares against (`this.resolutions` holds the same
+    // committed frontier; reading the inputs keeps the diff on exactly what
+    // the picker saw). The previous side is the layout the last committed
+    // compile sent, when kept. STAGED here and LOGGED only at the commit
+    // point below: a plan that later fails the budget, coverage or emission
+    // checks is not a fold the resident experienced, and a retry would
+    // otherwise log the same moves twice (PR #157 review). Quiet compiles
+    // cost nothing here.
     this._lastFoldDiff = null;
     let stagedFoldDiff: FoldDiff | null = null;
+    let stagedFoldLayout: RenderLayout | null = null;
     if (!dryRun && result.moves > 0) {
       try {
         const carried = new Map<ChunkId, number>(
           pickerChunks.map((c) => [c.id, c.currentResolution]),
         );
+        const tree = foldDiffTree?.() ?? new SummaryTree(pickerInputs);
+        const nextLayout = foldDiffNextLayout ?? renderLayout(pickerInputs, tree, result.finalResolutions);
         stagedFoldDiff = describeFoldDiff(
           pickerInputs,
-          new SummaryTree(pickerInputs),
+          tree,
           carried,
           result.finalResolutions,
+          { previousLayout: this._committedFoldLayout?.() ?? undefined, nextLayout },
         );
+        stagedFoldLayout = nextLayout;
       } catch (err) {
         // Observability must never fail a compile.
         console.warn('[fold-diff] unavailable for this compile:', err);
@@ -9531,6 +9557,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (stagedFoldDiff) {
       this._lastFoldDiff = stagedFoldDiff;
       console.error(formatFoldDiff(stagedFoldDiff));
+    }
+    // Keep what this compile sent as the next fold diff's previous side. A
+    // compile that moved hands over the layout it rendered; a quiet one
+    // defers the render (memoized) to the next compile that moves. A moving
+    // compile whose diff failed keeps nothing, so the next diff falls back
+    // to re-rendering rather than diffing against a stale request.
+    if (!dryRun) {
+      if (stagedFoldLayout) {
+        const layout = stagedFoldLayout;
+        this._committedFoldLayout = () => layout;
+      } else if (result.moves > 0) {
+        this._committedFoldLayout = null;
+      } else {
+        // No moves: every chunk rendered at the level it carried in, which
+        // the inputs snapshot holds. Reading the picker's result later would
+        // materialize its lazy frontier map, or read solver state the next
+        // solve may reuse.
+        const inputs = pickerInputs;
+        let layout: RenderLayout | undefined;
+        this._committedFoldLayout = () => (layout ??= renderLayout(
+          inputs,
+          new SummaryTree(inputs),
+          new Map(inputs.chunks.map((c) => [c.id, c.currentResolution])),
+        ));
+      }
     }
     // Same commit point for the receipt left behind by kv-unified: a real
     // presentation by a non-kv-unified strategy has now succeeded, so that
