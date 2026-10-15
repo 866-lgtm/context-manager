@@ -605,7 +605,8 @@ function suffixAdopt(
  * A leaf renders at its level through its own lineage there, so it stays only
  * where that node lists it. A level carried from before the tree's links
  * changed can point through a summary that no longer lists the leaf, which
- * would leave the leaf in no recall, so it is lowered.
+ * would leave the leaf in no recall, so it is lowered. A held leaf gets the
+ * same clamp where the base sets its level (renderableLevel).
  *
  * A leaf the node lists vetoes its unanimity only when it renders in more
  * detail than the node, below the node's level, and the node is its own
@@ -668,7 +669,7 @@ function projectToValidCut(
     for (const c of byDepth) {
       const lvl = F.get(c.id) ?? 0;
       if (lvl <= 0) continue;
-      if (frozen.has(c.id) || fixedLevels.has(c.id)) continue; // held; consistent by construction
+      if (frozen.has(c.id) || fixedLevels.has(c.id)) continue; // held where the base set it
       const node = tree.ancestorAt(c.id, lvl);
       let unanimous = false;
       // The leaf renders at this level through the node, so the node has to
@@ -698,6 +699,22 @@ function projectToValidCut(
       if (!unanimous) { F.set(c.id, lvl - 1); changed = true; } // un-fold one level
     }
   }
+}
+
+/**
+ * A held level, lowered while the summary of the chunk's own lineage there
+ * exists but doesn't list the chunk: rendered through it, the chunk would be in
+ * no recall. A level with no such summary is kept, since the renderer renders
+ * it raw.
+ */
+function renderableLevel(tree: SummaryTree, chunkId: ChunkId, level: number): number {
+  let k = level;
+  while (k > 0) {
+    const node = tree.ancestorAt(chunkId, k);
+    if (!node || node.leafChunkIds.includes(chunkId)) break;
+    k--;
+  }
+  return k;
 }
 
 /** Earliest source sequence whose resolution changed `prev → next`. */
@@ -879,7 +896,10 @@ export function planControlledFrontier(
 
   // Base = the non-negotiable part of every cut: raw zone raw, pins at their
   // level, frozen at their carried resolution. Everything else starts raw here;
-  // the carried frontier and the ideal cut both build on this base.
+  // the carried frontier and the ideal cut both build on this base. The
+  // projection never lowers a held leaf, so a held level whose own-lineage
+  // summary doesn't list the leaf (links changed since it was carried, or a
+  // pin on a non-nested tree) is lowered here, by renderableLevel.
   const base = new Map<ChunkId, number>();
   for (const c of ordered) {
     if (p.rawZone.has(c.id)) {
@@ -888,9 +908,9 @@ export function planControlledFrontier(
       // Pin-at-k: fix to exactly k, clamped to the deepest produced level for
       // this chunk (can't render at a level whose summary doesn't exist yet).
       const k = Math.max(0, fixedLevels.get(c.id)!);
-      base.set(c.id, k === 0 ? 0 : Math.min(k, tree.maxLevel(c.id)));
+      base.set(c.id, k === 0 ? 0 : renderableLevel(tree, c.id, Math.min(k, tree.maxLevel(c.id))));
     } else if (frozen.has(c.id)) {
-      base.set(c.id, p.previous.get(c.id) ?? c.currentResolution);
+      base.set(c.id, renderableLevel(tree, c.id, p.previous.get(c.id) ?? c.currentResolution));
     } else {
       base.set(c.id, 0);
     }

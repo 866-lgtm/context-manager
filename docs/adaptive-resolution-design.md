@@ -995,7 +995,9 @@ Only a listed leaf of the group's own lineage rendered in more detail than
 the group vetoes it, and a hard-protected leaf (raw zone, pinned or locked)
 never does. A leaf also stays at its level only where its own lineage there
 lists it: a level carried from before the tree's links changed can point
-through a summary that no longer covers the leaf. Every projection applies
+through a summary that no longer covers the leaf. The projection lowers such
+a leaf, and the base clamps a locked or pinned leaf's level the same way,
+since the projection holds those. Every projection applies
 the rule alike, the ideal cut's, the carried frontier's and each
 suffix-adoption candidate's, so a frontier the planner emitted projects to
 itself on unchanged inputs. Before this rule,

@@ -295,6 +295,26 @@ for (const [kind, bParent, m2Level] of [
   });
 }
 
+// The same store with m1 held at L2, locked there or pinned there. The
+// projection never lowers a held leaf, so the base clamps the held level to
+// the deepest one whose summary lists the leaf, rather than keep m1 in no
+// recall for as long as the hold lasts.
+for (const [kind, hold] of [
+  ['locked', { frozen: new Set<ChunkId>(['m1']) }],
+  ['pinned', { fixedLevels: new Map<ChunkId, number>([['m1', 2]]) }],
+] as const) {
+  test(`a ${kind} leaf is held at the deepest level whose summary lists it`, () => {
+    const { inputs, tree } = store(
+      [message('m1', 1, 100, 'A'), message('m2', 2, 100, 'B')],
+      [summary('A', 1, ['m1'], 30, 'H'), summary('B', 1, ['m2'], 30), summary('H', 2, ['B'], 40)],
+    );
+    const previous = new Map<ChunkId, number>([['m1', 2], ['m2', 1]]);
+    const plan = planControlledFrontier(inputs, tree, { ...trio, targetTokens: 30, foldAtTokens: 1_000, previous, ...hold });
+    assert.equal(plan.resolutions.get('m1'), 1);
+    assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['recall:A', 'recall:B']);
+  });
+}
+
 test('suffix adoption takes a summary beside a lineage-disagreeing leaf', () => {
   // The trio after m0, whose own L1 Z has no parent. From an all-raw carried
   // frontier the ideal cut (Z, A and G) rewrites all 100 tokens it renders;
@@ -428,14 +448,25 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
       { reachTokens: Math.max(1, Math.floor(params.targetTokens / 2)), previous: new Map(inputs.chunks.map((c) => [c.id, 0])) },
     ];
     let ideal: ReadonlyMap<ChunkId, number> | null = null;
+    // A held level, lowered while its own-lineage summary exists but doesn't
+    // list the leaf (a level with no summary renders raw, so it stays).
+    const renderable = (id: ChunkId, level: number): number => {
+      let k = level;
+      while (k > 0) {
+        const node = tree.ancestorAt(id, k);
+        if (!node || node.leafChunkIds.includes(id)) break;
+        k--;
+      }
+      return k;
+    };
     // The level a protection sets, which every plan must keep: the raw zone
-    // raw, a pinned leaf at its level (as deep as its summaries go), a locked
-    // leaf where it was.
+    // raw, a pinned leaf at its level (as deep as its summaries go) and a
+    // locked leaf where it was, each lowered where its summary doesn't list it.
     const heldLevel = (c: PickerChunk): number | undefined => {
       if (params.rawZone.has(c.id)) return 0;
       const k = params.fixedLevels!.get(c.id);
-      if (k !== undefined) return k === 0 ? 0 : Math.min(k, tree.maxLevel(c.id));
-      if (params.frozen!.has(c.id)) return c.currentResolution;
+      if (k !== undefined) return k === 0 ? 0 : renderable(c.id, Math.min(k, tree.maxLevel(c.id)));
+      if (params.frozen!.has(c.id)) return renderable(c.id, c.currentResolution);
       return undefined;
     };
     const { overlapWarnings } = quietOverlap(() => {
@@ -456,9 +487,10 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
             if (held !== undefined) assert.equal(level, held, `${c.id} keeps its protected level, ${where}`);
             const cap = params.pinCaps!.get(c.id);
             if (held === undefined && cap !== undefined) assert.ok(level <= cap, `${c.id} stays at or below its pin cap, ${where}`);
-            if (held === undefined && level > 0) {
-              assert.ok(tree.ancestorAt(c.id, level)?.leafChunkIds.includes(c.id), `${c.id} at L${level} renders through a summary that lists it, ${where}`);
-            }
+            // A leaf renders through its own lineage at its level, which has to
+            // list it; a level with no summary renders raw.
+            const node = level > 0 ? tree.ancestorAt(c.id, level) : null;
+            if (node) assert.ok(node.leafChunkIds.includes(c.id), `${c.id} at L${level} renders through a summary that lists it, ${where}`);
           }
           if (turn > 1 && sameLevels(previous, ideal)) {
             assert.ok(sameLevels(plan.resolutions, ideal), `the adopted ideal cut stays put, ${where}`);
