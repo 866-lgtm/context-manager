@@ -766,6 +766,25 @@ function hasSummaryText(summary: SummaryEntry): boolean {
 }
 
 /**
+ * Why readers can't use a summary's sources, or above L1 its range, as it
+ * holds them, or null. By the open's predicates, sources must be a non-empty
+ * list of ids at every level, and above L1 the range two ids. The open drops
+ * a summary without them unless another copy has them or, for an L1, the
+ * compressed chunk record naming it does. A write has neither: the summary
+ * was just minted, and the package's L1 writers mark that record only after
+ * the push. An L1's range is its sources' ends, whatever it holds.
+ */
+function unreadableSourcesOrRange(summary: SummaryEntry): string | null {
+  const ids: unknown = summary.sourceIds;
+  const range: unknown = summary.sourceRange;
+  if (!isIdList(ids)) return `its sourceIds is ${JSON.stringify(ids)}, where readers need a non-empty list of ids`;
+  if (summary.level !== 1 && !isReadableRange(range)) {
+    return `its sourceRange is ${JSON.stringify(range)}, where readers need two message ids`;
+  }
+  return null;
+}
+
+/**
  * The level a message is planned from: its saved level when the summaries
  * over it reach that level, else the deepest one at or below it that they
  * reach, walking up from its L1. A saved level names a summary's level, and
@@ -2757,10 +2776,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return out;
   }
 
-  /**
-   * Append a summary to the in-memory list and to the chronicle AppendLog.
-   * Single point so subclasses inherit persistence.
-   */
   /** Sliding-window timestamps of split-stitch sub-calls (compressionSplitMaxCallsPer10Min). */
   protected splitCallTimes: number[] = [];
   /** Accounting of the most recent split-stitch attempt (receipts/tests). */
@@ -2768,12 +2783,44 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected lastSplitDetails: NormalizedResponse['details'] | undefined;
   protected lastSplitAttempted: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; complete: boolean } | undefined;
 
+  /**
+   * Append a summary to the in-memory list and to the chronicle AppendLog.
+   * Single point so subclasses inherit persistence. A summary readers can't
+   * use is refused with an error, and nothing is held or stored: empty text,
+   * `sourceIds` that aren't a non-empty list of ids, or above L1 a
+   * `sourceRange` that isn't two message ids. An L1 is stored with its range
+   * set to its sources' first and last ids, with a warning when it held
+   * another.
+   */
   protected pushSummary(entry: SummaryEntry): void {
     this.requireBranchMutation('pushSummary');
     if (typeof entry.content !== 'string' || entry.content.trim().length === 0) {
       throw new Error(
         `[autobiographical] refusing to persist empty summary ${entry.id} at L${entry.level}`,
       );
+    }
+    // Sources readers can't use, and above L1 a range they can't use, are
+    // refused here, where the code that built the summary is still on the
+    // stack. Persisted, it reaches readers that can't use it until an open
+    // rebuilds or drops it, and by then nothing says where it came from: the
+    // null `sourceIds` that #130 found in a real store has no known writer.
+    const unreadable = unreadableSourcesOrRange(entry);
+    if (unreadable) {
+      throw new Error(
+        `[autobiographical] refusing to persist summary ${entry.id} at L${entry.level}, a bug in the code ` +
+          `that built it: ${unreadable}`,
+      );
+    }
+    // The open rewrites any other range an L1 holds to its sources' ends, so
+    // the write stores that range now, and says what the summary held.
+    const ids = entry.sourceIds;
+    const range = entry.sourceRange as { first?: unknown; last?: unknown } | null | undefined;
+    if (entry.level === 1 && (range?.first !== ids[0] || range?.last !== ids[ids.length - 1])) {
+      console.warn(
+        `[autobiographical] storing summary ${entry.id} at L1 with its sourceRange set to its first and last ` +
+          `source, a bug in the code that built it: it held ${JSON.stringify(range)}`,
+      );
+      entry.sourceRange = { first: ids[0]!, last: ids[ids.length - 1]! };
     }
     this.summaries.push(entry);
     this.store?.appendToStateJson(this.summariesStateId, entry);
