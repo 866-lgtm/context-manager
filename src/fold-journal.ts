@@ -234,7 +234,7 @@ interface AcceptedLayoutRecord {
   /** Snapshot: the members, gap-coded. */
   m?: string;
   /** Snapshot: the units. */
-  units?: LayoutUnit[];
+  units?: readonly LayoutUnit[];
   /** Delta: the record it edits. */
   prev?: string;
   /** Delta: the members removed and added, gap-coded. */
@@ -261,8 +261,8 @@ interface AcceptedLayoutRecord {
 
 /** A layout as an acceptance persists it: membership and forms, no ids. */
 export interface StoredLayout {
-  members: number[];
-  units: LayoutUnit[];
+  readonly members: readonly number[];
+  readonly units: readonly LayoutUnit[];
 }
 
 interface LatestLayout extends StoredLayout {
@@ -480,6 +480,16 @@ function storeIndex(store: JsStore): StoreIndex {
   return index;
 }
 
+/** A copy of a branch reference, which the journal can keep as its own. */
+function copyBranch(ref: BranchRef): BranchRef {
+  return { id: ref.id, name: ref.name, created: ref.created };
+}
+
+/** A copy of a layout unit, its summary references included. */
+function copyUnit(unit: LayoutUnit): LayoutUnit {
+  return unit.k === 's' ? { k: 's', n: unit.n, sm: unit.sm.map((ref) => [...ref] as typeof ref) } : { ...unit };
+}
+
 /** A record's envelope, or null when it has none to read (reported once). */
 function readHead(store: JsStore, index: StoreIndex, id: string): RecordHead | null {
   const stored = store.getRecord(id);
@@ -599,7 +609,9 @@ export class FoldJournal {
    */
   mark(): JournalMark | null {
     try {
-      return storeIndex(this.store).mark;
+      // A copy: the compile's caller holds it, and the index keeps its own.
+      const mark = storeIndex(this.store).mark;
+      return mark ? { ...mark } : null;
     } catch (err) {
       if (!markFailures.has(this.store)) {
         markFailures.add(this.store);
@@ -626,7 +638,10 @@ export class FoldJournal {
    * last accepted one. Idempotent per compile: a compile accepted before
    * returns the receipt that acceptance wrote, or null when it wrote none.
    * Returns the receipt, if any. A compile of another namespace is refused,
-   * and so is one whose branch this store doesn't know, live or recorded.
+   * and so is one whose branch this store doesn't know, live or recorded,
+   * and one whose layout's members aren't in ascending order, whose units'
+   * counts aren't positive whole numbers adding up to its members, or that
+   * doesn't have one id for each member.
    */
   accept(
     provenance: CompileProvenance,
@@ -686,6 +701,19 @@ export class FoldJournal {
       const receipt = accepted.receiptAt !== null ? this.loadReceipt(accepted.id) : null;
       if (receipt) this.announce(receipt);
       return receipt;
+    }
+    // A layout persists as accepted, so one changed after its compile returned
+    // it would land, fail to rebuild later, and leave its branch to start
+    // again from a baseline; receipts name messages by its ids, member by
+    // member. Only its shape can be checked: the ids aren't stored, and a
+    // unit's form can't be told from its count, so a change that keeps the
+    // shape lands as written. Checked before anything reads it for this record.
+    if (!wellFormed(layout) || layout.memberIds.length !== layout.members.length) {
+      throw new Error(
+        `the layout of compile ${provenance.compileId} can't be accepted: its members aren't in ascending order, its ` +
+          `units' counts aren't positive whole numbers adding up to its members, or it doesn't have one id for each ` +
+          `member, so accepting it again is refused the same way. Accept a compile's provenance as compile returned it`,
+      );
     }
     const prev = branch ? this.loadLatest(index, branch) : null;
 
@@ -888,7 +916,9 @@ export class FoldJournal {
       // As receipts name it: live or deleted, whatever its name now.
       const match = live.find((b) => b.id === branch.id && b.created === branch.created);
       if (match) return { id: match.id, name: match.name, created: match.created };
-      return this.branchState(index, branch)?.ref ?? null;
+      // A copy, as everywhere the journal hands out a branch it keeps.
+      const known = this.branchState(index, branch)?.ref;
+      return known ? copyBranch(known) : null;
     }
     const match = live.find((b) => b.name === branch);
     if (match) return { id: match.id, name: match.name, created: match.created };
@@ -901,7 +931,7 @@ export class FoldJournal {
       if (!state || !key.startsWith(`${this.namespace}\u0000`) || state.ref.name !== branch || state.newestReceipt === null) continue;
       if (!found || Number(state.newest.id) > Number(found.newest.id)) found = state;
     }
-    return found ? found.ref : null;
+    return found ? copyBranch(found.ref) : null;
   }
 
   private sourceFor(provenance: CompileProvenance): FoldReceiptSource {
@@ -911,7 +941,7 @@ export class FoldJournal {
       agent: this.source.agent ?? 'unknown',
       namespace: this.namespace,
       dataDirectory: this.source.dataDirectory ?? 'unknown',
-      branch: provenance.branch,
+      branch: copyBranch(provenance.branch),
     };
   }
 
@@ -1006,12 +1036,16 @@ export class FoldJournal {
     draft: Omit<FoldReceipt, 'id'> | null,
   ): FoldReceipt | null {
     const key = branchKey(provenance.branch);
-    const next: StoredLayout = { members: layout.members, units: layout.units };
+    // What the journal keeps of an acceptance is its own copy, so a change to
+    // the caller's provenance afterwards, which its types forbid, can't reach
+    // the layout the next acceptance diffs against or the branch the index
+    // names.
+    const next: StoredLayout = { members: [...layout.members], units: layout.units.map(copyUnit) };
     const pr = branch?.newestReceipt ?? null;
     const base = {
       v: RECORD_VERSION as typeof RECORD_VERSION,
       ns: this.namespace,
-      branch: provenance.branch,
+      branch: copyBranch(provenance.branch),
       compileId: provenance.compileId,
       totalTokens: layout.totalTokens,
       ...(pr !== null ? { pr } : {}),
