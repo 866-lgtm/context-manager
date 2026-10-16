@@ -8796,8 +8796,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Append the new merged entry first, then mark sources. Persist each
       // mergedInto edit individually so chronicle reflects the same shape as
       // the in-memory mirror. (If the process crashes mid-loop, restart sees
-      // the new entry plus a partial set of marked sources; un-marked sources
-      // would re-trigger a merge — accept the rare duplicate over data loss.)
+      // the new entry plus a partial set of marked sources, and the open makes
+      // the new entry the parent of each unmarked one, as the one summary a
+      // level up that lists it, unless another instance's merge lists it too:
+      // see loadPersistedState.)
       this.pushSummary(newEntry);
 
       for (const source of sources) {
