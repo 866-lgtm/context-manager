@@ -998,10 +998,19 @@ export interface AutobiographicalConfig {
   topologyPolicy?: 'reject' | 'report';
   /**
    * Open for inspection only: `initialize` still loads and audits the store,
-   * but never chunks the uncovered frontier, enqueues merges, or rewrites the
-   * persisted merge queue. Audit and repair tooling opens stores this way; a
-   * plain open under a config that is not the resident's own would otherwise
-   * mint chunk records with the wrong head window and chunk size.
+   * but never chunks the uncovered frontier, enqueues merges, or drops queued
+   * merges that the current grouping grammar refuses. Audit and repair tooling
+   * opens stores this way; a plain open under a config that is not the
+   * resident's own would otherwise mint chunk records with the wrong head
+   * window and chunk size. Loading repairs what readers can't use on every
+   * open, this one included, and persists the repair: it keeps one of a
+   * summary's duplicate copies, rebuilds sources and ranges it can recover,
+   * drops summaries that are empty, whose sources or range it can't recover,
+   * or that list a summary at their own level or above, and the summaries
+   * above them, resolves each summary's parent pointers, and
+   * reopens or removes the chunk records and queued merges that name a
+   * summary it doesn't keep. It also stores the summary-id counter when the
+   * stored one trails the ids the store holds.
    */
   auditOnly?: boolean;
   /** Legacy first-choice target-only merge request. Default false. */
