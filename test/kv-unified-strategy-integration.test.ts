@@ -622,3 +622,16 @@ test('a usage report inside the calibration dead band keeps the kv-unified fores
   assert.equal(derived(), false, 'an applied multiplier change is a full build');
   manager.close();
 });
+
+test('every compile stamps its own elapsed time on plan-vs-actual, with the kv-unified solve inside it', async () => {
+  const manager = await ContextManager.open({ path: STORE, strategy: strategy() });
+  const added = ['time me', 'timing you', 'and again'];
+  for (const [i, text] of added.entries()) manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  const pva = manager.getRenderStats()!.planVsActual!;
+  assert.equal(pva.messages, added.length, 'messages= is the number of stored messages the compile read');
+  assert.ok(Number.isInteger(pva.compileMs) && pva.compileMs >= 0, `compileMs=${pva.compileMs}`);
+  assert.ok(Number.isInteger(pva.solveMs) && pva.solveMs! >= 0, `solveMs=${pva.solveMs}`);
+  assert.ok(pva.solveMs! <= pva.compileMs, `solveMs=${pva.solveMs} exceeds compileMs=${pva.compileMs}`);
+  manager.close();
+});
