@@ -714,7 +714,9 @@ export interface KvUnifiedConfig {
    * Certified hysteresis exit (see `docs/kv-unified-hysteresis-certificate.md`):
    * when the accepted presentation provably remains the policy's selection,
    * skip label propagation. Proves the exact hysteresis policy; it does not
-   * guarantee identity with every bucketed approximate solve. Off unless set.
+   * guarantee identity with every bucketed approximate solve. On unless set
+   * to `false`; the solver itself treats an absent flag as off, the strategy
+   * built from a recipe fills in `true`.
    */
   hysteresisCertificate?: boolean;
 }
