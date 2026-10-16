@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
+import { Membrane } from '@animalabs/membrane';
 
 import { ContextManager, AutobiographicalStrategy, MessageStore } from '../src/index.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
@@ -991,8 +992,45 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
+  it('a refusal through membrane itself counts a cache-inclusive provider\'s prompt once', async () => {
+    // The sum rests on membrane's normalization, so this crosses it: a real
+    // Membrane around an adapter whose provider reports cache reads inside its
+    // input count, as OpenAI's does. 10,000 prompt tokens, 8,000 of them read
+    // from cache, are 2,000 fresh plus 8,000 cached once membrane has them.
+    const adapter = {
+      name: 'stub-cache-inclusive',
+      usageCacheConvention: 'cache-inclusive' as const,
+      calls: 0,
+      supportsModel: () => true,
+      async complete(request: { model: string }) {
+        adapter.calls++;
+        return {
+          content: [{ type: 'text', text: '' }],
+          stopReason: 'refusal',
+          usage: { inputTokens: 10_000, outputTokens: 0, cacheReadTokens: 8_000 },
+          model: request.model,
+          rawRequest: request,
+          raw: {},
+        };
+      },
+      async stream(): Promise<never> { throw new Error('the strategy does not stream'); },
+    };
+    const fx = await fixture(new Membrane(adapter as never) as never, {
+      compressionContextBudgetTokens: 10_000,
+      compressionRefusalCurveFallbacks: 1,
+    });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(adapter.calls, 1, 'no expansion of a 10,000-token prompt fits a 10,000-token budget');
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+      .record as Record<string, unknown>;
+    assert.equal(record.canonicalProviderInputTokens, 10_000);
+    fx.manager.close();
+  });
+
   it('zero usage, or usage without an input count, falls back to the complete request bound', async () => {
-    // Cache counts with no input count beside them are no observation of the prompt.
+    // Cache counts with no input count beside them are no observation of the
+    // prompt. Through membrane the input count is always a number, an omitted
+    // one reported as zero, so this shape comes only from a caller outside it.
     const withoutInputCount = response('refusal');
     (withoutInputCount as { usage: Record<string, number> }).usage = { outputTokens: 0 };
     (withoutInputCount as unknown as { details: unknown }).details = {

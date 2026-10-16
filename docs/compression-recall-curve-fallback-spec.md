@@ -107,7 +107,10 @@ allowance, and the output reserve. After canonical refusal reports complete
 provider input usage, admission uses `provider total input + positive
 serialized expansion delta + output reserve`; the complete-request bound
 remains the fail-closed path when usage is absent, has no input count, or
-totals zero. The provider total is `inputTokens +
+totals zero. Through membrane the input count is always a number, since its
+adapters report an omitted prompt total as zero, so "no input count" covers
+only a caller outside membrane, and a cache-only report through membrane
+reads as a full cache hit. The provider total is `inputTokens +
 cacheCreationTokens + cacheReadTokens` for every provider: membrane (0.5.81
 and later) states each adapter's counts as disjoint, subtracting the cached
 span from `inputTokens` for adapters whose providers report it inside, such
