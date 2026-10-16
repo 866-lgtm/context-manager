@@ -1465,9 +1465,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // it in before a late render-stage throw.
         const partial = this._lastPreview as PreviewResult | undefined;
         // A plan already over the budget is refused at its gate by the live
-        // compile, with the numbers and list its preview recorded, so a later
-        // stage's refusal of this dry run doesn't change the answer: the
-        // preview is the plan's, as when nothing later throws.
+        // compile, with the numbers its preview recorded and the plan's list
+        // (which the preview gives as this dry run sees it), so a later stage's
+        // refusal of this dry run doesn't change the answer: the preview is the
+        // plan's, as when nothing later throws.
         if (partial?.fits === false) return partial;
         // Infeasible at this budget. That is an ANSWER, not a failure — it is
         // the whole reason to preview before applying. Report it with the
@@ -8494,14 +8495,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (headTokens + tailTokens > rejectionBudget) {
       // Compression never touches the raw windows. A smaller recent window
       // moves history out of the tail into the middle, which clears this
-      // refusal when the head fits beside the newest turn kept whole. The
-      // middle then folds only once its chunks have closed and compression
-      // has summarized them, so the next refusal can be the picker's. No
-      // window starts after a compression hold (getRecentWindowStart). The
-      // newest turn is the newest body, which the structural repair refuses
-      // a compile to leave out. For a body split into shards at ingress, its
-      // newest shard is enough, since the earlier shards can close into
-      // chunks and fold, unless the body holds a tool_result: ingress puts a
+      // refusal when the head fits beside the newest turn as the compile must
+      // keep it raw. The middle then folds only once its chunks have closed
+      // and compression has summarized them, so the next refusal can be the
+      // picker's. No window starts after a compression hold
+      // (getRecentWindowStart). The newest turn is the newest body, which the
+      // structural repair refuses a compile to leave out. For a body split
+      // into shards at ingress, its newest shard is all that must stay raw,
+      // since the earlier shards can close into chunks and fold, unless the
+      // body holds a tool_result: ingress puts a
       // split message's non-text blocks on its first shard
       // (chunkIngressMessage), and a result whose call isn't raw just before
       // it is blanked as an orphan (enforceToolPairing), without a refusal.
@@ -8929,8 +8931,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // work is only what the ops would add: the newest closed chunks, which the
     // holdback (l1HoldbackChunks) keeps out of the queue until they're
     // demanded, or a merge. There a dry run names nothing.
-    // Taken only when the plan is over the budget, at a refusal or for a dry
-    // run's preview of one, since a plan that fits needs no list.
+    // Taken at a refusal of this select (the plan check's, or a later
+    // stage's), or for a dry run's preview of a plan over the budget, since a
+    // plan that fits and renders needs no list.
     const planClearedBy = (): OverBudgetClearedBy[] =>
       result.produced.length > 0 && this.compressionWorkQueued(store, 'adaptive') ? ['compression'] : [];
     const planFits = result.finalTokens <= rejectionBudget;
@@ -8938,8 +8941,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Record what a dry run needs (select() puts back the transition
     // bookkeeping the pick just wrote). Done before the over-budget check so
     // an infeasible preview still reports, with the plan's list as this dry
-    // run sees it: since it doesn't queue the plan's work, it names
-    // compression only for work already queued.
+    // run sees it: since it doesn't queue the plan's own work, it names
+    // compression only for work queued by now, the chunks its rebuild closed
+    // included.
     if (dryRun) {
       this._lastPreview = {
         finalTokens: result.finalTokens,

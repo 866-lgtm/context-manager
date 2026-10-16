@@ -146,14 +146,19 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   }
 }
 
+/** A membrane whose every model call is counted and fails. */
+function countingMembrane(calls: { n: number }): Membrane {
+  return { complete: async () => { calls.n++; throw new Error('no model in this test'); } } as unknown as Membrane;
+}
+
 async function withManager(
   strategy: AutobiographicalStrategy,
   run: (manager: ContextManager) => Promise<void>,
-  opts?: { membrane?: boolean },
+  opts?: { membrane?: true | Membrane },
 ) {
   const directory = mkdtempSync(join(tmpdir(), 'cm-budget-diagnostics-'));
   // A stub is enough for tick to adopt an exact L1, which calls no model.
-  const membrane = opts?.membrane ? { membrane: {} as unknown as Membrane } : {};
+  const membrane = opts?.membrane ? { membrane: opts.membrane === true ? ({} as unknown as Membrane) : opts.membrane } : {};
   const manager = await ContextManager.open({ path: join(directory, 'store'), strategy, ...membrane });
   try {
     await run(manager);
@@ -430,7 +435,7 @@ describe('OverBudgetError.clearedBy', () => {
       toolTurn(manager, 't1', 150, 5);
       const error = await refusal(manager);
       assert.match(error.message, /^Head\/tail reservation exceeded budget/);
-      assert.deepEqual(error.clearedBy, [], 'the least tail any window leaves is the call and its result');
+      assert.deepEqual(error.clearedBy, [], 'the newest turn the compile must keep raw is the call and its result');
     });
   });
 
@@ -472,8 +477,12 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
-  for (const [resultWords, expected] of [[200, []], [30, ['smaller-recent-window']]] as const) {
-    it(`counts a result split into shards with its whole body and its call, since its first shard holds the tool_result (${expected.length ? 'names a smaller window when they fit' : 'names nothing when only its last shard would'})`, async () => {
+  for (const [resultWords, callWords, expected, when] of [
+    [200, 0, [], 'names nothing when only its last shard would fit'],
+    [30, 0, ['smaller-recent-window'], 'names a smaller window when they fit'],
+    [30, 60, [], 'names nothing when its body alone would fit but not with its call'],
+  ] as const) {
+    it(`counts a result split into shards with its whole body and its call, since its first shard holds the tool_result (${when})`, async () => {
       const strategy = new AutobiographicalStrategy({
         adaptiveResolution: true,
         targetChunkTokens: 10,
@@ -485,8 +494,10 @@ describe('OverBudgetError.clearedBy', () => {
       });
       await withManager(strategy, async (manager) => {
         for (let i = 0; i < 4; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
-        manager.addMessage('agent', [{ type: 'text', text: 'calling' }, { type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+        const beforeCall = manager.getAllMessages().length;
+        manager.addMessage('agent', [{ type: 'text', text: 'calling ' + 'word '.repeat(callWords) }, { type: 'tool_use', id: 't1', name: 'read', input: {} }]);
         const before = manager.getAllMessages().length;
+        if (callWords > 0) assert.ok(before - beforeCall > 1, 'the call is stored as shards too');
         // Over twice targetChunkTokens, so ingress splits the result into shards.
         manager.addMessage('user', [
           { type: 'tool_result', toolUseId: 't1', content: 'ok' },
@@ -509,7 +520,7 @@ describe('OverBudgetError.clearedBy', () => {
       for (let i = 0; i < 6; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
       const first = await refusal(manager);
       assert.deepEqual(first.clearedBy, ['smaller-recent-window']);
-      // The least raw tail is the newest message: a window that holds only it.
+      // The newest turn is the newest message: a window that holds only it.
       strategy.updateHotContextSettings({ tailTokens: 1 });
       const next = await refusal(manager);
       assert.doesNotMatch(next.message, /^Head\/tail reservation exceeded budget/, 'the raw windows now fit');
@@ -573,7 +584,7 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
-  it('prices the least raw tail as the cap prices it, and names a smaller window when the head and that tail just fit', async () => {
+  it('prices the newest turn as the cap prices it, and names a smaller window when the head and that turn just fit', async () => {
     const strategy = new AutobiographicalStrategy({
       adaptiveResolution: true,
       headWindowTokens: 0,
@@ -843,6 +854,7 @@ describe('OverBudgetError.clearedBy', () => {
 
   for (const adaptiveResolution of [false, true]) {
     it(`names nothing on the ${adaptiveResolution ? 'adaptive' : 'hierarchical'} path for queued chunks an L1 covers only partly, which tick refuses`, async () => {
+      const calls = { n: 0 };
       const strategy = new DiagnosticStrategy({
         adaptiveResolution,
         targetChunkTokens: 40,
@@ -863,13 +875,14 @@ describe('OverBudgetError.clearedBy', () => {
         assert.match(error.message, adaptiveResolution ? /^Adaptive picker exhausted/ : /^Hierarchical emission overran the budget/);
         assert.deepEqual(strategy.queuedChunkIds(), queued, 'the compile closed no new chunk');
         assert.deepEqual(error.clearedBy, []);
-        // Tick refuses each one without compressing it: the stub membrane has
-        // no model to call, and no L1 is added.
+        // Tick refuses each one without compressing it: no model call, and
+        // no L1 is added.
         const l1s = strategy.summaryIds();
         for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
         assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
         assert.deepEqual(strategy.summaryIds(), l1s);
-      }, { membrane: true });
+        assert.equal(calls.n, 0, 'no model call');
+      }, { membrane: countingMembrane(calls) });
     });
   }
 
@@ -889,6 +902,22 @@ describe('OverBudgetError.clearedBy', () => {
       for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
       assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
       for (let i = 0; i < queued.length; i++) assert.ok(strategy.summaryIds().includes(`L1-stored-${i}`), `tick adopted L1-stored-${i}`);
+    }, { membrane: true });
+  });
+
+  it('names nothing for queued chunks an in-memory L1 covers partly when the store holds their exact L1s, if chunks keep no records', async () => {
+    const strategy = queuedChunks();
+    strategy.persistChunks = false;
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      queued.forEach((ids, i) => {
+        strategy.seedL1(`L1-part-${i}`, [ids[0]!]);
+        strategy.seedStoredL1(`L1-stored-${i}`, ids);
+      });
+      const error = await refusal(manager);
+      assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assert.deepEqual(error.clearedBy, [], 'adoption doesn\'t persist, so the stored L1s shrink nothing');
     }, { membrane: true });
   });
 

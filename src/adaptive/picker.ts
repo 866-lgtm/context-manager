@@ -78,11 +78,12 @@ export interface OverBudgetDiagnostics {
  *   newer message that fits moves the window past it.
  * - `'smaller-recent-window'`: the raw recent window, which compression never
  *   touches, is what's over the budget, and the head fits beside the newest
- *   turn kept whole, or beside everything from a compression hold if one
- *   starts earlier. The newest turn is the newest message (for one split into
- *   shards, its newest shard, since the earlier shards can fold); when it
- *   holds a tool_result, it's the result's whole body and the whole call
- *   before it, which the result must follow raw. A smaller
+ *   turn as the compile must keep it raw, or beside everything from a
+ *   compression hold if one starts earlier. That's the newest message (for
+ *   one split into shards, its newest shard, since the earlier shards can
+ *   fold), unless the newest message's body holds a tool_result, on its first
+ *   shard: then it's that whole body and the whole call before it, which the
+ *   result must follow raw. A smaller
  *   `recentWindowTokens` (the hot `tailTokens`) moves the rest out of the raw
  *   window into the middle, which folds once its chunks have closed and
  *   compression has summarized them.
