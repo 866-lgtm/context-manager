@@ -94,6 +94,42 @@ describe('mergeMessageStoreViews', () => {
     const primary = fakeView([{ id: 'p1', sequence: 1 }]);
     assert.equal(mergeMessageStoreViews(primary, []), primary);
   });
+
+  it('serves one merged listing while every source listing is the same array', () => {
+    // A store's getAll returns its cached array until a write; the memo
+    // keys on those arrays, so fresh view objects over unchanged sources
+    // share the merge and the listing keeps its identity.
+    let primaryListing: StoredMessage[] = fakeView([{ id: 'p1', sequence: 1 }, { id: 'p2', sequence: 4 }]).getAll();
+    let auxListing: StoredMessage[] = fakeView([{ id: 'x1', sequence: 2 }]).getAll();
+    const stable = (read: () => StoredMessage[]): MessageStoreView => ({
+      getAll: read,
+      get: (id) => read().find((m) => m.id === id) ?? null,
+      getFrom: (index) => read().slice(index),
+      getTail: (count) => read().slice(Math.max(0, read().length - count)),
+      length: () => read().length,
+      estimateTokens: () => 10,
+    });
+    const primary = stable(() => primaryListing);
+    const aux = stable(() => auxListing);
+
+    const first = mergeMessageStoreViews(primary, [aux]).getAll();
+    assert.deepEqual(first.map((m) => m.id), ['p1', 'x1', 'p2']);
+    assert.equal(mergeMessageStoreViews(primary, [aux]).getAll(), first, 'a fresh view over the same sources shares the merge');
+    assert.equal(mergeMessageStoreViews(primary, [aux]).getTail(5), first);
+
+    // An append replaces the source array: the merge is rebuilt once and shared again.
+    auxListing = [...auxListing, { id: 'x2', sequence: 3 } as StoredMessage];
+    const second = mergeMessageStoreViews(primary, [aux]).getAll();
+    assert.notEqual(second, first);
+    assert.deepEqual(second.map((m) => m.id), ['p1', 'x1', 'x2', 'p2']);
+    assert.equal(mergeMessageStoreViews(primary, [aux]).getAll(), second);
+
+    // The old combination is still served if a view still holds the old source.
+    primaryListing = [...primaryListing];
+    const third = mergeMessageStoreViews(primary, [aux]).getAll();
+    assert.notEqual(third, second);
+    assert.deepEqual(third.map((m) => m.id), ['p1', 'x1', 'x2', 'p2']);
+  });
 });
 
 describe('ContextManager viewFilter', () => {

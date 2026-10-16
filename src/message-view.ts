@@ -78,16 +78,29 @@ export function filterMessageStoreView(
  * Merge one primary view with any number of auxiliary views into a single
  * timeline ordered by `sequence`.
  *
- * Cost: every `getAll` / `getFrom` / `getTail` re-concatenates and re-sorts
- * (O(n log n) per read). Only managers configured with auxiliary views pay
- * it, and their strategies read once per select; do not hang a hot path
- * (per-message bookkeeping, tight loops) off a merged view.
+ * Cost: the merged listing is built once per combination of source
+ * listings and served from a memo while every source returns the same
+ * array. The sources are the stores' own cached listings (MessageStore
+ * memoizes getAll on branch and write version), so a compile's ten-odd
+ * getAll/getFrom/getTail calls, across the fresh view objects the host
+ * builds for each strategy call, share one O(n log n) merge; the next
+ * append misses on the changed source and merges again. The memo also
+ * keeps the listing's identity stable, which the strategy's per-listing
+ * memos (post-strip estimates, the chunk index) key on.
  *
  * Token estimation and calibration delegate to the primary view (estimators
  * are store-level and identical across slots of one chronicle store).
  * Auxiliary views are read-only by construction — MessageStoreView carries
  * no write surface.
  */
+/** Merged listings per primary listing, each entry keyed by the auxiliary
+ * listings it was merged from (compared by identity). A primary listing
+ * meets few auxiliary combinations before an append replaces it. */
+const mergedListings = new WeakMap<
+  readonly StoredMessage[],
+  Array<{ sources: readonly (readonly StoredMessage[])[]; merged: StoredMessage[] }>
+>();
+
 export function mergeMessageStoreViews(
   primary: MessageStoreView,
   auxiliary: MessageStoreView[],
@@ -95,8 +108,21 @@ export function mergeMessageStoreViews(
   if (auxiliary.length === 0) return primary;
 
   const all = () => {
-    const merged = primary.getAll().concat(...auxiliary.map((v) => v.getAll()));
+    const source = primary.getAll();
+    const sources = auxiliary.map((v) => v.getAll());
+    let entries = mergedListings.get(source);
+    if (!entries) {
+      entries = [];
+      mergedListings.set(source, entries);
+    }
+    for (const entry of entries) {
+      if (entry.sources.length === sources.length && entry.sources.every((listing, i) => listing === sources[i])) {
+        return entry.merged;
+      }
+    }
+    const merged = source.concat(...sources);
     merged.sort((a, b) => a.sequence - b.sequence);
+    entries.push({ sources, merged });
     return merged;
   };
   return {
