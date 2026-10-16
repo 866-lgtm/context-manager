@@ -10557,6 +10557,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       const strategy = new KvUnifiedStrategy({
         ...configured,
+        // The certified hysteresis exit is on unless the recipe says
+        // `hysteresisCertificate: false`. It only skips the full solve when it
+        // proves the carried layout is the policy's choice, and declines to
+        // the full solver otherwise, so the default changes solve time, not
+        // the eligibility, adoption or fallback rules.
+        hysteresisCertificate: configured.hysteresisCertificate ?? true,
         reuse: this.kvUnifiedReuse,
         continuityMultiplier: this.kvUnifiedContinuityMultiplier(continuityRelaxation),
         latentDemand: {
