@@ -1327,6 +1327,50 @@ describe('fold journal durability and index', () => {
     cm.close();
   });
 
+  it('refuses a compile of another store in the same namespace, and writes nothing', async () => {
+    const { cm } = await open();
+    add(cm, 3);
+    const provenance = (await cm.compile(BUDGET)).provenance!;
+    const otherPath = `${STORE}-other`;
+    rmSync(otherPath, { recursive: true, force: true });
+    const other = await ContextManager.open({ path: otherPath, strategy: new ScriptedStrategy(), namespace: 'agents/tester' });
+    try {
+      add(other, 3);
+      assert.throws(() => other.acceptRound({ provenance }), /has no live branch with that id and creation time, and this namespace has no readable record of one, so accepting it here again is refused the same way/);
+      assert.equal(layoutRecords(other.getStore()).length, 0);
+      assert.deepEqual(other.listFoldReceipts().receipts, []);
+      assert.equal((await acceptCompile(other))?.kind, 'baseline', 'its own compiles are accepted as before');
+    } finally {
+      other.close();
+      rmSync(otherPath, { recursive: true, force: true });
+    }
+    cm.close();
+  });
+
+  it('accepts a late compile of a deleted branch it has records of, and refuses one of a branch deleted before any', async () => {
+    let { cm, strategy } = await open();
+    const ids = add(cm, 3);
+    const main = cm.currentBranchRef();
+    await cm.fork('kept');
+    assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+    strategy.plan.set(ids[0]!, 'omit');
+    const onKept = (await cm.compile(BUDGET)).provenance!;
+    await cm.switchBranch(main.name);
+    await cm.fork('gone');
+    const onGone = (await cm.compile(BUDGET)).provenance!;
+    await cm.switchBranch(main.name);
+    cm.getStore().deleteBranch('kept');
+    cm.getStore().deleteBranch('gone');
+    // After a reopen, only the records can say the deleted branch existed.
+    cm.close();
+    ({ cm } = await open(strategy));
+    assert.equal(cm.acceptRound({ provenance: onKept })?.kind, 'change', 'a deleted branch with records stays known');
+    const before = layoutRecords(cm.getStore()).length;
+    assert.throws(() => cm.acceptRound({ provenance: onGone }), /has no live branch with that id and creation time, and this namespace has no readable record of one/);
+    assert.equal(layoutRecords(cm.getStore()).length, before);
+    cm.close();
+  });
+
   it('a branch whose newest record cannot be read gets a baseline, never a diff against an older layout', async () => {
     let { cm, strategy } = await open();
     const ids = add(cm, 3);

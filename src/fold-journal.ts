@@ -624,7 +624,8 @@ export class FoldJournal {
    * newest record can't be read), and records the layout as the branch's
    * last accepted one. Idempotent per compile: a compile accepted before
    * returns the receipt that acceptance wrote, or null when it wrote none.
-   * Returns the receipt, if any. A compile of another namespace is refused.
+   * Returns the receipt, if any. A compile of another namespace is refused,
+   * and so is one whose branch this store doesn't know, live or recorded.
    */
   accept(
     provenance: CompileProvenance,
@@ -642,6 +643,20 @@ export class FoldJournal {
     if (!layout) return null;
     const index = storeIndex(this.store);
     const branch = this.branchState(index, provenance.branch);
+    // Only this store's branches. Another store's compile in the same
+    // namespace names a branch this store never had, and a record of it here
+    // would be announced and exported as this store's. A branch this
+    // namespace has records of stays known after it's deleted.
+    const ref = provenance.branch;
+    if (!branch && !this.store.listBranches().some((b) => b.id === ref.id && b.created === ref.created)) {
+      throw new Error(
+        `a compile of branch ${JSON.stringify(ref.name)} (id ${JSON.stringify(ref.id)}, created ${ref.created}) can't be ` +
+          `accepted on this store: it has no live branch with that id and creation time, and this namespace has no ` +
+          `readable record of one, so accepting it here again is refused the same way. A compile is accepted by the ` +
+          `manager that compiled it, over the store it read; a branch deleted before anything readable was recorded ` +
+          `for it can't take one`,
+      );
+    }
     // The branch's newest receipt may be one this journal never announced:
     // its write reported failure after landing, in this stream or the turn
     // before, or another journal wrote it, whether or not records without a
