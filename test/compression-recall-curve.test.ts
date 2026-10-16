@@ -1029,8 +1029,10 @@ describe('compression refusal recall curves', () => {
 
   it('zero usage, or usage without an input count, falls back to the complete request bound', async () => {
     // Cache counts with no input count beside them are no observation of the
-    // prompt. Through membrane the input count is always a number, an omitted
-    // one reported as zero, so this shape comes only from a caller outside it.
+    // prompt. Through membrane the input count is always a number, since the
+    // adapters whose providers can omit it report zero and Anthropic's and
+    // Bedrock's APIs always send one, so this shape comes only from a caller
+    // outside it.
     const withoutInputCount = response('refusal');
     (withoutInputCount as { usage: Record<string, number> }).usage = { outputTokens: 0 };
     (withoutInputCount as unknown as { details: unknown }).details = {

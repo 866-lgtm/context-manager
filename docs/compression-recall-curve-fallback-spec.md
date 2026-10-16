@@ -107,8 +107,9 @@ allowance, and the output reserve. After canonical refusal reports complete
 provider input usage, admission uses `provider total input + positive
 serialized expansion delta + output reserve`; the complete-request bound
 remains the fail-closed path when usage is absent, has no input count, or
-totals zero. Through membrane the input count is always a number, since its
-adapters report an omitted prompt total as zero, so "no input count" covers
+totals zero. Through membrane the input count is always a number: the
+adapters whose providers can omit a prompt total report it as zero, and
+Anthropic's and Bedrock's APIs always send one. So "no input count" covers
 only a caller outside membrane, and a cache-only report through membrane
 reads as a full cache hit. The provider total is `inputTokens +
 cacheCreationTokens + cacheReadTokens` for every provider: membrane (0.5.81
