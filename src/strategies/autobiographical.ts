@@ -2029,6 +2029,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       deltaSnapshotEvery: 50,
       fullSnapshotEvery: 10,
     });
+    // imageStripHysteresisRatio's watermark, registered only when the option
+    // is on, as the adaptive slots below are, so chronicles without it don't
+    // accumulate an unused slot.
+    if (this.imageHysteresisRatio() !== undefined) {
+      registerState({
+        id: this.imageWatermarkStateId,
+        strategy: 'snapshot',
+      });
+    }
     // Adaptive-resolution state slots — only registered when the flag is on
     // so chronicles without the flag don't accumulate unused slots.
     if (this.config.adaptiveResolution) {
@@ -12159,6 +12168,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  sequence stay stripped (undefined = none). Loaded lazily, persisted. */
   private _imageWatermark: number | undefined;
   private _imageWatermarkLoaded = false;
+  /** Whether a failed watermark write has been logged (once per instance). */
+  private _imageWatermarkWriteWarned = false;
 
   protected imageWatermark(): number | undefined {
     if (!this._imageWatermarkLoaded) {
@@ -12225,7 +12236,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this._dryRunSelect) return;
     try {
       this.store?.setStateJson(this.imageWatermarkStateId, { sequence: next, at: Date.now() });
-    } catch { /* persistence is best-effort */ }
+    } catch (error) {
+      // The watermark still holds in memory, so trims strip as they should
+      // until the strategy next loads its state from the store (initialize
+      // clears it), as a restart, a branch switch or fork, or setStrategy
+      // does. Its next trim may then strip a different set, which rewrites
+      // the prompt cache from there. Said once per instance, so a store that keeps refusing doesn't
+      // log on every trim.
+      if (!this._imageWatermarkWriteWarned) {
+        this._imageWatermarkWriteWarned = true;
+        console.warn(
+          `[autobiographical] image watermark not persisted to ${this.imageWatermarkStateId} ` +
+            `(${error instanceof Error ? error.message : String(error)}); it holds in memory until the strategy next loads its state`,
+        );
+      }
+    }
   }
 
   /** True when an image in the message with this sequence is below the watermark. */
