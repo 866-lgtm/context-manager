@@ -1285,7 +1285,8 @@ export interface AutobiographicalConfig {
   /**
    * Per-tool retention limit: keep at most the last N `tool_result` blocks
    * for each tool name. Older results get their content replaced with a
-   * brief marker referencing the tool name and how many newer results exist.
+   * brief marker naming the tool and the limit; a limit of 0 replaces every
+   * result of the tool.
    *
    * Two shapes accepted:
    *  - `number`: applies as a global default across all tools.

@@ -5408,8 +5408,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // and are NOT reflected in the snapshot. Trims only remove entries (total
   // over-counts by at most the trimmed tail); the pairing validator can also
   // ADD stub tool_result entries (total then under-counts by those stubs).
-  // Both deltas are a handful of tokens — the stats describe the selection, not
-  // the byte-exact wire payload. Do not treat `total` as an exact wire count.
+  // Neither delta is counted (a stub is about 36 tokens): the stats describe
+  // the selection, not the byte-exact wire payload. Do not treat `total` as
+  // an exact wire count.
   // ===========================================================================
   private _rs: RenderStats | null = null;
   private _lastRenderStats: RenderStats | null = null;
@@ -12071,8 +12072,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return 0;
   }
 
-  /** Text substituted for an image block once it leaves the live-image window. */
-  private static readonly IMAGE_PLACEHOLDER = '[image dropped from live context]';
+  /** Text substituted for an image block the context doesn't carry. It
+   *  names no particular limit and no recency, since several rules write it:
+   *  the count, byte and depth limits (the byte rule is greedy, so a large
+   *  newest image can be replaced while smaller older ones stay), the
+   *  hysteresis watermark, which strips below them, and the compression
+   *  request's own image byte cap. Windowed passthrough uses the same text. */
+  private static readonly IMAGE_PLACEHOLDER = '[image not shown: this context keeps only some images]';
 
   /** Post-pass over compiled entries: replace image blocks with a text
    *  placeholder once they fall outside the live-image window — either deeper
@@ -12872,9 +12878,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
-  /** Placeholder body for a stub tool_result inserted by enforceToolPairing. */
+  /** Placeholder body for a stub tool_result inserted by enforceToolPairing:
+   *  the call's result isn't in the rendered context next to it (see the
+   *  cases listed there, and its tail pass, for a last entry that holds both
+   *  a call and a result), so the text names no cause. A read-only call can be
+   *  made again, and returns what the tool reads now; one with effects
+   *  shouldn't be repeated blind. */
   private static readonly STUB_TOOL_RESULT_TEXT =
-    '[tool result unavailable — omitted during context compression]';
+    '[this call\'s result isn\'t shown in this context. If you need its output and the tool only reads, call it again; you\'ll get what it returns now.]';
 
   // Track generated objects, not their text: genuine tool output can quote
   // the same marker. Weak keys avoid retaining previous rendered contexts.
@@ -13066,10 +13077,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *     `toolUseInputMaxTokens`.
    *  2. For each tool name, keep only the last N `tool_result` blocks
    *     per `toolResultMaxLastN`; older ones get their `content` replaced
-   *     with a brief marker referencing the tool name and how many newer
-   *     results exist below.
+   *     with a brief marker naming the tool and the limit. A limit of 0
+   *     replaces every result of the tool.
    *
-   * Both passes are no-ops when the corresponding config is unset/0.
+   * The first pass does nothing when `toolUseInputMaxTokens` is unset or 0,
+   * and the second when `toolResultMaxLastN` is unset, or for a tool whose
+   * limit is unset or negative.
    * Pruning runs AFTER selection and orphan-trimming, so it doesn't
    * affect chunk formation or the recall/pin layout.
    */
@@ -13156,10 +13169,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const { entry, blockIndex } = occs[i];
           const orig = entry.content[blockIndex];
           if (orig.type !== 'tool_result') continue;
-          const fresherCount = occs.length - i - 1;
           replaceBlock(entry, blockIndex, {
             ...orig,
-            content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
+            // The whole result is replaced, not cut short. Name the limit
+            // rather than count what follows: later results may be replaced
+            // too, and with a limit of 0 every one is.
+            content: limit === 0
+              ? `[result of tool '${toolName}' left out: this context shows none of its results]`
+              : `[result of tool '${toolName}' left out: this context shows only the tool's last ${limit === 1 ? 'result' : `${limit} results`}]`,
           });
         }
       }
@@ -13634,7 +13651,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // Budget exhausted — include with minimal content to preserve pairing
             result.push({
               ...block,
-              content: '[content omitted — context budget exceeded]',
+              content: '[content omitted: this message reached its token limit before this result]',
             });
           } else if (text.length > remaining) {
             result.push({
