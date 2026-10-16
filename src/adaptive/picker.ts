@@ -186,10 +186,12 @@ export interface PickerChunk {
   sequence: number;
   rawTokens: number;
   /**
-   * The level this chunk carries in from the last committed solve. The greedy
-   * solvers and kv-stable render a pinned chunk raw whatever it carries (the
-   * greedy solvers seed it at 0); kv-unified composes a pin with the chunk's
-   * other constraints, a lock among them.
+   * The level this chunk starts the solve at (0 = raw). The autobiographical
+   * strategy passes the level it carries in from the last committed solve, or,
+   * when the summaries over it no longer reach that level, the deepest level
+   * below it that they reach. The greedy solvers and kv-stable render a pinned
+   * chunk raw whatever it carries (the greedy solvers seed it at 0); kv-unified
+   * composes a pin with the chunk's other constraints, a lock among them.
    */
   currentResolution: number;
   lockedByAgent: boolean;
@@ -277,7 +279,8 @@ export interface PickerResult {
    *  full folding exceeds the hard wall (a dead-band hold is NOT exhausted).
    *  Falls back to the greedy formula when a solver doesn't set it. */
   exhausted: boolean;
-  /** Number of chunks whose resolution changed vs the carried state. */
+  /** Number of chunks whose resolution changed from the `currentResolution`
+   *  they started at. */
   moves: number;
   /** Solver-frontier entries that reference no live chunk (summaries whose
    *  sources were removed by store surgery). Dropped from application;
