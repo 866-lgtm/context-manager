@@ -25,7 +25,7 @@ function texts(req: NormalizedRequest): string[] {
 }
 
 /** Refuses when >= `refuseAt` target messages are present; optionally refuses one message forever. */
-function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; throwOn?: string; leafDetails?: boolean | 'first-only' | 'same' }) {
+function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; throwOn?: string; leafDetails?: boolean | 'first-only' | 'same'; refusedDetails?: boolean }) {
   let leaf = 0;
   const calls: NormalizedRequest[] = [];
   return {
@@ -38,6 +38,7 @@ function cumulativeMembrane(opts: { refuseAt: number; alwaysRefuse?: string; thr
         const refuse = targets.length >= opts.refuseAt || (opts.alwaysRefuse !== undefined && targets.some((t) => t.startsWith(opts.alwaysRefuse!)));
         if (refuse) {
           return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 },
+            ...(opts.refusedDetails ? { details: { usage: { inputTokens: 100, outputTokens: 0, cacheCreationTokens: 5, cacheReadTokens: 11 } } } : {}),
             raw: { response: { stop_details: { category: 'bio' } } } };
         }
         const which = targets.map((t) => t.split(' ')[0]).join('+');
@@ -295,6 +296,33 @@ describe('split-stitch L1 fallback', () => {
     assert.ok(d.cache.hitRatio > 0 && d.cache.hitRatio < 1, 'aggregate hit ratio computed from summed counts');
     const disc = d.usage.discardedAttempts as { attempts: number };
     assert.ok(disc.attempts >= 1, 'refused leaves counted as discarded attempts');
+  });
+
+  it('discarded attempts carry the cache counts the refused leaves reported', async () => {
+    const fx = await build(cumulativeMembrane({ refuseAt: 2, leafDetails: true, refusedDetails: true }).membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const att = fx.strategy.attempted()! as { refused: number; cacheCreationTokens?: number; cacheReadTokens?: number };
+    assert.ok(att.refused >= 1, 'some leaves were refused');
+    const d = fx.strategy.details()!;
+    // The stitched usage is the four successful leaves' (4×7 written, 4×3 read),
+    // and what the refused leaves reported (5 written, 11 read each) is the
+    // discarded spend's.
+    assert.equal(d.usage.cacheCreationTokens, 28);
+    assert.equal(d.usage.cacheReadTokens, 12);
+    const disc = d.usage.discardedAttempts as { attempts: number; cacheCreationTokens?: number; cacheReadTokens?: number };
+    assert.equal(disc.cacheCreationTokens, att.refused * 5);
+    assert.equal(disc.cacheReadTokens, att.refused * 11);
+    assert.equal(att.cacheCreationTokens, 28 + att.refused * 5, 'attempted sums every completed call');
+    assert.equal(att.cacheReadTokens, 12 + att.refused * 11);
+  });
+
+  it('discarded attempts carry no cache counts when no call reported any', async () => {
+    const fx = await build(cumulativeMembrane({ refuseAt: 2 }).membrane, { split: true });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const disc = fx.strategy.details()!.usage.discardedAttempts as { attempts: number; cacheCreationTokens?: number; cacheReadTokens?: number };
+    assert.ok(disc.attempts >= 1);
+    assert.equal(disc.cacheCreationTokens, undefined);
+    assert.equal(disc.cacheReadTokens, undefined);
   });
 
   it('model identity is unanimous only when every successful leaf reported it; present/missing mix is "mixed"', async () => {

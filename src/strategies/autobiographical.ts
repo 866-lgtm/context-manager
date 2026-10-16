@@ -7467,7 +7467,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           let lastGood: NormalizedResponse | undefined;
           let calls = 0;
           let inputTokens = 0;
-          const attempted = { calls: 0, refused: 0, errors: 0, inputTokens: 0, outputTokens: 0 };
+          const attempted = { calls: 0, refused: 0, errors: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
+          let attemptedCacheSeen = false;
           const succ = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, cacheSeen: false };
           const leafModels = new Set<string>();
           let successfulLeaves = 0;
@@ -7506,9 +7507,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const assessment = this.assessFallbackCompressionResponse(res);
             const trace = attemptTraces[attemptTraces.length - 1]!;
             {
-              const u = (res as { usage?: { inputTokens?: number; outputTokens?: number } } | undefined)?.usage;
+              const r = res as { usage?: { inputTokens?: number; outputTokens?: number }; details?: { usage?: { cacheCreationTokens?: number; cacheReadTokens?: number } } } | undefined;
+              const u = r?.usage;
               attempted.inputTokens += u?.inputTokens ?? 0;
               attempted.outputTokens += u?.outputTokens ?? 0;
+              // Cache counts are in the response's details, as succ reads them.
+              const du = r?.details?.usage;
+              if (du?.cacheCreationTokens !== undefined || du?.cacheReadTokens !== undefined) { attemptedCacheSeen = true; attempted.cacheCreationTokens += du?.cacheCreationTokens ?? 0; attempted.cacheReadTokens += du?.cacheReadTokens ?? 0; }
               if (assessment.outcome !== 'valid') attempted.refused++;
             }
             if (assessment.outcome === 'valid') {
@@ -7578,7 +7583,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                   outputTokens: succ.outputTokens,
                   ...(succ.cacheSeen ? { cacheCreationTokens: succ.cacheCreationTokens, cacheReadTokens: succ.cacheReadTokens } : {}),
                   // discardedAttempts exists on newer membrane DetailedUsage; older membranes ignore the extra field.
-                  discardedAttempts: { attempts: attempted.refused + attempted.errors, inputTokens: Math.max(0, attempted.inputTokens - succ.inputTokens), outputTokens: Math.max(0, attempted.outputTokens - succ.outputTokens) },
+                  discardedAttempts: {
+                    attempts: attempted.refused + attempted.errors,
+                    inputTokens: Math.max(0, attempted.inputTokens - succ.inputTokens),
+                    outputTokens: Math.max(0, attempted.outputTokens - succ.outputTokens),
+                    ...(attemptedCacheSeen ? {
+                      cacheCreationTokens: Math.max(0, attempted.cacheCreationTokens - succ.cacheCreationTokens),
+                      cacheReadTokens: Math.max(0, attempted.cacheReadTokens - succ.cacheReadTokens),
+                    } : {}),
+                  },
                 } as NormalizedResponse['details']['usage'],
                 timing: { totalDurationMs: Date.now() - splitStart, attempts: attempted.calls },
                 // One identity only when EVERY successful leaf reported one and they all agree;
