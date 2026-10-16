@@ -453,6 +453,11 @@ describe("content that doesn't match ContentBlock", () => {
           [[toolUse('u1', () => 1)], 'content\\[0\\]\\.input is a function, not an object'],
           [[toolUse('u1', cyclic())], 'content\\[0\\]\\.input is an array, not an object'],
           [[{ type: 'document', source: 'x' }], 'content\\[0\\]\\.source is a string, not an object'],
+          // Inline media the store can't keep as a blob.
+          [[t('kept'), { type: 'document', source: { type: 'base64', data: 'JVBERi0=' } }], 'content\\[1\\]\\.source\\.mediaType is undefined, not a string'],
+          [[{ type: 'audio', source: { type: 'base64', mediaType: 'audio/wav', data: 7 } }], 'content\\[0\\]\\.source\\.data is a number, not base64 data'],
+          [[{ type: 'image', source: { type: 'base64', data: 'AAAA' } }],
+            "content\\[0\\]\\.source\\.mediaType is undefined, not a string, and the image's data has no png, jpeg, gif or webp signature"],
           [[{ type: 'generated_image', data: 1 }],
             'content\\[0\\]\\.data is a number, not a string; content\\[0\\]\\.mimeType is undefined, not a string'],
           [[{ type: 'blob_ref', ref: { hash: 'h', mediaType: 'image/png', originalType: 'image' } }], 'content\\[0\\] is a blob_ref, which only the store writes'],
@@ -476,8 +481,12 @@ describe("content that doesn't match ContentBlock", () => {
         manager.addMessage('User', [toolResult('t1', 'a string') as ContentBlock]);
         manager.addMessage('Claude', [toolUse('u1', {}) as ContentBlock, { type: 'thinking', thinking: '' } as ContentBlock]);
         manager.addMessage('User', [{ type: 'a_later_block', data: 1 } as unknown as ContentBlock]);
-        assert.equal(manager.getAllMessages().length, 3, 'a string tool_result content, an object input, an empty thinking and a block of a type the check names nowhere are stored');
+        // The store keeps media inside a tool_result as given, so a write doesn't read its source.
+        const nested = toolResult('t2', [{ type: 'audio', source: { type: 'base64', mediaType: 'audio/wav' } }]);
+        manager.addMessage('User', [nested as ContentBlock]);
+        assert.equal(manager.getAllMessages().length, 4, 'a string tool_result content, an object input, an empty thinking, a block of a type the check names nowhere and media inside a tool_result are stored');
         assert.deepEqual(manager.getAllMessages()[2]!.content, [{ type: 'a_later_block', data: 1 }], 'and a read gives that block as it is');
+        assert.deepEqual(manager.getAllMessages()[3]!.content, [nested]);
       } finally {
         manager.close();
       }
@@ -560,6 +569,14 @@ describe("content that doesn't match ContentBlock", () => {
       assert.throws(() => log.append('User', [toolResult('t1', [null])] as ContentBlock[]), { message: /^Context entry refused: content\[0\]\.content\[0\] is null, not a content block\.$/ });
       log.append('User', [t('entry')]);
       assert.throws(() => log.edit(0, [{ type: 'text' }] as ContentBlock[]), { message: /^Edit of context entry 0 refused: content\[0\]\.text is undefined, not a string\.$/ });
+      assert.throws(
+        () => log.append('User', [{ type: 'video', source: { type: 'base64', data: 'AAAA' } }] as ContentBlock[]),
+        { message: /^Context entry refused: content\[0\]\.source\.mediaType is undefined, not a string\.$/ },
+      );
+      assert.throws(
+        () => messages.append('User', [{ type: 'audio', source: { type: 'base64', mediaType: 'audio/wav' } }] as ContentBlock[]),
+        { message: /^Message refused: content\[0\]\.source\.data is undefined, not base64 data\.$/ },
+      );
       assert.deepEqual(log.getAll().map((entry) => entry.content), [[t('entry')]], 'the context log stored nothing refused');
       assert.throws(
         () => log.replaceAll([

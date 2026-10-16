@@ -9,55 +9,10 @@ import type {
 } from '@animalabs/membrane';
 import type { BlobReference, StoredContentBlock } from './types/index.js';
 import { blockForWrite } from './well-formed-content.js';
-
-/** Detect provider-supported raster image types from their byte signature.
- * Returns null for unknown/container types so callers can preserve the
- * declared MIME rather than guessing. */
-function sniffRasterImageMediaType(bytes: Uint8Array): string | null {
-  if (bytes.length >= 8 &&
-      bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
-      bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) {
-    return 'image/png';
-  }
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
-    return 'image/jpeg';
-  }
-  if (bytes.length >= 6) {
-    const signature = Buffer.from(bytes.subarray(0, 6)).toString('ascii');
-    if (signature === 'GIF87a' || signature === 'GIF89a') return 'image/gif';
-  }
-  if (bytes.length >= 12 &&
-      Buffer.from(bytes.subarray(0, 4)).toString('ascii') === 'RIFF' &&
-      Buffer.from(bytes.subarray(8, 12)).toString('ascii') === 'WEBP') {
-    return 'image/webp';
-  }
-  return null;
-}
+import { blobKindOf, imageMediaTypeOfBase64, sniffRasterImageMediaType } from './stored-media.js';
 
 function canonicalImageMediaTypeFromBase64(data: string, declared: string): string {
-  // 32 base64 characters decode to 24 bytes, which cover every signature
-  // above (the longest needs 12). Decode only a short prefix so legacy
-  // multi-megabyte blobs do not get copied in full.
-  const prefix = Buffer.from(data.slice(0, 32), 'base64');
-  return sniffRasterImageMediaType(prefix) ?? declared;
-}
-
-/**
- * The blob a block is kept as, by its original type, or null for a block the
- * store keeps as given. Inline media becomes a blob: an image whose source
- * isn't a URL, and every document, audio or video block.
- */
-function blobKindOf(block: ContentBlock): BlobReference['originalType'] | null {
-  switch (block.type) {
-    case 'image':
-      return block.source.type === 'url' ? null : 'image';
-    case 'document':
-    case 'audio':
-    case 'video':
-      return block.type;
-    default:
-      return null;
-  }
+  return imageMediaTypeOfBase64(data) ?? declared;
 }
 
 /**
@@ -132,13 +87,14 @@ function blockFromBlob(kind: BlobReference['originalType'], data: string, mediaT
  * (`chunkIngressMessage`) can store one delivered message as several, each
  * holding part of its content, which this doesn't predict.
  *
- * It throws for a block the store refuses on write, which has no stored form:
- * content that doesn't match `ContentBlock` where its readers read it
- * (well-formed-content.ts), a `blob_ref`, which only the store writes (it
- * reads back as the media it references, and that takes the store to know),
- * inline media whose data the store can't read as base64, or one without a
- * media type (for an image: none declared, and no recognized signature in its
- * bytes). A `tool_use` whose input isn't an object comes back mended, as the
+ * It throws a `MalformedContentError` naming what it refuses for a block the
+ * store refuses on write, which has no stored form (well-formed-content.ts):
+ * content that doesn't match `ContentBlock` where its readers read it, a
+ * `blob_ref`, which only the store writes (it reads back as the media it
+ * references, and that takes the store to know), and inline media the store
+ * can't keep: data that doesn't read as base64, or no media type (for an
+ * image: none declared, and no recognized signature in its data). A
+ * `tool_use` whose input isn't an object comes back mended, as the
  * store keeps it: `input: {}`, the value kept in `unparseableInput`, and its
  * raw replay forms given up. In a message, blocks that share a form with it
  * give that form up too, which one block can't show.
@@ -151,18 +107,10 @@ export function blockAsStored(block: ContentBlock): ContentBlock {
   const kind = blobKindOf(block);
   if (!kind) return block;
   const { data, mediaType } = (block as { source: Base64Source }).source;
-  // The store's own read of the data (storeBase64), so this refuses exactly what it refuses.
-  let bytes: Buffer;
-  try {
-    bytes = Buffer.from(data, 'base64');
-  } catch {
-    throw new Error(`blockAsStored: a ${kind} block whose data the store can't read as base64 has no stored form: the store refuses it`);
-  }
-  const storedType = blobMediaType(bytes, mediaType, kind);
-  if (typeof storedType !== 'string') {
-    throw new Error(`blockAsStored: a ${kind} block without a media type${kind === 'image' ? ' its bytes supply' : ''} has no stored form: the store refuses it`);
-  }
-  return blockFromBlob(kind, bytes.toString('base64'), storedType);
+  // The store's own read of the data (storeBase64). What it refuses, the
+  // boundary has refused by name above.
+  const bytes = Buffer.from(data, 'base64');
+  return blockFromBlob(kind, bytes.toString('base64'), blobMediaType(bytes, mediaType, kind));
 }
 
 /**

@@ -145,20 +145,49 @@ describe('blockAsStored', () => {
     const untypedUnsniffable = { type: 'image', source: { type: 'base64', data: b64(AVIF) } } as unknown as ContentBlock;
     const noData = { type: 'audio', source: { type: 'base64', mediaType: 'audio/wav' } } as unknown as ContentBlock;
     const ref = { type: 'blob_ref', ref: { hash: 'h', mediaType: 'image/png', originalType: 'image' } } as unknown as ContentBlock;
-    assert.throws(() => blockAsStored(untypedDocument), /document block without a media type has no stored form/);
-    assert.throws(() => blockAsStored(untypedUnsniffable), /image block without a media type its bytes supply has no stored form/);
-    assert.throws(() => blockAsStored(noData), /audio block whose data the store can't read as base64 has no stored form/);
-    assert.throws(() => blockAsStored(ref), /block is a blob_ref, which only the store writes/);
-    // The store refuses the same blocks on write.
+    const urlDocument = { type: 'document', source: { type: 'url', url: 'https://example.com/a.pdf' } } as unknown as ContentBlock;
+    const refusals: Array<[ContentBlock, string]> = [
+      [untypedDocument, 'source.mediaType is undefined, not a string'],
+      [untypedUnsniffable, "source.mediaType is undefined, not a string, and the image's data has no png, jpeg, gif or webp signature"],
+      [noData, 'source.data is undefined, not base64 data'],
+      [urlDocument, 'source.data is undefined, not base64 data; content[0].source.mediaType is undefined, not a string'],
+    ];
+    // blockAsStored names the block's places from `block`.
+    for (const [block, place] of refusals) {
+      assert.throws(() => blockAsStored(block), {
+        name: 'MalformedContentError',
+        message: `blockAsStored: block.${place.replaceAll('content[0].', 'block.')}.`,
+      });
+    }
+    assert.throws(() => blockAsStored(ref), { name: 'MalformedContentError', message: 'blockAsStored: block is a blob_ref, which only the store writes.' });
+    // A write refuses the same blocks by name, before anything is stored.
     const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
     try {
-      for (const block of [untypedDocument, untypedUnsniffable, noData]) {
-        assert.throws(() => manager.addMessage('user', [block]));
+      for (const [block, place] of refusals) {
+        assert.throws(() => manager.addMessage('user', [block]), { name: 'MalformedContentError', message: `Message refused: content[0].${place}.` });
       }
       assert.throws(() => manager.addMessage('user', [ref]), {
         name: 'MalformedContentError',
         message: 'Message refused: content[0] is a blob_ref, which only the store writes.',
       });
+      assert.equal(manager.getAllMessages().length, 0, 'nothing stored');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('a write takes inline media the store can keep, as the store reads its source', async () => {
+    // An image without a declared type whose data names one, with whitespace the decode skips before it, past
+    // the first 32 characters a short read of the data would see.
+    const spaced = { type: 'image', source: { type: 'base64', data: `${'\n'.repeat(40)}${b64(PNG)}` } } as unknown as ContentBlock;
+    // Data that isn't a string, which the store reads as bytes.
+    const bytes = { type: 'audio', source: { type: 'base64', mediaType: 'audio/wav', data: [0x52, 0x49, 0x46, 0x46] } } as unknown as ContentBlock;
+    assert.deepStrictEqual(blockAsStored(spaced), { type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' } });
+    assert.deepStrictEqual(blockAsStored(bytes), { type: 'audio', source: { type: 'base64', data: b64('52494646'), mediaType: 'audio/wav' } });
+    const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+    try {
+      manager.addMessage('user', [spaced, bytes]);
+      assert.deepStrictEqual(manager.getAllMessages()[0]!.content, [blockAsStored(spaced), blockAsStored(bytes)]);
     } finally {
       manager.close();
     }

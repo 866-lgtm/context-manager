@@ -8,14 +8,19 @@
  *     at any depth;
  *   - an `image`, `document`, `audio` or `video` block's `source` is an
  *     object, and a `generated_image`'s `data` and `mimeType` are strings.
+ * A write also refuses inline media the store can't keep as a blob, by the
+ * store's own read of its source (stored-media.ts): data that doesn't read
+ * as base64, or no media type, neither a declared one nor, for an image, one
+ * its data's signature names. The store keeps a block of the content as a
+ * blob, not media inside a `tool_result`, which it keeps as given.
  * Nothing else is checked: not ids, names or signatures, which a provider may
- * still refuse a block without, and not what a media source holds, which is
- * for the store (inline media), the formatters and the providers to read.
- * A block of a type none of these names passes as it is, since
- * membrane adds types: whether a provider can take one is the provider's to
- * say. One type is the store's own: a `blob_ref`, which the store writes in
- * place of inline media. A write can't give one, and a read takes one whose
- * `ref` is an object with a string `hash`.
+ * still refuse a block without, and nothing else of a media source, such as
+ * a URL image's URL, which the formatters and the providers read. A block of
+ * a type none of these names passes as it is, since membrane adds types:
+ * whether a provider can take one is the provider's to say. One type is the
+ * store's own: a `blob_ref`, which the store writes in place of inline media.
+ * A write can't give one, and a read takes one whose `ref` is an object with
+ * a string `hash`.
  *
  * Every reader of stored content, from the token estimators to compression
  * and the formatters, is written against `ContentBlock`, and a reader that
@@ -37,12 +42,15 @@
  *
  * Content is walked with index loops throughout: a hole in an array reads as
  * undefined, so it is named and refused like any other. (A stored record has
- * no holes, since JSON writes a hole as null.)
+ * no holes, since JSON writes a hole as null.) Content that contains itself,
+ * through a `tool_result`'s content, overflows the walk's stack instead of
+ * being named: JSON can't produce it.
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredContentBlock } from './types/index.js';
 import { releaseEditedRawForms } from './raw-forms.js';
+import { unstorableSource } from './stored-media.js';
 
 /** A write, which mends only a `tool_use`'s input and refuses the rest, or a read of stored content. */
 type Side = 'write' | 'read';
@@ -91,8 +99,20 @@ function wellFormed(block: unknown, side: Side): boolean {
   }
 }
 
+/** Whether inline media in `block`, a block of the content, is media the store can't keep as a blob (unstorableSource). */
+function storeRefuses(block: unknown): boolean {
+  return (
+    isRecord(block) &&
+    MEDIA_TYPES.has(block.type as string) &&
+    isRecord(block.source) &&
+    unstorableSource(block as unknown as ContentBlock) !== null
+  );
+}
+
 function allWellFormed(content: readonly unknown[], side: Side): boolean {
-  for (let i = 0; i < content.length; i++) if (!wellFormed(content[i], side)) return false;
+  for (let i = 0; i < content.length; i++) {
+    if (!wellFormed(content[i], side) || (side === 'write' && storeRefuses(content[i]))) return false;
+  }
   return true;
 }
 
@@ -174,9 +194,26 @@ function placesIn(block: unknown, at: string, places: string[], side: Side): voi
   }
 }
 
+/** The places of inline media in `block`, a block of the content, that the store can't keep, as phrases from `at`. */
+function storePlacesIn(block: unknown, at: string, places: string[]): void {
+  if (!storeRefuses(block)) return;
+  const { type, source } = block as { type: string; source: Record<string, unknown> };
+  const unstorable = unstorableSource(block as unknown as ContentBlock)!;
+  if (unstorable.data) places.push(`${at}.source.data is ${kindOf(source.data)}, not base64 data`);
+  if (unstorable.mediaType) {
+    places.push(
+      `${at}.source.mediaType is ${kindOf(source.mediaType)}, not a string` +
+        (type === 'image' && !unstorable.data ? ", and the image's data has no png, jpeg, gif or webp signature" : ''),
+    );
+  }
+}
+
 function malformedPlaces(content: readonly unknown[], side: Side, at = 'content'): string[] {
   const places: string[] = [];
-  for (let i = 0; i < content.length; i++) placesIn(content[i], `${at}[${i}]`, places, side);
+  for (let i = 0; i < content.length; i++) {
+    placesIn(content[i], `${at}[${i}]`, places, side);
+    if (side === 'write') storePlacesIn(content[i], `${at}[${i}]`, places);
+  }
   return places;
 }
 
@@ -191,9 +228,9 @@ function notAnArray(content: unknown): string {
  * not a content block"), in content order, or the one place "content is
  * null, not an array of content blocks". A `tool_use` whose input isn't an
  * object isn't a place, since a write mends it (contentForWrite).
- * Non-throwing, whatever it's given, for a host that checks content before
- * it queues it. It doesn't cover the store's own refusal of inline media it
- * can't read (blockAsStored).
+ * Non-throwing, whatever it's given short of content that contains itself,
+ * which JSON can't produce, for a host that checks content before it queues
+ * it.
  */
 export function malformedContentPlaces(content: unknown): string[] {
   if (!Array.isArray(content)) return [notAnArray(content)];
@@ -231,9 +268,10 @@ export function contentForWrite(content: ContentBlock[], what: string): ContentB
 
 /** As contentForWrite, for one block, whose places are named from `block`. */
 export function blockForWrite(block: ContentBlock, what: string): ContentBlock {
-  if (wellFormed(block, 'write')) return block;
+  if (wellFormed(block, 'write') && !storeRefuses(block)) return block;
   const places: string[] = [];
   placesIn(block, 'block', places, 'write');
+  storePlacesIn(block, 'block', places);
   if (places.length > 0) throw new MalformedContentError(what, places);
   return transformed([block], 'write')[0]!;
 }

@@ -170,10 +170,10 @@ export class ContextLog {
     sourceRelation?: SourceRelation;
     cacheMarker?: boolean;
   }>): ContextEntry[] {
-    // An entry that doesn't match is refused before the log is cleared, so
-    // that refusal leaves the log as it was rather than half replaced. What
-    // a write mends, append mends. (The store's own refusal of media it
-    // can't store still comes from append, after the clear, as before.)
+    // An entry that doesn't match, or holds inline media the store can't
+    // keep, is refused before the log is cleared, so that refusal leaves the
+    // log as it was rather than half replaced. What a write mends, append
+    // mends.
     entries.forEach((entry, i) => {
       const places = malformedContentPlaces(entry.content);
       if (places.length > 0) throw new MalformedContentError(`Context entry ${i} of the replacement refused`, places);
