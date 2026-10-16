@@ -1,16 +1,17 @@
 /**
- * Content that matches `ContentBlock` where its readers read it. Every block
- * is an object, not an array, whose `type` is a string, and the field that
- * carries its content has its type:
+ * Content that matches `ContentBlock` where its readers read it. Content is
+ * an array, every block in it an object, not an array, whose `type` is a
+ * string, and the field that carries a block's content has its type:
  *   - a `text` block's `text` and a `thinking` block's `thinking` are strings;
  *   - a `tool_use`'s `input` is an object, not null and not an array;
  *   - a `tool_result`'s `content` is a string, or an array of such blocks,
  *     at any depth;
  *   - an `image`, `document`, `audio` or `video` block's `source` is an
  *     object, and a `generated_image`'s `data` and `mimeType` are strings.
- * Nothing else is checked: not ids, names, signatures, or what a media
- * source holds. A provider may still refuse a block that is missing one of
- * those. A block of a type none of these names passes as it is, since
+ * Nothing else is checked: not ids, names or signatures, which a provider may
+ * still refuse a block without, and not what a media source holds, which is
+ * for the store (inline media), the formatters and the providers to read.
+ * A block of a type none of these names passes as it is, since
  * membrane adds types: whether a provider can take one is the provider's to
  * say. One type is the store's own: a `blob_ref`, which the store writes in
  * place of inline media. A write can't give one, and a read takes one whose
@@ -19,19 +20,20 @@
  * Every reader of stored content, from the token estimators to compression
  * and the formatters, is written against `ContentBlock`, and a reader that
  * meets content that doesn't match it can throw. A stored message holding a
- * block that isn't an object made every compile throw, under every strategy
- * and after a reopen too, until someone edited the store by hand. Under the
- * autobiographical strategy, so did a text or thinking block missing its
- * text or thinking, whose token estimate reads the field's length, and a
- * `blob_ref` without a `ref` made every compile throw under all of them.
+ * block that isn't an object, or a `blob_ref` without a `ref`, made every
+ * compile throw under the passthrough and windowed strategies, after a
+ * reopen too, and made opening the store throw under the autobiographical
+ * one, until someone edited the store by hand. Under the autobiographical
+ * strategy, whose token estimate reads the field's length, opening a store
+ * holding a text or thinking block missing its text or thinking threw too.
  *
  * So a write mends what released providers produce, and refuses the rest
  * ({@link contentForWrite}). A read leaves out or mends what doesn't match
  * ({@link wellFormedContent}), for a store written before the refusal, which
  * keeps the content as written. The mend both share is a `tool_use` whose
- * `input` isn't an object, as membrane's adapters before 0.5.88 can give it:
- * `input` becomes `{}`, and `unparseableInput` keeps the value, as membrane
- * keeps arguments that aren't an object (mendedToolUse).
+ * `input` isn't an object, as membrane 0.5.87's adapters can give it: `input`
+ * becomes `{}`, and `unparseableInput` keeps the value, as membrane keeps
+ * arguments that aren't an object (mendedToolUse).
  *
  * Content is walked with index loops throughout: a hole in an array reads as
  * undefined, so it is named and refused like any other. (A stored record has
@@ -178,15 +180,23 @@ function malformedPlaces(content: readonly unknown[], side: Side, at = 'content'
   return places;
 }
 
+/** The place naming content that isn't an array. */
+function notAnArray(content: unknown): string {
+  return `content is ${kindOf(content)}, not an array of content blocks`;
+}
+
 /**
- * Where `content` doesn't match `ContentBlock`, as a write refuses it: one
- * phrase per place, naming its path ("content[2] is a string, not a content
- * block"), in content order. Empty when a write takes it. A `tool_use` whose
- * input isn't an object isn't a place, since a write mends it
- * (contentForWrite). Non-throwing, for a host that checks content before
- * it queues it.
+ * Where `content` doesn't match `ContentBlock`, as this boundary refuses it
+ * on write: one phrase per place, naming its path ("content[2] is a string,
+ * not a content block"), in content order, or the one place "content is
+ * null, not an array of content blocks". A `tool_use` whose input isn't an
+ * object isn't a place, since a write mends it (contentForWrite).
+ * Non-throwing, whatever it's given, for a host that checks content before
+ * it queues it. It doesn't cover the store's own refusal of inline media it
+ * can't read (blockAsStored).
  */
-export function malformedContentPlaces(content: readonly unknown[]): string[] {
+export function malformedContentPlaces(content: unknown): string[] {
+  if (!Array.isArray(content)) return [notAnArray(content)];
   return allWellFormed(content, 'write') ? [] : malformedPlaces(content, 'write');
 }
 
@@ -212,6 +222,7 @@ export class MalformedContentError extends Error {
  * opens its message ("Message refused", "Edit of m-12 refused").
  */
 export function contentForWrite(content: ContentBlock[], what: string): ContentBlock[] {
+  if (!Array.isArray(content)) throw new MalformedContentError(what, [notAnArray(content)]);
   if (allWellFormed(content, 'write')) return content;
   const places = malformedContentPlaces(content);
   if (places.length > 0) throw new MalformedContentError(what, places);
@@ -299,7 +310,8 @@ function readBlock(block: Record<string, unknown>): ContentBlock | undefined {
 /**
  * Stored content as a read gives it: what doesn't match is left out or
  * mended (readBlock), at any depth, and the store keeps the content as
- * written. Content that matches is returned as it is. The first read of a
+ * written. Content that isn't an array reads as empty. Content that matches
+ * is returned as it is. The first read of a
  * record logs one line naming where it doesn't match, once per instance.
  * `logged` keys it by `where` and those places, so a record that comes to
  * have another's label, such as a context entry at an index that a
@@ -312,8 +324,9 @@ export function wellFormedContent(
   where: string,
   logged: Set<string>,
 ): StoredContentBlock[] {
-  if (allWellFormed(content, 'read')) return content;
-  const places = malformedPlaces(content, 'read').join('; ');
+  const array = Array.isArray(content);
+  if (array && allWellFormed(content, 'read')) return content;
+  const places = array ? malformedPlaces(content, 'read').join('; ') : notAnArray(content);
   const key = `${where}\u0000${places}`;
   if (!logged.has(key)) {
     logged.add(key);
@@ -322,5 +335,5 @@ export function wellFormedContent(
         'the store keeps it as written',
     );
   }
-  return transformed(content, 'read') as StoredContentBlock[];
+  return array ? (transformed(content, 'read') as StoredContentBlock[]) : [];
 }

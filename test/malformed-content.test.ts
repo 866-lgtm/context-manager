@@ -1,6 +1,7 @@
 /**
  * Content that doesn't match ContentBlock where its readers read it (#184):
- * a block that isn't an object, is an array, or has no string type; a text
+ * content that isn't an array; a block that isn't an object, is an array,
+ * or has no string type; a text
  * block whose text, or a thinking block whose thinking, isn't a string; a
  * tool_use whose input isn't an object; a tool_result whose content is
  * neither a string nor an array of such blocks, at any depth; media without
@@ -33,6 +34,12 @@ import {
 const t = (text: string) => ({ type: 'text', text }) as ContentBlock;
 const toolResult = (toolUseId: string, content: unknown) => ({ type: 'tool_result', toolUseId, content });
 const toolUse = (id: string, input?: unknown) => ({ type: 'tool_use', id, name: 'probe', ...(input === undefined ? {} : { input }) });
+/** An array that holds itself: a value with no JSON form. */
+const cyclic = (): unknown[] => {
+  const a: unknown[] = [];
+  a.push(a);
+  return a;
+};
 
 /** Each user message that doesn't match ContentBlock at its top level. */
 const MALFORMED_BLOCKS: unknown[][] = [
@@ -48,6 +55,7 @@ const MALFORMED_BLOCKS: unknown[][] = [
   [t('kept'), { text: 'without a type' }],
   [t('kept'), { type: 'image' }],
   [t('kept'), { type: 'document', source: null }],
+  [t('kept'), { type: 'video', source: 'x' }],
   [t('kept'), { type: 'generated_image', mimeType: 'image/png' }],
   [t('kept'), { type: 'blob_ref' }],
   [t('kept'), { type: 'blob_ref', ref: {} }],
@@ -164,6 +172,9 @@ describe("content that doesn't match ContentBlock", () => {
         MessageStore.register(store);
         writeRaw(store, 'User', [t('hi')]);
         for (const content of MALFORMED_BLOCKS) writeRaw(store, 'User', content);
+        // Content that isn't an array at all.
+        writeRaw(store, 'User', null as unknown as unknown[]);
+        writeRaw(store, 'User', 'not blocks' as unknown as unknown[]);
         for (const content of MALFORMED_ASSISTANT) {
           writeRaw(store, 'Claude', content);
           writeRaw(store, 'User', [t('go on')]);
@@ -244,7 +255,7 @@ describe("content that doesn't match ContentBlock", () => {
           toolResult('t9', '42'),
         ],
       ];
-      await errorLines(() => {
+      const lines = await errorLines(() => {
         const messages = new MessageStore(store);
         assert.deepEqual(messages.getAll().map((message) => message.content), expected);
         const viewed = messages.getWindow(0, 3, { resolveBlobs: false }).messages;
@@ -256,6 +267,22 @@ describe("content that doesn't match ContentBlock", () => {
       assert.deepEqual((stored[2]!.content[1] as { content: unknown[] }).content, [t('x'), null, 3]);
       assert.equal((stored[2]!.content[4] as { content: unknown }).content, null);
       assert.equal((stored[2]!.content[6] as { content: unknown }).content, 42);
+      assert.ok(lines.some((line) => line.includes('content[8].ref is an object without a string hash, not a blob reference')), lines.join('\n'));
+    });
+  });
+
+  it("a stored message whose content isn't an array reads as empty, with a line, and the store keeps it", async () => {
+    await withStore(async (store) => {
+      MessageStore.register(store);
+      writeRaw(store, 'User', null as unknown as unknown[]);
+      writeRaw(store, 'User', 'not blocks' as unknown as unknown[]);
+      const lines = await errorLines(() => {
+        assert.deepEqual(new MessageStore(store).getAll().map((message) => message.content), [[], []]);
+      });
+      assert.ok(lines.some((line) => line.includes('content is null, not an array of content blocks')), lines.join('\n'));
+      assert.ok(lines.some((line) => line.includes('content is a string, not an array of content blocks')), lines.join('\n'));
+      const kept = store.getStateJson('messages') as Array<{ content: unknown }>;
+      assert.deepEqual(kept.map((m) => m.content), [null, 'not blocks']);
     });
   });
 
@@ -422,6 +449,9 @@ describe("content that doesn't match ContentBlock", () => {
           [[{ type: 'thinking', signature: 'sig' }], 'content\\[0\\]\\.thinking is undefined, not a string'],
           [[toolUse('u1', 10n)], 'content\\[0\\]\\.input is a bigint, not an object'],
           [[{ type: 'image' }], 'content\\[0\\]\\.source is undefined, not an object'],
+          [[{ type: 'video' }], 'content\\[0\\]\\.source is undefined, not an object'],
+          [[toolUse('u1', () => 1)], 'content\\[0\\]\\.input is a function, not an object'],
+          [[toolUse('u1', cyclic())], 'content\\[0\\]\\.input is an array, not an object'],
           [[{ type: 'document', source: 'x' }], 'content\\[0\\]\\.source is a string, not an object'],
           [[{ type: 'generated_image', data: 1 }],
             'content\\[0\\]\\.data is a number, not a string; content\\[0\\]\\.mimeType is undefined, not a string'],
@@ -597,9 +627,36 @@ describe("content that doesn't match ContentBlock", () => {
     });
   });
 
+  it('every write path stores what a write mends, append returns it, and a marker a block carries is kept', async () => {
+    await withStore(async (store) => {
+      MessageStore.register(store);
+      ContextLog.register(store);
+      const messages = new MessageStore(store);
+      const appended = messages.append('Claude', [toolUse('m1', null)] as ContentBlock[]);
+      const mended = { ...toolUse('m1', {}), unparseableInput: 'null' };
+      assert.deepEqual(appended.content, [mended], 'MessageStore.append returns what it stored');
+      assert.deepEqual(messages.get(appended.id)!.content, [mended]);
+      messages.edit(appended.id, [toolUse('m1', 'x')] as ContentBlock[]);
+      assert.deepEqual(messages.get(appended.id)!.content, [{ ...toolUse('m1', {}), unparseableInput: '"x"' }], 'MessageStore.edit');
+      // A block that already carries a marker keeps it, whatever its input.
+      const marked = messages.append('Claude', [{ ...toolUse('m2', 10n), unparseableInput: '{"q": ' }] as ContentBlock[]);
+      assert.deepEqual(messages.get(marked.id)!.content, [{ ...toolUse('m2', {}), unparseableInput: '{"q": ' }]);
+      const log = new ContextLog(store);
+      log.append('Claude', [toolUse('c1', null)] as ContentBlock[]);
+      assert.deepEqual(log.getAll()[0]!.content, [{ ...toolUse('c1', {}), unparseableInput: 'null' }], 'ContextLog.append');
+      log.edit(0, [toolUse('c1', [1])] as ContentBlock[]);
+      assert.deepEqual(log.getAll()[0]!.content, [{ ...toolUse('c1', {}), unparseableInput: '[1]' }], 'ContextLog.edit');
+      log.replaceAll([{ participant: 'Claude', content: [toolUse('c2', 'y')] as ContentBlock[] }]);
+      assert.deepEqual(log.getAll()[0]!.content, [{ ...toolUse('c2', {}), unparseableInput: '"y"' }], 'ContextLog.replaceAll');
+    });
+  });
+
   it('malformedContentPlaces names what a write refuses, without throwing, and the refusal carries its answer', async () => {
     assert.deepEqual(malformedContentPlaces([t('fine'), toolUse('u1', {})]), []);
     assert.deepEqual(malformedContentPlaces([toolUse('u1', null), toolUse('u2')]), [], 'a write mends these, so it refuses nothing');
+    for (const [content, kind] of [[null, 'null'], [undefined, 'undefined'], ['a string', 'a string'], [{}, 'an object']] as const) {
+      assert.deepEqual(malformedContentPlaces(content), [`content is ${kind}, not an array of content blocks`], `content that is ${kind}`);
+    }
     const content = [t('ok'), null, toolResult('t1', [{ type: 'text' }]), { type: 'blob_ref', ref: { hash: 'h' } }];
     const places = [
       'content[1] is null, not a content block',
@@ -616,6 +673,11 @@ describe("content that doesn't match ContentBlock", () => {
           assert.equal(error.message, `Message refused: ${places.join('; ')}.`);
           return true;
         });
+        assert.throws(() => manager.addMessage('User', null as unknown as ContentBlock[]), {
+          name: 'MalformedContentError',
+          message: 'Message refused: content is null, not an array of content blocks.',
+        });
+        assert.equal(manager.getAllMessages().length, 0, 'nothing stored');
       } finally {
         manager.close();
       }

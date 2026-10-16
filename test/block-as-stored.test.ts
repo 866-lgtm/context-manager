@@ -152,9 +152,13 @@ describe('blockAsStored', () => {
     // The store refuses the same blocks on write.
     const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
     try {
-      for (const block of [untypedDocument, untypedUnsniffable, noData, ref]) {
+      for (const block of [untypedDocument, untypedUnsniffable, noData]) {
         assert.throws(() => manager.addMessage('user', [block]));
       }
+      assert.throws(() => manager.addMessage('user', [ref]), {
+        name: 'MalformedContentError',
+        message: 'Message refused: content[0] is a blob_ref, which only the store writes.',
+      });
     } finally {
       manager.close();
     }
