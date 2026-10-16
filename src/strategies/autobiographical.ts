@@ -152,7 +152,12 @@ function isAdmissionDeferral(error: unknown): boolean {
  * about whether this one answers. A membrane instance has no identity of its
  * own, so each gets a token minted here. Strategies that share a membrane
  * instance share its domains. Routing below membrane, such as a proxy that
- * picks a backend per call, is invisible here.
+ * picks a backend per call, is invisible here. The design assumes a
+ * long-lived membrane instance: a host that builds one per call gives every
+ * failure a domain of its own, so no run reaches a second failure and the
+ * run rule decides nothing (a failure whose kind decides it still does); a
+ * chunk failing that way shows in getCompressionDebt, not in the quarantine
+ * count.
  */
 let compressionDomainTokens = 0;
 const membraneDomainTokens = new WeakMap<object, string>();
@@ -9009,6 +9014,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * again: a pending chunk with a run of failures in progress, and a queued
    * merge with one (see nextFailureStreak). A hole they cover in a run of
    * summaries is not stranded, since a summary will fill it.
+   *
+   * Runs live in the process, so after a restart a hole over a chunk that
+   * failed before it holds nothing until the chunk's next attempt (a failure
+   * starts a run again, and an answer fills the hole), and the merge check
+   * at open can consolidate the interior run before it at two: a lopsided
+   * merge, with nothing lost. Coverage stays with runs rather than every
+   * pending chunk: a chunk the lane won't attempt, such as a held one (tick
+   * ends its scan there), would keep the run before it waiting for as long as
+   * it waits, the stranding the newest-run rule in contiguousMergeCandidates
+   * exists to prevent.
    */
   private pendingRetrySpans(messageOrder: Map<MessageId, number>): Array<[number, number]> {
     const spans: Array<[number, number]> = [];

@@ -1119,6 +1119,38 @@ describe('compression lane: failures are evidence only by the company they keep'
     assert.equal(fx.strategy.mergeCandidates(level2, 4), null, 'a failing merge holds the hole its parent will fill');
     fx.manager.close();
   });
+
+  it("after a reopen a pending chunk's earlier failures hold nothing until its next attempt: open's merge check enqueues the interior run before its hole at two", async () => {
+    const path = freshPath();
+    // A threshold the four summaries meet, so the merge check reaches its runs.
+    const config = { hierarchical: true, mergeThreshold: 4 };
+    const a = await queued(scripted([]).membrane, { path, config });
+    for (let i = 8; i < 10; i++) a.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
+    const ids = a.manager.queryMessages({}).messages.map((m) => m.id);
+    const overHole = (chunk: Chunk): boolean => !chunk.compressed && chunk.messages[0]!.id === ids[4] && chunk.messages.at(-1)!.id === ids[7];
+    const hole = a.strategy.chunksView().find(overHole);
+    assert.ok(hole, 'a pending chunk over messages 4-7');
+    const summary = (id: string, first: number, last: number): SummaryEntry => ({
+      id, level: 1, content: id, tokens: 10, sourceLevel: 0,
+      sourceIds: ids.slice(first, last + 1), sourceRange: { first: ids[first]!, last: ids[last]! }, created: 1,
+    });
+    const unmerged = [summary('L1-a', 0, 1), summary('L1-b', 2, 3), summary('L1-c', 8, 8), summary('L1-d', 9, 9)];
+    for (const entry of unmerged) a.strategy.seed(entry);
+    assert.deepEqual(a.strategy.mergeCandidates(unmerged, 4)?.map((s) => s.id), ['L1-a', 'L1-b'], 'with no run, the interior pair is a candidate');
+    // The chunk over the hole failed in this process: its run keeps the interior run before it waiting.
+    (a.strategy as unknown as { compressionFailureRuns: Map<string, unknown> }).compressionFailureRuns
+      .set('zz-subject', { run: { key: 'zz-request', domain: 'zz', failures: 1, atLanded: 0 }, chunkKey: hole!.messages.map((m) => m.id).join(':') });
+    assert.equal(a.strategy.mergeCandidates(unmerged, 4), null, 'held while the run stands');
+    a.manager.close();
+
+    const b = await queued(scripted([]).membrane, { path, config });
+    assert.deepEqual(l1RunsOf(b.strategy), [], 'runs live in the process');
+    assert.ok(b.strategy.chunksView().some(overHole), 'the chunk over the hole is still pending');
+    const merges = (b.strategy as unknown as { mergeQueue: Array<{ level: number; sourceIds: string[] }> }).mergeQueue;
+    assert.deepEqual(merges.map((merge) => [merge.level, merge.sourceIds]), [[2, ['L1-a', 'L1-b']]],
+      "open's merge check enqueued the interior pair before any attempt");
+    b.manager.close();
+  });
 });
 
 describe('a failure is evidence only against landings on its own route and model', () => {
@@ -1215,6 +1247,31 @@ describe('a failure is evidence only against landings on its own route and model
 
   it('control: landings on the same route decide it at the eighth', async () => {
     assert.equal((await crossRoute(true)).quarantine, 1);
+  });
+
+  it("a run belongs to its domain: after a model switch the subject's next failure starts a run of one, though the new model has landed more than the old one's watermark", async () => {
+    const membrane = { complete: async () => { throw failure('network'); } };
+    const fx = await build(membrane);
+    sourceOnly(fx.strategy);
+    try {
+      // Seven failures against model A, with model A's work landing between them: a run of seven.
+      fx.strategy.setCompressionModel('model-a');
+      for (let i = 0; i < 7; i++) {
+        fx.strategy.expirePause();
+        await fx.strategy.run(fx.target(), managerContext(fx.manager)).catch(swallowNetwork);
+        fx.strategy.land(membrane, 'model-a');
+      }
+      assert.deepEqual(l1RunsOf(fx.strategy).map((run) => run.failures), [7], 'a run of seven against model A');
+      // Model B's landed count passes model A's watermark before the subject's first failure there.
+      for (let i = 0; i < 20; i++) fx.strategy.land(membrane, 'model-b');
+      fx.strategy.setCompressionModel('model-b');
+      fx.strategy.expirePause();
+      await fx.strategy.run(fx.target(), managerContext(fx.manager)).catch(swallowNetwork);
+      assert.deepEqual(l1RunsOf(fx.strategy).map((run) => run.failures), [1], 'model B starts a run of its own');
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, "nothing is decided on model A's run");
+    } finally {
+      fx.manager.close();
+    }
   });
 
   it("a recorded answer is reused on any route until an operator's clear: after a route change it can exhaust a family the new route would answer, and the clear recovers it (room-383 #75066)", async () => {
