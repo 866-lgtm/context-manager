@@ -983,11 +983,16 @@ every exempted leaf means messages are semantically
 a covering recall also renders). The solve proceeding is the mitigation; the
 topology is the disease. `[kv-overlap]` warns on **every** affected compile
 until the store gets nesting repair. It reads the frontier the plan emits: a
-rendered summary that lists a leaf whose own lineage at that level is another
-summary, or none. So a plan that keeps carried folds reports them as one that
-makes them does. Folds, phase C's un-folds and the validity projection all
-decide which leaves a node renders by that same lineage rule, per node, so no
-pass depends on which folds ran in this compile.
+rendered summary that lists a leaf whose own lineage at that level is
+another summary, or none, or that a leaf's own lineage runs through but
+that doesn't list it (a summary written again without one of its sources).
+So a plan that keeps carried folds reports them as one that makes them
+does. A leaf that a lock or a pin holds beside a summary of its own
+lineage that lists it renders in both recalls without a warning: a
+protection put it there, not the topology. A fold's eligibility and its
+moves, phase C's un-folds and the validity projection all decide which
+leaves a node renders by that same lineage rule, per node, so no pass
+depends on which folds ran in this compile.
 
 The validity projection decides the exemption by lineage: a leaf that a group
 lists, but whose own lineage at the group's level is another summary or none,
@@ -996,11 +1001,12 @@ renders through a coarser summary of its own lineage, and that summary's
 unanimity decides whether it stays there. Where it stays and the group
 renders, the leaf is in both recalls. On a nested tree that can't last for a
 leaf no protection holds, since the coarser summary owns the group's leaves
-and those below its level veto it. A held leaf stays where the base put it: a
-pin-at-level holds a whole node's leaves at one level, but a lock holds one
-chunk, so a lock above its group stays there with the group's recall beside
-it, boundary-cut tolerance extended to a lock. On a non-nested tree an unheld
-leaf can stay too, overlap like the rest of this section's.
+and those below its level veto it, unless every one of them is
+hard-protected, since those never veto. A held leaf stays where the base
+put it: a pin-at-level holds a whole node's leaves at one level, but a lock
+holds one chunk, so a lock above its group stays there with the group's
+recall beside it, boundary-cut tolerance extended to a lock. On a non-nested
+tree an unheld leaf can stay too, overlap like the rest of this section's.
 Only a listed leaf of the group's own lineage rendered in more detail than
 the group vetoes it, and a hard-protected leaf (raw zone, pinned or locked)
 never does. A leaf also stays at its level only where its own lineage there

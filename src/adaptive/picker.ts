@@ -210,7 +210,8 @@ export interface PickerChunk {
    * move it to its level), but the controller holds it there and never
    * folds/un-folds it. Under kv-stable, a level deeper than the chunk's
    * summaries go is clamped to the deepest, and a level whose own-lineage
-   * summary doesn't list the chunk is lowered until one does, or to raw.
+   * summary exists but doesn't list the chunk is lowered until one does, or
+   * to raw. A level its lineage has no summary at is kept, and renders raw.
    */
   pinLevel?: number;
   /**

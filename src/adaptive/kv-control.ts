@@ -294,11 +294,11 @@ function relevanceCut(
   // disagrees are skipped by folds and stay at their own level beside the
   // recall — exactly the renderer's existing ownership-wins semantics for
   // boundary-cut members. Every pass decides it the same way, by the leaf's
-  // own lineage at the node's level: folds and phase C's un-folds move only
-  // the leaves the node renders, and the validity projection exempts the rest
-  // (projectToValidCut). The [kv-overlap] warning reads the emitted frontier
-  // (reportOverlap), not which folds ran, so a plan built on carried folds
-  // reports them as a fresh one does.
+  // own lineage at the node's level: a fold's eligibility and its moves, and
+  // phase C's un-folds, count only the leaves the node renders, and the
+  // validity projection exempts the rest (projectToValidCut). The [kv-overlap]
+  // warning reads the emitted frontier (reportOverlap), not which folds ran,
+  // so a plan built on carried folds reports them as a fresh one does.
   // Fold priority: cheapest information first — ascending salience, then oldest.
   const priority = [...ordered].sort((a, b) => {
     const sa = salienceOf(a);
@@ -331,14 +331,18 @@ function relevanceCut(
       const cap = caps.get(leafId) ?? 0;
       // Boundary-cut tolerance (2026-07-27): a hard-protected leaf (−1
       // sentinel — raw zone / pins / locked) is EXCLUDED from the fold rather
-      // than vetoing it. The renderer's ownership machinery already renders
-      // protected messages raw alongside their chunk's recall ("ownership
+      // than vetoing it. It renders at the level it's held at (raw for the raw
+      // zone and a classic pin) alongside its group's recall ("ownership
       // wins"), so a boundary cutting through a group must not make the whole
       // group permanently unfoldable. Observed: calibration drift moved the
       // token-derived head boundary 2 messages into an L3's first chunk — the
       // 2-leaf overlap vetoed the entire 742-leaf group in every phase, and
       // the agent was OverBudget-wedged with its own L3 sitting unused.
       if (cap < 0) continue;
+      // Nor does a leaf whose own lineage at this level is another node, or
+      // none: the fold doesn't move it (see the marking loop below), so its
+      // caps aren't this fold's to keep (§13.6 overlap).
+      if (tree.ancestorAt(leafId, level)?.id !== nodeId) continue;
       foldable++;
       const pinCap = pinCaps.get(leafId);
       if (pinCap !== undefined && level > pinCap) { eligible = false; break; }
@@ -608,7 +612,8 @@ function suffixAdopt(
  * summary's unanimity decides whether it stays there. Where it stays and the
  * node renders, the leaf is in both recalls. On a nested tree that can't last
  * for a leaf no protection holds: the coarser summary owns the node's leaves,
- * and those below its level veto it, bringing the leaf down to theirs. A held
+ * and those below its level veto it, bringing the leaf down to theirs, unless
+ * every one of them is hard-protected, since those never veto. A held
  * leaf stays where the base put it. A pin-at-level holds a whole node's leaves
  * at one level, but a lock holds one chunk, so a lock above its group stays
  * there with the group's recall beside it, boundary-cut tolerance extended to
@@ -625,8 +630,9 @@ function projectToValidCut(
   ordered: PickerChunk[],
   frozen: ReadonlySet<ChunkId>,
   fixedLevels: ReadonlyMap<ChunkId, number>,
-  /** Hard-protected leaves (raw zone / pins / locked): rendered raw beside
-   *  their group's recall (ownership-wins), so they are exempt from the
+  /** Hard-protected leaves (raw zone / pins / locked): rendered at the level
+   *  they're held at (raw for the raw zone and a classic pin) beside their
+   *  group's recall (ownership-wins), so they are exempt from the
    *  unanimity requirement — a boundary cutting through a group must not
    *  force the whole group back to raw (boundary-cut tolerance, 2026-07-27). */
   exempt: ReadonlySet<ChunkId>,
@@ -825,7 +831,8 @@ export interface ControlPlanParams {
    * (0 = raw). Held there and never folded or un-folded — the frontier cut
    * passes through that L_k node. A level deeper than the tree has produced is
    * clamped to the deepest available, and a level whose own-lineage summary
-   * doesn't list the chunk is lowered until one does, or to raw.
+   * exists but doesn't list the chunk is lowered until one does, or to raw. A
+   * level its lineage has no summary at is kept, and renders raw.
    * (`ProtectedRange.level`.)
    */
   fixedLevels?: ReadonlyMap<ChunkId, number>;
@@ -833,7 +840,9 @@ export interface ControlPlanParams {
    * V2 pin-max-level: per-chunk HARD cap on fold depth — the chunk may fold no
    * deeper than this level, enforced in normal AND emergency shedding, and any
    * carried resolution deeper than the cap, a locked chunk's included, is
-   * un-folded to it at plan start. (`ProtectedRange.maxLevel`.)
+   * un-folded to it at plan start. A chunk in `fixedLevels` keeps its fixed
+   * level instead: kv-stable fixes a pin-at-level's whole node there, a capped
+   * leaf of it included. (`ProtectedRange.maxLevel`.)
    */
   pinCaps?: ReadonlyMap<ChunkId, number>;
   /** Newest source sequence — the age reference for the log-age fold caps. */
@@ -897,41 +906,54 @@ export function planControlledFrontier(
 
 /**
  * NEVER QUIET (2026-08-03): overlap tolerance is a degraded mode, not a
- * feature. A rendered summary that lists a leaf whose own lineage at that
- * level is another summary, or none, means the store's summary tree is
- * NON-NESTED (two live lineages over one span), and that leaf's message is
- * SEMANTICALLY DOUBLE-REPRESENTED in the window: the summary's recall covers
- * it while it renders raw or through its own chain. The solve proceeding is
- * the mitigation; the topology is the disease. So every compile whose plan
- * renders such a summary says so, until the store is repaired (nesting
- * reconciler, see the 2026-08-03 opus4 incident). It reads the frontier the
- * plan emits, so a plan that keeps carried folds reports them as one that
- * makes them does.
+ * feature. A rendered summary whose listing disagrees with the lineage of the
+ * window's leaves means the store's summary tree is NON-NESTED, and messages
+ * are SEMANTICALLY DOUBLE-REPRESENTED in the window. Either direction says so:
+ * - the summary lists a leaf whose own lineage at that level is another
+ *   summary, or none (two live lineages over one span): the summary's recall
+ *   covers the leaf while it renders raw or through its own chain;
+ * - a leaf's own lineage runs through the summary, but the summary doesn't
+ *   list it (a summary written again without one of its sources): the leaf
+ *   renders lower, and a summary of its lineage that lists it beside a leaf
+ *   held above can render in both recalls, which neither listing shows.
+ * The solve proceeding is the mitigation; the topology is the disease. So
+ * every compile whose plan renders such a summary says so, until the store is
+ * repaired (nesting reconciler, see the 2026-08-03 opus4 incident). It reads
+ * the frontier the plan emits, so a plan that keeps carried folds reports them
+ * as one that makes them does. A leaf that a lock or a pin holds beside a
+ * summary of its own lineage that lists it renders in both recalls too, and
+ * goes unreported: a protection put it there, not the topology.
  */
 function reportOverlap(
   tree: SummaryTree,
   chunks: readonly PickerChunk[],
   F: ReadonlyMap<ChunkId, number>,
 ): void {
-  const rendered = new Set<string>();
-  const doubled: ChunkId[] = [];
-  const seen = new Set<ChunkId>();
+  const rendered = new Map<string, ReadonlySet<ChunkId>>();
+  const conflicting = new Set<ChunkId>();
   for (const c of chunks) {
     const level = F.get(c.id) ?? 0;
     if (level < 1) continue;
     const node = tree.ancestorAt(c.id, level);
     if (!node || rendered.has(node.id)) continue;
-    rendered.add(node.id);
+    rendered.set(node.id, new Set(node.leafChunkIds));
     for (const leafId of node.leafChunkIds) {
-      if (seen.has(leafId)) continue;
-      if (tree.ancestorAt(leafId, level)?.id !== node.id) { seen.add(leafId); doubled.push(leafId); }
+      if (tree.ancestorAt(leafId, level)?.id !== node.id) conflicting.add(leafId);
     }
   }
-  if (doubled.length > 0) {
+  for (const c of chunks) {
+    if (conflicting.has(c.id)) continue;
+    for (let k = 1, top = tree.maxLevel(c.id); k <= top; k++) {
+      const node = tree.ancestorAt(c.id, k);
+      const listed = node ? rendered.get(node.id) : undefined;
+      if (listed && !listed.has(c.id)) { conflicting.add(c.id); break; }
+    }
+  }
+  if (conflicting.size > 0) {
     console.error(
-      `[kv-overlap] ⚠️ non-nested summary tree: ${doubled.length} leaf(s) with ` +
+      `[kv-overlap] ⚠️ non-nested summary tree: ${conflicting.size} leaf(s) with ` +
         `conflicting lineage tolerated this compile (double-representation in window). ` +
-        `Store needs nesting repair. sample=${doubled.slice(0, 5).join(',')}`,
+        `Store needs nesting repair. sample=${[...conflicting].slice(0, 5).join(',')}`,
     );
   }
 }

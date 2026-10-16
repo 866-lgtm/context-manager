@@ -27,16 +27,26 @@
   leaf's own lineage as the projection decides. It used to leave out any
   leaf that some fold in the same compile had met under another lineage,
   and could then settle on a plan above `foldAt`, the same on every
-  compile.
-- kv-stable: `[kv-overlap]` now reports what the plan renders: it warns on
-  every compile whose plan renders a summary over a leaf of another
-  lineage, and only then. It used to report the folds the compile made, so
-  a plan that kept the carried folds could render the overlap without a
-  warning, and a plan that didn't render it could still warn.
+  compile. A fold decides the same way: a listed leaf of another lineage,
+  which the fold doesn't move, no longer vetoes it with its pin-max-level or
+  its fold-depth cap.
+- kv-stable: `[kv-overlap]` now reads the frontier the plan emits. It warns
+  on every compile that renders a summary whose listing disagrees with the
+  lineage of a leaf in the window, and only then: the summary lists a leaf
+  of another lineage, or a leaf's own lineage runs through it and it
+  doesn't list the leaf, as after the summary was written again without one
+  of its sources. It used to report the folds the compile made, so a plan
+  that kept the carried folds could render the overlap without a warning, a
+  plan that didn't render it could still warn, and a summary that had lost a
+  source never warned. A lock or a pin can still hold a leaf beside a
+  summary of its own lineage that lists it, which renders the leaf in both
+  recalls without a warning.
 - kv-stable: a locked chunk with a pin-max-level is lowered to the cap at
   plan start, as the cap promises. It used to keep its carried level above
-  the cap.
-- kv-stable: a level carried far above the summary tree's top is now
-  lowered in one compile to a level its summaries render. A plan that held
-  it could emit a level with no summary, which renders raw, and the next
-  compile then rendered the summary while reporting a perturbation of 0.
+  the cap. A chunk under another range's pin-at-level keeps that level, as
+  before, since kv-stable fixes the pin's whole node there.
+- kv-stable: an unlocked chunk's level carried far above the summary tree's
+  top is now lowered in one compile to a level its summaries render. A plan
+  that held it could emit a level with no summary, which renders raw, and
+  the next compile then rendered the summary while reporting a perturbation
+  of 0.

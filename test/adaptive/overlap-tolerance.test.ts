@@ -439,6 +439,40 @@ for (const [kind, previousLevels, targetTokens, warnings, units] of [
   });
 }
 
+// M's sources were N1 and N2, but M was written again without N2, while N2
+// still names M as its parent: y's own lineage runs through M, which no
+// longer lists y. A held plan that renders M (through x) and N2 (y, at L1)
+// warns, though each summary it renders lists only leaves of its own
+// lineage.
+test('[kv-overlap] warns when a rendered summary doesn\'t list a leaf whose own lineage runs through it', () => {
+  const { inputs, tree } = store(
+    [message('x', 0, 100, 'N1'), message('y', 1, 100, 'N2')],
+    [summary('N1', 1, ['x'], 20, 'M'), summary('N2', 1, ['y'], 20, 'M'), summary('M', 2, ['N1'], 15)],
+  );
+  const previous = new Map<ChunkId, number>([['x', 2], ['y', 1]]);
+  const { result: plan, overlapWarnings } = quietOverlap(() => planControlledFrontier(inputs, tree, {
+    ...trio, targetTokens: 30, expandAtTokens: 30, foldAtTokens: 300, previous,
+  }));
+  assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['recall:M', 'recall:N2']);
+  assert.equal(plan.perturbation, 0);
+  assert.equal(overlapWarnings, 1);
+});
+
+// N lists m1, m2 and z, but z's own L1 is Z: N's fold doesn't move z, which
+// renders raw beside N's recall, so z's pin cap of 0 isn't N's to keep. A
+// fold judges the leaves it moves, by their own lineage, as phase C and the
+// projection do.
+test('a listed leaf of another lineage doesn\'t veto a summary\'s fold with its pin cap', () => {
+  const { inputs, tree } = store(
+    [message('m1', 0, 100, 'N'), message('m2', 1, 100, 'N'), message('z', 2, 100, 'Z')],
+    [summary('N', 1, ['m1', 'm2', 'z'], 20), summary('Z', 1, ['z'], 20)],
+  );
+  const { result: plan } = quietOverlap(() => planControlledFrontier(inputs, tree, {
+    ...trio, targetTokens: 150, foldAtTokens: 200, pinCaps: new Map([['z', 0]]), previous: new Map(),
+  }));
+  assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['recall:N', 'raw:z']);
+});
+
 // A level carried far above the tree's top: m0 carried at L8, while its only
 // summary is the L1 A. The projection bounds its passes by the deepest level
 // in the frontier as well as the tree's, so the first compile takes m0 all

@@ -1611,7 +1611,9 @@ export interface ProtectedRange {
 /** Optional fold-depth bounds for a V2 dynamic pin (see `ProtectedRange`). */
 export interface PinLevelOptions {
   name?: string;
-  /** Pin AT exactly this level (0 = raw). Fixes the cut through the L_k node. */
+  /** Pin at this level (0 = raw): fixes the cut through the L_k node, with
+   *  kv-stable's exceptions for a chunk its summaries don't reach there
+   *  (`ProtectedRange.level`). */
   level?: number;
   /** Fold no deeper than this level (hard cap; `0` ≡ classic pin-raw). */
   maxLevel?: number;
