@@ -54,6 +54,19 @@ import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
 import type { StoreBranchGeneration } from './branch-generation.js';
+import { randomUUID } from 'node:crypto';
+import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
+import { FoldJournal, branchRefOf } from './fold-journal.js';
+import { describeThrown, logThrown } from './describe-thrown.js';
+import type { FoldQuery, FoldQueryResult, FoldReceipt, Presentation, ReceiptSource, RoundUsage } from './fold-journal.js';
+import type {
+  BranchRef,
+  CompiledMessageSources,
+  CompileProvenance,
+  MessageStoreView,
+  RenderedLayout,
+  RenderedSummaryInfo,
+} from './types/index.js';
 
 type InitializationStamp = StoreBranchGeneration & { id: string; attempt: number };
 
@@ -230,6 +243,8 @@ export class ContextManager {
    * persisted, so a restart can never leave compression permanently stalled.
    */
   private compressionHolds = new Set<MessageId>();
+  /** Summaries the strategy rendered but couldn't describe, already reported. */
+  private undescribedSummariesReported = new Set<string>();
   /** Sharded adds held on ingress: first-shard id -> every shard id. */
   private compressionHoldGroups = new Map<MessageId, MessageId[]>();
   /** heldAt / expiresAt per held id (expiresAt absent = no timeout). */
@@ -242,6 +257,8 @@ export class ContextManager {
   private holdingAdds: MessageId[] | null = null;
   /** Read-only auxiliary stores merged into the strategy-facing view. */
   private auxiliaryStores: MessageStore[];
+  /** Fold receipts for this manager's namespace (see fold-journal.ts). */
+  private foldJournal: FoldJournal;
 
   private constructor(
     store: JsStore,
@@ -265,6 +282,7 @@ export class ContextManager {
     this.debugLogContext = debugLogContext;
     this.viewFilter = viewFilter;
     this.auxiliaryStores = auxiliaryStores;
+    this.foldJournal = new FoldJournal(store, strategyNamespace);
 
     // Set up edit propagation
     this.messageStore.addListener((event) => this.handleMessageStoreEvent(event));
@@ -278,10 +296,7 @@ export class ContextManager {
    * filter sees (and can exclude from) the merged world.
    */
   private strategyMessageView() {
-    let view = mergeMessageStoreViews(
-      this.messageStore.createView(),
-      this.auxiliaryStores.map((s) => s.createView()),
-    );
+    let view = this.mergedMessageView();
     if (this.viewFilter) {
       view = filterMessageStoreView(view, this.viewFilter);
     }
@@ -291,6 +306,14 @@ export class ContextManager {
     view.isCompressionHeld = (id: MessageId) => holds.has(id);
     view.hasCompressionHolds = () => holds.size > 0;
     return view;
+  }
+
+  /** This manager's messages merged with its auxiliary slots, before the view filter. */
+  private mergedMessageView(): MessageStoreView {
+    return mergeMessageStoreViews(
+      this.messageStore.createView(),
+      this.auxiliaryStores.map((s) => s.createView()),
+    );
   }
 
   /**
@@ -519,6 +542,21 @@ export class ContextManager {
     if (typeof strategyAny.chunkIngressMessage === 'function') {
       const decision = strategyAny.chunkIngressMessage(participant, content);
       if (decision && decision.shards.length > 1) {
+        // Every shard declares its group's size, so a group an interrupted
+        // write left short reads as partial, not whole (compile provenance).
+        // That needs indices exactly 0..n-1: refuse anything else before
+        // writing a shard.
+        const shardCount = decision.shards.length;
+        const indices = new Set(decision.shards.map((s) => s.shardIndex));
+        if (indices.size !== shardCount || ![...indices].every((i) => Number.isInteger(i) && i >= 0 && i < shardCount)) {
+          throw new Error(
+            `chunkIngressMessage returned shard indices ${JSON.stringify(decision.shards.map((s) => s.shardIndex))}; ` +
+              `a group of ${shardCount} shards needs each index 0..${shardCount - 1} exactly once`,
+          );
+        }
+        // Shards are written in index order, so the id returned (the first
+        // written) is shard 0's: the body's identity in compile provenance.
+        const ordered = [...decision.shards].sort((a, b) => a.shardIndex - b.shardIndex);
         // A shard that doesn't match is refused before any shard is stored,
         // as the message was: the store's own refusal would meet it only once
         // the shards before it were stored. The error names the shard, since
@@ -530,6 +568,7 @@ export class ContextManager {
           }
         }
         let firstId: MessageId | null = null;
+        const lengthBefore = this.messageStore.length();
         // These appends must stay synchronous: one body's shards in one loop, in
         // shard order, with no await between them. The body-runs rule (body-runs.ts)
         // reads a body as consecutive messages of one group id whose shard indices
@@ -538,18 +577,43 @@ export class ContextManager {
         // anywhere but here and below, so nothing of its own can. A host's
         // onMessage listener runs inside each append, and its contract rules out
         // adding a message from there synchronously.
-        for (const shard of decision.shards) {
-          const message = this.messageStore.append(
-            participant,
-            shard.content,
-            metadata,
-            causedBy,
-            {
-              bodyGroupId: decision.bodyGroupId,
-              shardIndex: shard.shardIndex,
+        try {
+          for (const shard of ordered) {
+            const message = this.messageStore.append(
+              participant,
+              shard.content,
+              metadata,
+              causedBy,
+              {
+                bodyGroupId: decision.bodyGroupId,
+                shardIndex: shard.shardIndex,
+                shardCount,
+              }
+            );
+            if (firstId === null) firstId = message.id;
+          }
+        } catch (err) {
+          // A write that fails partway leaves no part of the body in the
+          // store: remove what it wrote (the failing shard too, if it
+          // landed), so a retry writes one body. If that fails as well, the
+          // shards may stay, and shardCount marks the body short. The first
+          // shard's own append can throw after it landed: then it's the
+          // store's last. Nothing here replaces the write's own error.
+          let landed = firstId;
+          try {
+            if (landed === null && this.messageStore.length() > lengthBefore) {
+              const last = this.messageStore.getTail(1)[0];
+              if (last?.bodyGroupId === decision.bodyGroupId) landed = last.id;
             }
-          );
-          if (firstId === null) firstId = message.id;
+            if (landed !== null) this.messageStore.removeBodyGroup(landed);
+          } catch (removal) {
+            console.error(
+              `[context-manager] a sharded addMessage failed partway, and removing what it wrote threw, so body group ` +
+                `${decision.bodyGroupId}${landed !== null ? ` (first shard ${landed})` : ''} may be left short: ` +
+                describeThrown(removal),
+            );
+          }
+          throw err;
         }
         return firstId!;
       }
@@ -799,10 +863,23 @@ export class ContextManager {
    * so it can run while a sharded addMessage is still storing that body's
    * remaining shards. It must not add a message synchronously: one added there
    * would land between a body's shards and split the body (body-runs.ts).
-   * Add it after the call returns (a microtask or later) instead.
+   * Add it after the call returns (a microtask or later) instead. A listener
+   * that throws is logged, naming the message it missed, and the write it
+   * heard stands: the throw doesn't reach the caller. Each call registers
+   * its own listener and returns its own unsubscribe, so a function
+   * registered twice hears each event twice.
    */
   onMessage(listener: MessageStoreListener): () => void {
-    return this.messageStore.addListener(listener);
+    // A host's listener observes; its throw isn't the write's failure. The
+    // manager's own listener (the context log's propagation) stays outside
+    // this, so a failure there still fails the write as before.
+    return this.messageStore.addListener((event) => {
+      try {
+        listener(event);
+      } catch (err) {
+        logThrown(`[context-manager] an onMessage listener threw on a '${event.type}' event for ${describeStoreEvent(event)}; the write stands:`, err);
+      }
+    });
   }
 
   /**
@@ -1064,14 +1141,27 @@ export class ContextManager {
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     const _t0 = _diag ? Date.now() : 0;
 
+    // The branch and view this compile reads; provenance binds to both.
+    const branch = branchRefOf(this.store);
+    const view = this.strategyMessageView();
+
     // Get selected entries from strategy
     const entries = this.strategy.select(
-      this.strategyMessageView(),
+      view,
       this.contextLog.createView(),
       effectiveBudget,
       opts
     );
+    const selectionCause = this.strategy.takeSelectionCause?.();
     if (_diag) console.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
+
+    const viewMessages = view.getAll();
+    // Raw bodies are judged as stored: the view filter can hide a shard of a
+    // body from the strategy, but the body's identity (shard 0, the id
+    // addMessage returned) and its membership are the stored group's. The
+    // layout stays on the filtered view the strategy rendered.
+    const storedMessages = this.viewFilter ? this.mergedMessageView().getAll() : viewMessages;
+    const attribution = attributeEntries(entries, storedMessages);
 
     // Convert to NormalizedMessage[]. We split each entry individually
     // so we know the output-count per input and can re-attach cache
@@ -1082,8 +1172,11 @@ export class ContextManager {
     // non-user message containing `tool_result` blocks becomes a sequence
     // of agent/user/agent turns so the API accepts it. Already-API-shape
     // messages pass through untouched. See `src/normalize-tool-messages.ts`.
+    // Every part of a split entry carries that entry's sources.
     const messages: NormalizedMessage[] = [];
-    for (const entry of entries) {
+    const messageSources: CompiledMessageSources[] = [];
+    for (let e = 0; e < entries.length; e++) {
+      const entry = entries[e]!;
       const splitParts = splitMixedToolMessages([
         { participant: entry.participant, content: entry.content },
       ]);
@@ -1095,14 +1188,30 @@ export class ContextManager {
           content: part.content,
           ...(entry.cacheMarker && isLast ? { cacheBreakpoint: true } : {}),
         });
+        messageSources.push(attribution.sources[e]!);
       }
     }
 
-    // If no injections, log and return early
-    if (!injections || injections.length === 0) {
-      const result: CompileResult = { messages, systemInjections: [] };
+    const finish = (result: CompileResult, injected: ContentBlock[][]): CompileResult => {
+      result.rawBodies = rawBodiesOf(attribution);
+      const layout = this.renderedLayoutFor(viewMessages, entries, attribution.rawComplete, injected, selectionCause);
+      result.provenance = {
+        compileId: randomUUID(),
+        namespace: this.strategyNamespace,
+        branch,
+        messages: messageSources,
+        layout,
+        strategy: this.strategy.name,
+        // Only a layout is ever accepted, so only then ask where the journal stands.
+        ...(layout ? { journalMark: this.foldJournal.mark() } : {}),
+      };
       if (this.debugLogContext) this.logCompiledContext(result);
       return result;
+    };
+
+    // If no injections, log and return early
+    if (!injections || injections.length === 0) {
+      return finish({ messages, systemInjections: [] }, []);
     }
 
     // Separate injections by position
@@ -1133,6 +1242,10 @@ export class ContextManager {
       }
     }
 
+    const injectedContent: ContentBlock[][] = [];
+    const injectionSources = (list: ContextInjection[]): CompiledMessageSources[] =>
+      list.map((inj) => ({ kind: 'injection', namespace: inj.namespace }));
+
     // Insert beforeUser injections before last user message
     if (beforeUser.length > 0 && lastUserIdx >= 0) {
       const injectedMessages: NormalizedMessage[] = beforeUser.map((inj) => ({
@@ -1140,6 +1253,8 @@ export class ContextManager {
         content: inj.content,
       }));
       messages.splice(lastUserIdx, 0, ...injectedMessages);
+      messageSources.splice(lastUserIdx, 0, ...injectionSources(beforeUser));
+      injectedContent.push(...beforeUser.map((inj) => inj.content));
       // Adjust lastUserIdx to account for inserted messages
       lastUserIdx += injectedMessages.length;
     }
@@ -1152,11 +1267,152 @@ export class ContextManager {
         content: inj.content,
       }));
       messages.splice(insertIdx, 0, ...injectedMessages);
+      messageSources.splice(insertIdx, 0, ...injectionSources(afterUser));
+      injectedContent.push(...afterUser.map((inj) => inj.content));
     }
 
-    const result: CompileResult = { messages, systemInjections };
-    if (this.debugLogContext) this.logCompiledContext(result);
-    return result;
+    return finish({ messages, systemInjections }, injectedContent);
+  }
+
+  /**
+   * The rendered layout of one compile, or null when the strategy does not
+   * report its layout, or names a summary it cannot describe (a layout that
+   * would read covered history as omitted is worse than none).
+   */
+  private renderedLayoutFor(
+    viewMessages: StoredMessage[],
+    entries: ContextEntry[],
+    rawComplete: ReadonlyMap<MessageId, boolean>,
+    injected: ContentBlock[][],
+    cause: string | undefined,
+  ): RenderedLayout | null {
+    if (!this.strategy.renderedForms) return null;
+    const summaryIds = new Set<string>();
+    for (const entry of entries) for (const s of entry.summaries ?? []) summaryIds.add(s.id);
+    const summaryInfo = summaryIds.size > 0
+      ? this.strategy.describeRenderedSummaries?.([...summaryIds]) ?? new Map<string, RenderedSummaryInfo>()
+      : new Map<string, RenderedSummaryInfo>();
+    const undescribed = [...summaryIds].filter((id) => !summaryInfo.has(id));
+    if (undescribed.length > 0) {
+      const fresh = undescribed.filter((id) => !this.undescribedSummariesReported.has(id));
+      if (fresh.length > 0) {
+        for (const id of fresh) this.undescribedSummariesReported.add(id);
+        console.warn(
+          `[context-manager] ${this.strategy.name} rendered summaries it cannot describe ` +
+          `(${fresh.slice(0, 5).join(', ')}${fresh.length > 5 ? ', …' : ''}); ` +
+          'no rendered layout is reported for a compile that renders them',
+        );
+      }
+      return null;
+    }
+    // Estimators are store-level: the strategy view's estimates and its
+    // calibration are this store's (auxiliary slots delegate to it). Layouts
+    // keep base estimates, taken before the calibration multiplier and its
+    // per-block rounding, so identical content costs the same in every
+    // compile whatever the calibration was.
+    const calibration = this.messageStore.getTokenCalibration();
+    const factor = Number.isFinite(calibration) && calibration > 0 ? calibration : 1;
+    const estimateBase = (content: ContentBlock[]): number => this.messageStore.estimateBaseTokens(content);
+    let extraTokens = 0;
+    for (const content of injected) extraTokens += estimateBase(content);
+    return buildRenderedLayout({
+      view: viewMessages,
+      entries,
+      rawComplete,
+      summaryInfo,
+      estimateBase,
+      extraTokens,
+      calibration: factor,
+      cause,
+    });
+  }
+
+  // ==========================================================================
+  // Accepted rounds and fold receipts
+  // ==========================================================================
+
+  /**
+   * Accept a compile whose provider round succeeded. Call once a round that
+   * carried `provenance`'s messages has stood. A compile is accepted once:
+   * repeat calls (later rounds of the same compile, or a retry after an
+   * uncertain failure, from this manager or another of its namespace on the
+   * store, before or after a reopen) are no-ops. Compares the compile's
+   * rendered layout with the last layout accepted on the compile's own branch
+   * in its namespace, by any manager of it on the store — even when another
+   * branch is selected by now — and appends a fold receipt when any message
+   * changed form, or a baseline when that branch has no record it can read.
+   * `usage` is the confirming round's own usage as the provider reported it;
+   * leave a field undefined when it was not reported. `presentation` is how
+   * that round carried the compile, as its producer reported (`verbatim`,
+   * `altered`, or `unknown`, the default); receipts record it beside the
+   * layout, which is the compile's.
+   *
+   * Returns the receipt, or null: no change, or a compile with no layout to
+   * record (`provenance.layout` is null): a strategy that doesn't report its
+   * layout, or one that rendered a summary it can't describe, reported once
+   * per summary. Nothing is recorded for such a compile, so the next one
+   * accepted is compared with the last layout recorded before it, and its
+   * receipt carries the changes of both rounds. A compile accepted before
+   * returns what that acceptance returned, its receipt or null, so a retry
+   * after an uncertain failure learns the outcome, and a receipt can come
+   * back again (key on its id and compileId: a receipt lost to Chronicle's
+   * rot exception can have its id go to a later receipt). A provenance of
+   * another namespace is refused with an error: accept a compile on the
+   * manager that compiled it.
+   */
+  acceptRound(args: {
+    provenance: CompileProvenance;
+    acceptedAt?: number;
+    usage?: RoundUsage;
+    presentation?: Presentation;
+  }): FoldReceipt | null {
+    return this.foldJournal.accept(args.provenance, args.acceptedAt ?? Date.now(), args.usage, args.presentation);
+  }
+
+  /**
+   * Fold receipts of one branch (default: the selected one): newest first,
+   * or, with `afterId`, oldest first from just after it, so a reader can page
+   * forward; `more` says whether the query matched more than it returned.
+   */
+  listFoldReceipts(query?: FoldQuery): FoldQueryResult {
+    return this.foldJournal.query(query);
+  }
+
+  /**
+   * Be told of fold receipts, each once it is durable: every receipt this
+   * manager's `acceptRound` returns, and, at its next acceptance on a
+   * branch, that branch's newest receipt if this manager hasn't announced it
+   * (one whose write reported a failure, one another manager on the store
+   * wrote, or one from before a reopen). So a listener can hear a receipt
+   * again, and needn't hear every receipt: key on `receipt.id`, and read
+   * `listFoldReceipts` for the whole record. Returns a detacher.
+   */
+  onFoldReceipt(listener: (receipt: FoldReceipt) => void): () => void {
+    return this.foldJournal.onReceipt(listener);
+  }
+
+  /** Deployment facts recorded in every receipt from now on. */
+  setReceiptSource(source: ReceiptSource): void {
+    this.foldJournal.setSource(source);
+  }
+
+  /** The store's id, minted once per store on first use. */
+  getStoreId(): string {
+    return this.foldJournal.storeId();
+  }
+
+  /** The selected branch as receipts name it (id, name, creation time). */
+  currentBranchRef(): BranchRef {
+    return branchRefOf(this.store);
+  }
+
+  /**
+   * How the active strategy can render history, for an honest answer when
+   * there are no receipts: which forms it uses, or null when it does not
+   * report its rendered layout at all.
+   */
+  describeRenderedForms(): { strategy: string; forms: ReadonlyArray<'raw' | 'summary' | 'omitted'> | null } {
+    return { strategy: this.strategy.name, forms: this.strategy.renderedForms ?? null };
   }
 
   /**
@@ -1702,5 +1958,18 @@ export class ContextManager {
       contextEntryCount: this.contextLog.length(),
       branches: this.listBranches().length,
     };
+  }
+}
+
+/** What a store event was about, for a log line: its message (and body group), or its span. */
+function describeStoreEvent(event: MessageStoreEvent): string {
+  switch (event.type) {
+    case 'add':
+      return `message ${event.message.id}${event.message.bodyGroupId ? ` (body group ${event.message.bodyGroupId})` : ''}`;
+    case 'edit':
+    case 'remove':
+      return `message ${event.messageId}`;
+    case 'removeRange':
+      return `messages ${event.fromId} to ${event.toId}`;
   }
 }

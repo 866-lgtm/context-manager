@@ -29,6 +29,7 @@ import type {
   HotContextSettingsStatus,
   SelectOptions,
   PreviewResult,
+  RenderedSummaryInfo,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
@@ -746,6 +747,47 @@ function sha256Json(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
 }
 
+/** Sources as readers iterate them: a non-empty list of ids. */
+function isIdList(ids: unknown): ids is string[] {
+  return Array.isArray(ids) && ids.length > 0 && ids.every((id) => typeof id === 'string' && id.length > 0);
+}
+
+/** A range as readers dereference it: its first and last message ids. */
+function isReadableRange(range: unknown): range is { first: string; last: string } {
+  const ends = range as { first?: unknown; last?: unknown } | null | undefined;
+  const first = ends?.first;
+  const last = ends?.last;
+  return typeof first === 'string' && first.length > 0 && typeof last === 'string' && last.length > 0;
+}
+
+/** Text a recall or a merge can carry. */
+function hasSummaryText(summary: SummaryEntry): boolean {
+  return typeof summary.content === 'string' && summary.content.trim().length > 0;
+}
+
+/**
+ * The level a message is planned from: its saved level when the summaries
+ * over it reach that level, else the deepest one at or below it that they
+ * reach, walking up from its L1. A saved level names a summary's level, and
+ * the load repair can drop that summary while the message's L1 survives. The
+ * greedy solvers never lower a level and price one with no summary as raw,
+ * so such a message stayed raw, and a compile that its L1 would have fit
+ * failed.
+ */
+function reachableLevel(saved: number, l1Id: SummaryId | undefined, summariesById: ReadonlyMap<SummaryId, SummaryEntry>): number {
+  // Every parent sits above its summary: the load repair keeps no other, a
+  // merge names the summary it wrote a level up, and the live lookup reloads
+  // rather than adopt stored pointers. So the walk climbs and ends.
+  let level = 0;
+  let current = l1Id === undefined ? undefined : summariesById.get(l1Id);
+  while (current && current.level <= saved) {
+    level = current.level;
+    const parentId = getSummaryParentId(current);
+    current = parentId ? summariesById.get(parentId) : undefined;
+  }
+  return level;
+}
+
 /**
  * Chronicle state mutation is synchronous but not transactional across a
  * read/project/append sequence. Serialize those short sequences for strategy
@@ -1056,6 +1098,10 @@ function defaultsForKeysLeftNullish(
  */
 export class AutobiographicalStrategy implements ResettableStrategy {
   readonly name: string = 'autobiographical';
+  /** History renders raw, through summaries, or (uncovered) not at all. */
+  readonly renderedForms: ReadonlyArray<'raw' | 'summary' | 'omitted'> = ['raw', 'summary', 'omitted'];
+  /** Why the last committed select changed resolutions (takeSelectionCause). */
+  private pendingSelectionCause: string | undefined;
 
   get maxMessageTokens(): number { return this.config.maxMessageTokens; }
 
@@ -2000,9 +2046,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Load summaries, counter, and pending merges from chronicle into the
    * in-memory mirrors. Called on every (re)initialize so branch switches
-   * pick up the new branch's state, and by a compression that waited on
-   * another instance's in-flight compression of its family, to take up that
-   * result (compressChunkHierarchical). That waiter passes
+   * pick up the new branch's state, by a compression that waited on another
+   * instance's in-flight compression of its family, to take up that result
+   * (compressChunkHierarchical), and by the live lookup when the store holds
+   * an L1 this instance doesn't (findExactL1). Those two reloads pass
    * `keepKvUnifiedPresentation`: a kv-unified strategy then keeps its own
    * receipt chain, whose pending submission is never persisted, rather than
    * replacing it from the store, and keeps its draft and pending layout (with
@@ -2010,6 +2057,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * memory, rather than clearing them (#166).
    */
   protected loadPersistedState(options: { keepKvUnifiedPresentation?: boolean } = {}): void {
+    // The summaries a load takes up can end an overlap the guard refused, so
+    // the next queue build tests those chunks again. The orphaned-records
+    // halt and its warning stay as they are: rebuildChunks recomputes the
+    // halt, and an open clears both (clearBranchMirrors).
+    this._overlapBlocked.clear();
     if (!this.store) {
       this.summaries = [];
       this.summaryIdCounter = 0;
@@ -2031,54 +2083,179 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const n = Number(r.id.replace(/^c-/, ''));
         return Number.isFinite(n) && n >= max ? n + 1 : max;
       }, 0);
-      this.chunkRecordsOrphaned = false;
-      this._orphanWarned = false;
-      this._overlapBlocked.clear();
     }
     const summaries = this.store.getStateJson(this.summariesStateId);
     const loaded = Array.isArray(summaries) ? (summaries as SummaryEntry[]) : [];
-    // Drop empty-content summaries (bugged/empty generations from before the
-    // production guards). Recalling or merging one yields an empty text block →
-    // Anthropic 400 "content must be non-empty". Never let them re-enter memory.
-    const nonEmpty = loaded.filter(s => s && typeof s.content === 'string' && s.content.trim().length > 0);
-    const droppedEmpty = loaded.length - nonEmpty.length;
-    const removedEmptyIds = new Set(
-      loaded
-        .filter(s => s && (typeof s.content !== 'string' || s.content.trim().length === 0))
-        .map(s => s.id),
-    );
-    if (droppedEmpty > 0) console.warn(`[autobiographical] dropped ${droppedEmpty} empty summary(ies) on load`);
-    // Dedupe by id, keeping the copy with mergedInto set (position of first
-    // occurrence preserved). Duplicate-id copies with diverging merge state
-    // exist in stores touched by the pre-fix setMergedInto index-desync bug;
-    // without dedupe, the plain copy stays on the unmerged frontier and its
-    // content renders twice (once itself, once via its parent's merge).
-    const byId = new Map<string, SummaryEntry>();
-    for (const s of nonEmpty) {
-      const prev = byId.get(s.id);
-      if (!prev) byId.set(s.id, s);
-      else if (!prev.mergedInto && s.mergedInto) byId.set(s.id, s);
+    // Readers need a summary's text, its sources as a list of ids, and its
+    // range as two ids: the adaptive picker's L1 index iterates every L1's
+    // sources, recall dereferences the range's ends, and empty text can't be
+    // recalled or merged. One null `sourceIds` threw on every compile.
+    //
+    // Copies of one id are one summary. Before setMergedInto resolved its
+    // log slot by id, a merge could be written over a neighbour's slot,
+    // leaving duplicates whose merge state diverged. The summary keeps the
+    // text of a non-empty copy, preferring one whose pointer names a stored
+    // summary above it that lists it, and its first copy's position; its
+    // parent is resolved across all its copies below.
+    const copiesById = new Map<string, SummaryEntry[]>();
+    let malformed = 0;
+    for (const summary of loaded) {
+      if (!summary || typeof summary !== 'object') { malformed++; continue; }
+      const copies = copiesById.get(summary.id);
+      if (copies) copies.push(summary);
+      else copiesById.set(summary.id, [summary]);
     }
-    const dupes = nonEmpty.length - byId.size;
-    if (dupes > 0) console.warn(`[autobiographical] deduped ${dupes} duplicate summary id(s) on load`);
-    // Dropping an invalid parent is only half the repair. Its children may
-    // still carry `mergedInto: <dropped-id>`, which makes them simultaneously
-    // unavailable to the picker (no parent to render) and ineligible for a
-    // replacement merge (they still look merged). Clear every dangling edge
-    // and persist the canonicalized array so the poison does not return on
-    // every restart.
-    let danglingParents = 0;
+    const dupes = loaded.length - malformed - copiesById.size;
+    // The counter starts past every summary id the store holds, dropped ones
+    // included, and is stored when that raises it, before any repair below
+    // removes a summary: no later open then mints a number the store has
+    // used. A store whose counter an older version wrote can trail its ids.
+    const counter = this.store.getStateJson(this.counterStateId);
+    const pastIds = [...copiesById.keys()].reduce((past, id) => {
+      const n = Number(/^L\d+-(\d+)$/.exec(id)?.[1]);
+      return Number.isFinite(n) && n >= past ? n + 1 : past;
+    }, 0);
+    const storedCounter = typeof counter === 'number' ? counter : 0;
+    this.summaryIdCounter = Math.max(storedCounter, pastIds);
+    if (this.summaryIdCounter > storedCounter) {
+      this.store.setStateJson(this.counterStateId, this.summaryIdCounter);
+      console.warn(`[autobiographical] raised the summary-id counter from ${storedCounter} to ${this.summaryIdCounter}, past the summary ids the store holds`);
+    }
+
+    // A compressed chunk record names its L1 and holds the ordered message
+    // ids it gives that L1: the ids compression read, unless a repair has
+    // retargeted the record since. An uncompressed record proves nothing
+    // about a summary.
+    const chunkSources = new Map<string, string[]>();
+    for (const record of this.chunkRecords) {
+      if (record.compressed && record.summaryId && isIdList(record.sourceIds) &&
+          !chunkSources.has(record.summaryId)) {
+        chunkSources.set(record.summaryId, record.sourceIds);
+      }
+    }
+    const byId = new Map<string, SummaryEntry>();
+    const emptyIds: string[] = [];
+    const unreadableIds: string[] = [];
+    const rebuiltIds: string[] = [];
+    const namesParent = (copy: SummaryEntry, pointer: unknown): boolean =>
+      typeof pointer === 'string' && (copiesById.get(pointer) ?? []).some(
+        (parent) => parent.level > copy.level && Array.isArray(parent.sourceIds) && parent.sourceIds.includes(copy.id),
+      );
+    for (const [id, copies] of copiesById) {
+      const withText = copies.filter(hasSummaryText);
+      let summary = withText.find((copy) => namesParent(copy, copy.parentId) || namesParent(copy, copy.mergedInto)) ?? withText[0];
+      if (!summary) { emptyIds.push(id); continue; }
+      if (summary.level === 1) {
+        // An L1's own sources, else its compressed chunk record's, else a
+        // copy's. Its range is their ends, which every L1 writer sets.
+        const ids = [summary.sourceIds, chunkSources.get(id), ...copies.map((copy) => copy.sourceIds)].find(isIdList);
+        if (!ids) { unreadableIds.push(id); continue; }
+        const range = summary.sourceRange as { first?: unknown; last?: unknown } | undefined;
+        if (ids !== summary.sourceIds || range?.first !== ids[0] || range?.last !== ids[ids.length - 1]) {
+          summary = { ...summary, sourceIds: [...ids], sourceRange: { first: ids[0]!, last: ids[ids.length - 1]! } };
+          rebuiltIds.push(id);
+        }
+      } else if (!(isIdList(summary.sourceIds) && isReadableRange(summary.sourceRange))) {
+        // Above L1 a range's ends are message ids that the sources don't
+        // name, so sources and range come together from one copy.
+        const donor = copies.find((copy) => isIdList(copy.sourceIds) && isReadableRange(copy.sourceRange));
+        if (!donor) { unreadableIds.push(id); continue; }
+        summary = { ...summary, sourceIds: [...donor.sourceIds], sourceRange: { ...donor.sourceRange } };
+        rebuiltIds.push(id);
+      }
+      byId.set(id, summary);
+    }
+
+    // A summary above L1 is kept only while every summary it names is kept
+    // and sits below it, whatever removed one and whenever: earlier versions
+    // dropped empty summaries without their parents, and a parent naming a
+    // missing summary covers messages that are rendered, or compressed again,
+    // without it. A merge reads summaries below the one it writes, so a
+    // summary that lists one at its own level or above wasn't written from
+    // it, and two such summaries can list each other, each covering the
+    // other's messages. Repeat to a fixed point. Dropping costs the
+    // ancestors' text; their surviving sources merge again.
+    // A drop's reason comes from its sources' levels as loaded, so it doesn't
+    // depend on which summary the pass reaches first.
+    const ancestorIds: string[] = [];
+    const misplacedIds: string[] = [];
+    const loadedLevel = new Map([...copiesById].map(([id, copies]) => [id, (byId.get(id) ?? copies[0]!).level]));
+    const notBelow = (summary: SummaryEntry) =>
+      summary.sourceIds.some((sourceId) => (loadedLevel.get(sourceId) ?? 0) >= summary.level);
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const [id, summary] of byId) {
+        if (!(summary.level > 1) || (!notBelow(summary) && summary.sourceIds.every((sourceId) => byId.has(sourceId)))) continue;
+        byId.delete(id);
+        (notBelow(summary) ? misplacedIds : ancestorIds).push(id);
+        changed = true;
+      }
+    }
+
+    // A summary has one parent: the first of its own pointers, then its other
+    // copies' (`parentId` before the older `mergedInto` in each, as readers
+    // take them), that names a kept summary above it listing it among its
+    // sources. A parent sits above its summary, so no two summaries can be
+    // each other's parent. Without such a pointer, the parent is the kept
+    // summary one level up that lists the summary, when exactly one does: a
+    // pointer can name a summary further up, such as a grandparent, or
+    // nothing, while the parent that covers the summary lists it, and
+    // clearing the pointer would render the summary beside that parent.
+    // `mergedInto`, which this strategy writes and its frontier reads, is set
+    // to the parent, and so is a `parentId` naming anything else, so every
+    // reader sees the one parent that renders the summary. With no parent,
+    // every pointer that isn't null is cleared, so the summary renders and
+    // merges again. A null pointer counts as none.
+    const reparentedIds: string[] = [];
+    const clearedIds: string[] = [];
+    const covers = (pointer: unknown, summary: SummaryEntry): pointer is string => {
+      const parent = typeof pointer === 'string' ? byId.get(pointer) : undefined;
+      return !!parent && parent.level > summary.level && parent.sourceIds.includes(summary.id);
+    };
+    const listedBy = new Map<string, SummaryEntry[]>();
+    for (const summary of byId.values()) {
+      if (summary.level === 1) continue;
+      for (const sourceId of new Set(summary.sourceIds)) {
+        const listers = listedBy.get(sourceId);
+        if (listers) listers.push(summary);
+        else listedBy.set(sourceId, [summary]);
+      }
+    }
     this.summaries = [...byId.values()].map((summary) => {
-      if (!summary.mergedInto || byId.has(summary.mergedInto)) return summary;
-      danglingParents++;
-      const { mergedInto: _dropped, ...repaired } = summary;
-      return repaired as SummaryEntry;
+      const pointers = [summary, ...copiesById.get(summary.id)!]
+        .flatMap((copy) => [copy.parentId, copy.mergedInto] as unknown[]);
+      const listers = (listedBy.get(summary.id) ?? []).filter((lister) => lister.level === summary.level + 1);
+      const parent = pointers.find((pointer): pointer is string => covers(pointer, summary)) ??
+        (listers.length === 1 ? listers[0]!.id : undefined);
+      let repaired = summary;
+      const edit = () => (repaired === summary ? (repaired = { ...summary }) : repaired);
+      if (parent === undefined) {
+        for (const field of ['parentId', 'mergedInto'] as const) {
+          const own = summary[field] as unknown;
+          if (own === undefined || own === null) continue;
+          delete edit()[field];
+        }
+        if (repaired !== summary) clearedIds.push(summary.id);
+        return repaired;
+      }
+      if (summary.mergedInto !== parent) edit().mergedInto = parent;
+      const ownParentId = summary.parentId as unknown;
+      if (ownParentId !== undefined && ownParentId !== null && ownParentId !== parent) edit().parentId = parent;
+      if (repaired !== summary) reparentedIds.push(summary.id);
+      return repaired;
     });
-    if (droppedEmpty > 0 || dupes > 0 || danglingParents > 0) {
+    const droppedIds = [...copiesById.keys()].filter((id) => !byId.has(id));
+    const keptRebuiltIds = rebuiltIds.filter((id) => byId.has(id));
+    if (malformed > 0 || dupes > 0 || droppedIds.length > 0 || keptRebuiltIds.length > 0 ||
+        reparentedIds.length > 0 || clearedIds.length > 0) {
       this.store.setStateJson(this.summariesStateId, this.summaries);
       console.warn(
-        `[autobiographical] repaired summary state: removed ${droppedEmpty} empty, ` +
-          `deduped ${dupes}, cleared ${danglingParents} dangling parent pointer(s)`,
+        `[autobiographical] repaired summary state: removed ${malformed} malformed entr(ies) and deduped ${dupes}; ` +
+          `dropped empty [${emptyIds.join(', ')}], with unreadable sources or range [${unreadableIds.join(', ')}], ` +
+          `naming a missing summary [${ancestorIds.join(', ')}], naming one not below it [${misplacedIds.join(', ')}]; ` +
+          `rebuilt sources or range of ` +
+          `[${keptRebuiltIds.join(', ')}]; set the parent of [${reparentedIds.join(', ')}]; cleared ` +
+          `the parent pointers of [${clearedIds.join(', ')}], which named no kept parent`,
       );
     }
 
@@ -2104,9 +2281,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    const counter = this.store.getStateJson(this.counterStateId);
-    this.summaryIdCounter = typeof counter === 'number' ? counter : 0;
-
     const queue = this.store.getStateJson(this.mergeQueueStateId);
     this.mergeQueue = Array.isArray(queue)
       ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean; serverErrorStreak?: number }>)
@@ -2117,14 +2291,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         .filter((r) => r && typeof r.key === 'string' && Array.isArray(r.sourceIds))
         .map((r) => [r.key, r]),
     );
+    // A queued merge is kept only while it is an entry whose sources are kept
+    // summaries, as for a summary above L1.
     const validMergeQueue = this.mergeQueue.filter(
-      merge => !merge.sourceIds.some(id => removedEmptyIds.has(id) && !byId.has(id)),
+      merge => merge && isIdList(merge.sourceIds) && merge.sourceIds.every((sourceId) => byId.has(sourceId)),
     );
     if (validMergeQueue.length !== this.mergeQueue.length) {
       const removed = this.mergeQueue.length - validMergeQueue.length;
       this.mergeQueue = validMergeQueue;
       this.store.setStateJson(this.mergeQueueStateId, this.mergeQueue);
-      console.warn(`[autobiographical] removed ${removed} merge queue item(s) with missing sources`);
+      console.warn(`[autobiographical] removed ${removed} merge queue item(s) with missing or unreadable sources`);
     }
 
     this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
@@ -2603,11 +2779,37 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.store?.appendToStateJson(this.summariesStateId, entry);
   }
 
-  /** Read the durable log as well as the local mirror for cross-instance L1 races. */
-  /** First live L1 per joined source-id key, rebuilt only when the summary
+  /**
+   * The L1 written for a chunk, by its joined source ids. Another instance
+   * sharing the store may have written it since this one loaded, perhaps
+   * with summaries above it that this one doesn't hold, so a miss here reads
+   * the store too. When the store has it, this instance reloads the store's
+   * summaries, as a compression that waited on another instance's does,
+   * keeping its kv-unified presentation in flight (#166). The L1 then comes
+   * with the summaries above it, repaired as the loader repairs them. The
+   * open's other steps, such as chunk-record migration, the chunk rebuild,
+   * the merge queue's sanitizing and the topology audit, don't run here.
+   * Adopting the L1 alone left its parent pointer naming a summary this
+   * instance didn't hold, which kv-unified's canonical forest refuses on
+   * every compile.
+   */
+  private findExactL1(chunkIdKey: string): SummaryEntry | undefined {
+    const held = this.heldExactL1(chunkIdKey);
+    if (held) return held;
+    const persisted = this.store?.getStateJson(this.summariesStateId);
+    if (!Array.isArray(persisted)) return undefined;
+    const written = (persisted as Array<SummaryEntry | null>).some(
+      (summary) => summary?.level === 1 && isIdList(summary.sourceIds) && summary.sourceIds.join(':') === chunkIdKey,
+    );
+    if (!written) return undefined;
+    this.loadPersistedState({ keepKvUnifiedPresentation: true });
+    return this.heldExactL1(chunkIdKey);
+  }
+
+  /** First held L1 per joined source-id key, rebuilt only when the summary
    *  list's entries change (the scan joined every L1's ids on every call). */
   private _exactL1: { entries: readonly SummaryEntry[]; byKey: Map<string, SummaryEntry> } | null = null;
-  private findExactL1(chunkIdKey: string): SummaryEntry | undefined {
+  private heldExactL1(chunkIdKey: string): SummaryEntry | undefined {
     const memo = this._exactL1;
     const current = this.summaries;
     let byKey: Map<string, SummaryEntry>;
@@ -2622,17 +2824,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       this._exactL1 = { entries: [...current], byKey };
     }
-    const local = byKey.get(chunkIdKey);
-    if (local) return local;
-    const persisted = this.store?.getStateJson(this.summariesStateId);
-    if (!Array.isArray(persisted)) return undefined;
-    const found = (persisted as SummaryEntry[]).find(
-      (summary) => summary?.level === 1 && summary.sourceIds?.join(':') === chunkIdKey,
-    );
-    if (found && !this.summaries.some((summary) => summary.id === found.id)) {
-      this.summaries.push(found);
-    }
-    return found;
+    return byKey.get(chunkIdKey);
   }
 
   /**
@@ -3846,10 +4038,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     entry.mergedInto = mergedIntoId;
     if (!this.store) return;
     // Resolve the log position by ID against the PERSISTED array — never by
-    // in-memory index. `loadPersistedState` filters empty-content summaries
-    // out of `this.summaries` while they remain in the log, so after a reload
-    // the in-memory index is shifted relative to the log slot. Editing by
-    // in-memory index wrote merge-updates onto NEIGHBORING entries, silently
+    // in-memory index. loadPersistedState now drops empty and unreadable
+    // summaries and persists the canonical array, so its mirror matches the
+    // log on load. Cross-instance appends can still change the log afterward.
+    // Before that canonical repair, editing by in-memory index wrote
+    // merge-updates onto NEIGHBORING entries, silently
     // clobbering them (4 summaries lost in the 2026-07 Lena incident, leaving
     // duplicate-id copies with diverging mergedInto). Update every stored
     // copy with this id so past duplicates converge too.
@@ -3876,6 +4069,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected nextSummaryIdCounter(): number {
     this.requireBranchMutation('nextSummaryIdCounter');
+    // Every instance on the store mints from the stored counter, which only
+    // rises, so no two of them hand out one id.
+    const stored = this.store?.getStateJson(this.counterStateId);
+    if (typeof stored === 'number' && stored > this.summaryIdCounter) this.summaryIdCounter = stored;
     const value = this.summaryIdCounter++;
     this.store?.setStateJson(this.counterStateId, this.summaryIdCounter);
     return value;
@@ -5211,8 +5408,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // and are NOT reflected in the snapshot. Trims only remove entries (total
   // over-counts by at most the trimmed tail); the pairing validator can also
   // ADD stub tool_result entries (total then under-counts by those stubs).
-  // Both deltas are a handful of tokens — the stats describe the selection, not
-  // the byte-exact wire payload. Do not treat `total` as an exact wire count.
+  // Neither delta is counted (a stub is about 36 tokens): the stats describe
+  // the selection, not the byte-exact wire payload. Do not treat `total` as
+  // an exact wire count.
   // ===========================================================================
   private _rs: RenderStats | null = null;
   private _lastRenderStats: RenderStats | null = null;
@@ -8815,16 +9013,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ? Math.min(pse[i], msgCap + 50)
         : pse[i];
       const bound = pinBounds.size > 0 ? pinBounds.get(i) : undefined;
+      const l1Id = ch?.summaryId ?? l1ByMessage.get(msg.id);
       pickerChunks.push({
         id: msg.id,
         sequence: i,
         rawTokens: tokens,
-        currentResolution: this.resolutions.get(msg.id) ?? 0,
+        currentResolution: reachableLevel(this.resolutions.get(msg.id) ?? 0, l1Id, summariesById),
         lockedByAgent: this.locked.has(msg.id),
         pinned: bound !== undefined && AutobiographicalStrategy.isRawPinBound(bound),
         pinLevel: bound !== undefined && bound !== 'raw' && 'level' in bound && bound.level > 0 ? bound.level : undefined,
         pinMaxLevel: bound !== undefined && bound !== 'raw' && 'maxLevel' in bound && bound.maxLevel > 0 ? bound.maxLevel : undefined,
-        l1Id: ch?.summaryId ?? l1ByMessage.get(msg.id),
+        l1Id,
         salience: salience[i],
       });
     }
@@ -9034,15 +9233,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // a failed compile: they are recovery work, not presentation state.
     const pendingResolutionChanges: Array<[string, number]> = [];
     let deepestLevel = 0;
+    // Reported with the layout only once the compile commits (below).
+    let selectionCause: string | undefined;
     // The middle chunks are the prefix of pickerChunks (head and tail were
-    // appended after them); each carries the resolution it was built with.
+    // appended after them). A change is staged against the saved level, not
+    // the level the chunk was planned from, which is lower when the saved
+    // level's summary is gone (reachableLevel), so the commit saves what this
+    // compile presents. A locked chunk keeps its saved level.
     for (let k = 0; k < middleChunkCount; k++) {
       const chunk = pickerChunks[k];
       const id = chunk.id;
       const level = levelAt(chunk.sequence, id);
       if (level > deepestLevel) deepestLevel = level;
       if (this.locked.has(id)) continue;
-      const prev = chunk.currentResolution;
+      const prev = this.resolutions.get(id) ?? 0;
       if (prev !== level && !dryRun) pendingResolutionChanges.push([id, level]);
     }
     if (plan?.override) {
@@ -9256,18 +9460,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const ancestor = currentRun.ancestor;
             if (!emittedAncestors.has(ancestor.id)) {
               emittedAncestors.add(ancestor.id);
+              const rendered = this.renderSummaryAnswer(ancestor, msgCap);
               const questionEntry: ContextEntry = {
                 index: entries.length,
                 participant: 'Context Manager',
                 content: [{ type: 'text', text: summaryLabel }],
                 sourceRelation: 'derived',
+                summaries: rendered.refs,
               };
               const answerEntry: ContextEntry = {
                 index: entries.length + 1,
                 participant: summaryParticipant,
-                content: this.summaryAnswerContentCapped(ancestor, msgCap),
+                content: rendered.content,
                 sourceRelation: 'derived',
                 cacheLayoutKey: ancestor.id,
+                summaries: rendered.refs,
               };
               // Price the same pair the planner selected. responseContent may
               // carry signed-empty thinking whose exact generation cost is in
@@ -9370,18 +9577,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           continue;
         }
         emittedAncestors.add(ancestor.id);
+        const rendered = this.renderSummaryAnswer(ancestor, msgCap);
         const questionEntry: ContextEntry = {
           index: entries.length,
           participant: 'Context Manager',
           content: [{ type: 'text', text: summaryLabel }],
           sourceRelation: 'derived',
+          summaries: rendered.refs,
         };
         const answerEntry: ContextEntry = {
           index: entries.length + 1,
           participant: summaryParticipant,
-          content: this.summaryAnswerContentCapped(ancestor, msgCap),
+          content: rendered.content,
           sourceRelation: 'derived',
           cacheLayoutKey: ancestor.id,
+          summaries: rendered.refs,
         };
         const pairTokens = this.recallPairCost(ancestor);
         if (totalTokens + pairTokens > prefixBudget) {
@@ -9493,7 +9703,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (pendingResolutionChanges.length > 0 && !dryRun) {
       for (const [id, level] of pendingResolutionChanges) this.resolutions.set(id, level);
       this.persistResolutions();
+      selectionCause = 'budget-fit';
     }
+    if (!dryRun) this.pendingSelectionCause = selectionCause;
     // Same commit point for the receipt left behind by kv-unified: a real
     // presentation by a non-kv-unified strategy has now succeeded, so that
     // receipt no longer describes the previous turn (#97). Independent of
@@ -10346,6 +10558,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       const strategy = new KvUnifiedStrategy({
         ...configured,
+        // The certified hysteresis exit is on unless the recipe says
+        // `hysteresisCertificate: false`. It only skips the full solve when it
+        // proves the carried layout is the policy's choice, and declines to
+        // the full solver otherwise, so the default changes solve time, not
+        // the eligibility, adoption or fallback rules.
+        hysteresisCertificate: configured.hysteresisCertificate ?? true,
         reuse: this.kvUnifiedReuse,
         continuityMultiplier: this.kvUnifiedContinuityMultiplier(continuityRelaxation),
         latentDemand: {
@@ -10977,17 +11195,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // but a legacy empty summary may already exist in the store.)
             if (!summary.content || !summary.content.trim()) continue;
             const headerText = this.buildRecallHeader(summary);
+            const rendered = this.renderSummaryAnswer(summary, msgCap);
             const questionEntry: ContextEntry = {
               index: entries.length,
               participant: 'Context Manager',
               content: [{ type: 'text', text: headerText }],
               sourceRelation: 'derived',
+              summaries: rendered.refs,
             };
             const answerEntry: ContextEntry = {
               index: entries.length + 1,
               participant: summaryParticipant,
-              content: this.summaryAnswerContentCapped(summary, msgCap),
+              content: rendered.content,
               sourceRelation: 'derived',
+              summaries: rendered.refs,
             };
             const pairTokens = this.recallPairCost(summary);
             // Never silently drop a selected representation: everything in
@@ -11053,12 +11274,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (selectedSummaries.length > 0) {
           const contextLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
 
-          const questionEntry: ContextEntry = {
-            index: entries.length,
-            participant: 'Context Manager',
-            content: [{ type: 'text', text: contextLabel }],
-            sourceRelation: 'derived',
-          };
           // Synthesised summary turns must respect maxMessageTokens. With L1+L2+L3
           // budgets defaulting to 30k each, an unconstrained concatenation can push
           // a single assistant turn past 90k tokens, eating the inference budget
@@ -11067,11 +11282,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // Per-summary blocks (verbatim reasoning + text when captured) are
           // concatenated with the legacy '---' separators as interstitial
           // text blocks — signed thinking must ride along here too.
+          const combinedRender = this.renderCombinedRecallAnswer(selectedSummaries, msgCap);
+          const combined = combinedRender.content;
+          const combinedRefs = combinedRender.refs;
+          const questionEntry: ContextEntry = {
+            index: entries.length,
+            participant: 'Context Manager',
+            content: [{ type: 'text', text: contextLabel }],
+            sourceRelation: 'derived',
+            summaries: combinedRefs,
+          };
           const answerEntry: ContextEntry = {
             index: entries.length + 1,
             participant: summaryParticipant,
-            content: this.combinedRecallAnswerContent(selectedSummaries, msgCap),
+            content: combined,
             sourceRelation: 'derived',
+            summaries: combinedRefs,
           };
 
           const pairTokens = this.estimateTokens(questionEntry.content) +
@@ -11846,8 +12072,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return 0;
   }
 
-  /** Text substituted for an image block once it leaves the live-image window. */
-  private static readonly IMAGE_PLACEHOLDER = '[image dropped from live context]';
+  /** Text substituted for an image block the context doesn't carry. It
+   *  names no particular limit and no recency, since several rules write it:
+   *  the count, byte and depth limits (the byte rule is greedy, so a large
+   *  newest image can be replaced while smaller older ones stay), the
+   *  hysteresis watermark, which strips below them, and the compression
+   *  request's own image byte cap. Windowed passthrough uses the same text. */
+  private static readonly IMAGE_PLACEHOLDER = '[image not shown: this context keeps only some images]';
 
   /** Post-pass over compiled entries: replace image blocks with a text
    *  placeholder once they fall outside the live-image window — either deeper
@@ -12647,9 +12878,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
-  /** Placeholder body for a stub tool_result inserted by enforceToolPairing. */
+  /** Placeholder body for a stub tool_result inserted by enforceToolPairing:
+   *  the call's result isn't in the rendered context next to it (see the
+   *  cases listed there, and its tail pass, for a last entry that holds both
+   *  a call and a result), so the text names no cause. A read-only call can be
+   *  made again, and returns what the tool reads now; one with effects
+   *  shouldn't be repeated blind. */
   private static readonly STUB_TOOL_RESULT_TEXT =
-    '[tool result unavailable — omitted during context compression]';
+    '[this call\'s result isn\'t shown in this context. If you need its output and the tool only reads, call it again; you\'ll get what it returns now.]';
 
   // Track generated objects, not their text: genuine tool output can quote
   // the same marker. Weak keys avoid retaining previous rendered contexts.
@@ -12825,6 +13061,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         src.content = rest.length > 0
           ? releaseEditedRawForms(source, rest)
           : [{ type: 'text', text: '[tool result moved during context repair]' }];
+        // The result still reaches the request, next to its tool_use:
+        // provenance credits the source body with it there.
+        (src.relocatedResults ??= []).push(id);
         return releaseSharedRawFormsOnMove(real, source);
       }
       return this.createToolResultStub(id);
@@ -12838,10 +13077,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *     `toolUseInputMaxTokens`.
    *  2. For each tool name, keep only the last N `tool_result` blocks
    *     per `toolResultMaxLastN`; older ones get their `content` replaced
-   *     with a brief marker referencing the tool name and how many newer
-   *     results exist below.
+   *     with a brief marker naming the tool and the limit. A limit of 0
+   *     replaces every result of the tool.
    *
-   * Both passes are no-ops when the corresponding config is unset/0.
+   * The first pass does nothing when `toolUseInputMaxTokens` is unset or 0,
+   * and the second when `toolResultMaxLastN` is unset, or for a tool whose
+   * limit is unset or negative.
    * Pruning runs AFTER selection and orphan-trimming, so it doesn't
    * affect chunk formation or the recall/pin layout.
    */
@@ -12928,10 +13169,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const { entry, blockIndex } = occs[i];
           const orig = entry.content[blockIndex];
           if (orig.type !== 'tool_result') continue;
-          const fresherCount = occs.length - i - 1;
           replaceBlock(entry, blockIndex, {
             ...orig,
-            content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
+            // The whole result is replaced, not cut short. Name the limit
+            // rather than count what follows: later results may be replaced
+            // too, and with a limit of 0 every one is.
+            content: limit === 0
+              ? `[result of tool '${toolName}' left out: this context shows none of its results]`
+              : `[result of tool '${toolName}' left out: this context shows only the tool's last ${limit === 1 ? 'result' : `${limit} results`}]`,
           });
         }
       }
@@ -13221,6 +13466,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     summaries: SummaryEntry[],
     maxTokens: number,
   ): ContentBlock[] {
+    return this.renderCombinedRecallAnswer(summaries, maxTokens).content;
+  }
+
+  /**
+   * The combined recall answer together with what of it survived the cap:
+   * each summary whose prose reached the answer, marked `partial` when its
+   * prose was cut. A summary the cap dropped entirely is not listed, so the
+   * rendered layout never claims history is represented by a summary the
+   * resident was not shown.
+   */
+  protected renderCombinedRecallAnswer(
+    summaries: SummaryEntry[],
+    maxTokens: number,
+  ): { content: ContentBlock[]; refs: Array<{ id: string; level: number; partial?: true }> } {
     // A separator follows the answer before it on the wire, so the reasoning at
     // that answer's end gives up its id first (see raw-forms.ts).
     const separated = (content: ContentBlock[]): ContentBlock[] => [
@@ -13229,14 +13488,61 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     ];
     if (this.config.recallEnvelope !== 'xml') {
       let content: ContentBlock[] = [];
+      // Which summary each text block of the full answer belongs to (-1 for
+      // separators), so a flat truncation can be read back per summary.
+      // releaseTrailingReasoning keeps every block's position, so the two
+      // stay aligned.
+      const owners: number[] = [];
       summaries.forEach((s, idx) => {
-        if (idx > 0) content = separated(content);
-        content.push(...this.liveWindowAnswerContent(s));
+        if (idx > 0) {
+          content = separated(content);
+          owners.push(-1);
+        }
+        for (const block of this.liveWindowAnswerContent(s)) {
+          content.push(block);
+          owners.push(idx);
+        }
       });
-      return maxTokens > 0 ? this.truncateContent(content, maxTokens) : content;
+      const out = maxTokens > 0 ? this.truncateContent(content, maxTokens) : content;
+      if (out === content) {
+        return { content: out, refs: summaries.map((s) => ({ id: s.id, level: s.level })) };
+      }
+      // truncateContent keeps blocks in order: text until the budget runs
+      // out (the straddling block cut, later text dropped), and every
+      // non-text block (a tool_result possibly shortened). Align the two
+      // arrays: an unchanged block is the same object, a cut or shortened one
+      // is a new block of the same type in the same position, and a dropped
+      // one has no counterpart. A summary is whole when all its blocks
+      // survived unchanged, partial when any of them survived at all —
+      // including a retained thinking block whose text was dropped — and
+      // absent otherwise.
+      const kept = new Map<number, { whole: number; touched: number; total: number }>();
+      let j = 0;
+      content.forEach((block, i) => {
+        const owner = owners[i]!;
+        const tally = owner >= 0 ? (kept.get(owner) ?? { whole: 0, touched: 0, total: 0 }) : null;
+        if (tally) tally.total++;
+        const counterpart = out[j];
+        if (counterpart === block) {
+          j++;
+          if (tally) { tally.whole++; tally.touched++; }
+        } else if (counterpart && counterpart.type === block.type) {
+          j++;
+          if (tally) tally.touched++;
+        }
+        if (tally) kept.set(owner, tally);
+      });
+      const refs: Array<{ id: string; level: number; partial?: true }> = [];
+      summaries.forEach((s, idx) => {
+        const tally = kept.get(idx);
+        if (!tally || tally.touched === 0) return;
+        refs.push(tally.whole === tally.total ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
+      });
+      return { content: out, refs };
     }
 
     let content: ContentBlock[] = [];
+    const refs: Array<{ id: string; level: number; partial?: true }> = [];
     const separatorCost = this.estimateTextOnlyTokens(
       { content: [{ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT }] } as StoredMessage,
     );
@@ -13249,12 +13555,63 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
       if (idx > 0) content = separated(content);
       content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
+      refs.push(capped === prose ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
       if (maxTokens > 0) {
         remainingTokens -=
           this.estimateTextOnlyTokens({ content: capped } as StoredMessage) + separatorTokens;
       }
     }
-    return content;
+    return { content, refs };
+  }
+
+  /** A single recall answer under the cap, with its layout reference. */
+  protected renderSummaryAnswer(
+    summary: SummaryEntry,
+    maxTokens: number,
+  ): { content: ContentBlock[]; refs: Array<{ id: string; level: number; partial?: true }> } {
+    const prose = this.liveWindowAnswerProse(summary);
+    const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
+    return {
+      content: wrapRecallAnswerContent(capped, summary, this.config.recallEnvelope),
+      refs: [capped === prose ? { id: summary.id, level: summary.level } : { id: summary.id, level: summary.level, partial: true }],
+    };
+  }
+
+  /**
+   * Layout reporting: the messages each rendered summary covers (its leaf
+   * messages, expanded through merged children), its level, and its method.
+   * This strategy does not record who authored a summary, so the method is
+   * 'unknown'.
+   */
+  describeRenderedSummaries(ids: readonly string[]): ReadonlyMap<string, RenderedSummaryInfo> {
+    const byId = new Map<string, SummaryEntry>();
+    for (const s of this.summaries) byId.set(s.id, s);
+    const out = new Map<string, RenderedSummaryInfo>();
+    for (const id of ids) {
+      const summary = byId.get(id);
+      if (!summary) continue;
+      const leaves: string[] = [];
+      const stack: string[] = [summary.id];
+      const seen = new Set<string>();
+      while (stack.length > 0) {
+        const next = stack.pop()!;
+        if (seen.has(next)) continue;
+        seen.add(next);
+        const s = byId.get(next);
+        if (!s) continue;
+        if (s.sourceLevel === 0) leaves.push(...s.sourceIds);
+        else stack.push(...s.sourceIds);
+      }
+      out.set(id, { level: summary.level, leaves, method: 'unknown' });
+    }
+    return out;
+  }
+
+  /** 'budget-fit' when the last committed adaptive select moved resolutions. */
+  takeSelectionCause(): string | undefined {
+    const cause = this.pendingSelectionCause;
+    this.pendingSelectionCause = undefined;
+    return cause;
   }
 
   /**
@@ -13294,7 +13651,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // Budget exhausted — include with minimal content to preserve pairing
             result.push({
               ...block,
-              content: '[content omitted — context budget exceeded]',
+              content: '[content omitted: this message reached its token limit before this result]',
             });
           } else if (text.length > remaining) {
             result.push({

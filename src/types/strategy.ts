@@ -208,6 +208,39 @@ export interface ContextStrategy {
     participant: string,
     content: ContentBlock[]
   ): IngressChunkResult | null;
+
+  /**
+   * Declares that select() reports its rendered layout completely, and which
+   * forms history can take under this strategy. Reporting completely means:
+   * every message it renders raw is a `copy` entry naming its source ids, and
+   * every entry that represents history through summaries names them in
+   * `ContextEntry.summaries`; a message of the view represented by neither
+   * is reported as omitted. A strategy that does not declare this gets no
+   * rendered layout, so no fold receipts are written for it.
+   */
+  readonly renderedForms?: ReadonlyArray<'raw' | 'summary' | 'omitted'>;
+
+  /**
+   * For layout reporting: which messages each named summary covers, at what
+   * level, and by what method it was written ('unknown' when the strategy
+   * does not record authorship). Required when select() names summaries.
+   */
+  describeRenderedSummaries?(ids: readonly string[]): ReadonlyMap<string, RenderedSummaryInfo>;
+
+  /**
+   * Why the last select() changed what it renders, when the strategy knows
+   * (for example 'budget-fit' or 'window'). Reading clears it.
+   */
+  takeSelectionCause?(): string | undefined;
+}
+
+/** What a rendered summary covers, for layout reporting. */
+export interface RenderedSummaryInfo {
+  level: number;
+  /** The stored message ids the summary covers. */
+  leaves: readonly MessageId[];
+  /** 'authored' | 'summarizer' | 'harness' | 'unknown'. */
+  method: string;
 }
 
 /**
@@ -681,7 +714,9 @@ export interface KvUnifiedConfig {
    * Certified hysteresis exit (see `docs/kv-unified-hysteresis-certificate.md`):
    * when the accepted presentation provably remains the policy's selection,
    * skip label propagation. Proves the exact hysteresis policy; it does not
-   * guarantee identity with every bucketed approximate solve. Off unless set.
+   * guarantee identity with every bucketed approximate solve. On unless set
+   * to `false`; the solver itself treats an absent flag as off, the strategy
+   * built from a recipe fills in `true`.
    */
   hysteresisCertificate?: boolean;
 }
@@ -998,10 +1033,19 @@ export interface AutobiographicalConfig {
   topologyPolicy?: 'reject' | 'report';
   /**
    * Open for inspection only: `initialize` still loads and audits the store,
-   * but never chunks the uncovered frontier, enqueues merges, or rewrites the
-   * persisted merge queue. Audit and repair tooling opens stores this way; a
-   * plain open under a config that is not the resident's own would otherwise
-   * mint chunk records with the wrong head window and chunk size.
+   * but never chunks the uncovered frontier, enqueues merges, or drops queued
+   * merges that the current grouping grammar refuses. Audit and repair tooling
+   * opens stores this way; a plain open under a config that is not the
+   * resident's own would otherwise mint chunk records with the wrong head
+   * window and chunk size. Loading repairs what readers can't use on every
+   * open, this one included, and persists the repair: it keeps one of a
+   * summary's duplicate copies, rebuilds sources and ranges it can recover,
+   * drops summaries that are empty, whose sources or range it can't recover,
+   * or that list a summary at their own level or above, and the summaries
+   * above them, resolves each summary's parent pointers, and
+   * reopens or removes the chunk records and queued merges that name a
+   * summary it doesn't keep. It also stores the summary-id counter when the
+   * stored one trails the ids the store holds.
    */
   auditOnly?: boolean;
   /** Legacy first-choice target-only merge request. Default false. */
@@ -1241,7 +1285,8 @@ export interface AutobiographicalConfig {
   /**
    * Per-tool retention limit: keep at most the last N `tool_result` blocks
    * for each tool name. Older results get their content replaced with a
-   * brief marker referencing the tool name and how many newer results exist.
+   * brief marker naming the tool and the limit; a limit of 0 replaces every
+   * result of the tool.
    *
    * Two shapes accepted:
    *  - `number`: applies as a global default across all tools.
