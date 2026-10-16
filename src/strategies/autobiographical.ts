@@ -29,6 +29,7 @@ import type {
   HotContextSettingsStatus,
   SelectOptions,
   PreviewResult,
+  RenderedSummaryInfo,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
@@ -1097,6 +1098,10 @@ function defaultsForKeysLeftNullish(
  */
 export class AutobiographicalStrategy implements ResettableStrategy {
   readonly name: string = 'autobiographical';
+  /** History renders raw, through summaries, or (uncovered) not at all. */
+  readonly renderedForms: ReadonlyArray<'raw' | 'summary' | 'omitted'> = ['raw', 'summary', 'omitted'];
+  /** Why the last committed select changed resolutions (takeSelectionCause). */
+  private pendingSelectionCause: string | undefined;
 
   get maxMessageTokens(): number { return this.config.maxMessageTokens; }
 
@@ -9227,6 +9232,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // a failed compile: they are recovery work, not presentation state.
     const pendingResolutionChanges: Array<[string, number]> = [];
     let deepestLevel = 0;
+    // Reported with the layout only once the compile commits (below).
+    let selectionCause: string | undefined;
     // The middle chunks are the prefix of pickerChunks (head and tail were
     // appended after them). A change is staged against the saved level, not
     // the level the chunk was planned from, which is lower when the saved
@@ -9452,18 +9459,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const ancestor = currentRun.ancestor;
             if (!emittedAncestors.has(ancestor.id)) {
               emittedAncestors.add(ancestor.id);
+              const rendered = this.renderSummaryAnswer(ancestor, msgCap);
               const questionEntry: ContextEntry = {
                 index: entries.length,
                 participant: 'Context Manager',
                 content: [{ type: 'text', text: summaryLabel }],
                 sourceRelation: 'derived',
+                summaries: rendered.refs,
               };
               const answerEntry: ContextEntry = {
                 index: entries.length + 1,
                 participant: summaryParticipant,
-                content: this.summaryAnswerContentCapped(ancestor, msgCap),
+                content: rendered.content,
                 sourceRelation: 'derived',
                 cacheLayoutKey: ancestor.id,
+                summaries: rendered.refs,
               };
               // Price the same pair the planner selected. responseContent may
               // carry signed-empty thinking whose exact generation cost is in
@@ -9566,18 +9576,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           continue;
         }
         emittedAncestors.add(ancestor.id);
+        const rendered = this.renderSummaryAnswer(ancestor, msgCap);
         const questionEntry: ContextEntry = {
           index: entries.length,
           participant: 'Context Manager',
           content: [{ type: 'text', text: summaryLabel }],
           sourceRelation: 'derived',
+          summaries: rendered.refs,
         };
         const answerEntry: ContextEntry = {
           index: entries.length + 1,
           participant: summaryParticipant,
-          content: this.summaryAnswerContentCapped(ancestor, msgCap),
+          content: rendered.content,
           sourceRelation: 'derived',
           cacheLayoutKey: ancestor.id,
+          summaries: rendered.refs,
         };
         const pairTokens = this.recallPairCost(ancestor);
         if (totalTokens + pairTokens > prefixBudget) {
@@ -9689,7 +9702,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (pendingResolutionChanges.length > 0 && !dryRun) {
       for (const [id, level] of pendingResolutionChanges) this.resolutions.set(id, level);
       this.persistResolutions();
+      selectionCause = 'budget-fit';
     }
+    if (!dryRun) this.pendingSelectionCause = selectionCause;
     // Same commit point for the receipt left behind by kv-unified: a real
     // presentation by a non-kv-unified strategy has now succeeded, so that
     // receipt no longer describes the previous turn (#97). Independent of
@@ -11173,17 +11188,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // but a legacy empty summary may already exist in the store.)
             if (!summary.content || !summary.content.trim()) continue;
             const headerText = this.buildRecallHeader(summary);
+            const rendered = this.renderSummaryAnswer(summary, msgCap);
             const questionEntry: ContextEntry = {
               index: entries.length,
               participant: 'Context Manager',
               content: [{ type: 'text', text: headerText }],
               sourceRelation: 'derived',
+              summaries: rendered.refs,
             };
             const answerEntry: ContextEntry = {
               index: entries.length + 1,
               participant: summaryParticipant,
-              content: this.summaryAnswerContentCapped(summary, msgCap),
+              content: rendered.content,
               sourceRelation: 'derived',
+              summaries: rendered.refs,
             };
             const pairTokens = this.recallPairCost(summary);
             // Never silently drop a selected representation: everything in
@@ -11249,12 +11267,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (selectedSummaries.length > 0) {
           const contextLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
 
-          const questionEntry: ContextEntry = {
-            index: entries.length,
-            participant: 'Context Manager',
-            content: [{ type: 'text', text: contextLabel }],
-            sourceRelation: 'derived',
-          };
           // Synthesised summary turns must respect maxMessageTokens. With L1+L2+L3
           // budgets defaulting to 30k each, an unconstrained concatenation can push
           // a single assistant turn past 90k tokens, eating the inference budget
@@ -11263,11 +11275,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // Per-summary blocks (verbatim reasoning + text when captured) are
           // concatenated with the legacy '---' separators as interstitial
           // text blocks — signed thinking must ride along here too.
+          const combinedRender = this.renderCombinedRecallAnswer(selectedSummaries, msgCap);
+          const combined = combinedRender.content;
+          const combinedRefs = combinedRender.refs;
+          const questionEntry: ContextEntry = {
+            index: entries.length,
+            participant: 'Context Manager',
+            content: [{ type: 'text', text: contextLabel }],
+            sourceRelation: 'derived',
+            summaries: combinedRefs,
+          };
           const answerEntry: ContextEntry = {
             index: entries.length + 1,
             participant: summaryParticipant,
-            content: this.combinedRecallAnswerContent(selectedSummaries, msgCap),
+            content: combined,
             sourceRelation: 'derived',
+            summaries: combinedRefs,
           };
 
           const pairTokens = this.estimateTokens(questionEntry.content) +
@@ -13021,6 +13044,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         src.content = rest.length > 0
           ? releaseEditedRawForms(source, rest)
           : [{ type: 'text', text: '[tool result moved during context repair]' }];
+        // The result still reaches the request, next to its tool_use:
+        // provenance credits the source body with it there.
+        (src.relocatedResults ??= []).push(id);
         return releaseSharedRawFormsOnMove(real, source);
       }
       return this.createToolResultStub(id);
@@ -13417,6 +13443,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     summaries: SummaryEntry[],
     maxTokens: number,
   ): ContentBlock[] {
+    return this.renderCombinedRecallAnswer(summaries, maxTokens).content;
+  }
+
+  /**
+   * The combined recall answer together with what of it survived the cap:
+   * each summary whose prose reached the answer, marked `partial` when its
+   * prose was cut. A summary the cap dropped entirely is not listed, so the
+   * rendered layout never claims history is represented by a summary the
+   * resident was not shown.
+   */
+  protected renderCombinedRecallAnswer(
+    summaries: SummaryEntry[],
+    maxTokens: number,
+  ): { content: ContentBlock[]; refs: Array<{ id: string; level: number; partial?: true }> } {
     // A separator follows the answer before it on the wire, so the reasoning at
     // that answer's end gives up its id first (see raw-forms.ts).
     const separated = (content: ContentBlock[]): ContentBlock[] => [
@@ -13425,14 +13465,61 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     ];
     if (this.config.recallEnvelope !== 'xml') {
       let content: ContentBlock[] = [];
+      // Which summary each text block of the full answer belongs to (-1 for
+      // separators), so a flat truncation can be read back per summary.
+      // releaseTrailingReasoning keeps every block's position, so the two
+      // stay aligned.
+      const owners: number[] = [];
       summaries.forEach((s, idx) => {
-        if (idx > 0) content = separated(content);
-        content.push(...this.liveWindowAnswerContent(s));
+        if (idx > 0) {
+          content = separated(content);
+          owners.push(-1);
+        }
+        for (const block of this.liveWindowAnswerContent(s)) {
+          content.push(block);
+          owners.push(idx);
+        }
       });
-      return maxTokens > 0 ? this.truncateContent(content, maxTokens) : content;
+      const out = maxTokens > 0 ? this.truncateContent(content, maxTokens) : content;
+      if (out === content) {
+        return { content: out, refs: summaries.map((s) => ({ id: s.id, level: s.level })) };
+      }
+      // truncateContent keeps blocks in order: text until the budget runs
+      // out (the straddling block cut, later text dropped), and every
+      // non-text block (a tool_result possibly shortened). Align the two
+      // arrays: an unchanged block is the same object, a cut or shortened one
+      // is a new block of the same type in the same position, and a dropped
+      // one has no counterpart. A summary is whole when all its blocks
+      // survived unchanged, partial when any of them survived at all —
+      // including a retained thinking block whose text was dropped — and
+      // absent otherwise.
+      const kept = new Map<number, { whole: number; touched: number; total: number }>();
+      let j = 0;
+      content.forEach((block, i) => {
+        const owner = owners[i]!;
+        const tally = owner >= 0 ? (kept.get(owner) ?? { whole: 0, touched: 0, total: 0 }) : null;
+        if (tally) tally.total++;
+        const counterpart = out[j];
+        if (counterpart === block) {
+          j++;
+          if (tally) { tally.whole++; tally.touched++; }
+        } else if (counterpart && counterpart.type === block.type) {
+          j++;
+          if (tally) tally.touched++;
+        }
+        if (tally) kept.set(owner, tally);
+      });
+      const refs: Array<{ id: string; level: number; partial?: true }> = [];
+      summaries.forEach((s, idx) => {
+        const tally = kept.get(idx);
+        if (!tally || tally.touched === 0) return;
+        refs.push(tally.whole === tally.total ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
+      });
+      return { content: out, refs };
     }
 
     let content: ContentBlock[] = [];
+    const refs: Array<{ id: string; level: number; partial?: true }> = [];
     const separatorCost = this.estimateTextOnlyTokens(
       { content: [{ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT }] } as StoredMessage,
     );
@@ -13445,12 +13532,63 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
       if (idx > 0) content = separated(content);
       content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
+      refs.push(capped === prose ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
       if (maxTokens > 0) {
         remainingTokens -=
           this.estimateTextOnlyTokens({ content: capped } as StoredMessage) + separatorTokens;
       }
     }
-    return content;
+    return { content, refs };
+  }
+
+  /** A single recall answer under the cap, with its layout reference. */
+  protected renderSummaryAnswer(
+    summary: SummaryEntry,
+    maxTokens: number,
+  ): { content: ContentBlock[]; refs: Array<{ id: string; level: number; partial?: true }> } {
+    const prose = this.liveWindowAnswerProse(summary);
+    const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
+    return {
+      content: wrapRecallAnswerContent(capped, summary, this.config.recallEnvelope),
+      refs: [capped === prose ? { id: summary.id, level: summary.level } : { id: summary.id, level: summary.level, partial: true }],
+    };
+  }
+
+  /**
+   * Layout reporting: the messages each rendered summary covers (its leaf
+   * messages, expanded through merged children), its level, and its method.
+   * This strategy does not record who authored a summary, so the method is
+   * 'unknown'.
+   */
+  describeRenderedSummaries(ids: readonly string[]): ReadonlyMap<string, RenderedSummaryInfo> {
+    const byId = new Map<string, SummaryEntry>();
+    for (const s of this.summaries) byId.set(s.id, s);
+    const out = new Map<string, RenderedSummaryInfo>();
+    for (const id of ids) {
+      const summary = byId.get(id);
+      if (!summary) continue;
+      const leaves: string[] = [];
+      const stack: string[] = [summary.id];
+      const seen = new Set<string>();
+      while (stack.length > 0) {
+        const next = stack.pop()!;
+        if (seen.has(next)) continue;
+        seen.add(next);
+        const s = byId.get(next);
+        if (!s) continue;
+        if (s.sourceLevel === 0) leaves.push(...s.sourceIds);
+        else stack.push(...s.sourceIds);
+      }
+      out.set(id, { level: summary.level, leaves, method: 'unknown' });
+    }
+    return out;
+  }
+
+  /** 'budget-fit' when the last committed adaptive select moved resolutions. */
+  takeSelectionCause(): string | undefined {
+    const cause = this.pendingSelectionCause;
+    this.pendingSelectionCause = undefined;
+    return cause;
   }
 
   /**
