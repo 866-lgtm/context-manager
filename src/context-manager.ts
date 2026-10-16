@@ -476,7 +476,9 @@ export class ContextManager {
     // First, so a message refused here changes nothing: no hold expires, no
     // hold is placed, and the strategy's ingress chunking never reads it.
     // What a write mends is mended here, so the strategy chunks what is
-    // stored (well-formed-content.ts).
+    // stored (well-formed-content.ts). A shard of that chunking is checked
+    // later (appendMessage), once expired holds have been released, as at
+    // any add.
     content = contentForWrite(content, 'Message refused');
     this.expireCompressionHolds();
     if (!options?.holdCompression) {

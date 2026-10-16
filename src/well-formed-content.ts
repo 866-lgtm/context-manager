@@ -9,8 +9,9 @@
  *   - an `image`, `document`, `audio` or `video` block's `source` is an
  *     object, and a `generated_image`'s `data` and `mimeType` are strings.
  * A write also refuses inline media the store can't keep as a blob, by the
- * store's own read of its source (stored-media.ts): data that doesn't read
- * as base64, or no media type, neither a declared one nor, for an image, one
+ * store's own rules (stored-media.ts): data its read of base64 can't take,
+ * which only data that isn't a string can be, since any string reads as
+ * base64, or no media type, neither a declared one nor, for an image, one
  * its data's signature names. The store keeps a block of the content as a
  * blob, not media inside a `tool_result`, which it keeps as given.
  * Nothing else is checked: not ids, names or signatures, which a provider may
@@ -37,14 +38,15 @@
  * ({@link wellFormedContent}), for a store written before the refusal, which
  * keeps the content as written. The mend both share is a `tool_use` whose
  * `input` isn't an object, as membrane 0.5.87's adapters can give it: `input`
- * becomes `{}`, and `unparseableInput` keeps the value, as membrane keeps
- * arguments that aren't an object (mendedToolUse).
+ * becomes `{}`, and `unparseableInput`, where membrane keeps arguments whose
+ * JSON didn't parse, keeps the value as JSON (mendedToolUse).
  *
  * Content is walked with index loops throughout: a hole in an array reads as
  * undefined, so it is named and refused like any other. (A stored record has
- * no holes, since JSON writes a hole as null.) Content that contains itself,
- * through a `tool_result`'s content, overflows the walk's stack instead of
- * being named: JSON can't produce it.
+ * no holes, since JSON writes a hole as null.) The walks recurse once per
+ * `tool_result` level, so content nested deeper than the call stack allows
+ * throws a RangeError instead of being named. Content that contains itself,
+ * through a `tool_result`'s content, always does, and JSON can't produce it.
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
@@ -117,12 +119,12 @@ function allWellFormed(content: readonly unknown[], side: Side): boolean {
 }
 
 /**
- * A `tool_use` whose `input` isn't an object, as membrane mends a call whose
- * arguments come as a value (`toolUseInputFromValue`, membrane #126): `input`
- * is `{}`, and `unparseableInput` keeps the value as JSON, so it can't pass
- * for the model's arguments. No value at all is a call with no arguments,
- * and isn't marked. A marker the block already carries is kept. Undefined
- * for a value with no JSON form (a bigint, a function, a cycle), which a
+ * A `tool_use` whose `input` isn't an object, mended so that it can't pass
+ * for the model's arguments: `input` is `{}`, and `unparseableInput`, where
+ * membrane keeps arguments whose JSON didn't parse, keeps the value as JSON.
+ * No value at all is a call with no arguments, and isn't marked. A string
+ * marker the block already carries is kept. Undefined for a value with no
+ * JSON form (a bigint, a function, an array that contains itself), which a
  * write then refuses by name.
  */
 function mendedToolUse(block: Record<string, unknown>): ContentBlock | undefined {
@@ -184,8 +186,9 @@ function placesIn(block: unknown, at: string, places: string[], side: Side): voi
       if (typeof block.mimeType !== 'string') places.push(`${at}.mimeType is ${kindOf(block.mimeType)}, not a string`);
       return;
     case 'blob_ref':
-      if (side === 'write') places.push(`${at} is a blob_ref, which only the store writes`);
-      else if (!isRecord(block.ref) || typeof block.ref.hash !== 'string') {
+      if (side === 'write') {
+        places.push(`${at} is a blob_ref, which only the store writes (a read with blobs resolved, the default, gives the block to write)`);
+      } else if (!isRecord(block.ref) || typeof block.ref.hash !== 'string') {
         places.push(`${at}.ref is ${isRecord(block.ref) ? 'an object without a string hash' : kindOf(block.ref)}, not a blob reference`);
       }
       return;
@@ -227,9 +230,10 @@ function notAnArray(content: unknown): string {
  * on write: one phrase per place, naming its path ("content[2] is a string,
  * not a content block"), in content order, or the one place "content is
  * null, not an array of content blocks". A `tool_use` whose input isn't an
- * object isn't a place, since a write mends it (contentForWrite).
- * Non-throwing, whatever it's given short of content that contains itself,
- * which JSON can't produce, for a host that checks content before it queues
+ * object is a place only when a write can't mend it (contentForWrite): when
+ * the input has no JSON form. Non-throwing for content nested no deeper
+ * than the call stack allows, which content that contains itself never is
+ * (JSON can't produce it), for a host that checks content before it queues
  * it.
  */
 export function malformedContentPlaces(content: unknown): string[] {
@@ -315,12 +319,13 @@ function writeBlock(block: Record<string, unknown>): ContentBlock {
  * block keeps its signature with `thinking: ''`, as membrane gives a
  * signature-only block, and a `tool_result` keeps its content blocks that
  * match, so that the pair they make survives: its content as a read gives an
- * array of them, a lone block as an array of one, and a number as its text;
- * anything else is an empty array. Anything else is left out (undefined): a
- * value that isn't an object, an array, a block without a string `type`, a
- * text block without its string, unsigned thinking without its string, media
- * without a source, a generated image without its data or media type, and a
- * `blob_ref` that doesn't reference a blob.
+ * array of them, a lone block as an array of that block when the read keeps
+ * it, and a number as its text; anything else is an empty array. Anything
+ * else is left out (undefined): a value that isn't an object, an array, a
+ * block without a string `type`, a text block without its string, unsigned
+ * thinking without its string, media without a source, a generated image
+ * without its data or media type, and a `blob_ref` that doesn't reference a
+ * blob.
  */
 function readBlock(block: Record<string, unknown>): ContentBlock | undefined {
   if (wellFormed(block, 'read')) return block as unknown as ContentBlock;

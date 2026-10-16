@@ -1,8 +1,9 @@
 /**
- * Which blocks the store keeps as blobs, and the media type a blob's bytes
- * name. Shared by the store (blob-manager.ts) and the write boundary
+ * Which blocks the store keeps as blobs, the media type a blob is written
+ * under, and what of a source the store can't keep: one rule each, shared by
+ * the store's write (blob-manager.ts) and the write boundary
  * (well-formed-content.ts), so the boundary refuses exactly what the store's
- * own read of a source refuses.
+ * own write refuses.
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
@@ -39,7 +40,8 @@ export function sniffRasterImageMediaType(bytes: Uint8Array): string | null {
  *  longest signature needs 12 bytes, which 32 base64 characters cover with
  *  room to spare (24). The prefix doubles until it gives 12 bytes or is the
  *  whole string, for data whose first characters aren't base64, which the
- *  decode skips. */
+ *  decode skips: only then does it decode more, and the prefixes it decodes
+ *  add up to less than three times the string. */
 export function imageMediaTypeOfBase64(data: string): string | null {
   let length = 32;
   let bytes = Buffer.from(data.slice(0, length), 'base64');
@@ -69,16 +71,37 @@ export function blobKindOf(block: ContentBlock): BlobReference['originalType'] |
 }
 
 /**
+ * The media type the store writes a blob under: for an image, the type its
+ * data's signature names (`sniff`, called for an image alone), else the
+ * declared one; for other media, the declared one. Null when that isn't a
+ * string: a blob the store can't keep. Transport MIME is testimony, not
+ * authority over the bytes: a wrong image label otherwise survives in the
+ * BlobReference and causes permanent provider 400s every time the message is
+ * rendered. Only raster formats with unambiguous signatures are relabeled;
+ * any other type is kept as declared.
+ */
+export function blobMediaType(
+  kind: BlobReference['originalType'],
+  declared: unknown,
+  sniff: () => string | null,
+): string | null {
+  const sniffed = kind === 'image' ? sniff() : null;
+  if (sniffed !== null) return sniffed;
+  return typeof declared === 'string' ? declared : null;
+}
+
+/**
  * What the store can't keep of inline media's source, by its own write of it
- * (storeBase64), or null when it can keep the block: `data` when the data
- * doesn't read as base64, and `mediaType` when the blob would have no media
- * type, neither a declared one nor, for an image, one its data's signature
- * names. A block the store keeps as given (blobKindOf) has neither. The
- * reads are the store's, done no further than they need: any string reads as
- * base64, so string data isn't decoded, and an image without a declared type
- * has a prefix of its data decoded (imageMediaTypeOfBase64). Data that isn't
- * a string is read as the store reads it (Buffer.from), which takes an array
- * of bytes, for one.
+ * (storeBase64), or null when it can keep the block: `data` when the store's
+ * read of the data throws, and `mediaType` when its rule gives the blob no
+ * media type (blobMediaType). A block the store keeps as given (blobKindOf)
+ * has neither. Any string reads as base64, so string data is never refused,
+ * and is decoded no further than the prefix an image's signature takes
+ * (imageMediaTypeOfBase64). Data that isn't a string, outside membrane's
+ * string type, is read as the store reads it (Buffer.from), which takes an
+ * array of bytes, for one. Whether the store's read takes such data only
+ * that read can say, so on that path alone the boundary copies the payload
+ * once more than the store's write does.
  */
 export function unstorableSource(block: ContentBlock): { data: boolean; mediaType: boolean } | null {
   const kind = blobKindOf(block);
@@ -89,11 +112,11 @@ export function unstorableSource(block: ContentBlock): { data: boolean; mediaTyp
     try {
       bytes = Buffer.from(data as string, 'base64');
     } catch {
-      return { data: true, mediaType: typeof mediaType !== 'string' };
+      // No bytes for a signature: the blob's type is the declared one or none.
+      return { data: true, mediaType: blobMediaType(kind, mediaType, () => null) === null };
     }
   }
-  if (typeof mediaType === 'string') return null;
-  if (kind !== 'image') return { data: false, mediaType: true };
-  const sniffed = typeof data === 'string' ? imageMediaTypeOfBase64(data) : sniffRasterImageMediaType(bytes!);
-  return sniffed === null ? { data: false, mediaType: true } : null;
+  const type = blobMediaType(kind, mediaType, () =>
+    typeof data === 'string' ? imageMediaTypeOfBase64(data) : sniffRasterImageMediaType(bytes!));
+  return type === null ? { data: false, mediaType: true } : null;
 }

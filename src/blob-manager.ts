@@ -9,21 +9,10 @@ import type {
 } from '@animalabs/membrane';
 import type { BlobReference, StoredContentBlock } from './types/index.js';
 import { blockForWrite } from './well-formed-content.js';
-import { blobKindOf, imageMediaTypeOfBase64, sniffRasterImageMediaType } from './stored-media.js';
+import { blobKindOf, blobMediaType, imageMediaTypeOfBase64, sniffRasterImageMediaType } from './stored-media.js';
 
 function canonicalImageMediaTypeFromBase64(data: string, declared: string): string {
   return imageMediaTypeOfBase64(data) ?? declared;
-}
-
-/**
- * The media type a blob is written under. Transport MIME is testimony, not
- * authority over the bytes: a wrong image label otherwise survives in the
- * BlobReference and causes permanent provider 400s every time the message is
- * rendered. Only raster formats with unambiguous signatures are relabeled;
- * any other type is kept as declared.
- */
-function blobMediaType(bytes: Uint8Array, declared: string, kind: BlobReference['originalType']): string {
-  return kind === 'image' ? sniffRasterImageMediaType(bytes) ?? declared : declared;
 }
 
 /** The block a blob reads back as, from its base64 data and its reference's media type. */
@@ -110,7 +99,8 @@ export function blockAsStored(block: ContentBlock): ContentBlock {
   // The store's own read of the data (storeBase64). What it refuses, the
   // boundary has refused by name above.
   const bytes = Buffer.from(data, 'base64');
-  return blockFromBlob(kind, bytes.toString('base64'), blobMediaType(bytes, mediaType, kind));
+  const type = blobMediaType(kind, mediaType, () => sniffRasterImageMediaType(bytes)) ?? mediaType;
+  return blockFromBlob(kind, bytes.toString('base64'), type);
 }
 
 /**
@@ -205,7 +195,10 @@ export class BlobManager {
     originalType: BlobReference['originalType']
   ): BlobReference {
     const buffer = Buffer.from(source.data, 'base64');
-    const mediaType = blobMediaType(buffer, source.mediaType, originalType);
+    // Every write path's boundary refuses a blob its rule gives no type
+    // (unstorableSource). A direct caller of extractBlobs isn't behind it, and
+    // gets chronicle's own refusal of the declared value, as before.
+    const mediaType = blobMediaType(originalType, source.mediaType, () => sniffRasterImageMediaType(buffer)) ?? source.mediaType;
     const hash = this.store.storeBlob(buffer, mediaType);
 
     return {

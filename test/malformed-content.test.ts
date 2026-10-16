@@ -460,7 +460,8 @@ describe("content that doesn't match ContentBlock", () => {
             "content\\[0\\]\\.source\\.mediaType is undefined, not a string, and the image's data has no png, jpeg, gif or webp signature"],
           [[{ type: 'generated_image', data: 1 }],
             'content\\[0\\]\\.data is a number, not a string; content\\[0\\]\\.mimeType is undefined, not a string'],
-          [[{ type: 'blob_ref', ref: { hash: 'h', mediaType: 'image/png', originalType: 'image' } }], 'content\\[0\\] is a blob_ref, which only the store writes'],
+          [[{ type: 'blob_ref', ref: { hash: 'h', mediaType: 'image/png', originalType: 'image' } }],
+            'content\\[0\\] is a blob_ref, which only the store writes \\(a read with blobs resolved, the default, gives the block to write\\)'],
           [[toolResult('t1', [t('ok'), null, 'x'])],
             'content\\[0\\]\\.content\\[1\\] is null, not a content block; content\\[0\\]\\.content\\[2\\] is a string, not a content block'],
           [[toolResult('t1', [toolResult('t2', [null])])], 'content\\[0\\]\\.content\\[0\\]\\.content\\[0\\] is null, not a content block'],
@@ -527,6 +528,10 @@ describe("content that doesn't match ContentBlock", () => {
         if (content.some((block) => (block as { text?: string }).text === 'bad shard')) {
           shards.push({ content: [null as unknown as ContentBlock], shardIndex: shards.length });
         }
+        if (content.some((block) => (block as { text?: string }).text === 'media shard')) {
+          // Inline media the store can't keep: a document with no media type.
+          shards.push({ content: [{ type: 'document', source: { type: 'base64', data: 'JVBERi0=' } } as unknown as ContentBlock], shardIndex: shards.length });
+        }
         return { bodyGroupId: 'each-block', shards };
       }
     }
@@ -541,7 +546,12 @@ describe("content that doesn't match ContentBlock", () => {
           { message: /^Shard 2 of the message, as the strategy chunked it, refused: content\[0\] is null, not a content block\.$/ },
         );
         assert.equal(strategy.ingress, 1);
-        assert.equal(manager.getAllMessages().length, 0, 'no shard of either was stored');
+        assert.throws(
+          () => manager.addMessage('User', [t('a'), t('media shard')]),
+          { message: /^Shard 2 of the message, as the strategy chunked it, refused: content\[0\]\.source\.mediaType is undefined, not a string\.$/ },
+        );
+        assert.equal(strategy.ingress, 2);
+        assert.equal(manager.getAllMessages().length, 0, 'no shard of any of them was stored');
         assert.equal(manager.getCompressionHolds().size, 0, 'and no hold was placed');
       } finally {
         manager.close();
@@ -586,6 +596,20 @@ describe("content that doesn't match ContentBlock", () => {
         { message: /^Context entry 1 of the replacement refused: content\[0\] is null, not a content block\.$/ },
       );
       assert.deepEqual(log.getAll().map((entry) => entry.content), [[t('entry')]], 'a refused replacement leaves the log as it was');
+      assert.throws(
+        () => log.replaceAll([
+          { participant: 'User', content: [t('new 1')] },
+          { participant: 'User', content: [{ type: 'video', source: { type: 'base64', data: 'AAAA' } }] as ContentBlock[] },
+        ]),
+        { message: /^Context entry 1 of the replacement refused: content\[0\]\.source\.mediaType is undefined, not a string\.$/ },
+      );
+      // A hole among the entries is an entry with no content.
+      const holed = [{ participant: 'User', content: [t('new 1')] }, , { participant: 'User', content: [t('new 3')] }] as Array<{ participant: string; content: ContentBlock[] }>;
+      assert.throws(
+        () => log.replaceAll(holed),
+        { message: /^Context entry 1 of the replacement refused: content is undefined, not an array of content blocks\.$/ },
+      );
+      assert.deepEqual(log.getAll().map((entry) => entry.content), [[t('entry')]], 'media it can\'t keep, or a hole, leaves the log as it was');
       assert.throws(() => blockAsStored(null as unknown as ContentBlock), { message: /^blockAsStored: block is null, not a content block\.$/ });
       assert.throws(() => blockAsStored(toolResult('t1', [t('ok'), 'x']) as ContentBlock), { message: /^blockAsStored: block\.content\[1\] is a string, not a content block\.$/ });
       assert.throws(() => blockAsStored(toolUse('u1', 10n) as ContentBlock), { message: /^blockAsStored: block\.input is a bigint, not an object\.$/ });
@@ -678,7 +702,7 @@ describe("content that doesn't match ContentBlock", () => {
     const places = [
       'content[1] is null, not a content block',
       'content[2].content[0].text is undefined, not a string',
-      'content[3] is a blob_ref, which only the store writes',
+      'content[3] is a blob_ref, which only the store writes (a read with blobs resolved, the default, gives the block to write)',
     ];
     assert.deepEqual(malformedContentPlaces(content), places);
     await withStore(async (store) => {

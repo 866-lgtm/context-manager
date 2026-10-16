@@ -1,9 +1,10 @@
 - **Hosts that write content they didn't build,** such as a channel's
   messages: `addMessage`, `editMessage`, `MessageStore.append` and `edit`,
-  `ContextLog.append`, `edit` and `replaceAll`, and `blockAsStored` now
-  refuse content that doesn't match `ContentBlock` where its readers read
-  it, and store nothing of it. Before, such content was stored, and a reader
-  written against `ContentBlock` could throw on it from then on. What's
+  `ContextLog.append`, `edit` and `replaceAll`, and `blockAsStored` for its
+  one block, now refuse content that doesn't match `ContentBlock` where its
+  readers read it, and store nothing of it. Before, such content was stored,
+  and a reader written against `ContentBlock` could throw on it from then
+  on, except inline media the store couldn't keep, whose write threw. What's
   refused: content that isn't an array; a block that isn't an object, is an
   array, or has no string `type`; a text or thinking block whose `text` or
   `thinking` isn't a string; a `tool_result` whose content is neither a
@@ -12,14 +13,17 @@
   store can't keep as a blob, where its own write threw an error naming
   neither the block nor the field: a document, audio or video block, or an
   image other than a URL one, in the content itself, not inside a
-  `tool_result`, whose `source.data` the store can't read as base64, or that
-  has no media type, neither a declared `source.mediaType` nor, for an
-  image, a png, jpeg, gif or webp signature in its data; a generated image
-  whose `data` or `mimeType` isn't a string; a `tool_use` whose `input`
-  isn't an object and has no JSON form, such as a `bigint`, unless the block
-  already carries an `unparseableInput`, which is kept; and a `blob_ref`,
-  which only the store writes. A host that copies messages from one store to
-  another copies them as read with blobs resolved, the default: a read with
+  `tool_result`, whose `source.data` the store's read of base64 can't take,
+  which only data that isn't a string can be, or that has no media type,
+  neither a declared `source.mediaType` nor, for an image, a png, jpeg, gif
+  or webp signature in its data (data outside membrane's string type, such
+  as a `Buffer`, is read for this as the store reads it, a copy the store's
+  write then makes again); a generated image whose `data` or `mimeType`
+  isn't a string; a `tool_use` whose `input` is given, isn't an object and
+  has no JSON form, such as a `bigint`, unless the block already carries a
+  string `unparseableInput`, which is kept; and a `blob_ref`, which only the
+  store writes. A host that copies messages from one store to another copies
+  them as read with blobs resolved, the default: a read with
   `resolveBlobs: false` gives `blob_ref`s. The refusal is a
   `MalformedContentError`. Its message names each place by its path, such as
   `Message refused: content[1] is a string, not a content block.`, and its

@@ -173,11 +173,12 @@ export class ContextLog {
     // An entry that doesn't match, or holds inline media the store can't
     // keep, is refused before the log is cleared, so that refusal leaves the
     // log as it was rather than half replaced. What a write mends, append
-    // mends.
-    entries.forEach((entry, i) => {
-      const places = malformedContentPlaces(entry.content);
+    // mends. An index loop, as the write loop below meets every index: a
+    // hole is an entry with no content.
+    for (let i = 0; i < entries.length; i++) {
+      const places = malformedContentPlaces(entries[i]?.content);
       if (places.length > 0) throw new MalformedContentError(`Context entry ${i} of the replacement refused`, places);
-    });
+    }
     // Clear existing entries
     const len = this.length();
     if (len > 0) {

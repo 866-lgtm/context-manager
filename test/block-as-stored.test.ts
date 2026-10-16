@@ -146,9 +146,12 @@ describe('blockAsStored', () => {
     const noData = { type: 'audio', source: { type: 'base64', mediaType: 'audio/wav' } } as unknown as ContentBlock;
     const ref = { type: 'blob_ref', ref: { hash: 'h', mediaType: 'image/png', originalType: 'image' } } as unknown as ContentBlock;
     const urlDocument = { type: 'document', source: { type: 'url', url: 'https://example.com/a.pdf' } } as unknown as ContentBlock;
+    // Data that isn't a string, whose bytes carry no signature the store reads.
+    const untypedUnsniffableBytes = { type: 'image', source: { type: 'base64', data: Buffer.from(AVIF, 'hex') } } as unknown as ContentBlock;
     const refusals: Array<[ContentBlock, string]> = [
       [untypedDocument, 'source.mediaType is undefined, not a string'],
       [untypedUnsniffable, "source.mediaType is undefined, not a string, and the image's data has no png, jpeg, gif or webp signature"],
+      [untypedUnsniffableBytes, "source.mediaType is undefined, not a string, and the image's data has no png, jpeg, gif or webp signature"],
       [noData, 'source.data is undefined, not base64 data'],
       [urlDocument, 'source.data is undefined, not base64 data; content[0].source.mediaType is undefined, not a string'],
     ];
@@ -159,7 +162,10 @@ describe('blockAsStored', () => {
         message: `blockAsStored: block.${place.replaceAll('content[0].', 'block.')}.`,
       });
     }
-    assert.throws(() => blockAsStored(ref), { name: 'MalformedContentError', message: 'blockAsStored: block is a blob_ref, which only the store writes.' });
+    assert.throws(() => blockAsStored(ref), {
+      name: 'MalformedContentError',
+      message: 'blockAsStored: block is a blob_ref, which only the store writes (a read with blobs resolved, the default, gives the block to write).',
+    });
     // A write refuses the same blocks by name, before anything is stored.
     const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
     try {
@@ -168,7 +174,7 @@ describe('blockAsStored', () => {
       }
       assert.throws(() => manager.addMessage('user', [ref]), {
         name: 'MalformedContentError',
-        message: 'Message refused: content[0] is a blob_ref, which only the store writes.',
+        message: 'Message refused: content[0] is a blob_ref, which only the store writes (a read with blobs resolved, the default, gives the block to write).',
       });
       assert.equal(manager.getAllMessages().length, 0, 'nothing stored');
     } finally {
@@ -182,12 +188,15 @@ describe('blockAsStored', () => {
     const spaced = { type: 'image', source: { type: 'base64', data: `${'\n'.repeat(40)}${b64(PNG)}` } } as unknown as ContentBlock;
     // Data that isn't a string, which the store reads as bytes.
     const bytes = { type: 'audio', source: { type: 'base64', mediaType: 'audio/wav', data: [0x52, 0x49, 0x46, 0x46] } } as unknown as ContentBlock;
+    // An image without a declared type whose data, bytes rather than a string, names one.
+    const pngBytes = { type: 'image', source: { type: 'base64', data: Buffer.from(PNG, 'hex') } } as unknown as ContentBlock;
     assert.deepStrictEqual(blockAsStored(spaced), { type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' } });
     assert.deepStrictEqual(blockAsStored(bytes), { type: 'audio', source: { type: 'base64', data: b64('52494646'), mediaType: 'audio/wav' } });
+    assert.deepStrictEqual(blockAsStored(pngBytes), { type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' } });
     const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
     try {
-      manager.addMessage('user', [spaced, bytes]);
-      assert.deepStrictEqual(manager.getAllMessages()[0]!.content, [blockAsStored(spaced), blockAsStored(bytes)]);
+      manager.addMessage('user', [spaced, bytes, pngBytes]);
+      assert.deepStrictEqual(manager.getAllMessages()[0]!.content, [blockAsStored(spaced), blockAsStored(bytes), blockAsStored(pngBytes)]);
     } finally {
       manager.close();
     }
