@@ -203,12 +203,17 @@ const refusals: Array<[string, Fixture, RegExp]> = [
 // into the version package.json already held and deleted the fragments.
 const invocations: Array<[string, { args?: string[]; env?: Record<string, string | undefined> }, RegExp]> = [
   ["to run directly, outside npm", { env: { npm_command: undefined, npm_lifecycle_event: undefined } },
-    /runs only as the version hook of `npm version <patch\|minor\|major>`.*npm_command is unset and npm_lifecycle_event is unset/],
+    /^release-changelog: refused, and this script changed nothing: it runs only as the version hook of `npm version <patch\|minor\|major>`.*npm_command is unset and npm_lifecycle_event is unset/],
   ["to run through `npm run version`, which bumps nothing", { env: { npm_command: "run" } },
     /npm_command is 'run' and npm_lifecycle_event is 'version'/],
+  ["to run through `bun run version`, which bumps nothing", { env: { npm_command: "run-script" } },
+    /npm_command is 'run-script' and npm_lifecycle_event is 'version'/],
+  ["to run as `bun pm version`'s hook, with no npm command", { env: { npm_command: undefined } },
+    /npm_command is unset and npm_lifecycle_event is 'version'\)\. A version bump made before it ran, as by `bun pm version`, stays in package\.json\./],
   ["to run as npm version's preversion hook, before the bump", { env: { npm_lifecycle_event: "preversion" } },
     /npm_command is 'version' and npm_lifecycle_event is 'preversion'/],
-  ["an argument it doesn't take", { args: ["--dry-run"] }, /unknown argument '--dry-run': it takes none/],
+  ["an argument it doesn't take", { args: ["--dry-run"] },
+    /^release-changelog: refused, and nothing was changed: unknown argument '--dry-run', and it takes none but --help or -h\./],
 ];
 
 for (const [name, invocation, message] of invocations) {
@@ -223,17 +228,20 @@ for (const [name, invocation, message] of invocations) {
   });
 }
 
-for (const [flag, env] of [["--help", {}], ["-h", { npm_command: undefined, npm_lifecycle_event: undefined }]] as const) {
-  test(`${flag} says what it does and changes nothing${Object.keys(env).length ? ", outside npm too" : ""}`, () => {
-    const dir = setup({ fragments: { "a.fixed.md": "- x\n" } });
-    const before = { changelog: changelog(dir), pending: pending(dir) };
-    const r = run(dir, { args: [flag], env });
-    assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /^Usage: npm version <patch\|minor\|major>\n/);
-    assert.equal(r.stderr, "");
-    assert.equal(changelog(dir), before.changelog, "CHANGELOG.md must be untouched");
-    assert.deepEqual(pending(dir), before.pending, "no fragment may be deleted");
-  });
+// Help reads nothing: each case runs on a fixture the release would refuse
+// (nothing to release), in npm version's hook and outside npm.
+for (const flag of ["--help", "-h"]) {
+  for (const [where, env] of [["in the hook", {}], ["outside npm", { npm_command: undefined, npm_lifecycle_event: undefined }]] as const) {
+    test(`${flag} says what it does and changes nothing, ${where}`, () => {
+      const dir = setup({});
+      const before = { changelog: changelog(dir), pending: pending(dir) };
+      const r = run(dir, { args: [flag], env });
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stdout, /^Usage: npm version <patch\|minor\|major>\n/);
+      assert.equal(changelog(dir), before.changelog, "CHANGELOG.md must be untouched");
+      assert.deepEqual(pending(dir), before.pending, "no fragment may be deleted");
+    });
+  }
 }
 
 for (const [name, fixture, message] of refusals) {

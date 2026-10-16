@@ -9,9 +9,11 @@
 // leaves a fresh empty `## Unreleased` above it. Refuses to release when
 // there is nothing to release, or when the input's shape is ambiguous.
 //
-// It runs only as that hook. Run any other way, it would release into the
-// version package.json already holds and delete the fragments it folded
-// (#198), so it refuses, and `--help` says what it does.
+// Run any other way, it would release into the version package.json already
+// holds and delete the fragments it folded (#198), so it refuses unless the
+// environment npm gives the hook shows `npm version` running it. That
+// guards against running it by mistake, not on purpose: any process can set
+// those variables. `--help` says what it does.
 import {
   existsSync,
   readdirSync,
@@ -208,10 +210,11 @@ npm version runs it, package.json already holds the new version, and it folds
 the fragments in ${FRAGMENT_DIR}/ and the entries under '## Unreleased' into a
 new '## X.Y.Z — YYYY-MM-DD' section of ${CHANGELOG}, deletes the fragments it
 folded, and leaves an empty '## Unreleased' above the new section. npm then
-commits and tags the release.
+makes its release commit and tag, as it's configured to.
 
-It takes no arguments, and it runs only as npm version's \`version\` hook: run
-any other way, it would release into the version package.json already holds.`;
+It takes no arguments but --help or -h, and it refuses to run except as npm
+version's \`version\` hook, since run any other way it would release into the
+version package.json already holds.`;
 
 // Whether this is npm version running its `version` hook: npm_command says
 // which npm command is running ("run" for `npm run version`, which bumps
@@ -220,14 +223,19 @@ any other way, it would release into the version package.json already holds.`;
 function checkInvocation(args, env) {
   if (args.includes("--help") || args.includes("-h")) return "help";
   if (args.length > 0) {
-    fail(`unknown argument '${args[0]}': it takes none, and nothing was changed. --help says what it does.`);
+    fail(
+      `refused, and nothing was changed: unknown argument '${args[0]}', and it takes none but --help or -h. ` +
+        "`node scripts/release-changelog.mjs --help` says what it does.",
+    );
   }
   if (env.npm_command !== "version" || env.npm_lifecycle_event !== "version") {
     const seen = (name) => (env[name] === undefined ? `${name} is unset` : `${name} is '${env[name]}'`);
     fail(
-      "this runs only as the version hook of `npm version <patch|minor|major>`, after npm " +
-        `has written the new version to package.json (here ${seen("npm_command")} and ` +
-        `${seen("npm_lifecycle_event")}). Nothing was changed. --help says what it does.`,
+      "refused, and this script changed nothing: it runs only as the version hook of " +
+        "`npm version <patch|minor|major>`, after npm has written the new version to package.json " +
+        `(here ${seen("npm_command")} and ${seen("npm_lifecycle_event")}). A version bump made ` +
+        "before it ran, as by `bun pm version`, stays in package.json. " +
+        "`node scripts/release-changelog.mjs --help` says what it does.",
     );
   }
   return "release";
