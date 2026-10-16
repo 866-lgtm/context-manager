@@ -893,3 +893,19 @@ test('messages= counts the strategy view: auxiliary slots merged in, after the v
   reader.close();
   main.close();
 });
+
+test('latent demand is joint unless the recipe says individual', async () => {
+  const modeOf = async (kvUnified: Record<string, unknown>) => {
+    const selected = strategy({ kvUnified });
+    const manager = await ContextManager.open({ path: STORE, strategy: selected });
+    manager.addMessage('user', [{ type: 'text', text: 'hello' }]);
+    await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+    const solver = (selected as unknown as { _lastKvUnified: { options: { latentDemand?: { mode?: string } } } })._lastKvUnified;
+    const mode = solver.options.latentDemand?.mode;
+    manager.close();
+    rmSync(STORE, { recursive: true, force: true });
+    return mode;
+  };
+  assert.equal(await modeOf({ ...KV_UNIFIED }), 'joint');
+  assert.equal(await modeOf({ ...KV_UNIFIED, latentDemandMode: 'individual' }), 'individual');
+});

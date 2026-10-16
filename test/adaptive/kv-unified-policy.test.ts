@@ -1724,3 +1724,137 @@ test('banded continuity holds stability, reads it at doublings, and saturates re
   assert.notEqual(continuity(4 * halfLife, moved), continuity(8 * halfLife, moved), 'not before');
   assert.notEqual(continuity(8 * halfLife, moved, exact), continuity(16 * halfLife, moved, exact));
 });
+
+function latentFixture(): PickerInputs {
+  const chronicle = new MockChronicle({ recallPairTokens: 60, mergeThreshold: 2 });
+  for (let index = 0; index < 4; index++) {
+    const id = `latent-${index}`;
+    chronicle.addChunk({ id, rawTokens: 100 });
+    chronicle.produceL1([id]);
+  }
+  return {
+    chunks: chronicle.chunks,
+    summaries: chronicle.summaries,
+    recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0,
+    tailTokens: 0,
+    headChunkIds: new Set(),
+    tailChunkIds: new Set(),
+  };
+}
+
+const latentPolicy = (budgetHighRatio: number) => ({
+  alpha: 0, budgetLowRatio: 0, budgetHighRatio, budgetUnderLambda: 0, budgetOverLambda: 100_000,
+  cacheLambda: 0, continuityLambda: 0,
+});
+
+test('joint latent demand measures the candidate set in one solve and demands the merges its cut uses', () => {
+  // Four L1s of 60 over 100-token leaves, hard wall 300, upper hinge at 75:
+  // the all-L1 cut (240) pays the hinge, one merge (150) still does, both
+  // merges (60) clear it. One what-if solve holds both candidates; its cut
+  // uses both, so both are demanded at the set's gain.
+  const build = (mode: 'individual' | 'joint') => {
+    const strategy = new KvUnifiedStrategy({
+      policy: latentPolicy(0.25),
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode },
+    });
+    const result = strategy.solve(latentFixture(), { totalBudget: 300, targetBudget: 270, slack: 0.1 });
+    return { strategy, result };
+  };
+  const joint = build('joint');
+  const individual = build('individual');
+  assert.deepEqual(joint.result.produced, individual.result.produced);
+  assert.deepEqual(joint.result.produced.map((request) => request.level), [2, 2]);
+  assert.equal(joint.strategy.lastTimings?.demandSolves, 1, 'the set is measured once');
+  assert.equal(individual.strategy.lastTimings?.demandSolves, 2);
+  const gains = joint.strategy.lastDemandEvaluations.map((e) => e.conservativeImprovement);
+  assert.equal(gains.length, 2);
+  assert.ok(gains[0] > 0 && gains[0] === gains[1], 'both carry the gain of the cut that uses them');
+  assert.ok(joint.strategy.lastDemandEvaluations.every((e) => e.expectedImprovement === e.conservativeImprovement));
+});
+
+test('joint latent demand leaves a merge the joint cut does not use undemanded', () => {
+  // Upper hinge at 150: one merge lands the cut exactly on the hinge at a
+  // lower fidelity loss than two, so the joint cut uses one candidate. Each
+  // candidate alone clears the hinge too, so the individual ranking demands
+  // both, and the second merge would be produced and never selected.
+  const build = (mode: 'individual' | 'joint') => {
+    const strategy = new KvUnifiedStrategy({
+      policy: latentPolicy(0.5),
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode },
+    });
+    const result = strategy.solve(latentFixture(), { totalBudget: 300, targetBudget: 270, slack: 0.1 });
+    return { strategy, result };
+  };
+  const joint = build('joint');
+  const individual = build('individual');
+  assert.equal(individual.result.produced.length, 2);
+  assert.equal(joint.result.produced.length, 1);
+  assert.equal(joint.result.produced[0].level, 2);
+  const evaluations = joint.strategy.lastDemandEvaluations;
+  assert.equal(evaluations.length, 2, 'every candidate is reported');
+  const used = evaluations.filter((e) => e.conservativeImprovement > 0);
+  assert.equal(used.length, 1);
+  assert.deepEqual(used[0].request, joint.result.produced[0]);
+  assert.ok(evaluations.some((e) => e.conservativeImprovement === 0 && e.expectedImprovement === 0));
+});
+
+test('joint latent demand demands nothing when the joint cut beats the live one by at most epsilon', () => {
+  // Hinge at 150 and one merge worth ~35,800: an epsilon above that gain
+  // keeps the merge undemanded while the evaluations still report it.
+  const strategy = new KvUnifiedStrategy({
+    policy: latentPolicy(0.5),
+    tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+    adoptEpsilon: 50_000,
+    latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode: 'joint' },
+  });
+  const result = strategy.solve(latentFixture(), { totalBudget: 300, targetBudget: 270, slack: 0.1 });
+  assert.deepEqual(result.produced, []);
+  assert.ok(strategy.lastDemandEvaluations.some((e) => e.conservativeImprovement > 0 && e.conservativeImprovement <= 50_000));
+});
+
+test('joint latent demand gates a certified base solve the way the individual ranking does', () => {
+  // The fixture of the certified-base test above: the carried raw layout
+  // certifies under a wide epsilon and the merge is worth less than epsilon
+  // against the unrestricted best cut. Both modes decide the same way from
+  // a certified and an unrestricted base.
+  const build = (hysteresisCertificate: boolean, mode: 'individual' | 'joint') => {
+    const chronicle = new MockChronicle({ recallPairTokens: 100 });
+    for (let i = 0; i < 4; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 100 });
+    for (const chunk of chronicle.chunks) chunk.salience = 0.2;
+    chronicle.produceL1(['c0', 'c1']);
+    chronicle.produceL1(['c2', 'c3']);
+    const inputs: PickerInputs = {
+      chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+    };
+    const leaves = new Map(chronicle.chunks.map((chunk) => [chunk.id, { level: 0, repHash: `raw:${chunk.id}`, lastChangedSeq: 1 }]));
+    const strategy = new KvUnifiedStrategy({
+      policy: {
+        alpha: 0, budgetLowRatio: 0, budgetHighRatio: 0.125, budgetUnderLambda: 0, budgetOverLambda: 1600,
+        cacheLambda: 0, continuityLambda: 0,
+      },
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      adoptEpsilon: 1300, hysteresisCertificate,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode },
+      presentation: { currentSeq: 1, leaves },
+    });
+    const result = strategy.solve(inputs, { totalBudget: 400, targetBudget: 400, slack: 0 });
+    return { strategy, result };
+  };
+  for (const certificate of [true, false]) {
+    const joint = build(certificate, 'joint');
+    const individual = build(certificate, 'individual');
+    assert.equal(Boolean(joint.strategy.lastResult?.certificate), certificate);
+    assert.deepEqual(joint.result.produced, individual.result.produced, `certificate ${certificate}`);
+    assert.deepEqual(joint.result.produced, []);
+    assert.equal(joint.strategy.lastDemandEvaluations.length, 1);
+    // One joint solve. With the certificate on, the what-if certifies the
+    // carried layout too, and its slack spans the gate: the joint solve runs
+    // again without the certificate to decide it. The gate fails either
+    // way, so the certified base is never solved unrestricted.
+    assert.equal(joint.strategy.lastTimings?.demandSolves, certificate ? 2 : 1);
+  }
+});

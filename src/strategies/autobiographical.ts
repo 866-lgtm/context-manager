@@ -13666,6 +13666,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           mergeThreshold: this.config.mergeThreshold ?? 6,
           fallbackRecallTokens: Math.max(1, (this.config.summaryTargetTokens ?? 2_000) + 20),
           maxCandidates: 16,
+          // One what-if solve for the whole candidate set unless the recipe
+          // asks for the per-candidate ranking; the solver treats an absent
+          // mode as individual.
+          mode: configured.latentDemandMode ?? 'joint',
         },
         ...(this.kvUnifiedReceipts.head
           ? {
