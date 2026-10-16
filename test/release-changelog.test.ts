@@ -199,17 +199,16 @@ const refusals: Array<[string, Fixture, RegExp]> = [
   ["two Unreleased headings", { changelog: BASE_CHANGELOG + "\n## Unreleased\n\n- stranded\n", fragments: { "a.fixed.md": "- x\n" } }, /2 '## Unreleased' headings/],
 ];
 
-// #198: run any other way than as npm version's hook, the script released
-// into the version package.json already held and deleted the fragments.
+// #198: run any other way than as a version command's hook, the script
+// released into the version package.json already held and deleted the
+// fragments.
 const invocations: Array<[string, { args?: string[]; env?: Record<string, string | undefined> }, RegExp]> = [
   ["to run directly, outside npm", { env: { npm_command: undefined, npm_lifecycle_event: undefined } },
-    /^release-changelog: refused, and this script changed nothing: it runs only as the version hook of `npm version <patch\|minor\|major>`.*npm_command is unset and npm_lifecycle_event is unset/],
+    /^release-changelog: refused, and this script changed nothing: it runs only as the version hook of a version command such as `npm version <patch\|minor\|major>`.*npm_command is unset and npm_lifecycle_event is unset/],
   ["to run through `npm run version`, which bumps nothing", { env: { npm_command: "run" } },
     /npm_command is 'run' and npm_lifecycle_event is 'version'/],
   ["to run through `bun run version`, which bumps nothing", { env: { npm_command: "run-script" } },
     /npm_command is 'run-script' and npm_lifecycle_event is 'version'/],
-  ["to run as `bun pm version`'s hook, with no npm command", { env: { npm_command: undefined } },
-    /npm_command is unset and npm_lifecycle_event is 'version'\)\. A version bump made before it ran, as by `bun pm version`, stays in package\.json\./],
   ["to run as npm version's preversion hook, before the bump", { env: { npm_lifecycle_event: "preversion" } },
     /npm_command is 'version' and npm_lifecycle_event is 'preversion'/],
   ["an argument it doesn't take", { args: ["--dry-run"] },
@@ -227,6 +226,16 @@ for (const [name, invocation, message] of invocations) {
     assert.deepEqual(pending(dir), before.pending, "no fragment may be deleted on refusal");
   });
 }
+
+// `bun pm version` bumps package.json and then runs the hook, as npm version
+// does, but sets no npm_command; it released before #198, and still does.
+test("releases as the hook of a version command that sets no npm command, as `bun pm version` does", () => {
+  const dir = setup({ fragments: { "a.fixed.md": "- Fixed thing.\n" } });
+  const r = run(dir, { env: { npm_command: undefined } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(section(changelog(dir), "1.1.0"), "### Fixed\n\n- Fixed thing.");
+  assert.deepEqual(pending(dir), ["README.md"], "the folded fragment is deleted");
+});
 
 // Help reads nothing: each case runs on a fixture the release would refuse
 // (nothing to release), in npm version's hook and outside npm.

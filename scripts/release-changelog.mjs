@@ -10,10 +10,11 @@
 // there is nothing to release, or when the input's shape is ambiguous.
 //
 // Run any other way, it would release into the version package.json already
-// holds and delete the fragments it folded (#198), so it refuses unless the
-// environment npm gives the hook shows `npm version` running it. That
-// guards against running it by mistake, not on purpose: any process can set
-// those variables. `--help` says what it does.
+// holds and delete the fragments it folded (#198), so it refuses unless its
+// environment shows a version command running it as the `version` hook:
+// `npm version`, or one such as `bun pm version` that sets no npm command.
+// That guards against running it by mistake, not on purpose: any process can
+// set those variables. `--help` says what it does.
 import {
   existsSync,
   readdirSync,
@@ -212,14 +213,19 @@ new '## X.Y.Z — YYYY-MM-DD' section of ${CHANGELOG}, deletes the fragments it
 folded, and leaves an empty '## Unreleased' above the new section. npm then
 makes its release commit and tag, as it's configured to.
 
-It takes no arguments but --help or -h, and it refuses to run except as npm
-version's \`version\` hook, since run any other way it would release into the
-version package.json already holds.`;
+It takes no arguments but --help or -h, and it refuses to run except as a
+version command's \`version\` hook (npm version's, or bun pm version's), since
+run any other way it would release into the version package.json already
+holds.`;
 
-// Whether this is npm version running its `version` hook: npm_command says
-// which npm command is running ("run" for `npm run version`, which bumps
-// nothing), and npm_lifecycle_event which script ("preversion" runs before
-// the bump).
+// Whether this is a version command running its `version` hook, after the
+// bump: npm_lifecycle_event says which script ("preversion" runs before the
+// bump), and npm_command which npm command is running ("run" for `npm run
+// version`, which bumps nothing; bun's and pnpm's `run` set "run-script").
+// Version commands that aren't npm's, such as `bun pm version`, set no
+// npm_command, so its absence is accepted too. yarn sets none for `yarn run`
+// either, so `yarn run version` gets past this check, and only the refusal of
+// a version that already has a section stops it.
 function checkInvocation(args, env) {
   if (args.includes("--help") || args.includes("-h")) return "help";
   if (args.length > 0) {
@@ -228,13 +234,12 @@ function checkInvocation(args, env) {
         "`node scripts/release-changelog.mjs --help` says what it does.",
     );
   }
-  if (env.npm_command !== "version" || env.npm_lifecycle_event !== "version") {
+  if (env.npm_lifecycle_event !== "version" || (env.npm_command !== undefined && env.npm_command !== "version")) {
     const seen = (name) => (env[name] === undefined ? `${name} is unset` : `${name} is '${env[name]}'`);
     fail(
-      "refused, and this script changed nothing: it runs only as the version hook of " +
-        "`npm version <patch|minor|major>`, after npm has written the new version to package.json " +
-        `(here ${seen("npm_command")} and ${seen("npm_lifecycle_event")}). A version bump made ` +
-        "before it ran, as by `bun pm version`, stays in package.json. " +
+      "refused, and this script changed nothing: it runs only as the version hook of a version " +
+        "command such as `npm version <patch|minor|major>`, after the new version is in package.json " +
+        `(here ${seen("npm_command")} and ${seen("npm_lifecycle_event")}). ` +
         "`node scripts/release-changelog.mjs --help` says what it does.",
     );
   }
