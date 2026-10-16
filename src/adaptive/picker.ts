@@ -77,15 +77,15 @@ export interface OverBudgetDiagnostics {
  * - `'newer-message'`: the newest message alone is over the budget, and a
  *   newer message that fits moves the window past it.
  * - `'smaller-recent-window'`: the raw recent window, which compression never
- *   touches, is what's over the budget, and the head fits beside the least
- *   raw tail any window leaves: from the newest message, and when it holds a
- *   tool_result, from the call before it, whose result must follow it raw
- *   (for a call split into shards, from its first shard, which holds the
- *   tool_use; for any other message split into shards, its newest shard,
- *   since the earlier shards can fold), or from a compression hold if one
- *   starts earlier. A smaller `recentWindowTokens`
- *   (the hot `tailTokens`) moves the rest out of the raw window into the
- *   middle, which folds once compression has closed and summarized it.
+ *   touches, is what's over the budget, and the head fits beside the newest
+ *   turn kept whole, or beside everything from a compression hold if one
+ *   starts earlier. The newest turn is the newest message (for one split into
+ *   shards, its newest shard, since the earlier shards can fold); when it
+ *   holds a tool_result, it's the result's whole body and the whole call
+ *   before it, which the result must follow raw. A smaller
+ *   `recentWindowTokens` (the hot `tailTokens`) moves the rest out of the raw
+ *   window into the middle, which folds once its chunks have closed and
+ *   compression has summarized them.
  *
  * Each list describes the refusal that was hit. Clearing it can bring the
  * next one: a smaller recent window can leave the picker waiting for

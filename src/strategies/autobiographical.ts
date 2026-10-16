@@ -1464,6 +1464,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // `undefined` from the reset above, but selectAdaptive may have filled
         // it in before a late render-stage throw.
         const partial = this._lastPreview as PreviewResult | undefined;
+        // A plan already over the budget is refused at its gate by the live
+        // compile, with the numbers and list its preview recorded, so a later
+        // stage's refusal of this dry run doesn't change the answer: the
+        // preview is the plan's, as when nothing later throws.
+        if (partial?.fits === false) return partial;
         // Infeasible at this budget. That is an ANSWER, not a failure — it is
         // the whole reason to preview before applying. Report it with the
         // diagnostics that explain which component does not fit.
@@ -8340,8 +8345,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Whether the drain has compression work it will take that would shrink the
    * context, as tick takes it: compression in flight; the first queued merge,
-   * unless a compression hold blocks it (tick then stops until the release);
-   * or a queued chunk tick would compress while it runs chunks at all (below
+   * unless a compression hold blocks it (tick runs no merge until the
+   * release, though it takes queued chunks first); or a queued chunk tick
+   * would compress while it runs chunks at all (below
    * the speculative cap). A chunk counts when it's still uncompressed, holds
    * no held message, and has no message an L1 in memory already covers: its
    * L1 shrinks the context on either path. An L1 only the store holds isn't
@@ -8349,7 +8355,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * adopts such an L1 that matches the chunk exactly (findExactL1 reads the
    * store), and compresses the chunk otherwise, and either way the selector
    * gets an L1 to fold through. A chunk with a covered message counts only on the
-   * hierarchical path, when an L1 matches it exactly and chunk persistence is
+   * hierarchical path, when an L1 matches it exactly (in memory, or only in
+   * the store, which tick's adoption reads too) and chunk persistence is
    * on: selectHierarchical renders an uncompressed chunk's messages raw beside
    * the L1s, and tick's adoption marks the chunk's record compressed, so the
    * next rebuild drops that fallback. The adaptive picker already folds a
@@ -8382,6 +8389,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (summary.level !== 1 || !Array.isArray(summary.sourceIds)) continue;
       for (const id of summary.sourceIds) coveredByL1.add(id);
       if (adoptionShrinks) exactL1.add(summary.sourceIds.join(':'));
+    }
+    if (adoptionShrinks) {
+      // tick adopts an exact L1 the store holds too (findExactL1).
+      const persisted = this.store?.getStateJson(this.summariesStateId);
+      for (const summary of Array.isArray(persisted) ? (persisted as SummaryEntry[]) : []) {
+        if (summary?.level === 1 && Array.isArray(summary.sourceIds)) exactL1.add(summary.sourceIds.join(':'));
+      }
     }
     return this.compressionQueue.some((index) => {
       const chunk = this.chunks[index];
@@ -8480,28 +8494,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (headTokens + tailTokens > rejectionBudget) {
       // Compression never touches the raw windows. A smaller recent window
       // moves history out of the tail into the middle, which clears this
-      // refusal when the head fits beside the least raw tail any window
-      // leaves. The middle then folds only once compression has closed and
-      // summarized it, so the next refusal can be the picker's. No window
-      // starts after a compression hold (getRecentWindowStart). The newest
-      // turn is rendered whatever the window, since the structural repair
-      // refuses a compile that leaves it out: the newest message, and when
-      // it holds a tool_result, the call before it, which the result must
-      // follow raw or be dropped as an orphan (enforceToolPairing). Ingress
-      // puts a sharded message's tool_use on its first shard
-      // (chunkIngressMessage), so for a call split into shards that's its
-      // whole body, from the first shard, as holdBoundary counts it. For any
-      // other message split into shards, it's the newest shard, since the
-      // earlier shards can close into chunks and fold. A hold inside the
-      // head leaves every window's tail starting at the head's end, so a
-      // floor counted from the hold covers at least the tail, and nothing is
-      // named, as it should be.
+      // refusal when the head fits beside the newest turn kept whole. The
+      // middle then folds only once its chunks have closed and compression
+      // has summarized them, so the next refusal can be the picker's. No
+      // window starts after a compression hold (getRecentWindowStart). The
+      // newest turn is the newest body, which the structural repair refuses
+      // a compile to leave out. For a body split into shards at ingress, its
+      // newest shard is enough, since the earlier shards can close into
+      // chunks and fold, unless the body holds a tool_result: ingress puts a
+      // split message's non-text blocks on its first shard
+      // (chunkIngressMessage), and a result whose call isn't raw just before
+      // it is blanked as an orphan (enforceToolPairing), without a refusal.
+      // So when the newest body holds a tool_result, the turn is the whole
+      // body and the whole call before it, from the call's first shard, as
+      // holdBoundary counts it. A hold inside the head leaves every window's
+      // tail starting at the head's end, so a floor counted from the hold
+      // covers at least the tail, and nothing is named, as it should be. So
+      // does a newest turn that starts inside the head.
       let floorTokens = 0;
       if (messages.length > 0) {
-        let newestTurn = messages.length - 1;
-        if (newestTurn > 0 && this.hasToolResult(messages[newestTurn])) {
-          newestTurn = bodyStart((k) => messages[k], newestTurn - 1);
-        }
+        const newestBody = bodyStart((k) => messages[k], messages.length - 1);
+        const newestTurn = newestBody > 0 && this.hasToolResult(messages[newestBody])
+          ? bodyStart((k) => messages[k], newestBody - 1)
+          : messages.length - 1;
         const floorStart = Math.min(newestTurn, this.holdBoundary(store));
         for (let i = floorStart; i < messages.length; i++) {
           floorTokens += msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
@@ -8914,15 +8929,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // work is only what the ops would add: the newest closed chunks, which the
     // holdback (l1HoldbackChunks) keeps out of the queue until they're
     // demanded, or a merge. There a dry run names nothing.
-    // Taken only at a refusal, since a compile that fits needs no list.
+    // Taken only when the plan is over the budget, at a refusal or for a dry
+    // run's preview of one, since a plan that fits needs no list.
     const planClearedBy = (): OverBudgetClearedBy[] =>
       result.produced.length > 0 && this.compressionWorkQueued(store, 'adaptive') ? ['compression'] : [];
     const planFits = result.finalTokens <= rejectionBudget;
 
     // Record what a dry run needs (select() puts back the transition
     // bookkeeping the pick just wrote). Done before the over-budget check so
-    // an infeasible preview still reports, with the list the live compile's
-    // refusal of this plan would carry.
+    // an infeasible preview still reports, with the plan's list as this dry
+    // run sees it: since it doesn't queue the plan's work, it names
+    // compression only for work already queued.
     if (dryRun) {
       this._lastPreview = {
         finalTokens: result.finalTokens,
@@ -9275,8 +9292,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           actual: totalTokens + tailTokens,
           // The newest turn is what's missing, and only room for it brings it
           // back. A newer message makes a different turn the newest, and this
-          // one then sits in the middle raw until compression closes and
-          // summarizes its chunk, so the next compile is no smaller.
+          // one then sits in the middle raw until its chunk closes and
+          // compression summarizes it, so the next compile is no smaller.
           clearedBy: [],
           diagnostics: {
             middleCountUnit: 'picker-chunks',

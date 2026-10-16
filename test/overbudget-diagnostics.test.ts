@@ -472,6 +472,37 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
+  for (const [resultWords, expected] of [[200, []], [30, ['smaller-recent-window']]] as const) {
+    it(`counts a result split into shards with its whole body and its call, since its first shard holds the tool_result (${expected.length ? 'names a smaller window when they fit' : 'names nothing when only its last shard would'})`, async () => {
+      const strategy = new AutobiographicalStrategy({
+        adaptiveResolution: true,
+        targetChunkTokens: 10,
+        headWindowTokens: 0,
+        recentWindowTokens: 100_000,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+      });
+      await withManager(strategy, async (manager) => {
+        for (let i = 0; i < 4; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+        manager.addMessage('agent', [{ type: 'text', text: 'calling' }, { type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+        const before = manager.getAllMessages().length;
+        // Over twice targetChunkTokens, so ingress splits the result into shards.
+        manager.addMessage('user', [
+          { type: 'tool_result', toolUseId: 't1', content: 'ok' },
+          { type: 'text', text: 'result ' + 'word '.repeat(resultWords) },
+        ]);
+        const shards = manager.getAllMessages().slice(before);
+        assert.ok(shards.length > 1, `the result is stored as shards (got ${shards.length})`);
+        assert.ok(shards[0]!.content.some((block) => block.type === 'tool_result'), 'its first shard holds the tool_result');
+        assert.ok(!shards.at(-1)!.content.some((block) => block.type === 'tool_result'), 'its last shard holds none');
+        const error = await refusal(manager);
+        assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+        assert.deepEqual(error.clearedBy, expected);
+      });
+    });
+  }
+
   it('clears the head/tail refusal at the smaller window it names (the next refusal can be the picker\'s)', async () => {
     const strategy = recentOnly(100_000);
     await withManager(strategy, async (manager) => {
@@ -666,7 +697,8 @@ describe('OverBudgetError.clearedBy', () => {
         if (running) strategy.startCompressing();
         // A dry run reports a plan over the budget rather than refusing it,
         // and this one renders within the budget, so nothing later throws:
-        // the preview is the one the plan recorded.
+        // the dry compile resolves, and the preview is the one the plan recorded.
+        await manager.compile({ maxTokens: 100, reserveForResponse: 20 }, undefined, { dryRun: true });
         const preview = manager.previewContext({ maxTokens: 100, reserveForResponse: 20 });
         assert.ok(preview);
         assert.equal(preview.fits, false);
@@ -679,6 +711,62 @@ describe('OverBudgetError.clearedBy', () => {
       });
     });
   }
+
+  it('keeps the plan\'s list and numbers in a preview whose plan is over when a later stage refuses with another', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: true,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    strategy.overstate = true;
+    strategy.produce = true;
+    await withManager(strategy, async (manager) => {
+      manager.addMessage('user', [{ type: 'text', text: 'message ' + 'word '.repeat(10) }]);
+      // An unanswered call is the newest turn; the structural repair trims it
+      // and then refuses, naming nothing.
+      manager.addMessage('agent', [{ type: 'text', text: 'calling' }, { type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+      strategy.startCompressing();
+      const dry = await refusal(manager, { dryRun: true });
+      assert.match(dry.message, /^Structural repair did not retain the newest turn/);
+      assert.deepEqual(dry.clearedBy, []);
+      // The live compile refuses the plan at its gate first, so the preview
+      // names what that refusal names.
+      const preview = manager.previewContext({ maxTokens: 100, reserveForResponse: 20 });
+      assert.ok(preview);
+      assert.equal(preview.fits, false);
+      assert.deepEqual(preview.clearedBy, ['compression']);
+      const live = await refusal(manager);
+      assert.match(live.message, /^Adaptive picker exhausted/);
+      assert.deepEqual(live.clearedBy, ['compression']);
+      // The preview's numbers are that refusal's too, not the later stage's.
+      assert.equal(preview.finalTokens, live.actual);
+      assert.equal(preview.budgetTokens, live.budget);
+      assert.notEqual(dry.actual, live.actual, 'the later stage measured something else');
+    });
+  });
+
+  it('carries no list in a preview that fits, with compression work running', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: true,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    strategy.produce = true;
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 2; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(10) }]);
+      strategy.startCompressing();
+      const preview = manager.previewContext({ maxTokens: 100_000, reserveForResponse: 20 });
+      assert.ok(preview);
+      assert.equal(preview.fits, true);
+      assert.equal('clearedBy' in preview, false);
+    });
+  });
 
   it('names compression in a dry run only for work queued without its plan\'s ops', async () => {
     const strategy = new DiagnosticStrategy({
@@ -775,9 +863,34 @@ describe('OverBudgetError.clearedBy', () => {
         assert.match(error.message, adaptiveResolution ? /^Adaptive picker exhausted/ : /^Hierarchical emission overran the budget/);
         assert.deepEqual(strategy.queuedChunkIds(), queued, 'the compile closed no new chunk');
         assert.deepEqual(error.clearedBy, []);
-      });
+        // Tick refuses each one without compressing it: the stub membrane has
+        // no model to call, and no L1 is added.
+        const l1s = strategy.summaryIds();
+        for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+        assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
+        assert.deepEqual(strategy.summaryIds(), l1s);
+      }, { membrane: true });
     });
   }
+
+  it('names compression for queued chunks an in-memory L1 covers partly when the store holds their exact L1s, and tick adopts them', async () => {
+    const strategy = queuedChunks();
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      queued.forEach((ids, i) => {
+        strategy.seedL1(`L1-part-${i}`, [ids[0]!]);
+        strategy.seedStoredL1(`L1-stored-${i}`, ids);
+      });
+      assert.ok(!strategy.summaryIds().some((id) => id.startsWith('L1-stored-')), 'no exact L1 is in memory');
+      const error = await refusal(manager);
+      assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assert.deepEqual(error.clearedBy, ['compression']);
+      for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+      assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
+      for (let i = 0; i < queued.length; i++) assert.ok(strategy.summaryIds().includes(`L1-stored-${i}`), `tick adopted L1-stored-${i}`);
+    }, { membrane: true });
+  });
 
   it('names compression for queued chunks whose exact L1s only the store holds, and tick adopts them without a model call', async () => {
     const strategy = queuedChunks();
