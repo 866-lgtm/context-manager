@@ -613,8 +613,9 @@ export interface RenderStats {
     moves: number;
     /** Stored messages on the branch this compile read: the listing the
      *  strategy chunked, before any folding. Logged as `messages=`, so a
-     *  compile time can be read against the history size it covered. */
-    messages: number;
+     *  compile time can be read against the history size it covered. Optional
+     *  so a custom strategy's stats still type-check. */
+    messages?: number;
     /** Name of the fold solver that planned this compile (e.g. 'kv-stable',
      *  'flat-profile'). Surfaces the policy actually in force — a config
      *  clobber that silently downgrades the solver is invisible without it. */
@@ -623,7 +624,7 @@ export interface RenderStats {
      *  chunk rebuild, planning (the fold solver) and emission. Logged on the
      *  `[plan-vs-actual]` line as `compileMs=`, so a solver change is
      *  measurable from a production journal alone. */
-    compileMs: number;
+    compileMs?: number;
     /** Under `foldingStrategy: 'kv-unified'` only: the forest build, solve
      *  and latent-demand ranking inside `compileMs`, in whole ms (`solveMs=`). */
     solveMs?: number;

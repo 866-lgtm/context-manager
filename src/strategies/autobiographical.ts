@@ -9101,6 +9101,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const prodBudget = this.config.productionBudgetTokens;
     if (!dryRun && prodBudget !== undefined && prodBudget > 0 && prodBudget < totalBudget) {
       const liveKvStable = this._lastKvStable;
+      const liveKvUnified = this._lastKvUnified;
       try {
         const shadowResult = this.buildPicker(pickerInputs).run(pickerInputs, {
           totalBudget: prodBudget,
@@ -9120,9 +9121,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // A failing shadow pick must never break the live compile.
         console.warn('autobio: shadow production pick failed:', err);
       } finally {
-        // The shadow pick is not a compile — keep §13.4 observability pointed
-        // at the strategy instance behind the live pick.
+        // The shadow pick is not a compile — keep §13.4 observability (and
+        // the live solve's timings on [plan-vs-actual]) pointed at the
+        // strategy instance behind the live pick.
         this._lastKvStable = liveKvStable;
+        this._lastKvUnified = liveKvUnified;
       }
     }
 
