@@ -7,9 +7,14 @@ import { AutobiographicalStrategy, ContextManager, OverBudgetError } from '../sr
 import type { SummaryEntry, SummaryLevel } from '../src/types/index.js';
 import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
 import type { FoldingBudget } from '../src/adaptive/folding-strategy.js';
-import type { Membrane } from '@animalabs/membrane';
+import type { ContentBlock, Membrane } from '@animalabs/membrane';
 
 class DiagnosticStrategy extends AutobiographicalStrategy {
+  // A host that compresses names its model; a test of one that doesn't passes `compressionModel: undefined`.
+  constructor(config: ConstructorParameters<typeof AutobiographicalStrategy>[0] = {}) {
+    super({ compressionModel: 'zz-model', ...config });
+  }
+
   level = 1;
   drift = false;
   /** When set, the plan says it's over the budget whatever it renders, as a planner that overestimates does. */
@@ -76,6 +81,66 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   /** The ids of the summaries in memory. */
   summaryIds(): string[] {
     return this.summaries.map((summary) => summary.id);
+  }
+
+  /** Sets the thin-chunk guard's threshold, as a host restarted with another configuration does. */
+  setMinChunkChars(chars: number): void {
+    this.config.minChunkCharsForLLM = chars;
+  }
+
+  /** Sets the head window's size, as a host restarted with another configuration does. */
+  setHeadWindowTokens(tokens: number): void {
+    this.config.headWindowTokens = tokens;
+  }
+
+  /** Makes the durable compression quarantine unreadable, as a ledger state that won't parse does. */
+  breakQuarantineRead(): void {
+    const store = this.store!;
+    const ledger = this.compressionRefusalQuarantineLedgerStateId;
+    const read = store.getStateJson.bind(store);
+    store.getStateJson = ((id: string) => {
+      if (id === ledger) throw new Error('zz the quarantine ledger cannot be read');
+      return read(id);
+    }) as typeof store.getStateJson;
+  }
+
+  /** The store view the last count read. */
+  private countedView: Parameters<AutobiographicalStrategy['compressionWorkQueued']>[0] | undefined;
+
+  protected compressionWorkQueued(...args: Parameters<AutobiographicalStrategy['compressionWorkQueued']>): boolean {
+    this.countedView = args[0];
+    return super.compressionWorkQueued(...args);
+  }
+
+  /** Whether a hierarchical refusal's count would name compression now, over the store view the last refusal read. */
+  countsCompressionWork(): boolean {
+    assert.ok(this.countedView, 'a refusal has counted');
+    return super.compressionWorkQueued(this.countedView, 'hierarchical');
+  }
+
+  /**
+   * Rewrites the durable compression quarantine as a store an older release
+   * wrote holds it: each record under budget accounting version 1. A record's
+   * key and family key hash its normalized config, accounting version
+   * included (compressionRefusalQuarantineRecord), so an older release's keys
+   * match none tick computes now; a 'v1:' prefix on each stands in for that.
+   */
+  ageQuarantine(): void {
+    const id = this.compressionRefusalQuarantineLedgerStateId;
+    const ledger = this.store?.getStateJson(id);
+    const events = structuredClone(Array.isArray(ledger) ? ledger : []) as Array<Record<string, any>>;
+    const age = (record: Record<string, any> | undefined) => {
+      if (!record) return;
+      record.key = `v1:${record.key}`;
+      record.familyKey = `v1:${record.familyKey}`;
+      record.normalizedConfig = { ...record.normalizedConfig, accountingVersion: 1 };
+    };
+    for (const event of events) {
+      if (typeof event.key === 'string') event.key = `v1:${event.key}`;
+      age(event.record);
+      for (const item of Array.isArray(event.active) ? event.active : []) age(item?.record);
+    }
+    this.store?.setStateJson(id, events);
   }
 
   /** When set, the reserved tail's emission reports one message fewer, as an emission that ran out of room does. */
@@ -806,6 +871,7 @@ describe('OverBudgetError.clearedBy', () => {
 
   it('names compression for a hierarchical refusal of history that chunks waiting for compression cover', async () => {
     const strategy = new AutobiographicalStrategy({
+      compressionModel: 'zz-model',
       adaptiveResolution: false,
       targetChunkTokens: 40,
       headWindowTokens: 0,
@@ -823,7 +889,153 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
-  const queuedChunks = () => new DiagnosticStrategy({
+  it('names nothing for queued chunks that need a model call while the compression quarantine holds them, which tick skips without one', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: false,
+      targetChunkTokens: 40,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+      compressionModel: 'zz-model',
+      compressionRefusalCurveFallbacks: 0,
+      minChunkCharsForLLM: 0,
+    });
+    const calls = { n: 0 };
+    // Every request is refused, so each chunk's family exhausts into the quarantine.
+    const refusing = {
+      complete: async () => {
+        calls.n++;
+        return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'reasoning_extraction' } } } };
+      },
+    } as unknown as Membrane;
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'before the drain, the queued chunks are compression work');
+      for (let round = 1; round <= 3; round++) {
+        const before = calls.n;
+        for (let i = 0; i < 30 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+        if (round > 1) assert.equal(calls.n, before, `round ${round}: tick asks no model about a quarantined chunk`);
+        assert.ok(strategy.getCompressionQuarantineStatus().count > 0, `round ${round}: chunks are quarantined`);
+        const error = await refusal(manager);
+        assert.ok(strategy.queuedChunkIds().length > 0, `round ${round}: the compile queued the quarantined chunks again`);
+        assert.deepEqual(error.clearedBy, [], `round ${round}: nothing tick will do clears it`);
+      }
+    }, { membrane: refusing });
+  });
+
+  /**
+   * A strategy whose every chunk needs a model call, a membrane that refuses
+   * every request, and a drive that ticks every queued chunk into the
+   * compression quarantine and answers the chunks a compile queues again.
+   */
+  const quarantining = () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: false,
+      targetChunkTokens: 40,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+      compressionModel: 'zz-model',
+      compressionRefusalCurveFallbacks: 0,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 1000,
+    });
+    const calls = { n: 0 };
+    const membrane = {
+      complete: async () => {
+        calls.n++;
+        return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'reasoning_extraction' } } } };
+      },
+    } as unknown as Membrane;
+    const drive = async (manager: ContextManager): Promise<string[][]> => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      await refusal(manager);
+      for (let i = 0; i < 30 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+      assert.ok(strategy.getCompressionQuarantineStatus().count > 0, 'chunks are quarantined');
+      assert.deepEqual((await refusal(manager)).clearedBy, [], 'the quarantine holds the queued chunks');
+      const queued = strategy.queuedChunkIds();
+      assert.ok(queued.length > 0, 'the compile queued the quarantined chunks again');
+      return queued;
+    };
+    return { strategy, calls, membrane, drive };
+  };
+
+  for (const settle of ['adopts', 'stubs'] as const) {
+    it(`names compression for quarantined chunks tick ${settle === 'adopts' ? 'adopts an exact L1 for' : 'stubs'} without a model call, before it reads the quarantine`, async () => {
+      const { strategy, calls, membrane, drive } = quarantining();
+      await withManager(strategy, async (manager) => {
+        const queued = await drive(manager);
+        if (settle === 'adopts') queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
+        else strategy.setMinChunkChars(100_000);
+        assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+        // The premise: tick settles each one without a model call, though the quarantine holds it.
+        const before = calls.n;
+        const summaries = strategy.summaryIds().length;
+        for (let i = 0; i < 30 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+        assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
+        assert.equal(calls.n, before, 'no model call');
+        assert.equal(strategy.summaryIds().length, summaries + queued.length, `an L1 for each chunk, ${settle === 'adopts' ? 'adopted' : 'a stub'}`);
+      }, { membrane });
+    });
+  }
+
+  it('names compression for quarantined chunks an in-memory exact L1 covers, which tick adopts before it reads the quarantine', async () => {
+    const { strategy, calls, membrane, drive } = quarantining();
+    await withManager(strategy, async (manager) => {
+      const queued = await drive(manager);
+      queued.forEach((ids, i) => strategy.seedL1(`L1-memory-${i}`, ids));
+      assert.deepEqual(strategy.queuedChunkIds(), queued, 'the quarantined chunks are still queued');
+      assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      // The premise: tick adopts each chunk's L1 without a model call, though the quarantine holds it.
+      const before = calls.n;
+      const summaries = strategy.summaryIds().length;
+      for (let i = 0; i < 30 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+      assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
+      assert.equal(calls.n, before, 'no model call');
+      assert.equal(strategy.summaryIds().length, summaries, 'each adopted the L1 seeded for it, and none was written');
+    }, { membrane });
+  });
+
+  for (const thin of [false, true]) {
+    it(`when the compression quarantine can't be read, names ${thin ? 'compression for chunks tick stubs before it reads it' : 'nothing for chunks that need a model call, since tick\'s read throws first'}`, async () => {
+      const strategy = new DiagnosticStrategy({
+        adaptiveResolution: false,
+        targetChunkTokens: 40,
+        headWindowTokens: 0,
+        recentWindowTokens: 0,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+        mergeThreshold: 1000,
+        minChunkCharsForLLM: thin ? 100_000 : 0,
+      });
+      const calls = { n: 0 };
+      await withManager(strategy, async (manager) => {
+        for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+        const queued = await settledQueue(manager, strategy);
+        strategy.breakQuarantineRead();
+        // The refusal is still the over-budget one, with the count's list.
+        assert.deepEqual((await refusal(manager)).clearedBy, thin ? ['compression'] : []);
+        if (thin) {
+          // The premise: tick stubs each chunk before it would read the quarantine.
+          for (let i = 0; i < 30 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+          assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
+          assert.equal(strategy.summaryIds().length, queued.length, 'a stub for each chunk');
+        } else {
+          // The premise: tick's own read throws before any model call.
+          await assert.rejects(manager.tick(), /the quarantine ledger cannot be read/);
+        }
+        assert.equal(calls.n, 0, 'no model call');
+      }, { membrane: countingMembrane(calls) });
+    });
+  }
+
+  /** The config of a strategy whose chunks each need a model call, unless a test settles one another way. */
+  const modelCallChunks = (extra: Record<string, unknown> = {}) => new DiagnosticStrategy({
     adaptiveResolution: false,
     targetChunkTokens: 40,
     headWindowTokens: 0,
@@ -831,6 +1043,355 @@ describe('OverBudgetError.clearedBy', () => {
     overBudgetGraceRatio: 0.25,
     autoTickOnNewMessage: false,
     speculativeProduction: false,
+    mergeThreshold: 1000,
+    minChunkCharsForLLM: 0,
+    ...extra,
+  });
+
+  /** A host's tick loop, as agent-framework's maintenance pass and its breaker run it: one try around every tick. */
+  const hostTicks = async (manager: ContextManager, strategy: DiagnosticStrategy): Promise<void> => {
+    for (let i = 0; i < 30 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+  };
+
+  for (const cause of ['no model', 'unreadable quarantine'] as const) {
+    it(`names nothing for a chunk tick adopts an L1 for, queued behind one that needs a model call ${cause === 'no model' ? 'without a compression model' : 'while the compression quarantine can\'t be read'}, since tick throws at that one first and a host's tick loop ends there`, async () => {
+      const strategy = modelCallChunks(cause === 'no model' ? { compressionModel: undefined } : {});
+      const calls = { n: 0 };
+      await withManager(strategy, async (manager) => {
+        for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+        const queued = await settledQueue(manager, strategy);
+        assert.ok(queued.length >= 2, 'two chunks or more are queued');
+        const last = queued.at(-1)!;
+        strategy.seedStoredL1('L1-stored-last', last);
+        if (cause === 'unreadable quarantine') strategy.breakQuarantineRead();
+        assert.deepEqual((await refusal(manager)).clearedBy, []);
+        assert.deepEqual(strategy.queuedChunkIds(), queued, 'the compile queued the same chunks, in the same order');
+        // The premise: the host's loop ends at the first chunk, and tick never reaches the last.
+        const summaries = strategy.summaryIds().length;
+        await assert.rejects(hostTicks(manager, strategy), cause === 'no model' ? /compressionModel is NOT configured/ : /the quarantine ledger cannot be read/);
+        assert.deepEqual(strategy.queuedChunkIds(), queued.slice(1), 'tick took the first chunk only');
+        assert.equal(strategy.summaryIds().length, summaries, 'tick adopted nothing');
+        assert.equal(calls.n, 0, 'no model call');
+      }, { membrane: countingMembrane(calls) });
+    });
+  }
+
+  it('without a compression model, names nothing for a chunk tick adopts an L1 for, queued behind one whose only tool block is unpaired, which tick strips and then throws at', async () => {
+    const strategy = modelCallChunks({ compressionModel: undefined });
+    const calls = { n: 0 };
+    await withManager(strategy, async (manager) => {
+      // A call stored without its result: tick strips it, so it doesn't defer the chunk for the host's tools.
+      const callId = manager.addMessage('assistant', [{ type: 'text', text: 'message 0 ' + 'word '.repeat(30) }, { type: 'tool_use', id: 'zz-lone', name: 'zz_tool', input: { q: 'zz' } } as ContentBlock]);
+      for (let i = 1; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      assert.ok(queued.length >= 2, 'two chunks or more are queued');
+      assert.ok(queued[0]!.includes(callId), 'the first queued chunk holds the call');
+      strategy.seedStoredL1('L1-stored-last', queued.at(-1)!);
+      assert.deepEqual((await refusal(manager)).clearedBy, []);
+      // The premise: tick doesn't defer the first chunk for the host's tools; it throws for want of a model.
+      const summaries = strategy.summaryIds().length;
+      await assert.rejects(hostTicks(manager, strategy), /compressionModel is NOT configured/);
+      assert.equal(strategy.summaryIds().length, summaries, 'tick adopted nothing');
+      assert.equal(calls.n, 0, 'no model call');
+    }, { membrane: countingMembrane(calls) });
+  });
+
+  it('names nothing for a merge queued behind a chunk that needs a model call while the compression quarantine can\'t be read, since tick takes queued chunks before merges and throws at that one', async () => {
+    const strategy = modelCallChunks({ hierarchical: true, positionedRecallPairs: true });
+    const calls = { n: 0 };
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 24; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      // Two L1s over messages of the last two queued chunks, and their merge; the first chunk holds neither.
+      assert.ok(queued.length >= 3, 'three chunks or more are queued');
+      strategy.seedL1('L1-a', [queued.at(-2)![0]!]);
+      strategy.seedL1('L1-b', [queued.at(-1)![0]!]);
+      strategy.queueMergeOf(['L1-a', 'L1-b']);
+      strategy.breakQuarantineRead();
+      assert.deepEqual((await refusal(manager)).clearedBy, []);
+      // The premise: the host's loop ends at a chunk before tick reaches the merge.
+      const summaries = strategy.summaryIds().length;
+      await assert.rejects(hostTicks(manager, strategy), /the quarantine ledger cannot be read/);
+      assert.equal(strategy.summaryIds().length, summaries, 'no merge ran');
+      assert.equal(calls.n, 0, 'no model call');
+    }, { membrane: countingMembrane(calls) });
+  });
+
+  it('names compression for a chunk tick adopts an L1 for, queued behind chunks the compression quarantine holds, which tick skips without a model call', async () => {
+    const { strategy, calls, membrane, drive } = quarantining();
+    await withManager(strategy, async (manager) => {
+      const queued = await drive(manager);
+      assert.ok(queued.length >= 2, 'two chunks or more are queued');
+      strategy.seedStoredL1('L1-stored-last', queued.at(-1)!);
+      assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      // The premise: tick skips the quarantined chunks without a model call or a throw, and adopts the last one's L1.
+      const before = calls.n;
+      const summaries = strategy.summaryIds().length;
+      await hostTicks(manager, strategy);
+      assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
+      assert.equal(calls.n, before, 'no model call');
+      assert.equal(strategy.summaryIds().length, summaries + 1, 'the last chunk adopted its L1');
+    }, { membrane });
+  });
+
+  it('names compression for a chunk tick adopts an L1 for, queued behind chunks it defers until the host declares its tools', async () => {
+    const strategy = modelCallChunks();
+    const calls = { n: 0 };
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) {
+        manager.addMessage('assistant', [{ type: 'tool_use', id: `zz-call-${i}`, name: 'zz_tool', input: { q: 'word '.repeat(20) } } as ContentBlock]);
+        manager.addMessage('user', [{ type: 'tool_result', toolUseId: `zz-call-${i}`, content: 'zz result' } as ContentBlock, { type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      }
+      const queued = await settledQueue(manager, strategy);
+      assert.ok(queued.length >= 2, 'two chunks or more are queued');
+      strategy.seedStoredL1('L1-stored-last', queued.at(-1)!);
+      assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      // The premise: tick defers the others without a model call or a throw, and adopts the last one's L1.
+      const summaries = strategy.summaryIds().length;
+      await hostTicks(manager, strategy);
+      assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
+      assert.equal(calls.n, 0, 'no model call');
+      assert.equal(strategy.summaryIds().length, summaries + 1, 'the last chunk adopted its L1');
+    }, { membrane: countingMembrane(calls) });
+  });
+
+  it('names compression for quarantined chunks whose records an older budget accounting wrote, which tick tries again', async () => {
+    const { strategy, calls, membrane, drive } = quarantining();
+    await withManager(strategy, async (manager) => {
+      await drive(manager);
+      strategy.ageQuarantine();
+      assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      // The premise: tick asks the model about them again.
+      const before = calls.n;
+      for (let i = 0; i < 30 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+      assert.ok(calls.n > before, 'tick asked the model again');
+    }, { membrane });
+  });
+
+  for (const settle of ['stubs', 'adopts'] as const) {
+    it(`names compression before the host declares its tools for chunks tick ${settle === 'stubs' ? 'stubs under a Fable summarizer' : 'adopts an exact L1 for though they hold tool blocks'}, since it settles them before it defers`, async () => {
+      const strategy = new DiagnosticStrategy({
+        adaptiveResolution: false,
+        targetChunkTokens: 40,
+        headWindowTokens: 0,
+        recentWindowTokens: 0,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+        mergeThreshold: 1000,
+        ...(settle === 'stubs' ? { compressionModel: 'claude-fable-5-1', minChunkCharsForLLM: 100_000 } : { minChunkCharsForLLM: 0 }),
+      });
+      // Without chunk records, adoption doesn't shrink a covered chunk, so the
+      // count reads the store's L1s for its own sake here.
+      if (settle === 'adopts') strategy.persistChunks = false;
+      const calls = { n: 0 };
+      await withManager(strategy, async (manager) => {
+        for (let i = 0; i < 12; i++) {
+          const words: ContentBlock = { type: 'text', text: `message ${i} ` + 'word '.repeat(30) };
+          if (settle === 'stubs') {
+            manager.addMessage('user', [words]);
+            continue;
+          }
+          manager.addMessage('assistant', [{ type: 'tool_use', id: `zz-call-${i}`, name: 'zz_tool', input: { q: 'word '.repeat(20) } } as ContentBlock]);
+          manager.addMessage('user', [{ type: 'tool_result', toolUseId: `zz-call-${i}`, content: 'zz result' } as ContentBlock, words]);
+        }
+        const queued = await settledQueue(manager, strategy);
+        if (settle === 'adopts') queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
+        assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+        // The premise: with no tools declared, tick settles every queued chunk without a model call.
+        for (let i = 0; i < 30 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+        assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
+        assert.equal(calls.n, 0, 'tick asked no model');
+        assert.equal(strategy.summaryIds().length, queued.length, `an L1 for each chunk, ${settle === 'adopts' ? 'adopted' : 'a stub'}`);
+      }, { membrane: countingMembrane(calls) });
+    });
+  }
+
+  const cycleAt = {
+    'head window': 'in the head window, which tick\'s request carries',
+    middle: 'in an earlier queued chunk, which tick\'s request carries as its raw middle',
+    'reset head': 'in an earlier queued chunk below a reset head start, with the head window off, which tick\'s raw middle still carries',
+    'covered head': 'in the head window that an L1 covers, which tick\'s request carries as that L1\'s recall pair',
+    'source-only': 'in the head window, which a source-only request leaves out',
+  } as const;
+  for (const place of Object.keys(cycleAt) as (keyof typeof cycleAt)[]) {
+    const counts = place === 'source-only' || place === 'covered head';
+    const inChunk = place === 'middle' || place === 'reset head';
+    it(`names ${counts ? 'compression' : 'nothing'} before the host declares its tools for text chunks after a tool cycle ${cycleAt[place]}`, async () => {
+      const strategy = new DiagnosticStrategy({
+        adaptiveResolution: false,
+        targetChunkTokens: 40,
+        headWindowTokens: inChunk ? 0 : 60,
+        recentWindowTokens: 0,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+        minChunkCharsForLLM: 0,
+        ...(place === 'source-only' ? { compressionSourceOnly: true } : {}),
+      });
+      const calls = { n: 0 };
+      await withManager(strategy, async (manager) => {
+        // The conversation opens with a tool cycle.
+        const cycle = [
+          manager.addMessage('assistant', [{ type: 'tool_use', id: 'zz-open', name: 'zz_tool', input: { q: 'zz' } } as ContentBlock]),
+          manager.addMessage('user', [{ type: 'tool_result', toolUseId: 'zz-open', content: 'zz result' } as ContentBlock]),
+        ];
+        const texts: string[] = [];
+        for (let i = 0; i < 12; i++) texts.push(manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+        if (place === 'reset head') strategy.resetHeadWindow(texts[6]);
+        if (place === 'covered head') strategy.seedL1('L1-cycle', cycle);
+        const error = await refusal(manager);
+        const queued = strategy.queuedChunkIds();
+        const textOnly = queued.filter((ids) => !ids.some((id) => cycle.includes(id)));
+        assert.ok(textOnly.length > 0, 'text chunks are queued');
+        if (inChunk) assert.ok(textOnly.length < queued.length, 'the cycle is in a queued chunk');
+        else assert.equal(textOnly.length, queued.length, 'the cycle is in the head window, not a chunk');
+        if (counts) {
+          assert.deepEqual(error.clearedBy, ['compression']);
+          // The premise: tick asks the model, tools or none, and the counting membrane throws.
+          await assert.rejects(manager.tick(), /no model in this test/);
+          assert.equal(calls.n, 1, 'tick asked the model');
+          return;
+        }
+        assert.deepEqual(error.clearedBy, [], 'nothing tick will do clears it');
+        // The premise: tick defers every queued chunk, with no model call.
+        for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+        assert.equal(calls.n, 0, 'tick asked no model');
+        manager.setToolDefinitions([{ name: 'zz_tool', description: 'zz', inputSchema: { type: 'object' } }]);
+        assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'with the tools declared, they count');
+      }, { membrane: countingMembrane(calls) });
+    });
+  }
+
+  it('before the host declares its tools, counts no queued chunk that starts inside the head window when the head carries a tool cycle after the chunk\'s start, which tick\'s head carries raw', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: false,
+      targetChunkTokens: 40,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+      mergeThreshold: 1000,
+      minChunkCharsForLLM: 0,
+    });
+    const calls = { n: 0 };
+    await withManager(strategy, async (manager) => {
+      const add = (from: number) => {
+        for (let i = from; i < from + 6; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      };
+      add(0);
+      const cycle = [
+        manager.addMessage('assistant', [{ type: 'tool_use', id: 'zz-later', name: 'zz_tool', input: { q: 'zz' } } as ContentBlock]),
+        manager.addMessage('user', [{ type: 'tool_result', toolUseId: 'zz-later', content: 'zz result' } as ContentBlock]),
+      ];
+      add(6);
+      // The chunks close with the head window off; widening it then puts them
+      // inside the head, as a host restarted with a larger window finds them.
+      const queued = await settledQueue(manager, strategy);
+      assert.ok(!queued[0].some((id) => cycle.includes(id)), 'the first queued chunk is text ahead of the cycle');
+      strategy.setHeadWindowTokens(100_000);
+      assert.equal(strategy.countsCompressionWork(), false, 'tick defers every queued chunk until the tools come');
+      // The premise: tick's head carries the cycle raw, so it defers each queued chunk, with no model call.
+      for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+      assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
+      assert.equal(calls.n, 0, 'tick asked no model');
+      assert.deepEqual(strategy.summaryIds(), [], 'and compressed none');
+    }, { membrane: countingMembrane(calls) });
+  });
+
+  for (const fable of [false, true]) {
+    it(`names nothing for chunks tick defers until the host declares its tools (${fable ? 'a Fable summarizer, text alone' : 'chunks holding tool blocks'}), and compression once it has`, async () => {
+      const strategy = new DiagnosticStrategy({
+        adaptiveResolution: false,
+        targetChunkTokens: 40,
+        headWindowTokens: 0,
+        recentWindowTokens: 0,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+        // No chunk is thin enough to stub, so each needs a model call.
+        minChunkCharsForLLM: 0,
+        ...(fable ? { compressionModel: 'claude-fable-5-1' } : {}),
+      });
+      const calls = { n: 0 };
+      const counting = { complete: async () => { calls.n++; throw new Error('zz no model call expected'); } } as unknown as Membrane;
+      await withManager(strategy, async (manager) => {
+        for (let i = 0; i < 12; i++) {
+          const words: ContentBlock = { type: 'text', text: `message ${i} ` + 'word '.repeat(30) };
+          if (fable) {
+            manager.addMessage('user', [words]);
+            continue;
+          }
+          // A call and its result, paired, as tick keeps them after stripping unpaired tool blocks.
+          manager.addMessage('assistant', [{ type: 'tool_use', id: `zz-call-${i}`, name: 'zz_tool', input: { q: 'word '.repeat(20) } } as ContentBlock]);
+          manager.addMessage('user', [{ type: 'tool_result', toolUseId: `zz-call-${i}`, content: 'zz result' } as ContentBlock, words]);
+        }
+        const error = await refusal(manager);
+        assert.ok(strategy.queuedChunkIds().length > 0, 'chunks are queued');
+        assert.deepEqual(error.clearedBy, [], 'nothing tick will do clears it');
+        // The premise: tick defers every queued chunk, with no model call.
+        for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+        assert.equal(calls.n, 0, 'tick asked no model');
+        manager.setToolDefinitions([{ name: 'zz_tool', description: 'zz', inputSchema: { type: 'object' } }]);
+        assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'with the tools declared, they count');
+      }, { membrane: counting });
+    });
+  }
+
+  for (const thin of [false, true]) {
+    it(`without a compression model, names compression only for chunks the thin-chunk guard stubs (${thin ? 'every chunk thin' : 'no chunk thin'})`, async () => {
+      const strategy = new DiagnosticStrategy({
+        adaptiveResolution: false,
+        targetChunkTokens: 40,
+        headWindowTokens: 0,
+        recentWindowTokens: 0,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+        minChunkCharsForLLM: thin ? 100_000 : 0,
+        compressionModel: undefined,
+      });
+      await withManager(strategy, async (manager) => {
+        for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+        assert.ok(strategy.queuedChunkIds().length > 0, 'chunks are queued');
+        assert.deepEqual((await refusal(manager)).clearedBy, thin ? ['compression'] : []);
+      }, { membrane: true });
+    });
+  }
+
+  it('without a compression model, names nothing for short chunks holding tool blocks, which the thin-chunk guard never stubs', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: false,
+      targetChunkTokens: 40,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+      // Every chunk's text is far below the threshold.
+      minChunkCharsForLLM: 100_000,
+      compressionModel: undefined,
+    });
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) {
+        manager.addMessage('assistant', [{ type: 'tool_use', id: `zz-call-${i}`, name: 'zz_tool', input: { q: 'zz' } } as ContentBlock]);
+        manager.addMessage('user', [{ type: 'tool_result', toolUseId: `zz-call-${i}`, content: 'zz result' } as ContentBlock, { type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      }
+      assert.ok(strategy.queuedChunkIds().length > 0, 'chunks are queued');
+      assert.deepEqual((await refusal(manager)).clearedBy, []);
+    }, { membrane: true });
+  });
+
+  const queuedChunks = (extra: Record<string, unknown> = {}) => new DiagnosticStrategy({
+    adaptiveResolution: false,
+    targetChunkTokens: 40,
+    headWindowTokens: 0,
+    recentWindowTokens: 0,
+    overBudgetGraceRatio: 0.25,
+    autoTickOnNewMessage: false,
+    speculativeProduction: false,
+    ...extra,
   });
 
   it('names nothing for queued chunks an L1 already covers under other boundaries, which tick drops without compressing', async () => {
@@ -921,21 +1482,23 @@ describe('OverBudgetError.clearedBy', () => {
     }, { membrane: true });
   });
 
-  it('names compression for queued chunks whose exact L1s only the store holds, and tick adopts them without a model call', async () => {
-    const strategy = queuedChunks();
-    await withManager(strategy, async (manager) => {
-      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
-      const queued = await settledQueue(manager, strategy);
-      queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
-      assert.deepEqual(strategy.summaryIds(), [], 'no L1 is in memory');
-      const error = await refusal(manager);
-      assert.match(error.message, /^Hierarchical emission overran the budget/);
-      assert.deepEqual(error.clearedBy, ['compression']);
-      for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
-      assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
-      assert.deepEqual([...strategy.summaryIds()].sort(), queued.map((_, i) => `L1-stored-${i}`).sort(), 'tick adopted each stored L1');
-    }, { membrane: true });
-  });
+  for (const modelled of [true, false]) {
+    it(`names compression for queued chunks whose exact L1s only the store holds, and tick adopts them without a model call (${modelled ? 'a compression model named' : 'no compression model, which adoption needs none of'})`, async () => {
+      const strategy = queuedChunks(modelled ? {} : { compressionModel: undefined });
+      await withManager(strategy, async (manager) => {
+        for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+        const queued = await settledQueue(manager, strategy);
+        queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
+        assert.deepEqual(strategy.summaryIds(), [], 'no L1 is in memory');
+        const error = await refusal(manager);
+        assert.match(error.message, /^Hierarchical emission overran the budget/);
+        assert.deepEqual(error.clearedBy, ['compression']);
+        for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+        assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
+        assert.deepEqual([...strategy.summaryIds()].sort(), queued.map((_, i) => `L1-stored-${i}`).sort(), 'tick adopted each stored L1');
+      }, { membrane: true });
+    });
+  }
 
   /** The queued chunks once a compile has closed every chunk the messages make. */
   const settledQueue = async (manager: ContextManager, strategy: DiagnosticStrategy): Promise<string[][]> => {
@@ -1005,6 +1568,31 @@ describe('OverBudgetError.clearedBy', () => {
     }, { membrane: true });
   });
 
+  it('names compression on the adaptive path without a compression model for queued chunks whose exact L1s only the store holds, which tick adopts without one', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: true,
+      targetChunkTokens: 40,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+      compressionModel: undefined,
+    });
+    strategy.produce = true;
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
+      assert.deepEqual(strategy.summaryIds(), [], 'no L1 is in memory, so the picker can fold none of them');
+      const error = await refusal(manager);
+      assert.match(error.message, /^Adaptive picker exhausted/);
+      assert.deepEqual(error.clearedBy, ['compression']);
+      await adoptAll(manager, strategy);
+      assert.deepEqual([...strategy.summaryIds()].sort(), queued.map((_, i) => `L1-stored-${i}`).sort(), 'tick adopted each stored L1');
+    }, { membrane: true });
+  });
+
   for (const merge of [false, true]) {
     it(`names compression when the compression preflight says no${merge ? ', for the merge too' : ''}, since a host's tick takes the queue whatever it says`, async () => {
       const strategy = queuedChunks();
@@ -1025,8 +1613,9 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
-  for (const held of [false, true]) {
-    it(`names ${held ? 'nothing' : 'compression'} for a queued merge of real summaries ${held ? 'while a real hold covers one of its sources' : 'with no hold'}`, async () => {
+  for (const [held, modelled] of [[false, true], [true, true], [false, false]] as const) {
+    const label = held ? 'while a real hold covers one of its sources' : modelled ? 'with no hold' : 'without a compression model, which a merge needs';
+    it(`names ${!held && modelled ? 'compression' : 'nothing'} for a queued merge of real summaries ${label}`, async () => {
       const strategy = new DiagnosticStrategy({
         adaptiveResolution: false,
         hierarchical: true,
@@ -1037,6 +1626,7 @@ describe('OverBudgetError.clearedBy', () => {
         overBudgetGraceRatio: 0.25,
         autoTickOnNewMessage: false,
         speculativeProduction: false,
+        compressionModel: modelled ? 'zz-model' : undefined,
       });
       await withManager(strategy, async (manager) => {
         const ids = Array.from({ length: 2 }, (_, i) =>
@@ -1046,7 +1636,7 @@ describe('OverBudgetError.clearedBy', () => {
         strategy.queueMergeOf(['L1-a', 'L1-b']);
         if (held) manager.holdCompression([ids[1]!], { timeoutMs: 60_000 });
         const error = await refusal(manager);
-        assert.deepEqual(error.clearedBy, held ? [] : ['compression']);
+        assert.deepEqual(error.clearedBy, !held && modelled ? ['compression'] : []);
         if (held) manager.releaseCompression([ids[1]!]);
       });
     });
@@ -1114,6 +1704,7 @@ describe('OverBudgetError.clearedBy', () => {
   for (const lateHold of [false, true]) {
     it(`names ${lateHold ? 'nothing' : 'compression'} for the chunk the picker's plan demands ${lateHold ? 'when a hold placed after it closed covers it, since tick skips it' : 'with no hold'}`, async () => {
       const strategy = new AutobiographicalStrategy({
+        compressionModel: 'zz-model',
         adaptiveResolution: true,
         targetChunkTokens: 40,
         headWindowTokens: 0,

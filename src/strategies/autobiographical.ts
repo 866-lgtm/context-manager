@@ -207,6 +207,11 @@ function withoutToolsParam(request: NormalizedRequest): NormalizedRequest {
   return rest as NormalizedRequest;
 }
 
+/** Whether a message's content, as stored, holds a tool call or a tool result. */
+function hasToolBlocks(content: readonly ContentBlock[]): boolean {
+  return content.some((block) => block.type === 'tool_use' || block.type === 'tool_result');
+}
+
 /** Standard compression instruction for chat/general chunks. */
 function formatInstruction(targetTokens: number): string {
   return (
@@ -1057,6 +1062,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected chunks: Chunk[] = [];
   protected pendingCompression: Promise<void> | null = null;
   protected compressionQueue: number[] = [];
+  /** The context initialize was given; its `tools` getter follows the host's declarations. */
+  private hostContext: StrategyContext | null = null;
   protected _compressionCount = 0;
   /**
    * Monotonic counter of tick() operations that actually processed a queue item
@@ -1685,6 +1692,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Bind to the chronicle store + namespace for persistent strategy state.
     this.store = ctx.store;
     this.ns = ctx.namespace;
+    // Its tools getter follows the host's declarations (compressionWorkQueued).
+    this.hostContext = ctx;
     observeStoreBranch(ctx.store);
     const sourceBranch = this.captureCompressionBranch();
     this.initializingBranchIdentity = {
@@ -5892,53 +5901,44 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // mechanical stub without an LLM call instead. Chunks with any
     // non-text blocks (tool cycles, images) are never stubbed.
     const minChunkChars = this.config.minChunkCharsForLLM ?? 200;
-    if (minChunkChars > 0) {
-      let substantiveChars = 0;
-      let hasNonText = false;
-      for (const m of chunk.messages) {
-        for (const b of m.content) {
-          if (b.type === 'text') substantiveChars += b.text.trim().length;
-          else hasNonText = true;
-        }
-      }
-      if (!hasNonText && substantiveChars < minChunkChars) {
-        const messageIds = chunk.messages.map(m => m.id);
-        const stub: SummaryEntry = {
-          id: `L1-${this.nextSummaryIdCounter()}`,
-          level: 1,
-          content:
-            `(A quiet stretch: ${chunk.messages.length} messages of routine ` +
-            `system traffic — heartbeats, empty turns, notices. Nothing ` +
-            `happened worth remembering.)`,
-          tokens: 40,
-          sourceLevel: 0,
-          sourceIds: messageIds,
-          sourceRange: { first: messageIds[0], last: messageIds[messageIds.length - 1] },
-          created: Date.now(),
-          phaseType: chunk.phaseType,
-        };
-        this.pushSummary(stub);
-        chunk.compressed = true;
-        chunk.summaryId = stub.id;
-        this.markChunkRecordCompressed(chunk.recordId, stub.id);
-        this._compressionCount++;
-        logCompressionCall({
-          operation: 'compress_l1',
-          system: null,
-          messages: [],
-          metadata: {
-            stub: true,
-            chunk_message_ids: messageIds,
-            chunk_size: chunk.messages.length,
-            substantive_chars: substantiveChars,
-            min_chunk_chars: minChunkChars,
-            summary_id: stub.id,
-          },
-          response: summarizeTelemetryText(stub.content),
-        });
-        this.checkMergeThreshold();
-        return;
-      }
+    const substantiveChars = this.thinChunkChars(chunk);
+    if (substantiveChars !== undefined) {
+      const messageIds = chunk.messages.map(m => m.id);
+      const stub: SummaryEntry = {
+        id: `L1-${this.nextSummaryIdCounter()}`,
+        level: 1,
+        content:
+          `(A quiet stretch: ${chunk.messages.length} messages of routine ` +
+          `system traffic — heartbeats, empty turns, notices. Nothing ` +
+          `happened worth remembering.)`,
+        tokens: 40,
+        sourceLevel: 0,
+        sourceIds: messageIds,
+        sourceRange: { first: messageIds[0], last: messageIds[messageIds.length - 1] },
+        created: Date.now(),
+        phaseType: chunk.phaseType,
+      };
+      this.pushSummary(stub);
+      chunk.compressed = true;
+      chunk.summaryId = stub.id;
+      this.markChunkRecordCompressed(chunk.recordId, stub.id);
+      this._compressionCount++;
+      logCompressionCall({
+        operation: 'compress_l1',
+        system: null,
+        messages: [],
+        metadata: {
+          stub: true,
+          chunk_message_ids: messageIds,
+          chunk_size: chunk.messages.length,
+          substantive_chars: substantiveChars,
+          min_chunk_chars: minChunkChars,
+          summary_id: stub.id,
+        },
+        response: summarizeTelemetryText(stub.content),
+      });
+      this.checkMergeThreshold();
+      return;
     }
 
     // Build the KV-preserving prompt per hermes-autobio spec:
@@ -5998,12 +5998,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const messageOrder = new Map<MessageId, number>(
       allMessages.map((message, index) => [message.id, index]),
     );
-    const priorSummaries = this.summaries
-      // Skip empty-content summaries: emitting `{type:'text', text:''}` as a
-      // recall pair triggers Anthropic 400 "text content blocks must be
-      // non-empty", which stalls ALL compression (mirrors the render-path guard
-      // + load-drop). A single empty summary otherwise poisons every compression.
-      .filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0)
+    const priorSummaries = this.recalledSummaries()
       .sort((a, b) => {
         const aOrder = messageOrder.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
         const bOrder = messageOrder.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
@@ -6015,19 +6010,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // live summary is represented by its recall pair, never raw. Uses
     // the FULL priorSummaries set (not the budget-capped keptSummaries):
     // a budget-dropped summary doesn't make its raw messages reappear.
-    // Expand summary sourceIds down to leaf message IDs — an L2's
-    // sourceIds are L1 IDs, not message IDs; a flat walk would miss
-    // every message it transitively covers (Bug 10). Also expand merged
-    // L1s as defense in depth.
-    const summariesById = new Map<string, SummaryEntry>();
-    for (const s of this.summaries) summariesById.set(s.id, s);
-    const priorSummaryMessageIds = new Set<MessageId>();
-    for (const s of this.summaries) {
-      if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
-    }
-    for (const s of priorSummaries) {
-      this.expandSummaryToLeafMessageIds(s, summariesById, priorSummaryMessageIds);
-    }
+    // compressionWorkQueued reads the same coverage.
+    const priorSummaryMessageIds = this.liveSummaryLeafIds();
 
     // ---- 1. Head window (raw, FIRST, ownership-capped) ----
     //
@@ -6220,8 +6204,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Opus-family summarizers mint tools-less (lena bench), and test
     // harnesses never push tools, so the content-independent rule is gated
     // on the model family.
-    const chunkHasToolBlocks = cleaned.some(m =>
-      m.content.some((b: ContentBlock) => b.type === 'tool_use' || b.type === 'tool_result'));
+    // compressionWorkQueued's count applies the same test (hasToolBlocks).
+    const chunkHasToolBlocks = cleaned.some((m) => hasToolBlocks(m.content));
     const toolsLessRefusingFamily = isToolsLessRefusingSummarizer(this.config.compressionModel ?? "");
     if ((chunkHasToolBlocks || toolsLessRefusingFamily) && !(ctx.tools && ctx.tools.length > 0)) {
       console.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; ${chunkHasToolBlocks ? 'history contains tool blocks' : 'Fable/Mythos-family summarizer refuses tools-less requests'}) — will retry after tools are pushed`);
@@ -8344,6 +8328,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * The substantive text length of a chunk the thin-chunk guard stubs (an L1
+   * written without a model call: no non-text block, and less trimmed text
+   * than minChunkCharsForLLM), or undefined for a chunk it doesn't.
+   */
+  protected thinChunkChars(chunk: Chunk): number | undefined {
+    const minChunkChars = this.config.minChunkCharsForLLM ?? 200;
+    if (minChunkChars <= 0) return undefined;
+    let substantiveChars = 0;
+    for (const m of chunk.messages) {
+      for (const b of m.content) {
+        if (b.type !== 'text') return undefined;
+        substantiveChars += b.text.trim().length;
+      }
+    }
+    return substantiveChars < minChunkChars ? substantiveChars : undefined;
+  }
+
+  /**
    * Whether the drain has compression work it will take that would shrink the
    * context, as tick takes it: compression in flight; the first queued merge,
    * unless a compression hold blocks it (tick runs no merge until the
@@ -8371,17 +8373,48 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * can be queued: select's rebuild leaves one out, but a produce op queues
    * the chunks it demands, held or not. Tick drops a held one from the queue
    * without compressing it, and its next call takes the next chunk, so a
-   * chunk queued behind a held one still counts. Like tick, this assumes the
-   * manager has a membrane to run it.
+   * chunk queued behind a held one still counts.
+   * Tick takes the queued chunks in order, one a call, and reaches a merge
+   * only once it has taken them all. It takes a chunk's steps in this order:
+   * it adopts an exact L1, drops or refuses a chunk with a covered message,
+   * and stubs a thin one, all without a model call; then it defers for the
+   * host's tools, needs a compression model, and skips a chunk the
+   * compression quarantine holds. The count walks the queue the same way and
+   * stops at the first chunk tick throws at, since a host's tick loop ends
+   * at a throw: one that needs a model call, without a compression model or
+   * while the quarantine can't be read, where tick's own read throws
+   * (quarantinedChunkSources). So a chunk tick adopts an L1 for or stubs
+   * counts, whatever the tools or the quarantine say, unless such a chunk is
+   * ahead of it, and so does a merge behind chunks tick only skips. Without
+   * a compression model, tick runs no merge, and the chunks it settles for
+   * good are those it adopts an L1 for or stubs (its drop of a covered chunk
+   * doesn't last, as above). Until the host declares its tools, tick defers
+   * any other chunk whose request carries a tool block, and every other
+   * chunk when the summarizer refuses requests without them (Fable and
+   * Mythos), so those don't count; the tools are read from the context
+   * initialize was given, whose getter follows the host. The request is read
+   * as stored (requestCarriesToolBlocks), where tick strips unpaired tool
+   * blocks first, so one whose only tool blocks are unpaired is left out
+   * too: the count can under-name here, but never names a chunk tick defers.
+   * For the same reason the walk stops at a chunk tick throws at before it
+   * asks about tools, which under-names a chunk tick would defer and pass.
+   * A chunk the quarantine holds doesn't count, and the walk goes past it,
+   * as tick does. The count assumes the host keeps ticking: one that ticks a
+   * fixed number of times between compiles reaches work only within that
+   * many queued chunks, since each compile queues the skipped ones again.
+   * Like tick, this assumes the manager has a membrane to run it.
    * checkReadiness waits on more: chunks the cap or a hold keeps, and a merge
    * a hold blocks. Compressing a chunk replaces its raw messages with a
    * summary, and a merge folds summaries into one.
    */
   protected compressionWorkQueued(store: MessageStoreView, path: 'adaptive' | 'hierarchical'): boolean {
     if (this.pendingCompression) return true;
-    const merge = this.config.hierarchical ? this.mergeQueue[0] : undefined;
-    if (merge && !this.mergeBlockedByHold(merge.sourceIds, store)) return true;
-    if (this.compressionQueue.length === 0 || this.isAtSpeculativeCap()) return false;
+    // Without a compression model, tick runs no merge. It reaches a merge
+    // only once it has taken every queued chunk, or at the cap.
+    const modelled = Boolean(this.config.compressionModel);
+    const merge = this.config.hierarchical && modelled ? this.mergeQueue[0] : undefined;
+    const mergeCounts = merge !== undefined && !this.mergeBlockedByHold(merge.sourceIds, store);
+    if (this.compressionQueue.length === 0 || this.isAtSpeculativeCap()) return mergeCounts;
     const held = this.holdBlockedIds(store);
     const adoptionShrinks = path === 'hierarchical' && this.chunkPersistenceEnabled;
     const coveredByL1 = new Set<string>();
@@ -8389,21 +8422,106 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const summary of this.summaries) {
       if (summary.level !== 1 || !Array.isArray(summary.sourceIds)) continue;
       for (const id of summary.sourceIds) coveredByL1.add(id);
-      if (adoptionShrinks) exactL1.add(summary.sourceIds.join(':'));
+      exactL1.add(summary.sourceIds.join(':'));
     }
-    if (adoptionShrinks) {
-      // tick adopts an exact L1 the store holds too (findExactL1).
-      const persisted = this.store?.getStateJson(this.summariesStateId);
-      for (const summary of Array.isArray(persisted) ? (persisted as SummaryEntry[]) : []) {
-        if (summary?.level === 1 && Array.isArray(summary.sourceIds)) exactL1.add(summary.sourceIds.join(':'));
+    // tick adopts an exact L1 the store holds too (findExactL1).
+    const persisted = this.store?.getStateJson(this.summariesStateId);
+    for (const summary of Array.isArray(persisted) ? (persisted as SummaryEntry[]) : []) {
+      if (summary?.level === 1 && Array.isArray(summary.sourceIds)) exactL1.add(summary.sourceIds.join(':'));
+    }
+    // Until the host has declared its tools, tick defers a chunk it would
+    // call the model for when its request carries tool blocks, or every such
+    // chunk when the summarizer refuses requests without them.
+    const deferredForTools: (chunk: Chunk) => boolean =
+      (this.hostContext?.tools?.length ?? 0) > 0 ? () => false
+        : isToolsLessRefusingSummarizer(this.config.compressionModel ?? '') ? () => true
+          : this.requestCarriesToolBlocks(store);
+    const quarantined = this.quarantinedChunkSources();
+    // Tick takes the queued chunks in order, one a call, and a host's tick
+    // loop ends at the first call that throws.
+    for (const index of this.compressionQueue) {
+      const chunk = this.chunks[index];
+      if (chunk === undefined || chunk.compressed || this.chunkHasHeldMessage(chunk, held)) continue;
+      const adoptable = exactL1.has(this.chunkKey(chunk));
+      if (chunk.messages.some((m) => coveredByL1.has(m.id))) {
+        if (adoptionShrinks && adoptable) return true;
+        continue;
+      }
+      if (adoptable || this.thinChunkChars(chunk) !== undefined) return true;
+      // Any other chunk needs a model call. Tick throws at it without a
+      // model, or when the quarantine can't be read, unless it defers it for
+      // the host's tools first. deferredForTools reads the request as
+      // stored, which can hold a tool block tick strips, so the walk stops
+      // here either way.
+      if (!modelled || quarantined === undefined) return false;
+      if (deferredForTools(chunk) || quarantined.has(sha256Json(chunk.messages.map((m) => m.id)))) continue;
+      return true;
+    }
+    return mergeCounts;
+  }
+
+  /**
+   * Whether tick's request for a chunk carries a tool block, read as stored:
+   * the chunk's own messages, and, unless compressionSourceOnly, each message
+   * the request carries raw ahead of the chunk. Those are the head window,
+   * from its start to headEnd, and the middle, from headEnd to the chunk's
+   * first message, with headEnd clipped at a hold as tick clips it; so the
+   * range starts at the lower of the two, as with the head window off
+   * (headWindowTokens <= 0), where headEnd is 0 and the middle starts below a
+   * reset head. A message a live summary covers is left out, by the coverage
+   * tick's request reads (liveSummaryLeafIds). Tick strips unpaired tool
+   * blocks first, so this can say yes where tick's request has none, never the
+   * reverse. The test it returns takes one chunk.
+   */
+  private requestCarriesToolBlocks(store: MessageStoreView): (chunk: Chunk) => boolean {
+    const all = store.getAll();
+    const headEnd = Math.min(this.getHeadWindowEnd(store), this.holdBoundary(store));
+    // The first raw message tick's request can carry that holds a tool block.
+    let firstRaw = -1;
+    if (this.config.compressionSourceOnly !== true) {
+      const covered = this.liveSummaryLeafIds();
+      for (let i = Math.min(this.getHeadWindowStartIndex(store), headEnd); i < all.length; i++) {
+        if (!covered.has(all[i].id) && hasToolBlocks(all[i].content)) {
+          firstRaw = i;
+          break;
+        }
       }
     }
-    return this.compressionQueue.some((index) => {
-      const chunk = this.chunks[index];
-      if (chunk === undefined || chunk.compressed || this.chunkHasHeldMessage(chunk, held)) return false;
-      if (!chunk.messages.some((m) => coveredByL1.has(m.id))) return true;
-      return exactL1.has(this.chunkKey(chunk));
-    });
+    const position = firstRaw < 0 ? undefined : new Map(all.map((message, i) => [message.id, i]));
+    return (chunk) => {
+      if (chunk.messages.some((m) => hasToolBlocks(m.content))) return true;
+      if (position === undefined) return false;
+      const start = position.get(chunk.messages[0]?.id ?? '') ?? -1;
+      return firstRaw < Math.max(headEnd, start);
+    };
+  }
+
+  /**
+   * The source hashes (chunkSourceHash) of the chunks the compression
+   * quarantine holds under the current budget accounting, from the durable
+   * projection tick reads (empty without a store), or undefined when that
+   * projection can't be read: tick's own read throws there, so it takes no
+   * chunk past it to a model call. Tick skips a chunk the quarantine holds
+   * without a model call when the quarantine holds its request family, or the
+   * chunk has reached its cap of quarantined shapes under the same request
+   * regime; a request of a new shape, or a regime the configuration changed,
+   * gets a fresh attempt. Counting none of them under-names that, the safe
+   * side: naming work tick won't do tells a host to wait for nothing.
+   */
+  private quarantinedChunkSources(): Set<string> | undefined {
+    let projection: Map<string, ActiveCompressionQuarantine>;
+    try {
+      projection = this.readCompressionQuarantineProjection();
+    } catch {
+      return undefined;
+    }
+    const sources = new Set<string>();
+    for (const active of projection.values()) {
+      if (active.record.normalizedConfig?.accountingVersion === COMPRESSION_BUDGET_ACCOUNTING_VERSION) {
+        sources.add(active.record.chunkSourceHash);
+      }
+    }
+    return sources;
   }
 
   /** Attach common metadata; each internal refusal must also declare its count/depth meanings. */
@@ -10422,6 +10540,39 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const found = current && current.level === level ? current : null;
     if (known) known[level] = found;
     return found;
+  }
+
+  /**
+   * The summaries tick's chunk request recalls: every unmerged summary with
+   * content. An empty one is left out: emitting `{type:'text', text:''}` as a
+   * recall pair triggers Anthropic 400 "text content blocks must be
+   * non-empty", which stalls ALL compression (mirrors the render-path guard
+   * + load-drop). A single empty summary otherwise poisons every compression.
+   */
+  protected recalledSummaries(): SummaryEntry[] {
+    return this.summaries.filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0);
+  }
+
+  /**
+   * The message ids live summaries cover, down to their leaves: what tick's
+   * chunk request represents by recall pairs, never raw, and what
+   * compressionWorkQueued's count leaves out of that request with it. Every
+   * L1 counts, merged or not, as defense in depth, and so does each summary
+   * the request recalls (recalledSummaries). Each one's sourceIds are expanded
+   * down to message ids: an L2's sourceIds are L1 ids, so a flat walk would
+   * miss every message it transitively covers (Bug 10).
+   */
+  protected liveSummaryLeafIds(): Set<MessageId> {
+    const summariesById = new Map<string, SummaryEntry>();
+    for (const s of this.summaries) summariesById.set(s.id, s);
+    const leafIds = new Set<MessageId>();
+    for (const s of this.summaries) {
+      if (s.level === 1) this.expandSummaryToLeafMessageIds(s, summariesById, leafIds);
+    }
+    for (const s of this.recalledSummaries()) {
+      this.expandSummaryToLeafMessageIds(s, summariesById, leafIds);
+    }
+    return leafIds;
   }
 
   /**
