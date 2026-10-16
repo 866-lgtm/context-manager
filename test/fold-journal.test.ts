@@ -1371,6 +1371,81 @@ describe('fold journal durability and index', () => {
     cm.close();
   });
 
+  it('a receipt link that leaves its namespace or branch ends the walk, says so, and is never announced', async () => {
+    // What main's newest records link to, in turn: side's receipt (another
+    // branch), another namespace's receipt on main itself, and a record of
+    // another namespace that holds no receipt.
+    const kinds = ['branch', 'namespace', 'namespace, no receipt'] as const;
+    const lastRecord = (store: JsStore): string => store.getRecordIdsByType('context-manager/accepted-layout').at(-1)!;
+    for (const kind of kinds) {
+      cleanup();
+      let { cm, strategy } = await open();
+      const ids = add(cm, 3);
+      assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+      const main = cm.currentBranchRef();
+      const store = cm.getStore();
+      let target: string;
+      if (kind === 'branch') {
+        await cm.fork('side');
+        assert.equal((await acceptCompile(cm))?.kind, 'baseline');
+        target = lastRecord(store);
+        await cm.switchBranch(main.name);
+      } else {
+        const other = await ContextManager.open({ store, strategy: new ScriptedStrategy(), namespace: 'agents/other' });
+        const otherReceipt = await acceptCompile(other);
+        assert.equal(otherReceipt?.kind, 'baseline');
+        target = otherReceipt!.id;
+        other.close();
+        if (kind === 'namespace, no receipt') {
+          const { receipt: _otherReceipt, ...otherBare } = JSON.parse(store.getRecord(target)!.payload.toString('utf8'));
+          store.appendJson('context-manager/accepted-layout', { ...otherBare, compileId: 'other-bare' });
+          target = lastRecord(store);
+        }
+      }
+      strategy.plan.set(ids[0]!, 'omit');
+      const change = await acceptCompile(cm);
+      assert.equal(change?.kind, 'change');
+      const record = JSON.parse(store.getRecord(change!.id)!.payload.toString('utf8'));
+
+      // Main's newest receipt, copied with its link moved onto the target. A
+      // journal that never heard of it announces it, and nothing of the target's.
+      store.appendJson('context-manager/accepted-layout', { ...record, compileId: 'foreign-link', pr: target });
+      const forged = lastRecord(store);
+      cm.close();
+      ({ cm } = await open(strategy));
+      let heard: string[] = [];
+      cm.onFoldReceipt((r) => heard.push(r.id));
+      assert.equal(await acceptCompile(cm), null, kind);
+      assert.deepEqual(heard, [forged], `${kind}: main's own newest receipt is announced, and the target isn't`);
+      const listed = cm.listFoldReceipts({ limit: 10 });
+      assert.deepEqual(listed.receipts.map((r) => r.id), [forged], `${kind}: the target isn't spliced into main's receipts`);
+      assert.match(listed.note ?? '', new RegExp(`Receipts before ${forged} aren't listed: its link names record ${target}, which belongs to another namespace or branch`), kind);
+
+      // A newest record with no receipt whose link names the target: main
+      // lists nothing, and an acceptance announces nothing of the target's,
+      // though it announces main's own next receipt.
+      const { receipt: _receipt, ...bare } = record;
+      cm.getStore().appendJson('context-manager/accepted-layout', { ...bare, compileId: 'foreign-link-bare', pr: target });
+      cm.close();
+      ({ cm } = await open(strategy));
+      heard = [];
+      cm.onFoldReceipt((r) => heard.push(r.id));
+      assert.equal(await acceptCompile(cm), null, kind);
+      assert.deepEqual(heard, [], `${kind}: the target isn't announced on main`);
+      const empty = cm.listFoldReceipts({ limit: 10 });
+      assert.deepEqual(empty.receipts, [], kind);
+      assert.match(empty.note ?? '', new RegExp(`^No receipts are listed: record ${target}, where the branch's receipts start, belongs to another namespace or branch\\.`), kind);
+      strategy.plan.set(ids[1]!, 'omit');
+      const later = await acceptCompile(cm);
+      assert.equal(later?.kind, 'change', kind);
+      assert.deepEqual(heard, [later!.id], `${kind}: main's own receipt is announced`);
+      if (kind === 'branch') {
+        assert.deepEqual(cm.listFoldReceipts({ branch: 'side' }).receipts.map((r) => r.id), [target], 'side keeps its own');
+      }
+      cm.close();
+    }
+  });
+
   it('a branch whose newest record cannot be read gets a baseline, never a diff against an older layout', async () => {
     let { cm, strategy } = await open();
     const ids = add(cm, 3);

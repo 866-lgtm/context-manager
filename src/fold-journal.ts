@@ -388,9 +388,10 @@ interface BranchState {
    *  store object wrote it; extended as records are written. */
   receipts?: Array<{ id: string; at: number }>;
   /** Where that walk stopped short: a record a link named that couldn't be
-   *  read as a receipt (`at`), or a receipt whose link doesn't point to an
+   *  read as a receipt (`at`), or that belongs to another namespace or
+   *  branch (`at`, `foreign`), or a receipt whose link doesn't point to an
    *  earlier record (`at`, and the record it names, `linksTo`). */
-  receiptsCut?: { at: string; linksTo?: string };
+  receiptsCut?: { at: string; linksTo?: string; foreign?: true };
   /** A record after `newest` that couldn't be read at all, so it may have
    *  been this branch's newest: the next acceptance writes a baseline. */
   shadowedBy?: string;
@@ -663,7 +664,8 @@ export class FoldJournal {
     // receipt followed it. Announce it now, whatever this compile turns out
     // to be, so listeners (a projection) converge on the canonical record.
     if (branch?.newestReceipt && this.announced.get(branchKey(branch.ref)) !== branch.newestReceipt) {
-      const receipt = this.loadReceipt(branch.newestReceipt);
+      // Only a receipt of this branch: a link can name another's.
+      const receipt = this.loadReceipt(branch.newestReceipt, branch.ref);
       if (receipt) {
         // Its write may have failed at the sync after the append, leaving it
         // in the log with its durability unknown: durable before heard of.
@@ -750,7 +752,17 @@ export class FoldJournal {
     let id = branch.newestReceipt;
     while (id !== null) {
       const head = readHead(this.store, index, id);
-      if (!head || head.receiptAt === null) {
+      if (!head) {
+        branch.receiptsCut = { at: id };
+        break;
+      }
+      // Each link stays on its namespace and branch, as a layout chain's do,
+      // whether or not the record it names holds a receipt.
+      if (head.ns !== this.namespace || branchKey(head.branch) !== branchKey(branch.ref)) {
+        branch.receiptsCut = { at: id, foreign: true };
+        break;
+      }
+      if (head.receiptAt === null) {
         branch.receiptsCut = { at: id };
         break;
       }
@@ -839,12 +851,16 @@ export class FoldJournal {
     const cut = state?.receiptsCut;
     if (cut) {
       // A forward link is found on a receipt already listed, so only an
-      // unreadable one can leave the list empty.
+      // unreadable or foreign one can leave the list empty.
       notes.push(list.length === 0
-        ? `No receipts are listed: record ${cut.at}, where the branch's receipts start, can't be read as a receipt.`
-        : cut.linksTo === undefined
-          ? `Receipts before ${list[0]!.id} aren't listed: record ${cut.at}, which links to them, can't be read as a receipt.`
-          : `Receipts before ${list[0]!.id} aren't listed: record ${cut.at} links to ${cut.linksTo}, which isn't before it.`);
+        ? (cut.foreign
+          ? `No receipts are listed: record ${cut.at}, where the branch's receipts start, belongs to another namespace or branch.`
+          : `No receipts are listed: record ${cut.at}, where the branch's receipts start, can't be read as a receipt.`)
+        : cut.foreign
+          ? `Receipts before ${list[0]!.id} aren't listed: its link names record ${cut.at}, which belongs to another namespace or branch.`
+          : cut.linksTo === undefined
+            ? `Receipts before ${list[0]!.id} aren't listed: record ${cut.at}, which links to them, can't be read as a receipt.`
+            : `Receipts before ${list[0]!.id} aren't listed: record ${cut.at} links to ${cut.linksTo}, which isn't before it.`);
     }
     if (unloadable.length > 0) notes.push(`Receipt${unloadable.length === 1 ? '' : 's'} ${unloadable.join(', ')} can't be read and ${unloadable.length === 1 ? 'is' : 'are'} left out.`);
     return { branch, receipts, latestId, more, ...(notes.length > 0 ? { note: notes.join(' ') } : {}) };
@@ -857,9 +873,12 @@ export class FoldJournal {
 
   // --------------------------------------------------------------------------
 
-  private loadReceipt(id: string): FoldReceipt | null {
+  /** The receipt record `id` holds, or null; with `on`, only a receipt of this namespace on that branch. */
+  private loadReceipt(id: string, on?: BranchRef): FoldReceipt | null {
     const record = readRecord<AcceptedLayoutRecord>(this.store, id);
-    return isLayoutRecord(record) && record.receipt ? ({ ...record.receipt, id } as FoldReceipt) : null;
+    if (!isLayoutRecord(record) || !record.receipt) return null;
+    if (on && (record.ns !== this.namespace || branchKey(record.branch) !== branchKey(on))) return null;
+    return { ...record.receipt, id } as FoldReceipt;
   }
 
   private resolveBranch(index: StoreIndex, branch: FoldQuery['branch']): BranchRef | null {
