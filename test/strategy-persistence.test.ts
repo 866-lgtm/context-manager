@@ -1442,6 +1442,47 @@ describe('AutobiographicalStrategy — persistence', () => {
     } finally { manager.close(); }
   });
 
+  it('refuses as infeasible, under kv-unified, a range pinned at a level only a dropped summary supplied, until the pin is released', async (t) => {
+    t.mock.method(console, 'warn', () => {});
+    t.mock.method(console, 'error', () => {});
+    const config = { targetChunkTokens: 300, adaptiveResolution: true, recentWindowTokens: 40, ...kvUnified };
+    let pinId = '';
+    {
+      const strategy = new TestableStrategy(config);
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      const ids = Array.from({ length: 12 }, (_, i) => manager.addMessage(i % 2 ? 'Claude' : 'User', textBlock(`MSG${i} ` + 'word '.repeat(20))));
+      const pairs = [[0, 1], [2, 3], [4, 5]].map(([a, b]) => [ids[a]!, ids[b]!]);
+      const l1 = (g: number) => ({
+        id: `L1-${g}`, level: 1, content: `L1-SUMMARY-${g}`, tokens: 3, sourceLevel: 0, sourceIds: pairs[g]!,
+        sourceRange: { first: pairs[g]![0]!, last: pairs[g]![1]! }, created: 0, mergedInto: 'L2-0',
+      });
+      // As an earlier version leaves a store after dropping the L1 over the
+      // third pair: the L2 still lists it.
+      strategy.persistRawSummaries([
+        l1(0), l1(1),
+        { id: 'L2-0', level: 2, content: 'L2-SUMMARY', tokens: 3, sourceLevel: 1, sourceIds: ['L1-0', 'L1-1', 'L1-2'], sourceRange: { first: ids[0]!, last: ids[5]! }, created: 0 },
+      ]);
+      strategy.persistRawChunks(pairs.map((group, g) => ({ id: `c-${g}`, sourceIds: group, compressed: true, summaryId: `L1-${g}` })));
+      pinId = manager.pinAtLevel(ids[0]!, ids[3]!, 2, { name: 'at-two' });
+      manager.sync();
+      manager.close();
+    }
+    const strategy = new TestableStrategy(config);
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      assert.ok(!strategy.getSummariesView().some((summary) => summary.level === 2), 'the open drops the L2, which names a missing summary');
+      // kv-unified holds a range pinned at a level exactly there, and no
+      // summary supplies level 2 now, whatever the budget.
+      await assert.rejects(manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }), /kv-unified constraints are infeasible/);
+      assert.ok(manager.unpin(pinId), 'the pin is released');
+      assert.ok(textsOf(await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 })).length > 0, 'it compiles without the pin');
+      // Pinned at a level the surviving L1s supply, it compiles too.
+      const survivors = new Map(strategy.getSummariesView().map((summary) => [summary.id, summary]));
+      manager.pinAtLevel(survivors.get('L1-0')!.sourceIds[0]!, survivors.get('L1-1')!.sourceIds[1]!, 1, { name: 'at-one' });
+      assert.ok(textsOf(await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 })).length > 0, 'it compiles pinned at L1');
+    } finally { manager.close(); }
+  });
+
   it('isolates summary state per chronicle branch (fork)', async () => {
     const strategy = new TestableStrategy({ targetChunkTokens: 300 });
     const manager = await ContextManager.open({
