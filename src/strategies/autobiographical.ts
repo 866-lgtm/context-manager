@@ -1176,6 +1176,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return ctx.systemPrompt || this.config.compressionSystemPrompt || undefined;
   }
 
+  /** [local patch] Tools declared on memory-write requests: the agent's live
+   *  tools unless compressionDeclareTools is false. */
+  private compressionTools(ctx: StrategyContext): NormalizedRequest['tools'] {
+    return this.config.compressionDeclareTools === false ? undefined : ctx.tools;
+  }
+
   /** [local patch] The membrane that carries memory-write requests: the
    *  host's dedicated compression membrane when one is attached
    *  (ContextManager.setCompressionMembrane → ctx.compressionMembrane), else
@@ -6080,7 +6086,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const chunkHasToolBlocks = cleaned.some(m =>
       m.content.some((b: ContentBlock) => b.type === 'tool_use' || b.type === 'tool_result'));
     const toolsLessRefusingFamily = isToolsLessRefusingSummarizer(this.config.compressionModel ?? "");
-    if ((chunkHasToolBlocks || toolsLessRefusingFamily) && !(ctx.tools && ctx.tools.length > 0)) {
+    const declaresTools = this.config.compressionDeclareTools !== false;
+    if (declaresTools && (chunkHasToolBlocks || toolsLessRefusingFamily) && !(ctx.tools && ctx.tools.length > 0)) {
       console.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; ${chunkHasToolBlocks ? 'history contains tool blocks' : 'Fable/Mythos-family summarizer refuses tools-less requests'}) — will retry after tools are pushed`);
       return;
     }
@@ -6182,7 +6189,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // workaround. Undefined before the first activation of a session --
       // acceptable: those chunks stay raw and are retried after the agent's
       // first turn (see the defer guard in compressChunkHierarchical).
-      tools: ctx.tools,
+      tools: this.compressionTools(ctx),
     };
 
     let sourceOnlyFallbackRequest: NormalizedRequest | undefined;
@@ -6207,7 +6214,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         shedOversizeImages: true,
         messages: sourceOnlyFallbackWireMessages,
         config: structuredClone(request.config),
-        tools: ctx.tools,
+        tools: this.compressionTools(ctx),
       };
     }
 
@@ -6839,7 +6846,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               shedOversizeImages: true,
               messages: cleaned.map((m) => ({ participant: m.participant, content: stripEmptyTextBlocks(m.content) })).filter((m) => m.content.length > 0),
               config: structuredClone(request.config),
-              tools: ctx.tools,
+              tools: this.compressionTools(ctx),
             } as NormalizedRequest;
           };
           type SplitPart = { range: [number, number]; kind: 'fold' | 'placeholder'; tokens: number; inputTokens?: number; requestHash?: string; responseContentHash?: string; contentHash: string; text: string };
@@ -7991,7 +7998,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // workaround. Undefined before the first activation of a session --
       // acceptable: those chunks stay raw and are retried after the agent's
       // first turn (see the defer guard in compressChunkHierarchical).
-      tools: ctx.tools,
+      tools: this.compressionTools(ctx),
     };
 
     // Escalation past the no-tools sentence: if the line-carrying retry has

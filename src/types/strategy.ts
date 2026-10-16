@@ -695,6 +695,14 @@ export interface AutobiographicalConfig {
    *  while the fuller prompt is applied only on the rare refusal. No retry
    *  if unset. */
   compressionRefusalSystemPrompt?: string;
+  /** Declare the agent's live tools on memory-write (L1 / merge) requests.
+   *  Default true: Anthropic's classifier refuses tools-less requests that
+   *  replay tool history (labclaude 2026-07-09), and Fable/Mythos-family
+   *  summarizers refuse tools-less requests outright. Set false for
+   *  summarizers without that requirement (OpenAI-family: tool_calls history
+   *  is accepted with no `tools` param, probed 2026-10-16) to stop sending
+   *  the full tool surface on every compression call. */
+  compressionDeclareTools?: boolean;
   /** User prompt template for summarization. Use {content} for the transcript. */
   summaryUserPrompt?: string;
   /**

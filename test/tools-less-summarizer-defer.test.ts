@@ -41,16 +41,21 @@ async function drain(manager: ContextManager): Promise<void> {
   throw new Error('drain: queue did not converge within 500 ticks');
 }
 
-async function openChatty(model: string) {
+async function openChatty(model: string, extra: { compressionDeclareTools?: boolean; toolHistory?: boolean } = {}) {
   cleanup();
   const { membrane, calls } = mockMembrane();
   const strategy = new AutobiographicalStrategy({
     compressionModel: model, targetChunkTokens: 80, headWindowTokens: 0, recentWindowTokens: 0, hierarchical: true,
+    ...(extra.compressionDeclareTools !== undefined ? { compressionDeclareTools: extra.compressionDeclareTools } : {}),
   });
   const manager = await ContextManager.open({ path: STORE, strategy, membrane: membrane as any });
   // Pure chat, no tool blocks anywhere — the shape of a seeded transcript.
   for (let i = 0; i < 30; i++) {
     manager.addMessage('user', [t('word '.repeat(12))]);
+    if (extra.toolHistory) {
+      manager.addMessage('agent', [{ type: 'tool_use', id: `tu${i}`, name: 'fn', input: {} } as ContentBlock]);
+      manager.addMessage('user', [{ type: 'tool_result', toolUseId: `tu${i}`, content: 'ok' } as ContentBlock]);
+    }
     manager.addMessage('agent', [t('reply '.repeat(20))]);
   }
   return { manager, calls };
@@ -96,6 +101,25 @@ describe('tools-less summarizer deferral', () => {
     const { manager, calls } = await openChatty('test-compression-model');
     await drain(manager);
     assert.ok(calls.length > 0, 'tools-less compression proceeds on non-Fable summarizers');
+    await manager.close();
+  });
+
+  it('compressionDeclareTools:false never declares tools, even after the host pushes them', async () => {
+    const { manager, calls } = await openChatty('gpt-5.1', { compressionDeclareTools: false });
+    manager.setToolDefinitions(TOOLS);
+    await drain(manager);
+    manager.addMessage('user', [t('one more line')]);
+    await drain(manager);
+    assert.ok(calls.length > 0, 'compression ran');
+    assert.ok(calls.every((c) => c.tools === undefined), 'no summarizer request carries tools');
+    await manager.close();
+  });
+
+  it('compressionDeclareTools:false does not defer tool-bearing chunks while tools are unpushed', async () => {
+    const { manager, calls } = await openChatty('gpt-5.1', { compressionDeclareTools: false, toolHistory: true });
+    await drain(manager);
+    assert.ok(calls.length > 0, 'tool-history chunks mint without waiting for a tool push');
+    assert.ok(calls.every((c) => c.tools === undefined));
     await manager.close();
   });
 });
