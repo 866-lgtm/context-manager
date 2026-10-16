@@ -458,6 +458,29 @@ test('[kv-overlap] warns when a rendered summary doesn\'t list a leaf whose own 
   assert.equal(overlapWarnings, 1);
 });
 
+// m0 is held at L1, where its own A renders it, and the plan folds m1 and m2
+// to their L2 P, which lists m0 too and is m0's own lineage there. So m0 is
+// in A's recall and P's. Every summary the plan renders lists exactly the
+// leaves whose own lineage runs through it, so [kv-overlap] stays quiet: a
+// hold put m0 beside P, not the tree.
+for (const [hold, holds] of [
+  ['a locked leaf', { frozen: new Set<ChunkId>(['m0']) }],
+  ['a pinned leaf', { fixedLevels: new Map<ChunkId, number>([['m0', 1]]) }],
+] as const) {
+  test(`[kv-overlap] stays quiet about ${hold} beside a summary of its own lineage that lists it`, () => {
+    const { inputs, tree } = store(
+      [message('m0', 0, 100, 'A'), message('m1', 1, 100, 'B'), message('m2', 2, 100, 'B')],
+      [summary('A', 1, ['m0'], 30, 'P'), summary('B', 1, ['m1', 'm2'], 30, 'P'), summary('P', 2, ['A', 'B'], 20)],
+    );
+    const { result: plan, overlapWarnings } = quietOverlap(() => planControlledFrontier(inputs, tree, {
+      ...trio, targetTokens: 50, foldAtTokens: 200, previous: new Map<ChunkId, number>([['m0', 1]]), ...holds,
+    }));
+    assert.deepEqual([...plan.resolutions.entries()].sort(), [['m0', 1], ['m1', 2], ['m2', 2]]);
+    assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['recall:A', 'recall:P']);
+    assert.equal(overlapWarnings, 0);
+  });
+}
+
 // N lists m1, m2 and z, but z's own L1 is Z: N's fold doesn't move z, which
 // renders raw beside N's recall, so z's pin cap of 0 isn't N's to keep. A
 // fold judges the leaves it moves, by their own lineage, as phase C and the
