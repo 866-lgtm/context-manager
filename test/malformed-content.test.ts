@@ -623,7 +623,7 @@ describe("content that doesn't match ContentBlock", () => {
     });
   });
 
-  it('a write mends a tool_use whose input isn\'t an object, as membrane does, and stores what a read of it gives', async () => {
+  it('a write mends a tool_use whose input isn\'t an object, and stores what a read of it gives', async () => {
     await withStore(async (store) => {
       const sharedXml = '<function_calls><invoke name="probe">null</invoke><invoke name="probe"></invoke></function_calls>';
       const ownXml = '<function_calls><invoke name="probe"></invoke></function_calls>';
