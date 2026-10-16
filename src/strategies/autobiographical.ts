@@ -2766,7 +2766,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Accounting of the most recent split-stitch attempt (receipts/tests). */
   /** Aggregate details of the most recent stitched response (receipts/tests). */
   protected lastSplitDetails: NormalizedResponse['details'] | undefined;
-  protected lastSplitAttempted: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; complete: boolean } | undefined;
+  protected lastSplitAttempted: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; cacheCreationTokens?: number; cacheReadTokens?: number; complete: boolean } | undefined;
 
   protected pushSummary(entry: SummaryEntry): void {
     this.requireBranchMutation('pushSummary');
@@ -7467,8 +7467,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           let lastGood: NormalizedResponse | undefined;
           let calls = 0;
           let inputTokens = 0;
-          const attempted = { calls: 0, refused: 0, errors: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
-          let attemptedCacheSeen = false;
+          // Logged and persisted whole, so its cache sums appear only once some call has reported them.
+          const attempted: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; cacheCreationTokens?: number; cacheReadTokens?: number } = { calls: 0, refused: 0, errors: 0, inputTokens: 0, outputTokens: 0 };
+          // What the discarded calls (refused, incomplete or empty) reported of the cache.
+          const discardedCache = { cacheCreationTokens: 0, cacheReadTokens: 0, seen: false };
           const succ = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, cacheSeen: false };
           const leafModels = new Set<string>();
           let successfulLeaves = 0;
@@ -7513,8 +7515,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               attempted.outputTokens += u?.outputTokens ?? 0;
               // Cache counts are in the response's details, as succ reads them.
               const du = r?.details?.usage;
-              if (du?.cacheCreationTokens !== undefined || du?.cacheReadTokens !== undefined) { attemptedCacheSeen = true; attempted.cacheCreationTokens += du?.cacheCreationTokens ?? 0; attempted.cacheReadTokens += du?.cacheReadTokens ?? 0; }
-              if (assessment.outcome !== 'valid') attempted.refused++;
+              const cacheReported = du?.cacheCreationTokens !== undefined || du?.cacheReadTokens !== undefined;
+              if (cacheReported) {
+                attempted.cacheCreationTokens = (attempted.cacheCreationTokens ?? 0) + (du?.cacheCreationTokens ?? 0);
+                attempted.cacheReadTokens = (attempted.cacheReadTokens ?? 0) + (du?.cacheReadTokens ?? 0);
+              }
+              if (assessment.outcome !== 'valid') {
+                attempted.refused++;
+                if (cacheReported) {
+                  discardedCache.seen = true;
+                  discardedCache.cacheCreationTokens += du?.cacheCreationTokens ?? 0;
+                  discardedCache.cacheReadTokens += du?.cacheReadTokens ?? 0;
+                }
+              }
             }
             if (assessment.outcome === 'valid') {
               trace.outcome = 'success';
@@ -7587,10 +7600,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                     attempts: attempted.refused + attempted.errors,
                     inputTokens: Math.max(0, attempted.inputTokens - succ.inputTokens),
                     outputTokens: Math.max(0, attempted.outputTokens - succ.outputTokens),
-                    ...(attemptedCacheSeen ? {
-                      cacheCreationTokens: Math.max(0, attempted.cacheCreationTokens - succ.cacheCreationTokens),
-                      cacheReadTokens: Math.max(0, attempted.cacheReadTokens - succ.cacheReadTokens),
-                    } : {}),
+                    // Present once some discarded call reported cache counts, as the stitched
+                    // usage's are once some successful leaf did.
+                    ...(discardedCache.seen ? { cacheCreationTokens: discardedCache.cacheCreationTokens, cacheReadTokens: discardedCache.cacheReadTokens } : {}),
                   },
                 } as NormalizedResponse['details']['usage'],
                 timing: { totalDurationMs: Date.now() - splitStart, attempts: attempted.calls },
