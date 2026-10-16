@@ -57,7 +57,9 @@ export interface OverBudgetDiagnostics {
  * which clears any of them: waiting, or a hot setting. Cold configuration,
  * such as the head window's size, isn't named, and neither is a head-window
  * reset (`resetHeadWindow`), which clears a head that's over but starts a new
- * topic. The strategy that refuses sets it, since it knows which part of the
+ * topic, nor newer messages that would shrink a head holding images, since
+ * the image strip takes the oldest images first but may not take enough.
+ * The strategy that refuses sets it, since it knows which part of the
  * context is over and what can shrink that part:
  * - `'compression'`: compression work that would shrink this context is
  *   running or queued for the drain to take: a compression in flight, the
@@ -76,10 +78,12 @@ export interface OverBudgetDiagnostics {
  *   newer message that fits moves the window past it.
  * - `'smaller-recent-window'`: the raw recent window, which compression never
  *   touches, is what's over the budget, and the head fits beside the least
- *   raw tail any window leaves: from the newest message, with the tool_use
- *   before it when it holds a tool_result (for a message split into shards,
- *   its newest shard, since the earlier shards can fold), or from a
- *   compression hold if one starts earlier. A smaller `recentWindowTokens`
+ *   raw tail any window leaves: from the newest message, and when it holds a
+ *   tool_result, from the call before it, whose result must follow it raw
+ *   (for a call split into shards, from its first shard, which holds the
+ *   tool_use; for any other message split into shards, its newest shard,
+ *   since the earlier shards can fold), or from a compression hold if one
+ *   starts earlier. A smaller `recentWindowTokens`
  *   (the hot `tailTokens`) moves the rest out of the raw window into the
  *   middle, which folds once compression has closed and summarized it.
  *

@@ -8345,8 +8345,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the speculative cap). A chunk counts when it's still uncompressed, holds
    * no held message, and has no message an L1 in memory already covers: its
    * L1 shrinks the context on either path. An L1 only the store holds isn't
-   * in memory, so its chunk counts too, and adopting it gives the selector an
-   * L1 to fold through. A chunk with a covered message counts only on the
+   * in memory, so its chunk counts too: when tick starts on the chunk it
+   * adopts such an L1 that matches the chunk exactly (findExactL1 reads the
+   * store), and compresses the chunk otherwise, and either way the selector
+   * gets an L1 to fold through. A chunk with a covered message counts only on the
    * hierarchical path, when an L1 matches it exactly and chunk persistence is
    * on: selectHierarchical renders an uncompressed chunk's messages raw beside
    * the L1s, and tick's adoption marks the chunk's record compressed, so the
@@ -8359,8 +8361,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * recovery runs it) takes a queued chunk whatever it says. At the cap, tick
    * runs only merges, and a merge is what relieves the cap. A held chunk
    * can be queued: select's rebuild leaves one out, but a produce op queues
-   * the chunks it demands, held or not, and tick skips a held one and moves
-   * on. Like tick, this assumes the manager has a membrane to run it.
+   * the chunks it demands, held or not. Tick drops a held one from the queue
+   * without compressing it, and its next call takes the next chunk, so a
+   * chunk queued behind a held one still counts. Like tick, this assumes the
+   * manager has a membrane to run it.
    * checkReadiness waits on more: chunks the cap or a hold keeps, and a merge
    * a hold blocks. Compressing a chunk replaces its raw messages with a
    * summary, and a merge folds summaries into one.
@@ -8481,17 +8485,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // summarized it, so the next refusal can be the picker's. No window
       // starts after a compression hold (getRecentWindowStart). The newest
       // turn is rendered whatever the window, since the structural repair
-      // refuses a compile that leaves it out: the newest message, with the
-      // tool_use before it when it holds a tool_result, the pair
-      // getUnheldRecentWindowStart keeps together. For a message split into
-      // shards at ingress, that's its newest shard, since the earlier shards
-      // can close into chunks and fold. A hold inside the head leaves every
-      // window's tail starting at the head's end, so a floor counted from the
-      // hold covers at least the tail, and nothing is named, as it should be.
+      // refuses a compile that leaves it out: the newest message, and when
+      // it holds a tool_result, the call before it, which the result must
+      // follow raw or be dropped as an orphan (enforceToolPairing). Ingress
+      // puts a sharded message's tool_use on its first shard
+      // (chunkIngressMessage), so for a call split into shards that's its
+      // whole body, from the first shard, as holdBoundary counts it. For any
+      // other message split into shards, it's the newest shard, since the
+      // earlier shards can close into chunks and fold. A hold inside the
+      // head leaves every window's tail starting at the head's end, so a
+      // floor counted from the hold covers at least the tail, and nothing is
+      // named, as it should be.
       let floorTokens = 0;
       if (messages.length > 0) {
         let newestTurn = messages.length - 1;
-        if (newestTurn > 0 && this.hasToolResult(messages[newestTurn])) newestTurn--;
+        if (newestTurn > 0 && this.hasToolResult(messages[newestTurn])) {
+          newestTurn = bodyStart((k) => messages[k], newestTurn - 1);
+        }
         const floorStart = Math.min(newestTurn, this.holdBoundary(store));
         for (let i = floorStart; i < messages.length; i++) {
           floorTokens += msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
@@ -8895,14 +8905,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
+    // The plan's produce ops name summaries it still wants, and producing them
+    // is how compression makes room for a deeper fold, but only once there is
+    // work to make them: an op over the unclosed trailing span enqueues
+    // nothing (enqueueL1ForRange). A dry run doesn't enqueue the ops at all.
+    // It still sees what's queued, the chunks its own rebuildChunks closed
+    // included, so it names compression as the live compile does, unless the
+    // work is only what the ops would add: the newest closed chunks, which the
+    // holdback (l1HoldbackChunks) keeps out of the queue until they're
+    // demanded, or a merge. There a dry run names nothing.
+    // Taken only at a refusal, since a compile that fits needs no list.
+    const planClearedBy = (): OverBudgetClearedBy[] =>
+      result.produced.length > 0 && this.compressionWorkQueued(store, 'adaptive') ? ['compression'] : [];
+    const planFits = result.finalTokens <= rejectionBudget;
+
     // Record what a dry run needs (select() puts back the transition
     // bookkeeping the pick just wrote). Done before the over-budget check so
-    // an infeasible preview still reports.
+    // an infeasible preview still reports, with the list the live compile's
+    // refusal of this plan would carry.
     if (dryRun) {
       this._lastPreview = {
         finalTokens: result.finalTokens,
         budgetTokens: rejectionBudget,
-        fits: result.finalTokens <= rejectionBudget,
+        fits: planFits,
+        ...(planFits ? {} : { clearedBy: planClearedBy() }),
         exhausted: result.exhausted,
         headTokens,
         tailTokens,
@@ -8926,19 +8952,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // refusal so it takes the same fallback, and its preview says what the
     // real compile will do. If the retry at 1 is still over, it reports.
     const dryFallback = dryRun && this._calibrationProvisional !== null && this._calibration > 1;
-    // The plan's produce ops name summaries it still wants, and producing them
-    // is how compression makes room for a deeper fold, but only once there is
-    // work to make them: an op over the unclosed trailing span enqueues
-    // nothing (enqueueL1ForRange). A dry run doesn't enqueue the ops at all.
-    // It still sees what's queued, the chunks its own rebuildChunks closed
-    // included, so it names compression as the live compile does, unless the
-    // work is only what the ops would add: the newest closed chunks, which the
-    // holdback (l1HoldbackChunks) keeps out of the queue until they're
-    // demanded, or a merge. There a dry run names nothing.
-    // Taken only at a refusal, since a compile that fits needs no list.
-    const planClearedBy = (): OverBudgetClearedBy[] =>
-      result.produced.length > 0 && this.compressionWorkQueued(store, 'adaptive') ? ['compression'] : [];
-    if (result.finalTokens > rejectionBudget && (!dryRun || dryFallback)) {
+    if (!planFits && (!dryRun || dryFallback)) {
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: result.finalTokens,
@@ -9261,7 +9275,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           actual: totalTokens + tailTokens,
           // The newest turn is what's missing, and only room for it brings it
           // back. A newer message makes a different turn the newest, and this
-          // one then stays raw in the middle, so the context is no smaller.
+          // one then sits in the middle raw until compression closes and
+          // summarizes its chunk, so the next compile is no smaller.
           clearedBy: [],
           diagnostics: {
             middleCountUnit: 'picker-chunks',
@@ -10473,8 +10488,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           actual: totalTokens + tokens,
           // The head is verbatim by definition, and its size is cold
           // configuration (headWindowTokens isn't a hot setting). Besides a
-          // larger budget, only a head-window reset clears it, which starts a
-          // new topic and isn't a lever the list names (OverBudgetClearedBy).
+          // larger budget, a head-window reset clears it, which starts a new
+          // topic and isn't a lever the list names (OverBudgetClearedBy).
+          // Newer messages can shrink a head that holds images, since the
+          // image strip takes the oldest images first (maxLiveImages,
+          // maxLiveImageBytes, imageStripDepthTokens), but whether they'd
+          // strip enough isn't known, so nothing is named for that either.
           clearedBy: [],
           diagnostics: {
             middleCountUnit: 'selection-items',
