@@ -5,12 +5,14 @@
  * block whose text, or a thinking block whose thinking, isn't a string; a
  * tool_use whose input isn't an object; a tool_result whose content is
  * neither a string nor an array of such blocks, at any depth; media without
- * an object source, a generated image without string data and media type,
- * and a blob_ref, which only the store writes, whose ref has no string hash.
- * A store written before writes refused it can hold it. Reads leave it out
- * or make it match, so every compile, compression pass and reopen works,
- * and the store keeps it as written. A write mends a tool_use's input, as a
- * read does, and refuses the rest, naming where it is.
+ * an object source, such as MCP's form, which carries its data and mimeType
+ * on the block; a generated image without string data and media type; and a
+ * blob_ref, which only the store writes, whose ref has no string hash or an
+ * originalType other than image, document, audio or video. A store written
+ * before writes refused it can hold it. Reads leave it out or make it match,
+ * so every compile, compression pass and reopen works, and the store keeps
+ * it as written. A write mends a tool_use's input, as a read does, and
+ * refuses the rest, naming where it is.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -32,6 +34,13 @@ import {
 } from '../src/index.js';
 
 const t = (text: string) => ({ type: 'text', text }) as ContentBlock;
+/** A 1x1 PNG, and a WAV header with no samples, as base64. */
+const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+const WAV = 'UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+/** Media in MCP's form: its data and media type on the block, with no source. */
+const mcpMedia = (type: string, data: string, mimeType: string) => ({ type, data, mimeType });
+/** The same media as a read mends it, and as agent-framework converts MCP's media. */
+const asSource = (type: string, data: string, mediaType: string) => ({ type, source: { type: 'base64', data, mediaType } });
 const toolResult = (toolUseId: string, content: unknown) => ({ type: 'tool_result', toolUseId, content });
 const toolUse = (id: string, input?: unknown) => ({ type: 'tool_use', id, name: 'probe', ...(input === undefined ? {} : { input }) });
 /** An array that holds itself: a value with no JSON form. */
@@ -172,6 +181,9 @@ describe("content that doesn't match ContentBlock", () => {
         MessageStore.register(store);
         writeRaw(store, 'User', [t('hi')]);
         for (const content of MALFORMED_BLOCKS) writeRaw(store, 'User', content);
+        // A reference to a blob the store holds, of an original type no release writes.
+        const hash = store.storeBlob(Buffer.from(PNG, 'base64'), 'image/png');
+        writeRaw(store, 'User', [t('kept'), { type: 'blob_ref', ref: { hash, mediaType: 'image/png', originalType: 'hologram' } }]);
         // Content that isn't an array at all.
         writeRaw(store, 'User', null as unknown as unknown[]);
         writeRaw(store, 'User', 'not blocks' as unknown as unknown[]);
@@ -219,7 +231,9 @@ describe("content that doesn't match ContentBlock", () => {
       MessageStore.register(store);
       writeRaw(store, 'User', [
         t('a'), null, { type: 'text' }, [t('in an array')], { text: 'without a type' },
-        { type: 'image' }, { type: 'audio', source: [] }, { type: 'generated_image', data: 'x' }, { type: 'blob_ref', ref: { mediaType: 'image/png' } },
+        { type: 'image' }, { type: 'audio', source: [] }, { type: 'generated_image', data: 'x' },
+        // A reference whose only fault is its missing hash.
+        { type: 'blob_ref', ref: { mediaType: 'image/png', originalType: 'image' } },
       ]);
       writeRaw(store, 'Claude', [
         { type: 'thinking', thinking: 7 }, { type: 'thinking', signature: 'sig' },
@@ -268,6 +282,95 @@ describe("content that doesn't match ContentBlock", () => {
       assert.equal((stored[2]!.content[4] as { content: unknown }).content, null);
       assert.equal((stored[2]!.content[6] as { content: unknown }).content, 42);
       assert.ok(lines.some((line) => line.includes('content[8].ref is an object without a string hash, not a blob reference')), lines.join('\n'));
+    });
+  });
+
+  /** Media in MCP's form at the top and inside a tool_result, as a store can hold it, and the same messages as a read mends them. */
+  const MCP_IMAGE = mcpMedia('image', PNG, 'image/png');
+  function writeMcpMedia(store: JsStore): void {
+    writeRaw(store, 'User', [t('look'), MCP_IMAGE]);
+    writeRaw(store, 'Claude', [toolUse('s1', {})]);
+    writeRaw(store, 'User', [toolResult('s1', [
+      // MCP's annotations ride along: a mend changes only what doesn't match.
+      t('shot'), MCP_IMAGE, { ...mcpMedia('audio', WAV, 'audio/wav'), annotations: { audience: ['user'] } },
+      // Without its media type, or its data, there's no source to make, so a read leaves it out.
+      { type: 'image', data: PNG }, { type: 'video', mimeType: 'video/mp4' },
+    ])]);
+  }
+  const MCP_MENDED = [
+    [t('look'), asSource('image', PNG, 'image/png')],
+    [toolUse('s1', {})],
+    [toolResult('s1', [
+      t('shot'), asSource('image', PNG, 'image/png'), { ...asSource('audio', WAV, 'audio/wav'), annotations: { audience: ['user'] } },
+    ])],
+  ];
+
+  it("a read mends media in MCP's form, at the top and inside a tool_result, and every strategy compiles it, compresses it and reopens", async () => {
+    for (const [name, strategy] of Object.entries(STRATEGIES)) {
+      await withStore(async (store) => {
+        const asked: string[] = [];
+        const membrane = {
+          complete: async (request: unknown) => {
+            asked.push(JSON.stringify(request));
+            return { stopReason: 'end_turn', content: [t('Summary of the chunk')] };
+          },
+        };
+        const open = async () => {
+          const manager = await ContextManager.open({ store, strategy: strategy(), membrane: membrane as never });
+          manager.setToolDefinitions([{ name: 'probe', description: 'A probe tool', inputSchema: { type: 'object', properties: {} } }]);
+          return manager;
+        };
+        MessageStore.register(store);
+        writeMcpMedia(store);
+        const compiled: Array<{ messages: ReadonlyArray<{ content: readonly unknown[] }> }> = [];
+        await errorLines(async () => {
+          let manager = await open();
+          try {
+            assert.deepEqual(manager.getAllMessages().map((message) => message.content), MCP_MENDED, name);
+            for (let i = 0; i < 12; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [t(`filler ${i}: ${'x'.repeat(60)}`)]);
+            compiled.push(await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }));
+            for (let k = 0; k < 4; k++) await manager.tick();
+            compiled.push(await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }));
+          } finally {
+            manager.close();
+          }
+          manager = await open();
+          try {
+            compiled.push(await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 }));
+          } finally {
+            manager.close();
+          }
+        });
+        for (const result of compiled) assert.deepEqual(malformedIn(result.messages), [], name);
+        const blocks = compiled[0]!.messages.flatMap((message) => message.content) as Array<{ type: string; content?: unknown }>;
+        const mendedResult = MCP_MENDED[2]![0] as { content: unknown };
+        assert.deepEqual(blocks.find((block) => block.type === 'tool_result')?.content, mendedResult.content, `${name}: the compile carries the mended media`);
+        if (name === 'autobiographical') assert.ok(asked.some((request) => request.includes(WAV)), 'compression read the mended media');
+      });
+    }
+  });
+
+  it("what a read mends a write takes, and a write refuses MCP's form itself, naming where it is", async () => {
+    await withStore(async (store) => {
+      MessageStore.register(store);
+      writeMcpMedia(store);
+      const lines = await errorLines(async () => {
+        const manager = await ContextManager.open({ store });
+        try {
+          manager.addMessage('User', MCP_MENDED[0] as ContentBlock[]);
+          manager.addMessage('User', MCP_MENDED[2] as ContentBlock[]);
+          assert.deepEqual(manager.getAllMessages().slice(3).map((message) => message.content), [MCP_MENDED[0], MCP_MENDED[2]]);
+          assert.throws(() => manager.addMessage('User', [toolResult('s2', [MCP_IMAGE]) as ContentBlock]), {
+            message: 'Message refused: content[0].content[0].source is undefined, not an object.',
+          });
+        } finally {
+          manager.close();
+        }
+      });
+      assert.ok(lines.some((line) => line.includes('(content[1].source is undefined, not an object)')), lines.join('\n'));
+      assert.ok(lines.some((line) => line.includes('content[0].content[1].source is undefined, not an object; content[0].content[2].source is undefined')), lines.join('\n'));
+      const stored = store.getStateJson('messages') as Array<{ content: unknown[] }>;
+      assert.deepEqual(stored[0]!.content, [t('look'), MCP_IMAGE], 'the store keeps it as written');
     });
   });
 
@@ -449,6 +552,8 @@ describe("content that doesn't match ContentBlock", () => {
           [[{ type: 'thinking', signature: 'sig' }], 'content\\[0\\]\\.thinking is undefined, not a string'],
           [[toolUse('u1', 10n)], 'content\\[0\\]\\.input is a bigint, not an object'],
           [[{ type: 'image' }], 'content\\[0\\]\\.source is undefined, not an object'],
+          [[mcpMedia('image', PNG, 'image/png')], 'content\\[0\\]\\.source is undefined, not an object'],
+          [[toolResult('t1', [mcpMedia('audio', WAV, 'audio/wav')])], 'content\\[0\\]\\.content\\[0\\]\\.source is undefined, not an object'],
           [[{ type: 'video' }], 'content\\[0\\]\\.source is undefined, not an object'],
           [[toolUse('u1', () => 1)], 'content\\[0\\]\\.input is a function, not an object'],
           [[toolUse('u1', cyclic())], 'content\\[0\\]\\.input is an array, not an object'],

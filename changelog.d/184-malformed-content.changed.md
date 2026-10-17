@@ -8,6 +8,9 @@
   such a block was stored as given. Reads mend it the same way in a store
   written before. They also mend a signed thinking block whose `thinking`
   isn't a string, which keeps its signature with `thinking: ''`, as membrane
-  gives a signature-only block, and a `tool_result` whose content is a lone
-  block or a number, which reads as an array of that block, when the read
-  keeps the block, or as the number's text.
+  gives a signature-only block; media in MCP's form, with its `data` and
+  `mimeType` on the block and no `source`, which reads with them as its
+  base64 source, as agent-framework converts MCP's media; and a
+  `tool_result` whose content is a lone block or a number, which reads as an
+  array of that block, when the read keeps the block, or as the number's
+  text.

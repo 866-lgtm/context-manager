@@ -6,14 +6,19 @@
   `tool_result` whose content is neither a string nor an array of such
   blocks, at any depth; an image, document, audio or video block whose
   `source` isn't an object; a generated image whose `data` or `mimeType`
-  isn't a string; or a `blob_ref` whose `ref` has no string `hash`. Readers
-  written against `ContentBlock` throw on it. A store holding a block that
-  isn't an object, or a `blob_ref` without its `ref`, threw on every compile
-  under the passthrough and windowed strategies, after a reopen too. Under
-  the autobiographical strategy, opening such a store threw, and so did
-  opening one holding a text or thinking block without its `text` or
-  `thinking`. Membrane 0.5.87's native formatter throws on an image or audio
-  block without a `source`, so every native request carrying one failed.
+  isn't a string; or a `blob_ref` whose `ref` has no string `hash`, or whose
+  `originalType` isn't image, document, audio or video. Readers written
+  against `ContentBlock` throw on it. A store holding a block that isn't an
+  object, or a `blob_ref` without its `ref` or with any other
+  `originalType`, threw on every compile under the passthrough and windowed
+  strategies, after a reopen too. Under the autobiographical strategy,
+  opening such a store threw, and so did opening one holding a text or
+  thinking block without its `text` or `thinking`. Membrane 0.5.87 throws
+  while building a request that carries an image block without a `source` at
+  the top level, or inside a `tool_result` in xml tool mode. In native tool
+  mode, it replaces such an image inside a `tool_result` with a note that
+  its media type "undefined" isn't accepted, so the model loses it. Its
+  native formatter throws on audio without a `source` at the top level too.
   Reads (`MessageStore`'s messages and `ContextLog`'s entries) now leave
   such content out, or mend it so that it matches, before anything reads it,
   blob resolution included, and log one line per message or context entry

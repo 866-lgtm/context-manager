@@ -21,17 +21,19 @@
  * whether a provider can take one is the provider's to say. One type is the
  * store's own: a `blob_ref`, which the store writes in place of inline media.
  * A write can't give one, and a read takes one whose `ref` is an object with
- * a string `hash`.
+ * a string `hash` and an `originalType` of image, document, audio or video,
+ * which is what a read turns the blob back into.
  *
  * Every reader of stored content, from the token estimators to compression
  * and the formatters, is written against `ContentBlock`, and a reader that
  * meets content that doesn't match it can throw. A stored message holding a
- * block that isn't an object, or a `blob_ref` without a `ref`, made every
- * compile throw under the passthrough and windowed strategies, after a
- * reopen too, and made opening the store throw under the autobiographical
- * one, until someone edited the store by hand. Under the autobiographical
- * strategy, whose token estimate reads the field's length, opening a store
- * holding a text or thinking block missing its text or thinking threw too.
+ * block that isn't an object, or a `blob_ref` without a `ref` or whose
+ * `originalType` isn't image, document, audio or video, made every compile
+ * throw under the passthrough and windowed strategies, after a reopen too,
+ * and made opening the store throw under the autobiographical one, until
+ * someone edited the store by hand. Under the autobiographical strategy,
+ * whose token estimate reads the field's length, opening a store holding a
+ * text or thinking block missing its text or thinking threw too.
  *
  * So a write mends what released providers produce, and refuses the rest
  * ({@link contentForWrite}). A read leaves out or mends what doesn't match
@@ -39,7 +41,11 @@
  * keeps the content as written. The mend both share is a `tool_use` whose
  * `input` isn't an object, as membrane 0.5.87's adapters can give it: `input`
  * becomes `{}`, and `unparseableInput`, where membrane keeps arguments whose
- * JSON didn't parse, keeps the value as JSON (mendedToolUse).
+ * JSON didn't parse, keeps the value as JSON (mendedToolUse). A read also
+ * mends media in MCP's form, which carries its `data` and `mimeType` on the
+ * block and has no `source`: they become its base64 source, as
+ * agent-framework converts it (mendedMedia). A write refuses that form,
+ * naming where it is, since it isn't a `ContentBlock`.
  *
  * Content is walked with index loops throughout: a hole in an array reads as
  * undefined, so it is named and refused like any other. (A stored record has
@@ -95,7 +101,12 @@ function wellFormed(block: unknown, side: Side): boolean {
     case 'generated_image':
       return typeof block.data === 'string' && typeof block.mimeType === 'string';
     case 'blob_ref':
-      return side === 'read' && isRecord(block.ref) && typeof block.ref.hash === 'string';
+      return (
+        side === 'read' &&
+        isRecord(block.ref) &&
+        typeof block.ref.hash === 'string' &&
+        MEDIA_TYPES.has(block.ref.originalType as string)
+      );
     default:
       return MEDIA_TYPES.has(type) ? isRecord(block.source) : true;
   }
@@ -140,6 +151,19 @@ function mendedToolUse(block: Record<string, unknown>): ContentBlock | undefined
   }
   if (kept === undefined) return undefined;
   return { ...block, input: {}, unparseableInput: kept } as unknown as ContentBlock;
+}
+
+/**
+ * Media in MCP's form, an image, document, audio or video block with no
+ * `source` object whose `data` and `mimeType` are strings, mended to
+ * `ContentBlock`'s form: they become its base64 source, as agent-framework
+ * converts MCP's media, and the block keeps its other fields. Undefined for
+ * media without the data or media type to make a source.
+ */
+function mendedMedia(block: Record<string, unknown>): ContentBlock | undefined {
+  const { data, mimeType, ...rest } = block;
+  if (typeof data !== 'string' || typeof mimeType !== 'string') return undefined;
+  return { ...rest, source: { type: 'base64', data, mediaType: mimeType } } as unknown as ContentBlock;
 }
 
 /**
@@ -190,6 +214,12 @@ function placesIn(block: unknown, at: string, places: string[], side: Side): voi
         places.push(`${at} is a blob_ref, which only the store writes (a read with blobs resolved, the default, gives the block to write)`);
       } else if (!isRecord(block.ref) || typeof block.ref.hash !== 'string') {
         places.push(`${at}.ref is ${isRecord(block.ref) ? 'an object without a string hash' : kindOf(block.ref)}, not a blob reference`);
+      } else if (!MEDIA_TYPES.has(block.ref.originalType as string)) {
+        const originalType = block.ref.originalType;
+        places.push(
+          `${at}.ref.originalType is ${typeof originalType === 'string' ? JSON.stringify(originalType) : kindOf(originalType)}, ` +
+            'not image, document, audio or video',
+        );
       }
       return;
     default:
@@ -317,15 +347,17 @@ function writeBlock(block: Record<string, unknown>): ContentBlock {
  * A block as a read gives it: the block itself when it matches. Otherwise a
  * `tool_use` is mended (mendedToolUse, or `{}` alone), a signed thinking
  * block keeps its signature with `thinking: ''`, as membrane gives a
- * signature-only block, and a `tool_result` keeps its content blocks that
- * match, so that the pair they make survives: its content as a read gives an
- * array of them, a lone block as an array of that block when the read keeps
- * it, and a number as its text; anything else is an empty array. Anything
- * else is left out (undefined): a value that isn't an object, an array, a
- * block without a string `type`, a text block without its string, unsigned
- * thinking without its string, media without a source, a generated image
- * without its data or media type, and a `blob_ref` that doesn't reference a
- * blob.
+ * signature-only block, media in MCP's form gets its base64 source
+ * (mendedMedia), and a `tool_result` keeps its content blocks that match, so
+ * that the pair they make survives: its content as a read gives an array of
+ * them, a lone block as an array of that block when the read keeps it, and a
+ * number as its text; anything else is an empty array. Anything else is left
+ * out (undefined): a value that isn't an object, an array, a block without a
+ * string `type`, a text block without its string, unsigned thinking without
+ * its string, media without a source or the data and media type to make
+ * one, a generated image without its data or media type, and a `blob_ref`
+ * that doesn't reference a blob or whose `originalType` isn't image,
+ * document, audio or video.
  */
 function readBlock(block: Record<string, unknown>): ContentBlock | undefined {
   if (wellFormed(block, 'read')) return block as unknown as ContentBlock;
@@ -334,6 +366,11 @@ function readBlock(block: Record<string, unknown>): ContentBlock | undefined {
       return mendedToolUse(block) ?? ({ ...block, input: {} } as unknown as ContentBlock);
     case 'thinking':
       return typeof block.signature === 'string' ? ({ ...block, thinking: '' } as unknown as ContentBlock) : undefined;
+    case 'image':
+    case 'document':
+    case 'audio':
+    case 'video':
+      return mendedMedia(block);
     case 'tool_result': {
       const inner = block.content;
       const content = Array.isArray(inner)

@@ -112,12 +112,12 @@ describe('blockAsStored', () => {
     assert.equal(raw.ref.originalType, 'image');
   });
 
-  /** Store a message holding `ref` as an older release stored one, past the write, which refuses a blob_ref now. */
+  /** Store a message holding `ref`, a block or several, as an older release stored one, past the write, which refuses a blob_ref now. */
   function storeLegacyReference(ref: (hash: string) => unknown, mediaType: string): void {
     const store = JsStore.openOrCreate({ path: STORE });
     const hash = store.storeBlob(Buffer.from(PNG, 'hex'), mediaType);
     MessageStore.register(store);
-    store.appendToStateJsonWithIdentity('messages', { participant: 'user', content: [ref(hash)], timestamp: Date.now() }, 'id', 'sequence');
+    store.appendToStateJsonWithIdentity('messages', { participant: 'user', content: [ref(hash)].flat(), timestamp: Date.now() }, 'id', 'sequence');
     store.close();
   }
 
@@ -130,14 +130,26 @@ describe('blockAsStored', () => {
     assert.deepStrictEqual(back, { type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' } });
   });
 
-  it('a reference of an unknown original type fails its read, naming the type', async () => {
-    storeLegacyReference((hash) => ({ type: 'blob_ref', ref: { hash, mediaType: 'image/png', originalType: 'hologram' } }), 'image/png');
-    const manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+  it('leaves out of its read a reference of an unknown original type, naming the type, and reads one with no media type as before', async () => {
+    storeLegacyReference((hash) => [
+      { type: 'blob_ref', ref: { hash, mediaType: 'image/png', originalType: 'hologram' } },
+      { type: 'blob_ref', ref: { hash, originalType: 'image' } },
+    ], 'image/png');
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    let manager: ContextManager | undefined;
     try {
-      assert.throws(() => manager.getAllMessages(), /Blob reference of unknown original type: "hologram"/);
+      manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+      // The first reference is left out, where every read of it threw, and the second, of an image
+      // whose reference has no media type, reads relabelled from its bytes, as before.
+      assert.deepEqual(manager.getAllMessages()[0]!.content, [{ type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' } }]);
+      await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
     } finally {
-      manager.close();
+      console.error = original;
+      manager?.close();
     }
+    assert.ok(lines.some((line) => line.includes('(content[0].ref.originalType is "hologram", not image, document, audio or video)')), lines.join('\n'));
   });
 
   it('throws for a block the store refuses, and for a blob_ref, rather than return a form the store would not give back', async () => {
