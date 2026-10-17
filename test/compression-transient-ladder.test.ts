@@ -1337,7 +1337,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
-  it('a hole that a pending retry will fill keeps the run before it waiting; an entry that names no live chunk holds nothing (sheet I18, I44)', async () => {
+  it('a hole that a pending retry will fill keeps the run before it waiting, among summaries of the level its answer makes or above; an entry that names no live chunk holds nothing (sheet I18, I44; cm138-r15 I7)', async () => {
     const fx = await queued(scripted([OK('unused')]).membrane);
     for (let i = 8; i < 10; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
     const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
@@ -1370,6 +1370,9 @@ describe('compression lane: failures are evidence only by the company they keep'
     (fx.strategy as unknown as { mergeQueue: unknown[] }).mergeQueue.push({ level: 2, sourceIds: ['L1-x', 'L1-y'] });
     (fx.strategy as unknown as { mergeFailureRuns: Map<string, typeof run> }).mergeFailureRuns.set(`2\u0000L1-x\u0000L1-y`, run);
     assert.equal(fx.strategy.mergeCandidates(level2, 4), null, 'a failing merge holds the hole its parent will fill');
+    // Among the L1s, its span is its own sources, which its parent leaves in place: the interior run is stranded there.
+    assert.deepEqual(fx.strategy.mergeCandidates(unmerged, 4)?.map((s) => s.id), ['L1-a', 'L1-b'],
+      'a failing merge holds no hole among the summaries it merges');
     fx.manager.close();
   });
 

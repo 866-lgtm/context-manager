@@ -5811,7 +5811,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // no queue item consumed until the pause ends (see pauseCompressionLane).
     if (this.activeCompressionPause(ctx)) return;
 
-    // Priority 1: Compress raw chunks → L1. Skipped while at the speculative
+    // Priority 1: Compress raw chunks → L1. Skipped while past the speculative
     // cap (maxSpeculativeL1s) so we don't pile up more unmerged L1s; the merge
     // priority below still runs to consolidate existing L1s and relieve the cap.
     // No cap configured → isAtSpeculativeCap() is always false → unchanged.
@@ -7999,10 +7999,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // ladder first sees its family's progress isn't seen: a mint of the
       // span by another family drops progress by span and finds none of this
       // one's, and this ladder can then write progress, or an exhausted
-      // record and its one-shot alert, for a span that's covered. That takes
-      // sibling strategies with different families over one store, and the
-      // paid-off sweeps clear both before the klaxon reads. Across processes
-      // nothing coordinates.
+      // record, for a span that's covered, and the record's one-shot alert
+      // goes out with it. That takes sibling strategies with different
+      // families over one store. The record stands until the klaxon's
+      // paid-off sweep, which runs before it reads, finds the span's chunk
+      // compressed or gone, or an operator clears it; the progress sweep
+      // drops the progress by its own rule. Across processes nothing
+      // coordinates.
       const familyOpen = (): boolean => !progressSeen || this.readCompressionFamilyProgress().has(quarantineRecord.familyKey);
       /** The opt-in compression log's line for an exhaustion, at either exit: the record the ladder wrote. */
       const logExhausted = (): void => logCompressionCall({
@@ -9185,9 +9188,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * The message spans of work the lane put back after a failure and will try
-   * again: a pending chunk with a run of failures in progress, and a queued
-   * merge with one (see nextFailureStreak). A hole they cover in a run of
-   * summaries is not stranded, since a summary will fill it.
+   * again, each with the level of the summary its answer makes: a pending
+   * chunk with a run of failures in progress (an L1), and a queued merge with
+   * one (see nextFailureStreak; a summary of the merge's level). A hole such
+   * a span covers in a run of summaries of that level or above is not
+   * stranded, since a summary will fill it. Below that level a merge's span
+   * is its own sources, which its summary leaves in place, so it fills no
+   * hole there.
    *
    * Runs live in the process, so after a restart a hole over a chunk that
    * failed before it holds nothing until the chunk's next attempt (a failure
@@ -9199,9 +9206,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * it waits, the stranding the newest-run rule in contiguousMergeCandidates
    * exists to prevent.
    */
-  private pendingRetrySpans(messageOrder: Map<MessageId, number>): Array<[number, number]> {
-    const spans: Array<[number, number]> = [];
-    const addSpan = (ids: readonly string[]): void => {
+  private pendingRetrySpans(messageOrder: Map<MessageId, number>): Array<[number, number, number]> {
+    const spans: Array<[number, number, number]> = [];
+    const addSpan = (ids: readonly string[], level: number): void => {
       let first = Infinity;
       let last = -Infinity;
       for (const id of ids) {
@@ -9210,7 +9217,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         first = Math.min(first, position);
         last = Math.max(last, position);
       }
-      if (first <= last) spans.push([first, last]);
+      if (first <= last) spans.push([first, last, level]);
     };
     // A run holds a span only while its chunk is still pending: a chunk that
     // a rebuild re-cut is no live chunk, and no retry will fill its span.
@@ -9218,14 +9225,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const { chunkKey } of this.compressionFailureRuns.values()) {
       pendingByKey ??= new Map(this.chunks.filter((chunk) => !chunk.compressed).map((chunk) => [this.chunkKey(chunk), chunk]));
       const chunk = pendingByKey.get(chunkKey);
-      if (chunk) addSpan(chunk.messages.map((message) => message.id));
+      if (chunk) addSpan(chunk.messages.map((message) => message.id), 1);
     }
     for (const merge of this.mergeQueue) {
       if (!this.mergeFailureRuns.has(mergeFailureKey(merge))) continue;
       addSpan(merge.sourceIds.flatMap((id) => {
         const source = this.summaryById(id);
         return source ? [source.sourceRange.first, source.sourceRange.last] : [];
-      }));
+      }), merge.level);
     }
     return spans;
   }
@@ -9279,12 +9286,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Split into strictly contiguous live runs. Deleted messages do not occupy
     // positions in `messageOrder`, so this still bridges true tombstones; it
     // refuses only holes containing another live representation. A hole that
-    // work put back after a failure covers (pendingRetrySpans) will be filled:
-    // the run before it waits, as the newest run does.
-    let retrySpans: Array<[number, number]> | undefined;
-    const retryPendingIn = (from: number, to: number): boolean => {
+    // work put back after a failure will fill at this level (pendingRetrySpans)
+    // isn't stranded: the run before it waits, as the newest run does.
+    let retrySpans: Array<[number, number, number]> | undefined;
+    const retryPendingIn = (from: number, to: number, level: number): boolean => {
       retrySpans ??= this.pendingRetrySpans(messageOrder);
-      return retrySpans.some(([first, last]) => first <= to && last >= from);
+      return retrySpans.some(([first, last, filled]) => filled <= level && first <= to && last >= from);
     };
     const runs: Array<typeof withPos> = [];
     const waiting: boolean[] = [];
@@ -9293,7 +9300,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const x of withPos) {
       if (run.length > 0 && x.first !== runEnd + 1) {
         runs.push(run);
-        waiting.push(retryPendingIn(runEnd + 1, x.first - 1));
+        waiting.push(retryPendingIn(runEnd + 1, x.first - 1, x.s.level ?? 1));
         run = [];
         runEnd = -Infinity;
       }
@@ -9325,8 +9332,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // merges at two as a last resort, when no run is eligible without that,
     // so a run at the threshold after it still merges first. The cap counts
     // L1s alone, so a waiting run of a higher level keeps waiting. Past the
-    // cap no merge forms where fewer unmerged summaries than the threshold
-    // remain, or where no run before the newest holds two and the newest
+    // cap no L1 merge forms where fewer unmerged L1s than the threshold
+    // remain, or where no L1 run before the newest holds two and the newest
     // holds fewer than the threshold: compression then stops for good,
     // unless something outside tick changes the count or the cap.
     const pick = (lastResort: boolean): SummaryEntry[] | null => {
