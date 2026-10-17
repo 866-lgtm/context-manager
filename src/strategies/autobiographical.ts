@@ -975,6 +975,18 @@ interface CompressionRefusalOutcomeRecord {
   budgetTokens?: number;
 }
 
+/** The canonical stage's rungs: the canonical request and its tool_use retries. */
+const CANONICAL_STAGE_LABELS = new Set(['canonical', 'canonical-no-tools', 'canonical-toolless']);
+
+/**
+ * A rung decided by its failures (COMPRESSION_PERSISTENT_FAILURES transient
+ * failures, each after a landing): the policy's outcome, `persistent-<class>`,
+ * not an answer any provider gave.
+ */
+function isFailureDecision(entry: { outcome: string; errorType?: string }): boolean {
+  return entry.outcome === 'provider_error' && typeof entry.errorType === 'string' && entry.errorType.startsWith('persistent-');
+}
+
 interface CompressionRefusalPlanRecord extends CompressionRefusalVariantRecord {
   curveLabel: string;
   accountingSource:
@@ -3907,9 +3919,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           spans.set(hash, span);
         }
         span.records += 1;
-        // A recall variant planned over the compression's context budget is
-        // recorded as admission_rejected and never sent: count what a provider answered.
-        span.answeredAttempts += active.outcomes.filter((entry) => entry.outcome !== 'admission_rejected').length;
+        // Count what a provider answered: not a recall variant planned over
+        // the compression's context budget, recorded as admission_rejected and
+        // never sent, and not a rung its failures decided, which no provider
+        // gave as an answer.
+        span.answeredAttempts += active.outcomes.filter(
+          (entry) => entry.outcome !== 'admission_rejected' && !isFailureDecision(entry),
+        ).length;
         span.quarantinedAt = Math.min(span.quarantinedAt, active.record.created);
         if (active.record.created >= (newest.get(hash) ?? -Infinity)) {
           newest.set(hash, active.record.created);
@@ -4410,6 +4426,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * plus a structured log event (compression:lane-paused); a hold by the
    * caller's provider admission warns and logs (compression:lane-held-by-
    * admission) once per hold, and again when its deadline changes.
+   *
+   * `madeNoCall`: the failure was another instance's, on a request this one
+   * joined (a coalesced wait). It paces this lane by the provider's stated
+   * wait, so this instance doesn't send the same request inside it, and
+   * keeps the failure count and the backoff as they were: no call of this
+   * instance's failed. With no stated wait it installs nothing.
    */
   private pauseCompressionLane(
     source: CompressionOperationBranch,
@@ -4417,6 +4439,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     error: unknown,
     lane: 'l1' | 'merge',
     subject: string,
+    options: { madeNoCall?: boolean } = {},
   ): void {
     if (!this.isCompressionBranchCurrent(source)) return;
     const now = Date.now();
@@ -4427,7 +4450,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.compressionPause.model === model
       ? this.compressionPause
       : null;
-    const failures = (previous?.failures ?? 0) + 1;
+    const failures = (previous?.failures ?? 0) + (options.madeNoCall ? 0 : 1);
     const backoff = Math.min(
       AutobiographicalStrategy.COMPRESSION_PAUSE_BASE_MS * 2 ** (failures - 1),
       AutobiographicalStrategy.COMPRESSION_PAUSE_MAX_BACKOFF_MS,
@@ -4496,6 +4519,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
       return;
     }
+    // Another instance's failure gives this lane only its stated wait.
+    if (options.madeNoCall && statedUntil === null) return;
     // A stated wait still standing from an earlier failure (or deferral) on
     // this model is not shortened by this one (see the construction below).
     const reason = describeCompressionFailure(error);
@@ -4504,7 +4529,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       statedBy = previous.statedBy;
     }
     const pause: CompressionLanePause = {
-      backoffUntil: now + backoff,
+      backoffUntil: options.madeNoCall ? previous?.backoffUntil ?? 0 : now + backoff,
       statedUntil: previous?.statedUntil != null && (statedUntil === null || previous.statedUntil > statedUntil)
         ? previous.statedUntil
         : statedUntil,
@@ -4518,9 +4543,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.compressionPause = pause;
     const sourceLabel = pauseSource(pause);
     console.warn(
-      `[autobiographical] compression paused ${pauseUntilText(pause)} after a ${lane === 'l1' ? 'chunk' : 'merge'} failure ` +
-        `(${pauseSourceText(pause)}, failure ${failures}, model ${model ?? 'unset'}); ` +
-        `no compression call and no further queue item until then: ${reason}`,
+      options.madeNoCall
+        ? `[autobiographical] compression paused ${pauseUntilText(pause)}: another instance's call for the same ` +
+          `${lane === 'l1' ? 'chunk' : 'merge'} failed (${pauseSourceText(pause)}; none of this instance's calls failed, ` +
+          `so the failure count stays ${failures}, model ${model ?? 'unset'}); ` +
+          `no compression call and no further queue item until then: ${reason}`
+        : `[autobiographical] compression paused ${pauseUntilText(pause)} after a ${lane === 'l1' ? 'chunk' : 'merge'} failure ` +
+          `(${pauseSourceText(pause)}, failure ${failures}, model ${model ?? 'unset'}); ` +
+          `no compression call and no further queue item until then: ${reason}`,
     );
     const until = pauseUntil(pause);
     logCompressionCall({
@@ -4532,6 +4562,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         source: sourceLabel,
         model: model ?? null,
         error_type: compressionErrorType(error) ?? (error instanceof Error ? error.name : typeof error),
+        ...(options.madeNoCall ? { coalesced: true } : {}),
       },
     });
   }
@@ -5816,8 +5847,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (this.pendingCompression === compression) this.pendingCompression = null;
       }
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
-      // Decided (landed, or exhausted, or skipped): no longer failing.
-      this.compressionFailureOrder.delete(key);
+      if (quarantineSkipped) {
+        // Skipped: quarantined, still raw, and pending at every rebuild.
+        // Ordered like a failed chunk, behind the work that hasn't failed, so
+        // a rebuild (every inbound message) doesn't put it, and the request
+        // build that finds its quarantine, ahead of fresh chunks.
+        this.compressionFailureOrder.set(key, ++this.compressionFailureSequence);
+      } else {
+        // Decided (landed, or exhausted): no longer failing.
+        this.compressionFailureOrder.delete(key);
+      }
       // Attempts, including fresh refusals, still consume the tick. Existing
       // overrides that omit the optional notification keep that behavior.
       if (!quarantineSkipped) return;
@@ -7650,7 +7689,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.logCompressionBranchDiscard(sourceBranch, 'coalesced_wait', quarantineRecord);
         return;
       }
-      if (result.error) throw result.error;
+      if (result.error) {
+        // The producer's transient failure was on the very request this
+        // instance would send next: take the provider's stated wait from it,
+        // counting no failure, since none of this instance's calls failed.
+        if (compressionFailureKind(result.error) === 'transient') {
+          this.pauseCompressionLane(
+            sourceBranch, ctx, result.error, 'l1',
+            `the chunk of ${chunk.messages.length} message(s) from ${chunk.messages[0]?.id ?? '?'}`,
+            { madeNoCall: true },
+          );
+        }
+        throw result.error;
+      }
       // The producer may belong to a different strategy instance. Reload the
       // same namespace's durable result so a successful waiter gets its L1 and
       // an exhausted waiter gets the quarantine projection rather than merely
@@ -8120,7 +8171,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           canonicalProviderInputTokens,
           sourceOnlyFallbackRequestHash,
         );
-        const outcomes: CompressionRefusalOutcomeRecord[] = [canonicalRejection ?? {
+        // The ledger keeps what each request of the canonical stage got: the
+        // canonical request's answer, its no-tools and tools-less retries',
+        // and a rejection or a decision by failures, as noteOutcome recorded
+        // them, so the quarantine status counts every answer a provider gave.
+        const canonicalStage = progressOutcomes.filter((outcome) => CANONICAL_STAGE_LABELS.has(outcome.curveLabel));
+        const outcomes: CompressionRefusalOutcomeRecord[] = canonicalStage.length > 0 ? [...canonicalStage] : [canonicalRejection ?? {
           curveLabel: 'canonical',
           requestHash: canonicalRequestHash,
           outcome: canonicalOutcome,

@@ -1646,6 +1646,26 @@ describe('compression refusal recall curves', () => {
     }
   });
 
+  it('a skipped quarantined chunk waits behind fresh work after the next rebuild (Anarchid R1-5)', async () => {
+    const fx = await queuedRawFixture();
+    try {
+      await fx.strategy.tick(fx.ctx);
+      assert.equal(fx.mock.calls.length, 2, 'the tick skipped the quarantined chunk and compressed the next');
+      // Inbound traffic rebuilds the queue: the quarantined chunk is raw, so
+      // it is queued again, beside the chunks the new messages closed.
+      for (let i = 0; i < 8; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`fresh-${i} ` + 'word '.repeat(30))]);
+      const quarantinedIds = fx.chunks[0].messages.map((m) => m.id).join(':');
+      const chunks = fx.strategy.chunksView();
+      const quarantined = chunks.findIndex((chunk) => chunk.messages.map((m) => m.id).join(':') === quarantinedIds);
+      const queue = fx.strategy.compressionQueueView();
+      assert.ok(quarantined >= 0 && queue.includes(quarantined), 'the quarantined chunk is queued again');
+      assert.ok(queue.some((index) => index !== quarantined && !chunks[index]!.compressed), 'fresh chunks are queued');
+      assert.equal(queue.at(-1), quarantined, 'it waits behind the fresh chunks, so they are built first');
+    } finally {
+      fx.manager.close();
+    }
+  });
+
   it('a rebuilt scan resolves original source identities at their current queue indexes (#55)', async () => {
     const fx = await queuedRawFixture();
     const rebuilt = fx.chunks.map((chunk, index) => ({ ...chunk, index: 1 - index })).reverse();
@@ -2238,6 +2258,83 @@ describe('compression refusal recall curves', () => {
     assert.equal(secondChunk.compressed, true);
     secondManager.close();
     first.manager.close();
+  });
+
+  /** Two instances on one store, the second joining the first's in-flight call, which fails with `error`. */
+  async function coalescedFailure(error: Error) {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let calls = 0;
+    const concurrent = {
+      complete: async () => {
+        calls++;
+        await gate;
+        throw error;
+      },
+    } as never;
+    const path = freshPath();
+    const first = await fixture(concurrent, { compressionRefusalCurveFallbacks: 0 }, path);
+    const second = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+    });
+    const secondManager = await ContextManager.open({ store: first.manager.getStore(), strategy: second, membrane: concurrent });
+    const secondCtx = managerContext(secondManager);
+    const secondMessages = first.target.messages.map(
+      (message) => secondCtx.messageStore.get(message.id),
+    ).filter(Boolean) as StoredMessage[];
+    const secondChunk = { ...first.target, messages: secondMessages, compressed: false };
+    const joins = observeInFlightJoins();
+    const before = Date.now();
+    let runs: Promise<PromiseSettledResult<unknown>[]>;
+    try {
+      runs = Promise.allSettled([
+        first.strategy.run(first.target, managerContext(first.manager)),
+        second.run(secondChunk, secondCtx),
+      ]);
+      await until(() => joins.count() >= 1, 'the second producer to join the in-flight call');
+    } finally {
+      joins.restore();
+      release();
+    }
+    const [producer, waiter] = await runs;
+    assert.equal(calls, 1, "one provider call, the producer's");
+    assert.equal(producer!.status, 'rejected');
+    assert.equal(waiter!.status, 'rejected');
+    assert.equal((waiter as PromiseRejectedResult).reason, error, "the waiter rethrows the producer's failure");
+    const pause = (second as unknown as {
+      compressionPause: { statedUntil: number | null; backoffUntil: number; failures: number } | null;
+    }).compressionPause;
+    return {
+      before,
+      pause,
+      close: () => {
+        secondManager.close();
+        first.manager.close();
+      },
+    };
+  }
+
+  it("a waiter on another instance's call takes the provider's stated wait from its failure, counting none (Anarchid R1-3)", async () => {
+    const limited = Object.assign(new Error('zz rate limited'), { type: 'rate_limit', httpStatus: 429, retryAfterMs: 120_000 });
+    const { before, pause, close } = await coalescedFailure(limited);
+    assert.ok(pause && pause.statedUntil !== null && pause.statedUntil >= before + 120_000,
+      "the waiter's lane holds for the provider's stated wait, so it doesn't send the same request inside it");
+    assert.equal(pause!.failures, 0, 'no failure counted: none of its calls failed');
+    assert.equal(pause!.backoffUntil, 0, 'and no backoff of its own');
+    close();
+  });
+
+  it("with no stated wait, the waiter's lane takes no pause from another instance's failure (Anarchid R1-3)", async () => {
+    const unavailable = Object.assign(new Error('zz overloaded'), { type: 'server', httpStatus: 503, retryable: true });
+    const { pause, close } = await coalescedFailure(unavailable);
+    assert.equal(pause, null, 'nothing to hold for: its own calls failed none, and the provider stated no wait');
+    close();
   });
 
   it("a waiter on another instance's compression keeps its own kv-unified submission in flight, and still takes up the store (#166)", async () => {

@@ -639,6 +639,18 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
     fx.manager.close();
   });
 
+  it("an exhausted canonical stage keeps each request's answer in the ledger, and the span counts them all (Anarchid R1-4)", async () => {
+    const mock = scripted([TOOL_USE as never, TOOL_USE as never, REFUSAL as never]);
+    const fx = await build(mock.membrane);
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 3, 'the canonical request, its no-tools retry and its tools-less retry');
+    const status = fx.strategy.getCompressionQuarantineStatus();
+    assert.equal(status.count, 1, 'the family exhausted');
+    assert.equal(status.spans[0]!.answeredAttempts, 3, 'each of the three requests was answered');
+    assert.equal(status.spans[0]!.latestOutcome, 'refusal', 'the tools-less answer came last');
+    fx.manager.close();
+  });
+
   it('the same for an empty tools-less answer', async () => {
     const mock = scripted([TOOL_USE as never, TOOL_USE as never, THINKING as never, { throw: failure('network') }, OK('prose memory')]);
     const fx = await build(mock.membrane);
@@ -2116,6 +2128,20 @@ describe('the span table, read from records the test writes', () => {
     assert.equal(spans.get(recent[0]!)!.quarantinedAt, 100);
     assert.equal(spans.get(older[0]!)!.latestOutcome, null, 'its newest record holds no answer');
     assert.equal(spans.get(older[0]!)!.answeredAttempts, 1);
+    fx.manager.close();
+  });
+
+  it('counts no rung its failures decided as an answer, though the line still names it last (Anarchid R1-4)', async () => {
+    const fx = await build(scripted([]).membrane);
+    const recent = fx.ids.slice(10);
+    fx.strategy.adopt(fx.target());
+    writeLedger(fx, [
+      { hash: hashOf(recent), created: 100, outcomes: [{ outcome: 'refusal' }, { outcome: 'provider_error', errorType: 'persistent-server:503' }] },
+      { hash: hashOf(recent), created: 200, outcomes: [{ outcome: 'provider_error', errorType: 'persistent-network' }] },
+    ]);
+    const span = fx.strategy.getCompressionQuarantineStatus().spans.find((s) => s.firstMessageId === recent[0])!;
+    assert.equal(span.answeredAttempts, 1, 'only the refusal was a provider answer');
+    assert.equal(span.latestOutcome, 'provider_error:persistent-network', "the newest record's deciding outcome is still named");
     fx.manager.close();
   });
 

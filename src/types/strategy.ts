@@ -672,15 +672,21 @@ export interface CompressionQuarantineSpan {
   /** Its quarantine records, one per request shape it exhausted. */
   records: number;
   /**
-   * Requests a provider answered for those records, none giving a summary. A
-   * recall variant planned over the compression's context budget, recorded
-   * as `admission_rejected` and never sent, isn't counted.
+   * Requests a provider answered for those records, none giving a summary:
+   * the canonical request and its no-tools and tools-less retries, and each
+   * fallback after them. A recall variant planned over the compression's
+   * context budget, recorded as `admission_rejected` and never sent, isn't
+   * counted, and neither is a rung its failures decided
+   * (`provider_error:persistent-<class>`), which no provider gave as an answer.
+   * A record an earlier version wrote holds one outcome for the whole
+   * canonical stage, so it counts that stage once.
    */
   answeredAttempts: number;
   /**
    * The newest record's last outcome, with its error type after a colon when
    * it carries one (`refusal`, `incomplete`, `provider_error:invalid_request`,
-   * `admission_rejected`); null when that record holds none.
+   * `admission_rejected`, or `provider_error:persistent-<class>` for a rung its
+   * failures decided); null when that record holds none.
    */
   latestOutcome: string | null;
 }
