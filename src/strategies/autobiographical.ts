@@ -1836,11 +1836,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * The manager is done with this strategy (ContextStrategy.detach). A new
    * generation fails every compression and merge still in flight at its next
    * isCompressionBranchCurrent() check, so each discards its result instead
-   * of writing. The loaded identity no longer matches either, so the
-   * entrypoints fail closed, reads such as getSummary() and getStats()
-   * included, and a drain tick already scheduled does nothing. None of
-   * these checks reads the store, which the manager may close next.
-   * initialize() starts afresh.
+   * of writing. The loaded identity no longer matches either, so each
+   * entrypoint that requires the loaded branch throws, getSummary() and
+   * getStats() among them, and a drain tick already scheduled does nothing.
+   * None of these checks reads the store, which the manager may close next.
+   * The health reads, such as getCompressionQuarantineStatus(), still never
+   * throw. initialize() starts afresh.
    */
   detach(): void {
     this.compressionBranchGeneration++;

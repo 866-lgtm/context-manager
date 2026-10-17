@@ -152,9 +152,10 @@ export interface ContextStrategy {
    * manager closed. The strategy stops the work it still has running for that
    * manager, so it writes nothing more to the store and starts no provider
    * call. It is synchronous and not awaited: a call already waiting on the
-   * provider may finish, and its result is thrown away. A promise it returns
-   * anyway isn't awaited either; the manager logs its rejection. A later
-   * setStrategy() of the same instance initializes it again.
+   * provider may finish, and its result is thrown away. A promise or other
+   * thenable it returns anyway isn't awaited either; the manager logs its
+   * rejection. A later setStrategy() of the same instance on a manager that
+   * isn't closed initializes it again.
    */
   detach?(): void;
 

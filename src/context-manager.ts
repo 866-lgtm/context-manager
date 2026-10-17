@@ -232,7 +232,7 @@ export class ContextManager {
   private initializedAttempt: number | null = null;
   /** Whether we own the store (created it) vs app owns it (passed in) */
   private ownsStore: boolean;
-  /** close() has run: the strategy is detached and hears no more store events. */
+  /** close() has run: the strategy is detached, and the manager refuses its operations (requireOpen). */
   private closed = false;
   private debugLogContext: boolean;
   /** Namespace passed to strategies for scoping their persistent state slots. */
@@ -993,6 +993,7 @@ export class ContextManager {
    * InitializationSupersededError naming the branch it selected.
    */
   async switchBranch(branchId: string): Promise<void> {
+    this.requireOpen('switchBranch');
     await this.selectBranch(branchId, false);
   }
 
@@ -1350,6 +1351,7 @@ export class ContextManager {
     usage?: RoundUsage;
     presentation?: Presentation;
   }): FoldReceipt | null {
+    this.requireOpen('acceptRound');
     return this.foldJournal.accept(args.provenance, args.acceptedAt ?? Date.now(), args.usage, args.presentation);
   }
 
@@ -1441,6 +1443,7 @@ export class ContextManager {
    * fenced until another successful initialization; it does not restore the old strategy.
    */
   async setStrategy(strategy: ContextStrategy): Promise<void> {
+    this.requireOpen('setStrategy');
     if (strategy !== this.strategy) this.detachStrategy(this.strategy);
     this.strategy = strategy;
     await this.initializeStrategy();
@@ -1452,10 +1455,13 @@ export class ContextManager {
     // close() still closes the store.
     const failed = (err: unknown) => console.error('Strategy detach failed:', strategy.name, err);
     try {
-      // detach() is synchronous by contract. A promise one returns anyway
-      // isn't awaited, and its rejection is logged rather than left unhandled.
-      const returned: unknown = strategy.detach?.();
-      if (returned instanceof Promise) returned.catch(failed);
+      // detach() is synchronous by contract. A promise or other thenable one
+      // returns anyway isn't awaited, and its rejection is logged rather than
+      // left unhandled.
+      const returned = strategy.detach?.() as unknown;
+      if (typeof (returned as PromiseLike<unknown> | null | undefined)?.then === 'function') {
+        Promise.resolve(returned as PromiseLike<unknown>).catch(failed);
+      }
     } catch (err) {
       failed(err);
     }
@@ -1698,6 +1704,9 @@ export class ContextManager {
     if (strategy.initialize) {
       await strategy.initialize(this.createStrategyContext());
     }
+    // close() ran while the strategy initialized: the call that started this
+    // fails rather than leave a closed manager's strategy marked initialized.
+    if (this.closed) throw new Error('ContextManager closed during strategy initialization');
     if (attempt !== this.initializationAttempt || strategy !== this.strategy) {
       throw new InitializationSupersededError(selection);
     }
@@ -1718,8 +1727,14 @@ export class ContextManager {
     if (this.holdReleaseNotifyPending) this.notifyHoldsReleased();
   }
 
+  /** Refuse an operation on a closed manager, naming it. */
+  private requireOpen(operation: string): void {
+    if (this.closed) throw new Error(`ContextManager.${operation} after close()`);
+  }
+
   /** Fence failed/pending attempts; optionally pin a manager-owned operation across an await. */
   private requireInitialized(operation: string, expected?: InitializationStamp): InitializationStamp {
+    this.requireOpen(operation);
     const current: InitializationStamp = {
       ...observeStoreBranch(this.store),
       id: this.store.currentBranch().id,
@@ -1838,8 +1853,8 @@ export class ContextManager {
       this.holdingAdds.push(message.id);
       this.placeHold(message.id, this.holdingAddOptions, this.holdingAddAt);
     }
-    // Notify strategy of new message, unless close() has let it go
-    if (this.strategy.onNewMessage && !this.closed) {
+    // Notify strategy of new message
+    if (this.strategy.onNewMessage) {
       // Fire and forget - don't block on strategy processing
       this.strategy.onNewMessage(message, this.createStrategyContext()).catch((err) => {
         console.error('Strategy onNewMessage failed:', err);
@@ -1927,16 +1942,21 @@ export class ContextManager {
   }
 
   /**
-   * Close the context manager.
+   * Close the context manager. This is final, whoever owns the store.
    *
-   * The strategy is detached first (ContextStrategy.detach) and hears no
-   * more of the store's events, whoever owns the store, so a manager used
-   * after close() compresses nothing more.
+   * The strategy is detached first (ContextStrategy.detach). Mutations and
+   * strategy operations then stay blocked, with no recovery: each throws
+   * "ContextManager.<operation> after close()", and a setStrategy(),
+   * switchBranch() or fork() still initializing the strategy when close()
+   * runs rejects. Inspection, which reads the store while it's open, and
+   * the manager's own setters remain available, and releaseCompression()
+   * still doesn't throw. A second close() does nothing.
    * If the manager owns the store (created via path config), this closes the store.
    * If the app owns the store (passed via store config), the store stays open;
    * the app is responsible for closing it when done.
    */
   close(): void {
+    if (this.closed) return;
     this.closed = true;
     this.detachStrategy(this.strategy);
     if (this.ownsStore) {
@@ -1945,10 +1965,10 @@ export class ContextManager {
   }
 
   /**
-   * Check if the store has been closed.
+   * Whether close() has run, or the store has been closed.
    */
   isClosed(): boolean {
-    return this.store.isClosed();
+    return this.closed || this.store.isClosed();
   }
 
   /**
