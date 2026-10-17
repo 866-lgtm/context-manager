@@ -3748,9 +3748,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // interval and then sustains it.)
     if (!this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
     // Sweep BEFORE reading status: the klaxon must reflect real debt only.
+    const sweptIdentity = this.loadedBranchIdentity;
     await this.sweepPaidOffQuarantineRecords();
-    // A strategy detached during the sweep sounds no alarm for its old branch.
-    if (!this.isLoadedBranchCurrent()) return;
+    // A strategy detached, or loaded again on another branch, during the
+    // sweep sounds no alarm for the branch it swept.
+    if (this.loadedBranchIdentity !== sweptIdentity || !this.isLoadedBranchCurrent()) return;
     const status = this.getCompressionQuarantineStatus();
     if (status.count === 0) {
       // All-clear must travel the SAME channel the alarm did — after an
@@ -3803,6 +3805,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private async sweepPaidOffQuarantineRecords(): Promise<void> {
     if (!this.store) return;
+    const identity = this.loadedBranchIdentity;
     try {
       const projection = this.readCompressionQuarantineProjection();
       if (projection.size === 0) return;
@@ -3820,10 +3823,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ? `span already compressed (${match.summaryId ?? 'summary'})`
           : 'orphaned by chunk-boundary drift (no matching chunk record)';
         await this.clearCompressionRefusalQuarantine(key);
-        // A strategy detached, or whose branch moved, while a clear waited
-        // stops sweeping here: that clear may have written nothing, and the
-        // records stay for the next sweep.
-        if (!this.isLoadedBranchCurrent()) return;
+        // A strategy detached, loaded again on another branch, or whose
+        // branch moved, while a clear waited stops sweeping here: that clear
+        // may have written nothing, the chunk records read above are another
+        // branch's, and the records stay for the next sweep.
+        if (this.loadedBranchIdentity !== identity || !this.isLoadedBranchCurrent()) return;
         console.error(`[compression-quarantine] cleared ${key.slice(0, 12)}… — ${reason}`);
       }
     } catch (error) {
@@ -3842,12 +3846,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private async clearQuarantineForCompressedChunk(chunk: Chunk): Promise<void> {
     if (!this.store) return;
+    const identity = this.loadedBranchIdentity;
     try {
       const hash = sha256Json(chunk.messages.map((message) => message.id));
       const projection = this.readCompressionQuarantineProjection();
       for (const [key, active] of projection) {
         if (active.record.chunkSourceHash !== hash) continue;
         await this.clearCompressionRefusalQuarantine(key);
+        // As in the paid-off sweep: a strategy detached, loaded again on
+        // another branch, or whose branch moved while a clear waited stops
+        // here, since that clear may have written nothing.
+        if (this.loadedBranchIdentity !== identity || !this.isLoadedBranchCurrent()) return;
         console.error(
           `[compression-quarantine] cleared ${key.slice(0, 12)}… — its chunk compressed ` +
             `successfully under a newer request shape`,
@@ -7036,6 +7045,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         expandedChildIds?: string[],
       ): Promise<unknown> => {
         attemptRequest = this.prepareCompressionCandidate(attemptRequest, curveLabel);
+        // Each attempt, a ladder's next rung included, checks before it calls
+        // the provider: a strategy let go of between two attempts makes no
+        // further call.
+        if (!this.isCompressionBranchCurrent(sourceBranch)) {
+          this.logCompressionBranchDiscard(sourceBranch, curveLabel, quarantineRecord);
+          throw Object.assign(new Error('Compression result crossed a branch boundary'), {
+            name: 'CompressionBranchDiscard',
+          });
+        }
         const started = Date.now();
         let response: unknown;
         // The request the transport ACCEPTED, which is the one that authored

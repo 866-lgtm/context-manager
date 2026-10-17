@@ -1713,6 +1713,10 @@ export class ContextManager {
       throw new Error('ContextManager closed during strategy initialization');
     }
     if (attempt !== this.initializationAttempt || strategy !== this.strategy) {
+      // A setStrategy() that replaced it while it initialized detached it
+      // then; detach it again, for work it started after that. A newer
+      // initialization of the same instance is left alone.
+      if (strategy !== this.strategy) this.detachStrategy(strategy);
       throw new InitializationSupersededError(selection);
     }
     const current = observeStoreBranch(this.store);

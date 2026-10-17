@@ -155,10 +155,10 @@ export interface ContextStrategy {
    * provider may finish, and its result is thrown away. A promise or other
    * thenable it returns anyway isn't awaited either; the manager logs its
    * rejection. A later setStrategy() of the same instance on a manager that
-   * isn't closed initializes it again. A close() that lands while the
-   * strategy initializes detaches it at once and again once initialize()
-   * returns. detach() is per instance: a strategy that two managers share is
-   * detached when either lets it go.
+   * isn't closed initializes it again. A setStrategy() or close() that lands
+   * while the strategy initializes detaches it at once and again once
+   * initialize() returns. detach() is per instance: a strategy that two
+   * managers share is detached when either lets it go.
    */
   detach?(): void;
 

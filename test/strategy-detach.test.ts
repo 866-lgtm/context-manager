@@ -13,6 +13,7 @@
 import { describe, it, beforeEach, after } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, AutobiographicalStrategy, PassthroughStrategy } from '../src/index.js';
 
@@ -29,7 +30,7 @@ const filler = (n: number) => 'word '.repeat(n);
 /** A membrane whose compression calls each wait until the test answers them
  *  (release) or fails them (fail). */
 function heldMembrane() {
-  const calls: Array<{ request: unknown; release: (content?: unknown[]) => void; fail: (error: unknown) => void }> = [];
+  const calls: Array<{ request: unknown; release: (content?: unknown[], stopReason?: string) => void; fail: (error: unknown) => void }> = [];
   return {
     calls,
     membrane: {
@@ -37,7 +38,7 @@ function heldMembrane() {
         const n = calls.length + 1;
         calls.push({
           request,
-          release: (content = [{ type: 'text', text: `Summary #${n}` }]) => resolve({ stopReason: 'end_turn', content }),
+          release: (content = [{ type: 'text', text: `Summary #${n}` }], stopReason = 'end_turn') => resolve({ stopReason, content }),
           fail: reject,
         });
       }),
@@ -86,9 +87,13 @@ async function reaches(cond: () => boolean, ms = 3000): Promise<boolean> {
 /** Whether `promise` settles within `ms`. The bound only keeps a regression
  *  from hanging the suite, so it is generous. */
 async function settlesWithin(promise: Promise<unknown>, ms = 5000): Promise<boolean> {
-  let settled = false;
-  await Promise.race([promise.then(() => { settled = true; }, () => { settled = true; }), settle(ms)]);
-  return settled;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), ms); });
+  try {
+    return await Promise.race([promise.then(() => true, () => true), timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function persisted(store: JsStore, id: string): unknown[] {
@@ -925,6 +930,86 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     }
   });
 
+  it("a compression's next attempt after the swap makes no call", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = heldMembrane();
+    const strategy = newStrategy();
+    const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+    try {
+      seed(manager);
+      await manager.compile();
+      // The swap lands as the second attempt is prepared, after the first
+      // attempt's own check passed: between two attempts of one compression.
+      const internals = strategy as unknown as { prepareCompressionCandidate: (request: unknown, label: string) => unknown };
+      const prepare = internals.prepareCompressionCandidate.bind(strategy);
+      let swapping: Promise<void> | undefined;
+      internals.prepareCompressionCandidate = (request, label) => {
+        if (label === 'canonical-no-tools' && !swapping) swapping = manager.setStrategy(new PassthroughStrategy());
+        return prepare(request, label);
+      };
+      const ticking = manager.tick();
+      const ended = outcomeOf(ticking);
+      await waitFor(() => calls.length === 1);
+      // A tool call takes the compression to its no-tools attempt.
+      calls[0].release([{ type: 'tool_use', id: 'tool-1', name: 'note', input: {} }], 'tool_use');
+      await settlesWithin(ticking);
+      await swapping;
+
+      assert.ok(swapping, 'the second attempt began after the tool call');
+      assert.strictEqual(calls.length, 1, `the replaced strategy made ${calls.length - 1} more call(s)`);
+      assert.strictEqual(ended.outcome, 'resolved', 'the tick ended quietly');
+      assert.deepStrictEqual(persisted(store, SUMMARIES), [], 'no summary written');
+    } finally {
+      for (const call of calls.slice(1)) call.release();
+      manager.close();
+      store.close();
+    }
+  });
+
+  it('a strategy replaced while it initializes is detached again once its initialize() returns, and a newer initialization of the same instance is not', async () => {
+    // Each initialize() call waits on its own gate, then starts work, as a
+    // timer would be armed.
+    class GatedInitialize extends PassthroughStrategy {
+      gates: Array<() => void> = [];
+      running = false;
+      detaches = 0;
+      async initialize(): Promise<void> {
+        await new Promise<void>((resolve) => { this.gates.push(resolve); });
+        this.running = true;
+      }
+      detach(): void { this.detaches++; this.running = false; }
+    }
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const manager = await ContextManager.open({ store, strategy: new PassthroughStrategy() });
+    try {
+      // Replaced: setStrategy(replaced) is superseded by setStrategy(next).
+      const replaced = new GatedInitialize();
+      const replacing = manager.setStrategy(replaced);
+      await waitFor(() => replaced.gates.length === 1);
+      const next = new GatedInitialize();
+      const nexting = manager.setStrategy(next);
+      await waitFor(() => next.gates.length === 1);
+      replaced.gates[0]();
+      await assert.rejects(replacing, { name: 'InitializationSupersededError' });
+      assert.strictEqual(replaced.running, false, 'the work the replaced strategy started after it was replaced is stopped');
+      assert.strictEqual(replaced.detaches, 2, 'detached as it was replaced, and again once its initialize() returned');
+
+      // The same instance: a switchBranch() supersedes next's first
+      // initialization with a second one of its own.
+      const switching = manager.switchBranch(manager.currentBranch().name);
+      await waitFor(() => next.gates.length === 2);
+      next.gates[0]();
+      await assert.rejects(nexting, { name: 'InitializationSupersededError' });
+      next.gates[1]();
+      await switching;
+      assert.strictEqual(next.detaches, 0, 'a newer initialization of the same instance is left alone');
+      assert.strictEqual(next.running, true, 'and its strategy runs');
+    } finally {
+      manager.close();
+      store.close();
+    }
+  });
+
   for (const operation of ['setStrategy', 'switchBranch', 'fork'] as const) {
     it(`a close() while ${operation}() initializes the strategy fails that call, and detaches the strategy again`, async () => {
       let openInitialize!: () => void;
@@ -988,47 +1073,91 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     assert.strictEqual(manager.getStore().isClosed(), true, 'a second close() closed it');
   });
 
-  it('a quarantine sweep whose clear spans the swap stops there, and logs no clear', async () => {
-    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
-    const { calls, membrane } = heldMembrane();
-    const strategy = newStrategy();
-    const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
-    try {
-      seed(manager);
-      await manager.compile();
-      // Two quarantine records whose chunk no chunk record matches, so the
-      // sweep clears both. Each clear waits until the test lets it go, as one
-      // waiting on the state lock does, and then writes nothing, as one that
-      // finds its strategy detached by then does.
-      const internals = strategy as unknown as {
-        readCompressionQuarantineProjection: () => Map<string, unknown>;
-        clearCompressionRefusalQuarantine: (key?: string) => Promise<void>;
-        quarantineAlarmActive: boolean;
-      };
-      const orphan = (key: string) => ({ record: { key, chunkSourceHash: key } });
-      internals.readCompressionQuarantineProjection = () => new Map([['orphan-1', orphan('orphan-1')], ['orphan-2', orphan('orphan-2')]]);
-      let openClear!: () => void;
-      const clearing = new Promise<void>((resolve) => { openClear = resolve; });
-      const cleared: string[] = [];
-      internals.clearCompressionRefusalQuarantine = async (key) => { cleared.push(String(key)); await clearing; };
-      internals.quarantineAlarmActive = true;
-      let ended = { outcome: 'pending' };
-      const logged = await logsDuring(async () => {
-        const ticking = manager.tick();
-        ended = outcomeOf(ticking);
-        assert.ok(await reaches(() => cleared.length === 1), 'the sweep reached its first clear');
-        await manager.setStrategy(new PassthroughStrategy());
-        openClear();
-        await settlesWithin(ticking);
-      });
-      assert.deepStrictEqual(cleared, ['orphan-1'], 'the sweep made no further clear');
-      assert.deepStrictEqual(logged.filter((line) => line.includes('[compression-quarantine]')), [], 'no clear and no failed sweep logged');
-      assert.strictEqual(ended.outcome, 'resolved', 'the tick ended quietly');
-      assert.strictEqual(calls.length, 0, 'the tick started no compression');
-    } finally {
-      for (const call of calls) call.release();
-      manager.close();
-      store.close();
-    }
-  });
+  for (const move of ['swap', 'fork'] as const) {
+    it(`a quarantine sweep whose clear spans ${move === 'swap' ? 'the swap' : 'a fork that loads the same strategy on a new branch'} stops there, and logs no clear`, async () => {
+      const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+      const { calls, membrane } = heldMembrane();
+      const strategy = newStrategy();
+      const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+      try {
+        seed(manager);
+        await manager.compile();
+        // Two quarantine records whose chunk no chunk record matches, so the
+        // sweep clears both. Each clear waits until the test lets it go, as one
+        // waiting on the state lock does, and then writes nothing, as one that
+        // finds its strategy detached by then does.
+        const internals = strategy as unknown as {
+          readCompressionQuarantineProjection: () => Map<string, unknown>;
+          clearCompressionRefusalQuarantine: (key?: string) => Promise<void>;
+          quarantineAlarmActive: boolean;
+        };
+        const orphan = (key: string) => ({ record: { key, chunkSourceHash: key } });
+        internals.readCompressionQuarantineProjection = () => new Map([['orphan-1', orphan('orphan-1')], ['orphan-2', orphan('orphan-2')]]);
+        let openClear!: () => void;
+        const clearing = new Promise<void>((resolve) => { openClear = resolve; });
+        const cleared: string[] = [];
+        internals.clearCompressionRefusalQuarantine = async (key) => { cleared.push(String(key)); await clearing; };
+        internals.quarantineAlarmActive = true;
+        let ended = { outcome: 'pending' };
+        const logged = await logsDuring(async () => {
+          const ticking = manager.tick();
+          ended = outcomeOf(ticking);
+          assert.ok(await reaches(() => cleared.length === 1), 'the sweep reached its first clear');
+          if (move === 'swap') await manager.setStrategy(new PassthroughStrategy());
+          else await manager.fork();
+          openClear();
+          await settlesWithin(ticking);
+        });
+        assert.deepStrictEqual(cleared, ['orphan-1'], 'the sweep made no further clear');
+        assert.deepStrictEqual(logged.filter((line) => line.includes('[compression-quarantine]')), [], 'no clear and no failed sweep logged');
+        assert.strictEqual(ended.outcome, 'resolved', 'the tick ended quietly');
+        assert.strictEqual(calls.length, 0, 'the tick started no compression');
+      } finally {
+        for (const call of calls) call.release();
+        manager.close();
+        store.close();
+      }
+    });
+  }
+
+  for (const move of ['swap', 'fork'] as const) {
+    it(`a compressed chunk's quarantine clear that spans ${move === 'swap' ? 'the swap' : 'a fork that loads the same strategy on a new branch'} stops there, and logs no clear`, async () => {
+      const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+      const strategy = newStrategy();
+      const manager = await ContextManager.open({ store, strategy });
+      try {
+        seed(manager, 2);
+        await manager.compile();
+        // Two quarantine records of the chunk that just compressed, each
+        // cleared as one waiting on the state lock is: it waits until the
+        // test lets it go, then writes nothing.
+        const chunk = { messages: [{ id: 'chunk-a' }, { id: 'chunk-b' }] };
+        const hash = createHash('sha256').update(JSON.stringify(['chunk-a', 'chunk-b']), 'utf8').digest('hex');
+        const internals = strategy as unknown as {
+          readCompressionQuarantineProjection: () => Map<string, unknown>;
+          clearCompressionRefusalQuarantine: (key?: string) => Promise<void>;
+          clearQuarantineForCompressedChunk: (chunk: unknown) => Promise<void>;
+        };
+        const debt = (key: string) => ({ record: { key, chunkSourceHash: hash } });
+        internals.readCompressionQuarantineProjection = () => new Map([['debt-1', debt('debt-1')], ['debt-2', debt('debt-2')]]);
+        let openClear!: () => void;
+        const clearing = new Promise<void>((resolve) => { openClear = resolve; });
+        const cleared: string[] = [];
+        internals.clearCompressionRefusalQuarantine = async (key) => { cleared.push(String(key)); await clearing; };
+        const logged = await logsDuring(async () => {
+          const clearingChunk = internals.clearQuarantineForCompressedChunk(chunk);
+          assert.ok(await reaches(() => cleared.length === 1), 'the first clear began');
+          if (move === 'swap') await manager.setStrategy(new PassthroughStrategy());
+          else await manager.fork();
+          openClear();
+          await settlesWithin(clearingChunk);
+        });
+        assert.deepStrictEqual(cleared, ['debt-1'], 'the clear made no further clear');
+        assert.deepStrictEqual(logged.filter((line) => line.includes('[compression-quarantine]')), [], 'no clear and no failure logged');
+      } finally {
+        manager.close();
+        store.close();
+      }
+    });
+  }
 });
