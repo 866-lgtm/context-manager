@@ -926,13 +926,19 @@ export function planControlledFrontier(
  *   list it (a summary written again without one of its sources): the leaf
  *   renders lower, and a summary of its lineage that lists it beside a leaf
  *   held above can render in both recalls, which neither listing shows.
- * The solve proceeding is the mitigation; the topology is the disease. So
- * every compile whose plan renders such a summary says so, until the store is
- * repaired (nesting reconciler, see the 2026-08-03 opus4 incident). It reads
- * the frontier the plan emits, so a plan that keeps carried folds reports them
- * as one that makes them does. A leaf that a lock or a pin holds beside a
- * summary of its own lineage that lists it renders in both recalls too, and
- * goes unreported: a protection put it there, not the topology.
+ * Each direction has a line of its own: the first says a message is in the
+ * window twice, and the second only that listing and lineage disagree, which
+ * is all it shows. A leaf that disagrees both ways is named once, on the
+ * first. The solve proceeding is the mitigation; the topology is the
+ * disease. So every compile whose plan renders such a summary says so,
+ * until the store is repaired (nesting reconciler, see the 2026-08-03 opus4
+ * incident). kv-stable's shadow production pick plans through here too, in
+ * a compile that isn't a dry run with `productionBudgetTokens` set below its
+ * budget, and says so of its own plan, which no compile renders.
+ * It reads the frontier the plan emits, so a plan that keeps carried folds
+ * reports them as one that makes them does. A leaf that a lock or a pin holds
+ * beside a summary of its own lineage that lists it renders in both recalls
+ * too, and goes unreported: a protection put it there, not the topology.
  */
 function reportOverlap(
   tree: SummaryTree,
@@ -951,12 +957,13 @@ function reportOverlap(
       if (tree.ancestorAt(leafId, level)?.id !== node.id) conflicting.add(leafId);
     }
   }
+  const unlisted = new Set<ChunkId>();
   for (const c of chunks) {
     if (conflicting.has(c.id)) continue;
     for (let k = 1, top = tree.maxLevel(c.id); k <= top; k++) {
       const node = tree.ancestorAt(c.id, k);
       const listed = node ? rendered.get(node.id) : undefined;
-      if (listed && !listed.has(c.id)) { conflicting.add(c.id); break; }
+      if (listed && !listed.has(c.id)) { unlisted.add(c.id); break; }
     }
   }
   if (conflicting.size > 0) {
@@ -964,6 +971,13 @@ function reportOverlap(
       `[kv-overlap] ⚠️ non-nested summary tree: ${conflicting.size} leaf(s) with ` +
         `conflicting lineage tolerated this compile (double-representation in window). ` +
         `Store needs nesting repair. sample=${[...conflicting].slice(0, 5).join(',')}`,
+    );
+  }
+  if (unlisted.size > 0) {
+    console.error(
+      `[kv-overlap] ⚠️ non-nested summary tree: ${unlisted.size} leaf(s) whose own lineage runs through ` +
+        `a rendered summary that doesn't list them (listing and lineage disagree). ` +
+        `Store needs nesting repair. sample=${[...unlisted].slice(0, 5).join(',')}`,
     );
   }
 }

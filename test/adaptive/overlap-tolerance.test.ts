@@ -123,15 +123,16 @@ function store(chunks: PickerChunk[], summaries: SummaryEntry[]): { inputs: Pick
 const unitsOf = (layout: RenderLayout): string[] => layout.units.map((u) => `${u.kind}:${u.key}`);
 
 /** Each test plans on purpose over a tree that makes the planner warn. */
-function quietOverlap<T>(fn: () => T): { result: T; overlapWarnings: number } {
+function quietOverlap<T>(fn: () => T): { result: T; overlapWarnings: number; overlapLines: string[] } {
   const original = console.error;
-  let overlapWarnings = 0;
+  const overlapLines: string[] = [];
   console.error = (...args: unknown[]) => {
-    if (String(args[0]).includes('[kv-overlap]')) overlapWarnings++;
+    if (String(args[0]).includes('[kv-overlap]')) overlapLines.push(String(args[0]));
     else original(...args);
   };
   try {
-    return { result: fn(), overlapWarnings };
+    const result = fn();
+    return { result, overlapWarnings: overlapLines.length, overlapLines };
   } finally {
     console.error = original;
   }
@@ -452,12 +453,16 @@ test('[kv-overlap] warns when a rendered summary doesn\'t list a leaf whose own 
     [summary('N1', 1, ['x'], 20, 'M'), summary('N2', 1, ['y'], 20, 'M'), summary('M', 2, ['N1'], 15)],
   );
   const previous = new Map<ChunkId, number>([['x', 2], ['y', 1]]);
-  const { result: plan, overlapWarnings } = quietOverlap(() => planControlledFrontier(inputs, tree, {
+  const { result: plan, overlapLines } = quietOverlap(() => planControlledFrontier(inputs, tree, {
     ...trio, targetTokens: 30, expandAtTokens: 30, foldAtTokens: 300, previous,
   }));
   assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['recall:M', 'recall:N2']);
   assert.equal(plan.perturbation, 0);
-  assert.equal(overlapWarnings, 1);
+  // Its own phrase: M covers x and N2 covers y, so no message is in two
+  // recalls here, and the warning says what disagrees.
+  assert.equal(overlapLines.length, 1);
+  assert.match(overlapLines[0]!, /1 leaf\(s\) whose own lineage runs through a rendered summary that doesn't list them \(listing and lineage disagree\)/);
+  assert.doesNotMatch(overlapLines[0]!, /double-representation/);
 });
 
 // The same links, through the strategy. y is pinned at L2, where its own
