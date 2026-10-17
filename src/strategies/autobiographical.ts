@@ -3820,6 +3820,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ? `span already compressed (${match.summaryId ?? 'summary'})`
           : 'orphaned by chunk-boundary drift (no matching chunk record)';
         await this.clearCompressionRefusalQuarantine(key);
+        // A strategy detached, or whose branch moved, while a clear waited
+        // stops sweeping here: that clear may have written nothing, and the
+        // records stay for the next sweep.
+        if (!this.isLoadedBranchCurrent()) return;
         console.error(`[compression-quarantine] cleared ${key.slice(0, 12)}… — ${reason}`);
       }
     } catch (error) {

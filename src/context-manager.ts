@@ -1706,7 +1706,12 @@ export class ContextManager {
     }
     // close() ran while the strategy initialized: the call that started this
     // fails rather than leave a closed manager's strategy marked initialized.
-    if (this.closed) throw new Error('ContextManager closed during strategy initialization');
+    // close() detached the strategy before its initialize() finished, so it
+    // is detached again here, for work it started after that.
+    if (this.closed) {
+      this.detachStrategy(strategy);
+      throw new Error('ContextManager closed during strategy initialization');
+    }
     if (attempt !== this.initializationAttempt || strategy !== this.strategy) {
       throw new InitializationSupersededError(selection);
     }
@@ -1944,22 +1949,27 @@ export class ContextManager {
   /**
    * Close the context manager. This is final, whoever owns the store.
    *
-   * The strategy is detached first (ContextStrategy.detach). Mutations and
-   * strategy operations then stay blocked, with no recovery: each throws
-   * "ContextManager.<operation> after close()", and a setStrategy(),
-   * switchBranch() or fork() still initializing the strategy when close()
-   * runs rejects. Inspection, which reads the store while it's open, and
-   * the manager's own setters remain available, and releaseCompression()
-   * still doesn't throw. A second close() does nothing.
+   * The strategy is detached first (ContextStrategy.detach). The manager's
+   * mutations and strategy operations then stay blocked, with no recovery:
+   * each throws "ContextManager.<operation> after close()", the reads that
+   * go through the strategy, such as getSummary() and isReady(), included,
+   * and a setStrategy(), switchBranch() or fork() still initializing the
+   * strategy when close() runs rejects. Inspection of messages, branches and
+   * receipts, which reads the store while it's open, and the manager's own
+   * setters, such as setSystemPrompt(), remain available, and
+   * releaseCompression() still doesn't throw. A second close() detaches
+   * nothing more, and closes a store the manager owns only if an earlier
+   * close() left it open.
    * If the manager owns the store (created via path config), this closes the store.
    * If the app owns the store (passed via store config), the store stays open;
    * the app is responsible for closing it when done.
    */
   close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.detachStrategy(this.strategy);
-    if (this.ownsStore) {
+    if (!this.closed) {
+      this.closed = true;
+      this.detachStrategy(this.strategy);
+    }
+    if (this.ownsStore && !this.store.isClosed()) {
       this.store.close();
     }
   }

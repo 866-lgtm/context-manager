@@ -160,10 +160,10 @@ function countDrives(strategy: AutobiographicalStrategy) {
   return counts;
 }
 
-/** Count the compressions and merges the strategy starts, as each starts.
- *  Nothing awaits between a compression's start and its wait on identical
- *  work in flight, so once one has started it is either waiting there or has
- *  called the provider. */
+/** Count the compressions and merges the strategy starts, and the
+ *  compressions that have settled. Nothing awaits between a compression's
+ *  start and its wait on identical work in flight, so one that has started
+ *  and not settled, with no new provider call, is waiting there. */
 function watchWork(strategy: AutobiographicalStrategy) {
   const s = strategy as unknown as {
     compressChunkHierarchical: (...args: unknown[]) => Promise<void>;
@@ -171,10 +171,38 @@ function watchWork(strategy: AutobiographicalStrategy) {
   };
   const compress = s.compressChunkHierarchical.bind(strategy);
   const merge = s.executeMerge.bind(strategy);
-  const counts = { compressions: 0, merges: 0 };
-  s.compressChunkHierarchical = (...args: unknown[]) => { counts.compressions++; return compress(...args); };
+  const counts = { compressions: 0, compressionsSettled: 0, merges: 0 };
+  s.compressChunkHierarchical = (...args: unknown[]) => {
+    counts.compressions++;
+    const compressing = compress(...args);
+    compressing.finally(() => { counts.compressionsSettled++; }).catch(() => {});
+    return compressing;
+  };
   s.executeMerge = (...args: unknown[]) => { counts.merges++; return merge(...args); };
   return counts;
+}
+
+/** console.error's and console.warn's lines while `fn` runs. */
+async function logsDuring(fn: () => Promise<void>): Promise<string[]> {
+  const lines: string[] = [];
+  const realError = console.error;
+  const realWarn = console.warn;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  console.warn = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  try {
+    await fn();
+  } finally {
+    console.error = realError;
+    console.warn = realWarn;
+  }
+  return lines;
+}
+
+/** Record how a promise ends, so a test can assert it resolved. */
+function outcomeOf(promise: Promise<unknown>) {
+  const result = { outcome: 'pending' };
+  void promise.then(() => { result.outcome = 'resolved'; }, (e) => { result.outcome = `rejected: ${(e as Error).message}`; });
+  return result;
 }
 
 /** Collect what would otherwise end the process: uncaught exceptions and
@@ -249,10 +277,12 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       const drivesBefore = drives.drives;
 
       await manager.setStrategy(new PassthroughStrategy());
+      // The drain re-arms after the tick it was running; wait for that timer,
+      // not one that ran while the messages went in. A drive it makes happens
+      // before its run is counted.
+      const ranBefore = timers.counts.ran;
       calls[0].release();
-      // The drain re-arms after the tick it was running; wait for that timer.
-      await waitFor(() => timers.counts.ran >= 1);
-      await settle(20);
+      await waitFor(() => timers.counts.ran > ranBefore);
 
       assert.strictEqual(drives.drives, drivesBefore, "the replaced strategy's drain was driven again after the swap");
       assert.strictEqual(calls.length, 1, `the replaced strategy's drain called the provider ${calls.length - 1} more time(s)`);
@@ -306,10 +336,12 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       manager.close();
       closed = true;
       assert.strictEqual(store.isClosed(), false, 'the app still owns its store');
+      // The drain re-arms after the tick it was running; wait for that timer,
+      // not one that ran while the messages went in. A drive it makes happens
+      // before its run is counted.
+      const ranBefore = timers.counts.ran;
       calls[0].release();
-      // The drain re-arms after the tick it was running; wait for that timer.
-      await waitFor(() => timers.counts.ran >= 1);
-      await settle(20);
+      await waitFor(() => timers.counts.ran > ranBefore);
 
       assert.strictEqual(drives.drives, drivesBefore, "the closed manager's strategy was driven again after close()");
       assert.strictEqual(calls.length, 1, `the closed manager's strategy called the provider ${calls.length - 1} more time(s)`);
@@ -630,7 +662,11 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       await manager.compile();
       const replacementTick = manager.tick();
       assert.ok(await reaches(() => work.compressions === 1), 'the replacement started compressing');
-      assert.strictEqual(calls.length, 1, "the replacement waits on the replaced strategy's call for the same chunk");
+      assert.deepStrictEqual(
+        [work.compressionsSettled, calls.length],
+        [0, 1],
+        "the replacement waits on the replaced strategy's call for the same chunk",
+      );
 
       calls[0].release();
       await replacedTick.catch(() => {});
@@ -688,23 +724,29 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       other = await ContextManager.open({ store, strategy: otherStrategy, membrane: membrane as never });
       await other.compile();
       const otherTick = other.tick();
+      const otherEnd = outcomeOf(otherTick);
       assert.ok(await reaches(() => otherWork.compressions === 1), "the second manager's strategy started compressing");
       const replacement = newStrategy();
       const replacementWork = watchWork(replacement);
       await manager.setStrategy(replacement);
       await manager.compile();
       const replacementTick = manager.tick();
+      const replacementEnd = outcomeOf(replacementTick);
       assert.ok(await reaches(() => replacementWork.compressions === 1), 'the replacement started compressing');
-      assert.strictEqual(calls.length, 1, "both wait on the replaced strategy's call for the same chunk");
+      assert.deepStrictEqual(
+        [otherWork.compressionsSettled, replacementWork.compressionsSettled, calls.length],
+        [0, 0, 1],
+        "both wait on the replaced strategy's call for the same chunk",
+      );
 
       calls[0].release();
       await replacedTick.catch(() => {});
       assert.ok(await reaches(() => calls.length >= 2), 'one of them took the work over');
       calls[1].release();
-      const ended = await settlesWithin(Promise.all([otherTick, replacementTick]));
+      await settlesWithin(Promise.all([otherTick, replacementTick]));
 
       assert.strictEqual(calls.length, 2, 'the other waited on that call instead of making its own');
-      assert.ok(ended, 'both ticks ended');
+      assert.deepStrictEqual([otherEnd.outcome, replacementEnd.outcome], ['resolved', 'resolved'], 'both ticks resolved');
       assert.strictEqual(persisted(store, SUMMARIES).length, 1, "one summary for the chunk");
     } finally {
       for (const call of calls.slice(1)) call.release();
@@ -739,15 +781,18 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       }
       const merging = manager.tick();
       await waitFor(() => calls.length === 6);
-      assert.deepStrictEqual(work, { compressions: 4, merges: 2 }, 'the sixth call is the second merge');
+      assert.deepStrictEqual(work, { compressions: 4, compressionsSettled: 4, merges: 2 }, 'the sixth call is the second merge');
       assert.ok(JSON.stringify(calls[5].request).includes('"thinking"'), "the merge's request carries earlier summaries' reasoning");
 
+      const merged = outcomeOf(merging);
       await manager.setStrategy(new PassthroughStrategy());
       calls[5].fail(carrierRejection());
-      const ended = await settlesWithin(merging);
+      await settlesWithin(merging);
 
       assert.strictEqual(calls.length, 6, `the replaced strategy retried the merge ${calls.length - 6} time(s)`);
-      assert.ok(ended, 'the tick ended');
+      // A merge that found the call's failure no carrier rejection would
+      // rethrow it and fail the tick: resolving is the check before the retry.
+      assert.strictEqual(merged.outcome, 'resolved', 'the tick ended at the check before the retry');
     } finally {
       for (const call of calls.slice(6)) call.release();
       manager.close();
@@ -780,47 +825,84 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     }
   });
 
-  it('after close(), the manager refuses each operation, naming it, and a second close() does nothing', async () => {
-    class Watched extends PassthroughStrategy {
-      detaches = 0;
-      messages = 0;
-      detach(): void { this.detaches++; }
-      async onNewMessage(): Promise<void> { this.messages++; }
-    }
-    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
-    const strategy = new Watched();
-    const manager = await ContextManager.open({ store, strategy });
-    try {
-      seed(manager, 2);
-      assert.strictEqual(strategy.messages, 2, 'messages reach the strategy before close()');
-      manager.close();
-      manager.close();
-      assert.strictEqual(strategy.detaches, 1, 'a second close() detaches nothing more');
-      assert.strictEqual(manager.isClosed(), true, 'the manager says it is closed');
-      assert.strictEqual(store.isClosed(), false, "the app's store stays open");
-      assert.strictEqual(manager.getMessageCount(), 2, 'reads of messages still read the store');
-
-      const operations: Array<[string, () => unknown]> = [
-        ['addMessage', () => manager.addMessage('User', [{ type: 'text', text: 'after close' }])],
-        ['compile', () => manager.compile()],
-        ['tick', () => manager.tick()],
-        ['setStrategy', () => manager.setStrategy(new PassthroughStrategy())],
-        ['switchBranch', () => manager.switchBranch(manager.currentBranch().name)],
-        ['fork', () => manager.fork()],
-        ['acceptRound', () => manager.acceptRound({ provenance: {} as never })],
-      ];
-      for (const [operation, call] of operations) {
-        await assert.rejects(
-          async () => { await call(); },
-          { message: `ContextManager.${operation} after close()` },
-          `${operation} refuses`,
-        );
+  for (const owned of [false, true]) {
+    it(`after close(), the manager refuses each mutation and strategy operation by name, ${owned ? 'with the store it owned closed' : 'while the app keeps its store open'}`, async () => {
+      class Watched extends PassthroughStrategy {
+        detaches = 0;
+        messages = 0;
+        detach(): void { this.detaches++; }
+        async onNewMessage(): Promise<void> { this.messages++; }
       }
-      assert.strictEqual(strategy.messages, 2, 'no message reached the strategy after close()');
-    } finally {
-      store.close();
-    }
-  });
+      const strategy = new Watched();
+      const store = owned ? undefined : JsStore.openOrCreate({ path: TEST_STORE_PATH });
+      const manager = await ContextManager.open(owned ? { path: TEST_STORE_PATH, strategy } : { store: store!, strategy });
+      try {
+        seed(manager, 2);
+        assert.strictEqual(strategy.messages, 2, 'messages reach the strategy before close()');
+        const id = manager.getAllMessages()[0].id;
+        const branch = manager.currentBranch().name;
+        manager.close();
+        manager.close();
+        assert.strictEqual(strategy.detaches, 1, 'a second close() detaches nothing more');
+        assert.strictEqual(manager.isClosed(), true, 'the manager says it is closed');
+        assert.strictEqual(manager.getStore().isClosed(), owned, owned ? 'the store it owned is closed' : "the app's store stays open");
+        if (!owned) {
+          // Inspection of messages, branches and receipts, and the manager's
+          // own setters, still answer.
+          assert.strictEqual(manager.getMessageCount(), 2, 'messages still read');
+          assert.strictEqual(manager.currentBranch().name, branch, 'the branch still reads');
+          assert.ok(manager.listBranches().length >= 1, 'branches still list');
+          manager.listFoldReceipts();
+          manager.setSystemPrompt('after close');
+          manager.setToolDefinitions(undefined);
+          manager.releaseCompression([id]);
+        }
+
+        // Each operation's name and arguments; the refusal comes first, so
+        // the arguments needn't be valid. pinAtLevel() refuses as pinRange().
+        const operations: Array<[string, unknown[], string?]> = [
+          ['addMessage', ['User', [{ type: 'text', text: 'after close' }]]],
+          ['editMessage', [id, [{ type: 'text', text: 'after close' }]]],
+          ['removeMessage', [id]],
+          ['removeMessages', [id, id]],
+          ['branchAt', [id]],
+          ['switchBranch', [branch]],
+          ['fork', []],
+          ['isReady', []],
+          ['getPendingWork', []],
+          ['compile', []],
+          ['acceptRound', [{ provenance: {} }]],
+          ['setStrategy', [new PassthroughStrategy()]],
+          ['getHotContextSettings', []],
+          ['updateHotContextSettings', [{}]],
+          ['previewContext', [{}]],
+          ['pinRange', [id, id]],
+          ['pinAtLevel', [id, id, 1], 'pinRange'],
+          ['markDocument', [id]],
+          ['unpin', ['pin']],
+          ['listPins', []],
+          ['searchSummaries', ['query']],
+          ['getSummary', ['summary']],
+          ['getSummariesInRange', [id, id]],
+          ['getMaxSummaryLevel', []],
+          ['getRenderStats', []],
+          ['resetHeadWindow', []],
+          ['tick', []],
+        ];
+        const m = manager as unknown as Record<string, (...args: unknown[]) => unknown>;
+        for (const [name, args, operation = name] of operations) {
+          await assert.rejects(
+            async () => { await m[name](...args); },
+            { message: `ContextManager.${operation} after close()` },
+            `${name} refuses`,
+          );
+        }
+        assert.strictEqual(strategy.messages, 2, 'no message reached the strategy after close()');
+      } finally {
+        store?.close();
+      }
+    });
+  }
 
   it('after close(), a hold released through the manager reaches no strategy', async () => {
     class CountsReleases extends PassthroughStrategy {
@@ -843,22 +925,109 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     }
   });
 
-  it('a close() while setStrategy() initializes the new strategy fails that call', async () => {
-    let openInitialize!: () => void;
-    const gate = new Promise<void>((resolve) => { openInitialize = resolve; });
-    let initializing = false;
-    class SlowInitialize extends PassthroughStrategy {
-      async initialize(): Promise<void> { initializing = true; await gate; }
-    }
+  for (const operation of ['setStrategy', 'switchBranch', 'fork'] as const) {
+    it(`a close() while ${operation}() initializes the strategy fails that call, and detaches the strategy again`, async () => {
+      let openInitialize!: () => void;
+      const gate = new Promise<void>((resolve) => { openInitialize = resolve; });
+      let initializing = false;
+      // Work it starts at the end of initialize(), as a timer would be.
+      class SlowInitialize extends PassthroughStrategy {
+        gated = false;
+        running = false;
+        detaches = 0;
+        async initialize(): Promise<void> {
+          if (!this.gated) return;
+          initializing = true;
+          await gate;
+          this.running = true;
+        }
+        detach(): void { this.detaches++; this.running = false; }
+      }
+      const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+      const first = new SlowInitialize();
+      const manager = await ContextManager.open({ store, strategy: first });
+      try {
+        let initialized: SlowInitialize;
+        let call: Promise<unknown>;
+        if (operation === 'setStrategy') {
+          initialized = new SlowInitialize();
+          initialized.gated = true;
+          call = manager.setStrategy(initialized);
+        } else {
+          initialized = first;
+          initialized.gated = true;
+          call = operation === 'switchBranch' ? manager.switchBranch(manager.currentBranch().name) : manager.fork();
+        }
+        assert.ok(await reaches(() => initializing), 'the strategy is initializing');
+        manager.close();
+        openInitialize();
+        await assert.rejects(call, { message: 'ContextManager closed during strategy initialization' });
+        assert.strictEqual(initialized.running, false, 'the work it started after close() is stopped');
+        assert.strictEqual(initialized.detaches, 2, 'close() detached it, and the manager again once initialize() returned');
+      } finally {
+        store.close();
+      }
+    });
+  }
+
+  it("a close() whose store close fails can be called again, and closes the store it owns", async () => {
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: new PassthroughStrategy() });
+    const store = manager.getStore() as unknown as { close: () => void };
+    const realClose = store.close.bind(store);
+    let failed = false;
+    store.close = () => {
+      if (!failed) {
+        failed = true;
+        throw new Error('sync failed');
+      }
+      realClose();
+    };
+    assert.throws(() => manager.close(), /sync failed/);
+    assert.strictEqual(manager.getStore().isClosed(), false, 'the store is open after the failed close');
+    manager.close();
+    assert.strictEqual(manager.getStore().isClosed(), true, 'a second close() closed it');
+  });
+
+  it('a quarantine sweep whose clear spans the swap stops there, and logs no clear', async () => {
     const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
-    const manager = await ContextManager.open({ store, strategy: new PassthroughStrategy() });
+    const { calls, membrane } = heldMembrane();
+    const strategy = newStrategy();
+    const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
     try {
-      const setting = manager.setStrategy(new SlowInitialize());
-      assert.ok(await reaches(() => initializing), 'the new strategy is initializing');
-      manager.close();
-      openInitialize();
-      await assert.rejects(setting, { message: 'ContextManager closed during strategy initialization' });
+      seed(manager);
+      await manager.compile();
+      // Two quarantine records whose chunk no chunk record matches, so the
+      // sweep clears both. Each clear waits until the test lets it go, as one
+      // waiting on the state lock does, and then writes nothing, as one that
+      // finds its strategy detached by then does.
+      const internals = strategy as unknown as {
+        readCompressionQuarantineProjection: () => Map<string, unknown>;
+        clearCompressionRefusalQuarantine: (key?: string) => Promise<void>;
+        quarantineAlarmActive: boolean;
+      };
+      const orphan = (key: string) => ({ record: { key, chunkSourceHash: key } });
+      internals.readCompressionQuarantineProjection = () => new Map([['orphan-1', orphan('orphan-1')], ['orphan-2', orphan('orphan-2')]]);
+      let openClear!: () => void;
+      const clearing = new Promise<void>((resolve) => { openClear = resolve; });
+      const cleared: string[] = [];
+      internals.clearCompressionRefusalQuarantine = async (key) => { cleared.push(String(key)); await clearing; };
+      internals.quarantineAlarmActive = true;
+      let ended = { outcome: 'pending' };
+      const logged = await logsDuring(async () => {
+        const ticking = manager.tick();
+        ended = outcomeOf(ticking);
+        assert.ok(await reaches(() => cleared.length === 1), 'the sweep reached its first clear');
+        await manager.setStrategy(new PassthroughStrategy());
+        openClear();
+        await settlesWithin(ticking);
+      });
+      assert.deepStrictEqual(cleared, ['orphan-1'], 'the sweep made no further clear');
+      assert.deepStrictEqual(logged.filter((line) => line.includes('[compression-quarantine]')), [], 'no clear and no failed sweep logged');
+      assert.strictEqual(ended.outcome, 'resolved', 'the tick ended quietly');
+      assert.strictEqual(calls.length, 0, 'the tick started no compression');
     } finally {
+      for (const call of calls) call.release();
+      manager.close();
       store.close();
     }
   });
