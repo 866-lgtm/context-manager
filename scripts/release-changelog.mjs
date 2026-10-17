@@ -172,7 +172,8 @@ function main() {
   if (new RegExp(`^## ${escaped}([^0-9]|$)`, "m").test(text)) {
     fail(
       `refused, and this script changed nothing: a '## ${version}' section already exists, so the pending ` +
-        `entries can't be released as ${version}. Release them under a new version: npm version <patch|minor|major>.`,
+        `entries can't be released as ${version}. A version bump made before it ran stays in package.json. ` +
+        "Release them under a new version: npm version <patch|minor|major>.",
     );
   }
 
