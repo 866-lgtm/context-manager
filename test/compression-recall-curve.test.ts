@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { after, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
@@ -16,6 +17,7 @@ const paths: string[] = [];
 function freshPath(): string {
   const path = `${BASE}-${sequence++}`;
   paths.push(path);
+  if (existsSync(path)) rmSync(path, { recursive: true, force: true });
   return path;
 }
 
@@ -27,6 +29,7 @@ function cleanup(): void {
 
 interface RecordedCall {
   request: NormalizedRequest;
+  originalRequest?: NormalizedRequest;
 }
 
 function response(stopReason: 'refusal' | 'end_turn' | 'max_tokens', text = '') {
@@ -82,7 +85,7 @@ function flexibleMembrane(handlers: AttemptHandler[]) {
     membrane: {
       complete: async (request: NormalizedRequest) => {
         const handler = handlers[calls.length] ?? handlers[handlers.length - 1]!;
-        calls.push({ request: structuredClone(request) });
+        calls.push({ request: structuredClone(request), originalRequest: request });
         if ('error' in handler) throw handler.error;
         if ('raw' in handler) return handler.raw;
         const result = response(handler.stop, handler.text ?? '');
@@ -193,6 +196,8 @@ class ProbeStrategy extends AutobiographicalStrategy {
     }).compressionRefusalQuarantine;
     return [...projection.keys()].sort();
   }
+
+  inputBound(request: NormalizedRequest): number { return (this as unknown as { compressionRequestInputBoundTokens(r: NormalizedRequest): number }).compressionRequestInputBoundTokens(request); }
 
   run(chunk: Chunk, ctx: StrategyContext): Promise<void> {
     return this.compressChunkHierarchical(chunk, ctx);
@@ -394,6 +399,8 @@ describe('compression refusal recall curves', () => {
     await fx.strategy.run(fx.target, managerContext(fx.manager));
 
     assert.equal(mock.calls.length, 2, 'one retry, zero curve-fallback calls');
+    assert.notStrictEqual(mock.calls[0].originalRequest!.messages[0],
+      mock.calls[1].originalRequest!.messages[0], 'a mode rewrite owns its unchanged message wrappers');
     assert.ok(
       !JSON.stringify(mock.calls[0]!.request).includes('do not call any tools'),
       'first attempt stays byte-identical to the canonical prompt',
@@ -2090,6 +2097,104 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
+  const kvUnifiedOptions = {
+    recentWindowTokens: 100,
+    adaptiveResolution: true,
+    foldingStrategy: 'kv-unified',
+    kvUnified: {
+      policy: {
+        alpha: 0.7, budgetLowRatio: 0.5, budgetHighRatio: 0.9, budgetUnderLambda: 10, budgetOverLambda: 10,
+        cacheLambda: 1, cacheScale: 1000, cacheReadPrice: 0.1, cacheWritePrice: 1.25,
+        continuityLambda: 1, continuityScale: 1000, continuityRecencyHalfLifeTokens: 1000, continuityRecencyFloor: 0.2,
+        continuityStableHalfLife: 10, continuityStableFloor: 0.25,
+      },
+      tokenBucketSize: 100, continuityBucketSize: 100, fidelityBucketSize: 100, labelCeiling: 10_000, adoptEpsilon: 0,
+      treeifyNonContiguousSummaries: false, preserveGapBearingSummaries: false,
+    },
+  } as never;
+
+  /** Another instance on the same store, which compresses the target and merges its L1. */
+  async function otherInstance(fx: Fixture, membrane: unknown) {
+    const other = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+    });
+    const manager = await ContextManager.open({ store: fx.manager.getStore(), strategy: other, membrane: membrane as never });
+    const ids = fx.target.messages.map((message) => message.id);
+    const write = () => {
+      const l1 = summary('L1-900', 1, ids, ids[0]!, ids.at(-1)!, 20, "the other instance's L1");
+      other.seed(l1);
+      other.seed(summary('L2-901', 2, [l1.id], ids[0]!, ids.at(-1)!, 20, "the other instance's L2"));
+      other.linkChild(l1, 'L2-901');
+    };
+    return { manager, ids, write };
+  }
+
+  it("a compression adopts an L1 another instance wrote before it started, with the summary above it, and calls no provider", async () => {
+    let calls = 0;
+    const membrane = { complete: async () => { calls++; return response('end_turn', 'not needed'); } };
+    const fx = await fixture(membrane, { compressionRefusalCurveFallbacks: 0 });
+    const other = await otherInstance(fx, membrane);
+    other.write();
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(calls, 0, 'no provider call');
+    assert.equal(fx.target.compressed, true);
+    assert.equal(fx.target.summaryId, 'L1-900');
+    const held = new Map(fx.strategy.summariesView().map((entry) => [entry.id, entry]));
+    assert.equal(held.get('L1-900')?.mergedInto, 'L2-901', 'it holds the L1 with the summary above it');
+    assert.ok(held.has('L2-901'));
+    other.manager.close();
+    fx.manager.close();
+  });
+
+  it("a compression whose L1 another instance writes during the provider call adopts it, keeping its own kv-unified submission in flight", async () => {
+    let calls = 0;
+    let other!: Awaited<ReturnType<typeof otherInstance>>;
+    const membrane = {
+      complete: async () => {
+        calls++;
+        other.write();
+        return response('end_turn', 'a paid result the other instance made redundant');
+      },
+    };
+    const fx = await fixture(membrane, { compressionRefusalCurveFallbacks: 0, ...(kvUnifiedOptions as object) });
+    other = await otherInstance(fx, membrane);
+    await fx.manager.compile({ maxTokens: 10_000, reserveForResponse: 0 }, undefined, { kvUnifiedImmutablePrefixHash: 'immutable-v1' });
+    fx.strategy.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+    const presentation = fx.strategy as unknown as {
+      kvUnifiedDraft: unknown;
+      kvUnifiedPendingLayout: unknown;
+      kvUnifiedReceipts: { inFlightSubmissionId: string | null };
+    };
+    const draft = presentation.kvUnifiedDraft;
+    const submittedLayout = presentation.kvUnifiedPendingLayout;
+    assert.ok(draft && submittedLayout, 'compiled and submitted');
+    const reloads: unknown[] = [];
+    const probe = fx.strategy as unknown as { loadPersistedState(options?: unknown): void };
+    const reload = probe.loadPersistedState.bind(fx.strategy);
+    probe.loadPersistedState = (options?: unknown) => {
+      reloads.push(options);
+      reload(options);
+    };
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(calls, 1, 'the compression made its call');
+    assert.equal(fx.target.summaryId, 'L1-900', 'then adopted the L1 the other instance wrote meanwhile');
+    const overTarget = fx.strategy.summariesView().filter((entry) => entry.level === 1 && entry.sourceIds.join(':') === other.ids.join(':'));
+    assert.deepEqual(overTarget.map((entry) => entry.id), ['L1-900'], 'and stored no second L1 over the same messages');
+    assert.ok(fx.strategy.summariesView().some((entry) => entry.id === 'L2-901'), 'it holds the summary above it');
+    assert.deepEqual(reloads, [{ keepKvUnifiedPresentation: true }], 'the lookup reloaded once, keeping the presentation');
+    assert.equal(presentation.kvUnifiedReceipts.inFlightSubmissionId, 's1', 'the submission is still in flight');
+    assert.equal(presentation.kvUnifiedDraft, draft, 'the draft is kept');
+    assert.equal(presentation.kvUnifiedPendingLayout, submittedLayout, 'the submitted layout is kept');
+    other.manager.close();
+    fx.manager.close();
+  });
+
   it('reloads branch-scoped quarantine projection on every branch switch', async () => {
     const mock = scriptedMembrane(['refusal']);
     const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
@@ -2472,6 +2577,156 @@ describe('compression refusal recall curves', () => {
       (event) => event.kind === 'alert_sent' && event.alertKey === key,
     );
     assert.equal(sent.length, 1, 'initialization retries the pending keyed alert attempt');
+    fx.manager.close();
+  });
+});
+
+describe('prepared recall expansions', () => {
+  after(cleanup);
+  it('retains expansion eligibility and prices/hashes the prepared requests for parent and child data URLs', async () => {
+    for (const location of ['parent', 'child']) {
+      const mock = flexibleMembrane([
+        { stop: 'refusal', omitUsage: true }, { stop: 'refusal', omitUsage: true }, { stop: 'refusal', omitUsage: true },
+      ]);
+      const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 2 });
+      const payload = 'U'.repeat(20000);
+      const entry = location === 'parent' ? fx.parents[1] : fx.children[2];
+      // Two data URLs a JSON escape separates: one preparation must replace both,
+      // or the hash recorded for a request differs from the request sent.
+      entry.content = 'authored data:image/png;base64,' + payload + '\\ndata:image/png;base64,' + payload;
+      fx.strategy.flushSummaries();
+      const storedBefore = JSON.stringify(fx.manager.getStore().getStateJson('default/autobio:summaries'));
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      assert.equal(mock.calls.length, 3);
+      assert.ok(recallIds(mock.calls[1].request).includes('L1-102'), 'newest parent remains expandable');
+      for (const call of mock.calls) assert.ok(!JSON.stringify(call.request).includes(payload));
+      const expectedCall = location === 'parent' ? mock.calls[0] : mock.calls[1];
+      assert.ok(JSON.stringify(expectedCall.request).includes('omitted from compression prompt'));
+      const record = quarantineEvents(fx.manager).map(e => e.record).find(Boolean) as {
+        canonicalRequestHash: string; canonicalRequestBoundTokens: number;
+        plan: Array<{ requestHash: string; deterministicInputBoundTokens: number }>;
+      };
+      const hash = (r: NormalizedRequest) => createHash('sha256').update(JSON.stringify(r)).digest('hex');
+      assert.equal(record.canonicalRequestHash, hash(mock.calls[0].request));
+      assert.equal(record.canonicalRequestBoundTokens, fx.strategy.inputBound(mock.calls[0].request));
+      for (const call of mock.calls.slice(1)) {
+        const planned = record.plan.find(p => p.requestHash === hash(call.request));
+        assert.ok(planned, 'family plan hashes the actual prepared candidate');
+        assert.equal(planned.deterministicInputBoundTokens, fx.strategy.inputBound(call.request));
+      }
+      assert.equal(JSON.stringify(fx.manager.getStore().getStateJson('default/autobio:summaries')), storedBefore);
+      fx.manager.close();
+    }
+  });
+});
+
+describe('prepared recall expansions: what is logged', () => {
+  after(cleanup);
+  it('logs a recall expansion\'s replacements when it is sent, not when it is enumerated', async () => {
+    // One fallback: the newer parent's expansion is sent, the older one's
+    // is enumerated and never sent.
+    for (const location of ['parent', 'child'] as const) {
+      const mock = flexibleMembrane([{ stop: 'refusal', omitUsage: true }, { stop: 'refusal', omitUsage: true }]);
+      const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 1 });
+      const entry = location === 'parent' ? fx.parents[1] : fx.children[2];
+      entry.content = 'authored data:image/png;base64,' + 'U'.repeat(20000);
+      fx.strategy.flushSummaries();
+      const logs: string[] = [];
+      const original = console.error;
+      console.error = (...parts: unknown[]) => { logs.push(parts.map(String).join(' ')); };
+      try {
+        await fx.strategy.run(fx.target, managerContext(fx.manager));
+      } finally { console.error = original; }
+      assert.equal(mock.calls.length, 2, 'the canonical request and one recall expansion');
+      const sentWithMarker = mock.calls.filter((call) => JSON.stringify(call.request).includes('omitted from compression prompt'));
+      const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
+      assert.equal(sentWithMarker.length, 1, `${location}: one sent request carried the data URL`);
+      assert.equal(lines.length, 1, `${location}: one line, for the request that was sent`);
+      assert.equal(lines[0]!.endsWith('[canonical]'), location === 'parent', `${location}: ${lines[0]}`);
+      fx.manager.close();
+    }
+  });
+});
+
+describe('prepared requests are logged when they are sent', () => {
+  after(cleanup);
+  it('logs the prepared source-only request only if it is sent', async () => {
+    const payload = 'V'.repeat(20000);
+    for (const [stops, sent] of [[['end_turn'], false], [['refusal', 'end_turn'], true]] as const) {
+      const mock = scriptedMembrane([...stops]);
+      const fx = await fixture(mock.membrane, {
+        compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true,
+      });
+      fx.target.messages = fx.target.messages.map((m, i) => i ? m : {
+        ...m, content: [text('data:image/png;base64,' + payload)],
+      });
+      const logs: string[] = [];
+      const original = console.error;
+      console.error = (...parts: unknown[]) => { logs.push(parts.map(String).join(' ')); };
+      try {
+        await fx.strategy.run(fx.target, managerContext(fx.manager));
+      } finally { console.error = original; }
+      assert.equal(mock.calls.length, sent ? 2 : 1);
+      const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
+      assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), sent ? ['[canonical]', '[source-only-final]'] : ['[canonical]']);
+      fx.manager.close();
+    }
+  });
+});
+
+describe('prepared source-only identity', () => {
+  after(cleanup);
+  it('records the source-only hash from the prepared dispatched request', async () => {
+    const mock = scriptedMembrane(['refusal', 'refusal']);
+    const fx = await fixture(mock.membrane, {
+      compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true,
+    });
+    const payload = 'V'.repeat(20000);
+    fx.target.messages = fx.target.messages.map((m, i) => i ? m : {
+      ...m, content: [text('data:image/png;base64,' + payload)],
+    });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2);
+    assert.ok(!JSON.stringify(mock.calls[1].request).includes(payload));
+    const record = quarantineEvents(fx.manager).map(e => e.record).find(Boolean) as {
+      normalizedConfig: { sourceOnlyFallbackRequestHash: string };
+    };
+    const actualHash = createHash('sha256').update(JSON.stringify(mock.calls[1].request)).digest('hex');
+    assert.equal(record.normalizedConfig.sourceOnlyFallbackRequestHash, actualHash);
+    fx.manager.close();
+  });
+});
+
+describe('prepared tool-prose mode rewrite', () => {
+  after(cleanup);
+  it('prepares newly constructed result text before recording the rewrite hash', async () => {
+    const payload = 'W'.repeat(5000);
+    const mock = scriptedMembrane(['refusal', 'refusal']);
+    const fx = await fixture(mock.membrane, {
+      compressionRefusalCurveFallbacks: 0,
+      compressionToolProseFallback: {
+        intoTool: 'journal', field: 'content', minChars: 100, fromTools: ['skip_reply'],
+        result: 'data:image/png;base64,' + payload,
+      },
+    });
+    fx.manager.setToolDefinitions(['journal', 'skip_reply'].map(name => ({
+      name, description: name, inputSchema: { type: 'object' },
+    })));
+    fx.target.messages = fx.target.messages.map((m, i) => ({
+      ...m, participant: i ? 'User' : 'Claude',
+      content: i ? [{ type: 'tool_result', toolUseId: 't', content: '{"skipped":true}' } as ContentBlock]
+        : [{ type: 'tool_use', id: 't', name: 'skip_reply', input: { reason: 'note '.repeat(100) } } as ContentBlock],
+    }));
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2);
+    assert.ok(JSON.stringify(mock.calls[1].request).includes('omitted from compression prompt'));
+    assert.ok(!JSON.stringify(mock.calls[1].request).includes(payload));
+    const exhausted = quarantineEvents(fx.manager).find(e => e.kind === 'exhausted') as {
+      outcomes: Array<{ curveLabel: string; requestHash: string }>;
+    };
+    const outcome = exhausted.outcomes.find(o => o.curveLabel === 'tool-prose-hoist');
+    assert.ok(outcome);
+    assert.equal(outcome.requestHash, createHash('sha256').update(JSON.stringify(mock.calls[1].request)).digest('hex'));
     fx.manager.close();
   });
 });
