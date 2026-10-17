@@ -415,6 +415,72 @@ test('phase C un-folds a summary whose listed leaf of another lineage sits at an
   assert.equal(plan.tokens, 170);
 });
 
+// Greptile's store from its second review of #186: m0 and m1 name A as their
+// L1, and m2 names B, but A lists only m1 and B lists m0 and m2. Both name P,
+// the L2 that lists A and B. Un-folding P puts m1 in A's recall and m2 in B's,
+// and the projection lowers m0 to raw, since A, its own L1, doesn't list it:
+// 1,100 tokens against a window of 150. Phase C priced m0 at A's recall, took
+// the un-fold at 100 tokens, and every compile ended exhausted. Priced where
+// the projection leaves m0, the un-fold is declined, and P holds all three at
+// 20 tokens.
+const unlistedOwnL1 = (older: PickerChunk[] = [], olderSummaries: SummaryEntry[] = []) => store(
+  [
+    ...older,
+    message('m0', older.length, 1_000, 'A'), message('m1', older.length + 1, 1_000, 'A'),
+    message('m2', older.length + 2, 1_000, 'B'),
+  ],
+  [
+    ...olderSummaries,
+    summary('A', 1, ['m1'], 50, 'P'), summary('B', 1, ['m0', 'm2'], 50, 'P'), summary('P', 2, ['A', 'B'], 20),
+  ],
+);
+
+test('phase C prices an un-fold where the projection leaves each leaf, and keeps a summary whose un-fold would render a leaf raw', () => {
+  const { inputs, tree } = unlistedOwnL1();
+  for (let compile = 1; compile <= 3; compile++) {
+    const { result } = quietOverlap(() =>
+      new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 100, slack: 0.1 }));
+    assert.deepEqual(unitsOf(renderLayout(inputs, tree, result.finalResolutions)), ['recall:P'], `compile ${compile}`);
+    assert.equal(result.finalTokens, 20);
+    assert.equal(result.exhausted, false);
+    for (const c of inputs.chunks) c.currentResolution = result.finalResolutions.get(c.id) ?? 0;
+  }
+});
+
+// The same store beside g0 and g1, older, which G folds at L1 for 10 tokens.
+// Phase C declines P's un-fold and moves m0 back from raw, where it went. Moved
+// back from L1 instead, m0's 1,000 raw tokens stayed in the ledger, which then
+// read the plan as past its target, and G was never un-folded.
+test('phase C moves a declined un-fold\'s leaves back from the levels they went to, and un-folds the next summary', () => {
+  const { inputs, tree } = unlistedOwnL1(
+    [message('g0', 0, 30, 'G'), message('g1', 1, 30, 'G')],
+    [summary('G', 1, ['g0', 'g1'], 10)],
+  );
+  const { result } = quietOverlap(() =>
+    new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 100, slack: 0.1 }));
+  assert.deepEqual(unitsOf(renderLayout(inputs, tree, result.finalResolutions)), ['raw:g0', 'raw:g1', 'recall:P']);
+  assert.equal(result.finalTokens, 80);
+});
+
+// y's own L1 N names T, an L3, as its parent, so y's lineage skips L2, and T
+// lists M and N. Un-folding T leaves x in M's recall and lowers y past L2,
+// where its lineage has no summary, to N: 35 tokens against a target of 30.
+// Priced at L2 instead, y counted as raw, 115 tokens, past the window of 60,
+// so phase C declined the un-fold and the plan stayed at T's 10 tokens.
+test('phase C prices a leaf whose lineage skips the level below the summary where the projection leaves it, and takes the un-fold', () => {
+  const { inputs, tree } = store(
+    [message('x', 0, 100, 'N1'), message('y', 1, 100, 'N')],
+    [
+      summary('N1', 1, ['x'], 20, 'M'), summary('M', 2, ['N1'], 15, 'T'), summary('N', 1, ['y'], 20, 'T'),
+      summary('T', 3, ['M', 'N'], 10),
+    ],
+  );
+  const { result } = quietOverlap(() =>
+    new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 60, targetBudget: 30, slack: 0.1 }));
+  assert.deepEqual(unitsOf(renderLayout(inputs, tree, result.finalResolutions)), ['recall:M', 'recall:N']);
+  assert.equal(result.finalTokens, 35);
+});
+
 // [kv-overlap] reads the frontier the plan emits, not which folds the solve
 // made: a hold that keeps R and A, which both list m0 and m1, warns though the
 // ideal cut folds neither, and a hold that renders neither stays quiet though

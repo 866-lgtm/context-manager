@@ -445,16 +445,29 @@ function relevanceCut(
         // renderLayout, and every later accept decision is made on corrupt
         // arithmetic (observed: phase C walked an L3 fold all the way back to
         // carried while its ledger believed it sat on target).
-        const moved: Array<[ChunkId, number]> = [];
+        // Each leaf moves one level down, or deeper while the summary of its
+        // own lineage there is missing or doesn't list it, down to raw, as
+        // projectToValidCut lowers an unheld leaf, so the accept below weighs
+        // the leaf where the projection will put it for want of a summary that
+        // lists it. Moved one level down regardless, a leaf that summary
+        // doesn't list was priced at a recall the projection then took away:
+        // an un-fold the ledger said fit was accepted, then rendered the leaf
+        // raw.
+        const moved: Array<[ChunkId, number, number]> = [];
         for (const leafId of node.leafChunkIds) {
           if (rawZone.has(leafId) || immovable.has(leafId)) continue; // protected: not part of the fold
           if (tree.ancestorAt(leafId, level)?.id !== node.id) continue; // rendered by another node
           const from = F.get(leafId) ?? 0;
           if (from <= level - 1) continue; // already at/below the destination
+          let to = level - 1;
+          for (; to > 0; to--) {
+            const own = tree.ancestorAt(leafId, to);
+            if (own && lists(listedBy, own, leafId)) break;
+          }
           const leaf = byId.get(leafId);
-          if (leaf) ledger.move(leaf, byId, from, level - 1);
-          F.set(leafId, level - 1);
-          moved.push([leafId, from]);
+          if (leaf) ledger.move(leaf, byId, from, to);
+          F.set(leafId, to);
+          moved.push([leafId, from, to]);
         }
         // Accept an un-fold that lands PAST the target when it still gets
         // CLOSER to it (and stays under W). Merge groups are coarse quanta
@@ -465,10 +478,11 @@ function relevanceCut(
         const nt = ledger.tokens;
         const accept = nt <= windowTokens && Math.abs(nt - target) < Math.abs(before - target);
         if (!accept) {
-          // moves away from the target (or breaches W) → revert
-          for (const [leafId, from] of moved) {
+          // moves away from the target (or breaches W) → revert, each leaf
+          // from the level it moved to
+          for (const [leafId, from, to] of moved) {
             const leaf = byId.get(leafId);
-            if (leaf) ledger.move(leaf, byId, level - 1, from);
+            if (leaf) ledger.move(leaf, byId, to, from);
             F.set(leafId, from);
           }
           attempted.add(attemptKey);
