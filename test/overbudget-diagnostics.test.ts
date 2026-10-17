@@ -1489,6 +1489,52 @@ describe('OverBudgetError.clearedBy', () => {
     }, { membrane: countingMembrane(calls) });
   });
 
+  // The chunks the test above widens the head over lie wholly inside it, so they fold nothing and don't count
+  // whatever the tools say. A chunk that lies before a reset head start folds, and the head after it, which
+  // tick's request carries raw, is what holds it back: a tool message in the head lies past the chunk's start.
+  it('before the host declares its tools, counts no queued chunk that lies before a reset head start when the head carries a tool cycle, which tick\'s request carries raw though it lies after the chunk', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: false,
+      targetChunkTokens: 40,
+      headWindowTokens: 60,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+      mergeThreshold: 1000,
+      minChunkCharsForLLM: 0,
+    });
+    const calls = { n: 0 };
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 6; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      // The head starts at a text message, and a tool cycle follows it inside the head.
+      const headStartId = manager.addMessage('user', [{ type: 'text', text: 'the head starts here' }]);
+      const cycle = [
+        manager.addMessage('assistant', [{ type: 'tool_use', id: 'zz-head', name: 'zz_tool', input: { q: 'zz' } } as ContentBlock]),
+        manager.addMessage('user', [{ type: 'tool_result', toolUseId: 'zz-head', content: 'zz result' } as ContentBlock]),
+      ];
+      for (let i = 6; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      strategy.resetHeadWindow(headStartId);
+      const error = await refusal(manager);
+      const queued = strategy.queuedChunkIds();
+      assert.ok(queued.length > 0, 'chunks are queued');
+      const { indices, headStart, headEnd } = strategy.placement([...queued[0]!, ...cycle]);
+      const chunkAt = indices.slice(0, queued[0]!.length);
+      const cycleAt = indices.slice(queued[0]!.length);
+      assert.ok(chunkAt.every((i) => i >= 0 && i < headStart), 'the premise: the first queued chunk lies before the head window\'s start, so it folds');
+      assert.ok(!queued[0]!.some((id) => cycle.includes(id)), 'the premise: and holds no tool block of its own');
+      assert.ok(cycleAt.every((i) => i >= headStart && i < headEnd), 'the premise: the cycle sits in the head window, past the chunk\'s start');
+      assert.deepEqual(error.clearedBy, [], 'tick defers every queued chunk until the tools come');
+      // The premise: tick's request carries the head raw, cycle included, so it defers each queued chunk, with no model call.
+      for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+      assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
+      assert.equal(calls.n, 0, 'tick asked no model');
+      assert.deepEqual(strategy.summaryIds(), [], 'and compressed none');
+      manager.setToolDefinitions([{ name: 'zz_tool', description: 'zz', inputSchema: { type: 'object' } }]);
+      assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'with the tools declared, they count');
+    }, { membrane: countingMembrane(calls) });
+  });
+
   const pinnedCycleAt = {
     'head window': 'in the head window, which tick\'s head then carries raw',
     'reset head': 'before a reset head start, which tick\'s request then carries raw though it lies before the head',
