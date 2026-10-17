@@ -2319,7 +2319,11 @@ describe('compression refusal recall curves', () => {
    * Two instances on one store, the second joining the first's in-flight call,
    * which fails with `error`. `seed` runs on the second before it joins.
    */
-  async function coalescedFailure(error: Error, seed?: (strategy: ProbeStrategy, ctx: StrategyContext) => void) {
+  async function coalescedFailure(
+    error: Error,
+    seed?: (strategy: ProbeStrategy, ctx: StrategyContext) => void,
+    options: { secondMembrane?: unknown } = {},
+  ) {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let calls = 0;
@@ -2341,7 +2345,7 @@ describe('compression refusal recall curves', () => {
       mergeThreshold: 99,
       compressionRefusalCurveFallbacks: 0,
     });
-    const secondManager = await ContextManager.open({ store: first.manager.getStore(), strategy: second, membrane: concurrent });
+    const secondManager = await ContextManager.open({ store: first.manager.getStore(), strategy: second, membrane: (options.secondMembrane ?? concurrent) as never });
     const secondCtx = managerContext(secondManager);
     const secondMessages = first.target.messages.map(
       (message) => secondCtx.messageStore.get(message.id),
@@ -2384,6 +2388,15 @@ describe('compression refusal recall curves', () => {
       "the waiter's lane holds for the provider's stated wait, so it doesn't send the same request inside it");
     assert.equal(pause!.failures, 0, 'no failure counted: none of its calls failed');
     assert.equal(pause!.backoffUntil, 0, 'and no backoff of its own');
+    close();
+  });
+
+  it("a waiter on another membrane takes no pause from the producer's stated wait: the provider stated it for the producer's route (Greptile P1)", async () => {
+    const limited = Object.assign(new Error('zz rate limited'), { type: 'rate_limit', httpStatus: 429, retryAfterMs: 120_000 });
+    const elsewhere = { complete: async () => { throw new Error('zz the waiter makes no call of its own'); } };
+    const { pause, producerPause, close } = await coalescedFailure(limited, undefined, { secondMembrane: elsewhere });
+    assert.ok(producerPause && producerPause.statedUntil !== null, "premise: the producer's own lane holds for the stated wait");
+    assert.equal(pause, null, "the waiter's route stated no wait, so its lane takes none");
     close();
   });
 
