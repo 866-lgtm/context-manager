@@ -1,9 +1,9 @@
 /**
  * [fold-diff] wiring in the real strategy, driven through
  * ContextManager.compile() with adaptiveResolution: the dry-run gate, the
- * per-compile reset, logging only at the commit point, the attach on
- * planVsActual, the kept committed layout, and observability never failing a
- * compile (PR #157 review §1).
+ * per-compile reset, logging only once a compile that changed a saved level
+ * commits, the attach on planVsActual, the divergence measured on the
+ * entries placed, and observability never failing a compile (PR #157 review).
  *
  * The picker is replaced (buildPicker hook, as in hard-fail.test.ts) by one
  * whose plan the test sets per compile, over real L1 summaries produced by a
@@ -15,10 +15,12 @@ import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
 
 import { ContextManager, AutobiographicalStrategy } from '../../src/index.js';
-import { accountFrontier, type PickerInputs } from '../../src/adaptive/picker.js';
+import { accountFrontier, type PickerChunk, type PickerInputs } from '../../src/adaptive/picker.js';
 import type { ChunkId } from '../../src/adaptive/folding-strategy.js';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import { formatFoldDiff, type FoldDiff } from '../../src/adaptive/fold-diff.js';
+import type { ContentBlock } from '@animalabs/membrane';
+import type { ContextEntry, MessageId } from '../../src/types/index.js';
 
 const TEST_STORE_PATH = './test-adaptive-fold-diff-strategy-store';
 
@@ -36,16 +38,48 @@ function makeMockMembrane() {
   };
 }
 
-type Plan = 'fold' | 'raw' | 'carried';
+/** Every middle chunk with an L1 at L1 ('fold'), everything raw ('raw'), the
+ *  carried frontier unchanged ('carried', zero moves), or a level per chunk. */
+type Plan = 'fold' | 'raw' | 'carried' | ((c: PickerChunk, inputs: PickerInputs) => number);
 
-/** A strategy whose picker applies the plan the test sets: every middle chunk
- *  with an L1 at L1 ('fold'), everything raw ('raw'), or the carried frontier
- *  unchanged ('carried', zero moves). `lie` reports a 1-token plan, so the
- *  plan check passes and the EMITTER refuses an over-budget frontier — a
- *  failure after the fold diff was staged. */
+/** A strategy whose picker applies the plan the test sets. `lie` reports a
+ *  1-token plan, so the plan check passes and the EMITTER refuses an
+ *  over-budget frontier: a failure after the saved-level changes were staged.
+ *  It keeps a copy of the entries each compile compared for its cache
+ *  markers, which is what the fold diff measures. */
 class PlannedStrategy extends AutobiographicalStrategy {
   plan: Plan = 'fold';
   lie = false;
+  placed: Array<Array<{ participant: string; content: ContentBlock[]; sourceMessageId?: MessageId }>> = [];
+  /** Refuse the next compile after it has placed its cache markers, where the
+   *  coverage check refuses. */
+  refuseAfterMarkers = false;
+  /** The cache-marker baseline the next compile compares with, by identity. */
+  get baseline(): readonly string[] | undefined {
+    return this._prevCacheKeys;
+  }
+  protected assertMiddleCoverage(): void {
+    if (this.refuseAfterMarkers) {
+      this.refuseAfterMarkers = false;
+      throw new Error('refused after its markers were placed');
+    }
+    super.assertMiddleCoverage();
+  }
+  estimate(content: ContentBlock[]): number {
+    return this.estimateTokens(content);
+  }
+  protected placeCacheMarkers(
+    entries: ContextEntry[],
+    head: ReadonlySet<MessageId>,
+    tail: ReadonlySet<MessageId>,
+  ): number | null {
+    this.placed.push(entries.map((e) => ({
+      participant: e.participant,
+      content: structuredClone(e.content),
+      ...(e.sourceMessageId ? { sourceMessageId: e.sourceMessageId } : {}),
+    })));
+    return super.placeCacheMarkers(entries, head, tail);
+  }
   protected buildPicker(): any {
     return {
       solverName: 'test-plan',
@@ -53,9 +87,12 @@ class PlannedStrategy extends AutobiographicalStrategy {
         const middle = (id: ChunkId) => !inputs.headChunkIds.has(id) && !inputs.tailChunkIds.has(id);
         const finalResolutions = new Map<ChunkId, number>();
         for (const c of inputs.chunks) {
-          const level = this.plan === 'carried'
-            ? c.currentResolution
-            : this.plan === 'fold' && middle(c.id) && c.l1Id ? 1 : 0;
+          const plan = this.plan;
+          const level = typeof plan === 'function'
+            ? plan(c, inputs)
+            : plan === 'carried'
+              ? c.currentResolution
+              : plan === 'fold' && middle(c.id) && c.l1Id ? 1 : 0;
           finalResolutions.set(c.id, level);
         }
         let moves = 0;
@@ -76,7 +113,7 @@ class PlannedStrategy extends AutobiographicalStrategy {
   }
 }
 
-type Stats = { planVsActual?: { foldDiff?: FoldDiff } } | null;
+type Stats = { planVsActual?: { actual?: number; moves?: number; foldDiff?: FoldDiff } } | null;
 
 describe('AutobiographicalStrategy — [fold-diff] wiring', () => {
   let errors: string[] = [];
@@ -101,7 +138,7 @@ describe('AutobiographicalStrategy — [fold-diff] wiring', () => {
     console.warn = origWarn;
   });
 
-  async function open(): Promise<{ manager: ContextManager; strategy: PlannedStrategy }> {
+  async function open(): Promise<{ manager: ContextManager; strategy: PlannedStrategy; ids: MessageId[] }> {
     const strategy = new PlannedStrategy({
       compressionModel: 'mock',
       adaptiveResolution: true,
@@ -113,13 +150,23 @@ describe('AutobiographicalStrategy — [fold-diff] wiring', () => {
       strategy,
       membrane: makeMockMembrane() as any,
     });
+    const ids: MessageId[] = [];
     for (let i = 0; i < 30; i++) {
-      manager.addMessage('User', [{ type: 'text', text: `Msg ${i}. ` + 'word '.repeat(40) }]);
+      ids.push(manager.addMessage('User', [{ type: 'text', text: `Msg ${i}. ` + 'word '.repeat(40) }]));
     }
     while (!manager.isReady()) await manager.tick();
     errors = [];
     warnings = [];
-    return { manager, strategy };
+    return { manager, strategy, ids };
+  }
+
+  /** Where two compiles' entries first differ, found here, apart from the strategy's own search. */
+  function firstDifference(before: PlannedStrategy['placed'][number], now: PlannedStrategy['placed'][number]): number {
+    let first = 0;
+    while (first < now.length && first < before.length && JSON.stringify(now[first]) === JSON.stringify(before[first])) {
+      first++;
+    }
+    return first;
   }
 
   const BIG = { maxTokens: 100_000, reserveForResponse: 200 };
@@ -134,6 +181,143 @@ describe('AutobiographicalStrategy — [fold-diff] wiring', () => {
     assert.ok(diff, 'foldDiff attached to planVsActual');
     assert.ok(diff.moves > 0 && diff.deepened === diff.moves, 'the fold plan deepened chunks');
     assert.equal(formatFoldDiff(diff), lines[0], 'the attached record is the one logged');
+    // The strategy's first compile has nothing earlier to compare with.
+    assert.equal(diff.divergenceOffset, null);
+    assert.equal(diff.suffixTokens, null);
+    assert.match(lines[0], /no earlier compile to compare/);
+    manager.close();
+  });
+
+  it('a later compile reports where its request first differs from the one before, measured on the entries placed', async () => {
+    const { manager, strategy } = await open();
+    await manager.compile(BIG);
+    errors = [];
+    // Raise only the last folded chunk: what comes before it is sent as before.
+    strategy.plan = (c, inputs) => {
+      const folded = inputs.chunks.filter((x) => x.currentResolution === 1);
+      return c.id === folded.at(-1)?.id ? 0 : c.currentResolution;
+    };
+    await manager.compile(BIG);
+    assert.equal(foldLines().length, 1);
+    const diff = stats(manager)!.planVsActual!.foldDiff!;
+    assert.equal(diff.moves, 1);
+    assert.equal(diff.raised, 1);
+
+    const [before, now] = strategy.placed.slice(-2);
+    const first = firstDifference(before, now);
+    const tokens = now.map((e) => strategy.estimate(e.content));
+    const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
+    assert.ok(first > 0 && first < now.length, `fixture: the change falls inside the request (entry ${first} of ${now.length})`);
+    assert.equal(diff.divergenceOffset, sum(tokens.slice(0, first)));
+    assert.equal(diff.suffixTokens, sum(tokens.slice(first)));
+    manager.close();
+  });
+
+  it('a message edited in place before the fold moves the divergence to the edit (R1-5)', async () => {
+    const { manager, strategy, ids } = await open();
+    // Fold only the later half, so the earlier messages are sent raw.
+    const laterHalf = (c: PickerChunk) => c.sequence >= 15 && c.l1Id ? 1 : 0;
+    strategy.plan = (c, inputs) => (!inputs.headChunkIds.has(c.id) && !inputs.tailChunkIds.has(c.id) ? laterHalf(c) : 0);
+    await manager.compile(BIG);
+    const edited = ids[3];
+    assert.ok(strategy.placed.at(-1)!.some((e) => e.sourceMessageId === edited), 'fixture: the edited message is sent raw');
+    manager.editMessage(edited, [{ type: 'text', text: 'Msg 3, edited in place. ' + 'word '.repeat(40) }]);
+    errors = [];
+    // A fold far after the edit: raise the last folded chunk.
+    strategy.plan = (c, inputs) => {
+      const folded = inputs.chunks.filter((x) => x.currentResolution === 1);
+      return c.id === folded.at(-1)?.id ? 0 : c.currentResolution;
+    };
+    await manager.compile(BIG);
+    assert.equal(foldLines().length, 1);
+    const diff = stats(manager)!.planVsActual!.foldDiff!;
+    const [before, now] = strategy.placed.slice(-2);
+    const first = firstDifference(before, now);
+    assert.equal(now[first].sourceMessageId, edited, 'the request first differs at the edited message');
+    const tokens = now.map((e) => strategy.estimate(e.content));
+    const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
+    assert.equal(diff.divergenceOffset, sum(tokens.slice(0, first)));
+    assert.equal(diff.suffixTokens, sum(tokens.slice(first)));
+    manager.close();
+  });
+
+  it('a compile refused after placing its markers leaves the last request returned as the one the next compile compares with', async () => {
+    const { manager, strategy, ids } = await open();
+    strategy.plan = (c, inputs) =>
+      (!inputs.headChunkIds.has(c.id) && !inputs.tailChunkIds.has(c.id) && c.sequence >= 15 && c.l1Id ? 1 : 0);
+    await manager.compile(BIG);
+    const returned = strategy.baseline;
+    const placedBefore = strategy.placed.length;
+    const edited = ids[3];
+    assert.ok(strategy.placed.at(-1)!.some((e) => e.sourceMessageId === edited), 'fixture: the edited message is sent raw');
+    // The refused compile carries the edit, so measured against it the next
+    // compile would first differ at its fold, far later.
+    manager.editMessage(edited, [{ type: 'text', text: 'Msg 3, edited in place. ' + 'word '.repeat(40) }]);
+    strategy.refuseAfterMarkers = true;
+    await assert.rejects(manager.compile(BIG), /refused after its markers were placed/);
+    assert.equal(strategy.placed.length, placedBefore + 1, 'fixture: the refused compile placed its markers');
+    assert.strictEqual(strategy.baseline, returned, 'the baseline is the last request returned');
+    errors = [];
+    strategy.plan = (c, inputs) => {
+      const folded = inputs.chunks.filter((x) => x.currentResolution === 1);
+      return c.id === folded.at(-1)?.id ? 0 : c.currentResolution;
+    };
+    await manager.compile(BIG);
+    assert.equal(foldLines().length, 1);
+    const diff = stats(manager)!.planVsActual!.foldDiff!;
+    const [last, , now] = strategy.placed.slice(-3);
+    const first = firstDifference(last, now);
+    assert.equal(now[first].sourceMessageId, edited, 'the request first differs from the last one returned at the edit');
+    const tokens = now.map((e) => strategy.estimate(e.content));
+    const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
+    assert.equal(diff.divergenceOffset, sum(tokens.slice(0, first)));
+    assert.equal(diff.suffixTokens, sum(tokens.slice(first)));
+    manager.close();
+  });
+
+  it('a pin added since the previous request shows in the divergence, not in the runs', async () => {
+    const { manager, strategy, ids } = await open();
+    await manager.compile(BIG);
+    const before = strategy.placed.at(-1)!;
+    // The first folded message: everything before it is sent raw, so its
+    // chunk's summary is where the pin first changes the request.
+    const pinned = ids.find((id) => !before.some((e) => e.sourceMessageId === id))!;
+    assert.ok(pinned, 'fixture: some message is folded');
+    manager.pinRange(pinned, pinned);
+    errors = [];
+    // As the solvers do, a pinned chunk is planned raw; the last folded
+    // chunk is raised, a move far after the pin.
+    strategy.plan = (c, inputs) => {
+      const folded = inputs.chunks.filter((x) => x.currentResolution === 1 && !x.pinned);
+      return c.pinned || c.id === folded.at(-1)?.id ? 0 : c.currentResolution;
+    };
+    await manager.compile(BIG);
+    assert.equal(foldLines().length, 1);
+    const diff = stats(manager)!.planVsActual!.foldDiff!;
+    assert.equal(diff.moves, 1, 'the raised chunk is the one move: the pinned chunk rendered raw on both sides');
+    assert.deepEqual(diff.runs.map((r) => [r.from, r.to, r.count]), [[1, 0, 1]]);
+    const now = strategy.placed.at(-1)!;
+    const first = firstDifference(before, now);
+    assert.equal(now[first].sourceMessageId, pinned, 'the request first differs at the pinned message');
+    const tokens = now.map((e) => strategy.estimate(e.content));
+    const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
+    assert.equal(diff.divergenceOffset, sum(tokens.slice(0, first)));
+    manager.close();
+  });
+
+  it('a compile that changes no saved level logs nothing, though its solver moved a locked chunk', async () => {
+    const { manager, strategy } = await open();
+    await manager.compile(BIG);
+    const locked = stats(manager)!.planVsActual!.foldDiff!.runs[0].firstChunkId;
+    strategy.lockChunk(locked);
+    errors = [];
+    // The commit loop skips a locked chunk, so this plan changes no saved
+    // level, though the solver reports it as a move.
+    strategy.plan = (c) => (c.id === locked ? 0 : c.currentResolution);
+    await manager.compile(BIG);
+    assert.equal(stats(manager)?.planVsActual?.moves, 1, 'fixture: the solver moved the locked chunk');
+    assert.deepEqual(foldLines(), []);
+    assert.equal(stats(manager)?.planVsActual?.foldDiff, undefined);
     manager.close();
   });
 
@@ -166,27 +350,27 @@ describe('AutobiographicalStrategy — [fold-diff] wiring', () => {
     manager.close();
   });
 
-  it('a plan that fails after staging logs nothing; the retry that commits logs once', async () => {
+  it('a plan the emitter refuses logs nothing; the retry that commits logs once', async () => {
     const { manager, strategy } = await open();
     await manager.compile(BIG);
-    const folded = stats(manager)!.planVsActual!.foldDiff!;
+    const folded = stats(manager)!.planVsActual!;
     // Fits folded, not raw: the raw plan lies its way past the plan check and
     // the emitter refuses it.
-    const tight = { maxTokens: folded.nextTokens + 400, reserveForResponse: 0 };
+    const tight = { maxTokens: folded.actual! + 400, reserveForResponse: 0 };
     errors = [];
     strategy.plan = 'raw';
     strategy.lie = true;
-    await assert.rejects(() => manager.compile(tight));
+    await assert.rejects(() => manager.compile(tight), /Emission overran the plan/);
     assert.deepEqual(foldLines(), [], 'a refused plan is not a fold the resident saw');
     strategy.lie = false;
     await manager.compile(BIG);
     assert.equal(foldLines().length, 1, 'the committed retry logs once');
     const diff = stats(manager)!.planVsActual!.foldDiff!;
-    assert.equal(diff.raised, folded.deepened, 'the failed plan committed nothing');
+    assert.equal(diff.raised, folded.foldDiff!.deepened, 'the failed plan committed nothing');
     manager.close();
   });
 
-  it('a throw inside describeFoldDiff leaves the compile succeeding', async () => {
+  it('a throw inside the fold diff leaves the compile succeeding', async () => {
     const { manager } = await open();
     const original = SummaryTree.prototype.ancestorAt;
     SummaryTree.prototype.ancestorAt = function () {
@@ -201,21 +385,7 @@ describe('AutobiographicalStrategy — [fold-diff] wiring', () => {
     assert.deepEqual(foldLines(), []);
     assert.ok(warnings.some((w) => w.startsWith('[fold-diff] unavailable')), 'the failure is reported');
     assert.equal(stats(manager)?.planVsActual?.foldDiff, undefined);
-    assert.ok((stats(manager)?.planVsActual as { moves?: number } | undefined)?.moves, 'the fold itself committed');
-    manager.close();
-  });
-
-  it('diffs against the layout the last committed compile sent, not a re-render', async () => {
-    const { manager, strategy } = await open();
-    await manager.compile(BIG);
-    const first = stats(manager)!.planVsActual!.foldDiff!;
-    // A new message changes this compile's inputs: a re-render of the carried
-    // frontier would include it; the kept layout is the previous request.
-    manager.addMessage('User', [{ type: 'text', text: 'one more ' + 'word '.repeat(40) }]);
-    strategy.plan = 'raw';
-    await manager.compile(BIG);
-    const second = stats(manager)!.planVsActual!.foldDiff!;
-    assert.equal(second.previousTokens, first.nextTokens);
+    assert.ok(stats(manager)?.planVsActual?.moves, 'the fold itself committed');
     manager.close();
   });
 });

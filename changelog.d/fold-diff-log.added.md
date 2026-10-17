@@ -1,18 +1,31 @@
-- `[fold-diff]` observability for adaptive compiles: when a non-dry-run
-  compile that changed at least one resolution commits, the strategy logs
-  once which chunks moved between which levels, grouped into contiguous
-  source-order runs with each run's offset in the previous request's layout,
-  plus the earliest layout divergence and the suffix the provider will
-  re-read (`kvCost` semantics) — e.g.
-  `[fold-diff] moves=860 (deepened=860 raised=0) rendered 382k→344k divergence@27k suffix=317k runs=2: L2→L3×792@27k[…] L0→L1×68@310k[…]`.
-  A plan that fails after staging (budget, coverage, emission) prints
-  nothing. The same record is attached to `RenderStats.planVsActual.foldDiff`
-  and describes only the compile it is attached to.
-- Levels in the diff are the levels the layout renders: a pinned chunk counts
-  as raw whatever it carries, and locked chunks are skipped as the commit
-  loop skips them, so a line never reports a move with an unchanged layout.
-- The previous side is the layout the last committed compile actually sent,
-  kept by the strategy, so pins added and messages appended since that
-  request show in the divergence; after a restart the carried frontier is
-  re-rendered from the current inputs instead. Quiet compiles and dry runs
-  are unchanged.
+- `[fold-diff]` observability for adaptive compiles: when a compile that
+  changed at least one saved level commits, the strategy logs once which
+  chunks moved between which levels, grouped into contiguous source-order
+  runs, and where its request's entries first differ from those of the last
+  request the strategy returned, with the tokens from there to the end, which
+  no cached prefix can cover — e.g.
+  `[fold-diff] moves=18 (deepened=18 raised=0) divergence@20k suffix=32k runs=1: L0→L1×18[636..656]`.
+  A compile that commits no saved-level change prints nothing, whatever else
+  changed in its request, and neither does a dry run or a plan refused before
+  the commit. The same record is attached to
+  `RenderStats.planVsActual.foldDiff`, with at most eight runs and
+  `runsTotal` counting them all, and describes only the compile it is
+  attached to.
+- The runs compare the carried frontier with the new one, both at the levels
+  chunks render at under this compile's pins and summaries: a pinned chunk
+  counts as raw whatever it carries, and locked chunks are skipped as the
+  commit loop skips them. So the runs describe what the commit changes, and a
+  pin added or removed, a summary lost or a lock released since the previous
+  request changes the request without a run; the divergence shows where. A
+  compile that only saves a lower level for a chunk whose summary is gone
+  logs a line with no move. A move can leave the request unchanged, when the
+  summary it moves to already renders for its siblings and the one it leaves
+  still renders for theirs.
+- The divergence is measured: it is where this request's entries first
+  differ in their bytes from the previous request's, the comparison that
+  places the stable-prefix cache marker, which now also runs under
+  kv-unified. A pin, an appended message or a message edited in place since
+  the previous request shows where it lands. Its offsets count the entries'
+  tokens only: the system prompt and tools come before them and are neither
+  compared nor counted. The strategy's first compile after the process starts
+  has nothing to compare with, and its line says so.

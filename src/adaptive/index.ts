@@ -110,7 +110,6 @@ export {
   type RenderedUnit,
   type Frontier,
 } from './render-offsets.js';
-export { describeFoldDiff, formatFoldDiff, type FoldDiff, type FoldDiffRun } from './fold-diff.js';
 
 // KV-cache simulation + session replay (provider-cache stability measurement)
 export {
