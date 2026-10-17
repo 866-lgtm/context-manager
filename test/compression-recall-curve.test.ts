@@ -1524,7 +1524,7 @@ describe('compression refusal recall curves', () => {
     }
   });
 
-  it("a scan that yields after a quarantine skip leaves newer pending work alone (ethan-cm138-whole I8)", async () => {
+  it("a scan that yields after a quarantine skip leaves newer pending work alone", async () => {
     const mock = scriptedMembrane(['refusal']);
     const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
     try {
@@ -1544,7 +1544,7 @@ describe('compression refusal recall curves', () => {
     }
   });
 
-  it('an identity first queued during the scan waits for the next tick (ethan-cm138-whole I14)', async () => {
+  it('an identity first queued during the scan waits for the next tick', async () => {
     const mock = scriptedMembrane(['refusal', 'end_turn']);
     const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
     try {
@@ -1573,7 +1573,7 @@ describe('compression refusal recall curves', () => {
     }
   });
 
-  it('a queued chunk compressed during the scan\'s yield is passed over (ethan-cm138-whole I47)', async () => {
+  it('a queued chunk compressed during the scan\'s yield is passed over', async () => {
     const mock = scriptedMembrane(['refusal', 'end_turn']);
     const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
     try {
@@ -1593,7 +1593,7 @@ describe('compression refusal recall curves', () => {
     }
   });
 
-  it('the speculative drain goes on past a tick that only consumed a quarantine skip (ethan-cm138-whole I36)', async () => {
+  it('the speculative drain goes on past a tick that only consumed a quarantine skip', async () => {
     const mock = scriptedMembrane(['refusal', 'end_turn']);
     const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
     try {
@@ -1700,7 +1700,7 @@ describe('compression refusal recall curves', () => {
     }
   });
 
-  it('a skipped quarantined chunk waits behind fresh work after the next rebuild (Anarchid R1-5)', async () => {
+  it('a skipped quarantined chunk waits behind fresh work after the next rebuild', async () => {
     const fx = await queuedRawFixture();
     try {
       await fx.strategy.tick(fx.ctx);
@@ -2414,7 +2414,7 @@ describe('compression refusal recall curves', () => {
     };
   }
 
-  it("a waiter on another instance's call takes the provider's stated wait from its failure, counting none (Anarchid R1-3)", async () => {
+  it("a waiter on another instance's call takes the provider's stated wait from its failure, counting none", async () => {
     const limited = Object.assign(new Error('zz rate limited'), { type: 'rate_limit', httpStatus: 429, retryAfterMs: 120_000 });
     const { before, pause, close } = await coalescedFailure(limited);
     assert.ok(pause && pause.statedUntil !== null && pause.statedUntil >= before + 120_000,
@@ -2424,7 +2424,7 @@ describe('compression refusal recall curves', () => {
     close();
   });
 
-  it("a waiter on another membrane takes no pause from the producer's stated wait: the provider stated it for the producer's route (Greptile P1)", async () => {
+  it("a waiter on another membrane takes no pause from the producer's stated wait: the provider stated it for the producer's route", async () => {
     const limited = Object.assign(new Error('zz rate limited'), { type: 'rate_limit', httpStatus: 429, retryAfterMs: 120_000 });
     const elsewhere = { complete: async () => { throw new Error('zz the waiter makes no call of its own'); } };
     const { pause, producerPause, close } = await coalescedFailure(limited, undefined, { secondMembrane: elsewhere });
@@ -2433,14 +2433,14 @@ describe('compression refusal recall curves', () => {
     close();
   });
 
-  it("with no stated wait, the waiter's lane takes no pause from another instance's failure (Anarchid R1-3)", async () => {
+  it("with no stated wait, the waiter's lane takes no pause from another instance's failure", async () => {
     const unavailable = Object.assign(new Error('zz overloaded'), { type: 'server', httpStatus: 503, retryable: true });
     const { pause, close } = await coalescedFailure(unavailable);
     assert.equal(pause, null, 'nothing to hold for: its own calls failed none, and the provider stated no wait');
     close();
   });
 
-  it("a waiter with a backoff of its own keeps it, and its failure count, when it takes another instance's stated wait (Anarchid R1-3)", async () => {
+  it("a waiter with a backoff of its own keeps it, and its failure count, when it takes another instance's stated wait", async () => {
     const limited = Object.assign(new Error('zz rate limited'), { type: 'rate_limit', httpStatus: 429, retryAfterMs: 120_000 });
     const backoffUntil = Date.now() + 600_000;
     const { before, pause, close } = await coalescedFailure(limited, (strategy, ctx) => {

@@ -443,7 +443,7 @@ describe('Merge terminal-disposition gate', () => {
     // rhys 2026-08-06: 514 consecutive merge 500s across a week-long
     // provider episode, zero accounting. A failure that is not a rejection is
     // evidence about the merge only while other compression lands between its
-    // failures on its route and model (room-203 #70922, room-383 #74877): an
+    // failures on its route and model: an
     // outage, in which nothing lands, never counts; a merge that keeps failing
     // while other work lands routes, at the bound, into the normal bounded
     // rejection policy.
@@ -528,7 +528,7 @@ describe('Merge terminal-disposition gate', () => {
 
   it('a non-retryable failure that says nothing about the request (credentials) pauses the lane, spending no merge attempt', async () => {
     // Only a request-attributable rejection is evidence about the merge
-    // request (room-225 L3). An expired key fails every request identically
+    // request. An expired key fails every request identically
     // until fixed: it pauses the lane instead of walking the bounded policy
     // toward quarantine.
     const authErr = Object.assign(new Error('401 invalid x-api-key'), { type: 'auth', retryable: false });
@@ -544,7 +544,7 @@ describe('Merge terminal-disposition gate', () => {
     await fx.manager.close();
   });
 
-  it('any provider answer resets the pause, a refusal included (room-225 #46271 #4)', async () => {
+  it('any provider answer resets the pause, a refusal included', async () => {
     const network = Object.assign(new Error('zz network down'), { type: 'network', retryable: true });
     const mock = scripted([{ error: network }, { stop: 'refusal' }, { error: network }]);
     const fx = await fixture(mock.membrane);
@@ -561,7 +561,7 @@ describe('Merge terminal-disposition gate', () => {
     await fx.manager.close();
   });
 
-  it("the merge's compression-log record bounds its error (room-225 #46271 #5)", async () => {
+  it("the merge's compression-log record bounds its error", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'merge-log-'));
     const logPath = join(dir, 'compression.jsonl');
     const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
@@ -612,9 +612,9 @@ describe('Merge terminal-disposition gate', () => {
   });
 });
 
-// ── The review's further cases (sw-cm138) ──────────────────────────────────
+// ── Further cases ───────────────────────────────────────────────────────────
 
-describe('merge lane: classification, attribution and ownership (sw-cm138)', () => {
+describe('merge lane: classification, attribution and ownership', () => {
   after(cleanup);
 
   /** Wait for `n` provider calls, failing rather than hanging. */
@@ -627,7 +627,7 @@ describe('merge lane: classification, attribution and ownership (sw-cm138)', () 
   }
 
   for (const type of ['context_length', 'invalid_request', 'safety', 'unsupported']) {
-    it(`a ${type} rejection is evidence about the merge request: it spends an attempt and pauses nothing (I17)`, async () => {
+    it(`a ${type} rejection is evidence about the merge request: it spends an attempt and pauses nothing`, async () => {
       const rejection = Object.assign(new Error(`zz ${type}`), { type, retryable: false });
       const mock = scripted([{ error: rejection }]);
       const fx = await fixture(mock.membrane);
@@ -639,7 +639,7 @@ describe('merge lane: classification, attribution and ownership (sw-cm138)', () 
     });
   }
 
-  it('a merge failure is the dispatched model\'s, not the one configured when it lands (I21)', async () => {
+  it('a merge failure is the dispatched model\'s, not the one configured when it lands', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const calls: Array<{ config?: { model?: string } }> = [];
@@ -668,7 +668,7 @@ describe('merge lane: classification, attribution and ownership (sw-cm138)', () 
     await fx.manager.close();
   });
 
-  it("a merge settling after other work took the lane leaves that work's ownership alone (I16)", async () => {
+  it("a merge settling after other work took the lane leaves that work's ownership alone", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const calls: unknown[] = [];
@@ -693,7 +693,7 @@ describe('merge lane: classification, attribution and ownership (sw-cm138)', () 
   });
 });
 
-describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
+describe('merge lane: answers, holds and landings', () => {
   after(cleanup);
   async function calledAtLeast(calls: unknown[], n: number, ms = 10_000): Promise<void> {
     const deadline = Date.now() + ms;
@@ -709,7 +709,7 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
   };
   const answer = { stopReason: 'end_turn', content: [t('a merged parent')], usage: { inputTokens: 100, outputTokens: 20 } };
 
-  it('a hold placed on the span during the call keeps the answer out with no failure: no pause, the entry stays queued, its run ends (I5)', async () => {
+  it('a hold placed on the span during the call keeps the answer out with no failure: no pause, the entry stays queued, its run ends', async () => {
     let fx!: Fixture;
     const calls: unknown[] = [];
     const membrane = {
@@ -736,7 +736,7 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     await fx.manager.close();
   });
 
-  it("a refusal ends the run: the next failure starts a new one (I19), and the refusal's attempt is synced (sheet I2)", async () => {
+  it("a refusal ends the run: the next failure starts a new one, and the refusal's attempt is synced", async () => {
     const mock = scripted([{ error: network() }, { stop: 'refusal' }, { error: network() }]);
     const fx = await fixture(mock.membrane);
     const store = fx.manager.getStore();
@@ -761,7 +761,7 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     await fx.manager.close();
   });
 
-  it('a request-attributable rejection thrown as a plain object is recorded, not re-sent every tick (I26)', async () => {
+  it('a request-attributable rejection thrown as a plain object is recorded, not re-sent every tick', async () => {
     const rejection = { type: 'invalid_request', retryable: false, httpStatus: 400, message: 'zz plain-object 400' };
     const calls: unknown[] = [];
     const membrane = { complete: async (request: unknown) => { calls.push(request); throw rejection; } } as never;
@@ -772,7 +772,7 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     await fx.manager.close();
   });
 
-  it("an answer ends the entry's run even when the queue changed during the call (sheet I24)", async () => {
+  it("an answer ends the entry's run even when the queue changed during the call", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const calls: unknown[] = [];
@@ -801,7 +801,7 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     await fx.manager.close();
   });
 
-  it('a merge no longer queued leaves the failure order and its run (sheet I26)', async () => {
+  it('a merge no longer queued leaves the failure order and its run', async () => {
     const fx = await fixture(scripted([{ stop: 'end_turn', text: 'unused' }]).membrane);
     const order = (fx.strategy as unknown as { mergeFailureOrder: Map<string, number> }).mergeFailureOrder;
     const runs = (fx.strategy as unknown as { mergeFailureRuns: Map<string, unknown> }).mergeFailureRuns;
@@ -813,7 +813,7 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     await fx.manager.close();
   });
 
-  it('an answer that arrives after a branch switch still ends the pause: the pause is the route\'s (I41)', async () => {
+  it('an answer that arrives after a branch switch still ends the pause: the pause is the route\'s', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const calls: unknown[] = [];
@@ -840,7 +840,7 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     await fx.manager.close();
   });
 
-  it('a written merge is a landing in its domain: a failure of another merge there then counts (I45)', async () => {
+  it('a written merge is a landing in its domain: a failure of another merge there then counts', async () => {
     const calls: unknown[] = [];
     const membrane = {
       complete: async (request: unknown) => {
@@ -870,7 +870,7 @@ describe('merge lane: answers, holds and landings (ethan-cm138-whole)', () => {
     await fx.manager.close();
   });
 
-  it('a merge written as the branch switches is still a landing in its domain (cm138-r4 I6)', async () => {
+  it('a merge written as the branch switches is still a landing in its domain', async () => {
     const membrane = {
       complete: async (request: unknown) => {
         if (JSON.stringify(request).includes('raw-4 substance')) throw network();

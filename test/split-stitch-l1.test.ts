@@ -191,8 +191,8 @@ describe('split-stitch L1 fallback', () => {
     const opts: { refuseAt: number; throwOn?: string } = { refuseAt: 2, throwOn: 'raw-1' };
     const { calls, membrane } = cumulativeMembrane(opts);
     const fx = await build(membrane, { split: true, placeholder: true });
-    // An untyped transport error says nothing about the request (room-225
-    // L3): the rung is one atomic retry unit, so it propagates and the rung
+    // An untyped transport error says nothing about the request: the rung
+    // is one atomic retry unit, so it propagates and the rung
     // runs again later instead of exhausting the family.
     await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /transport-down/);
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'not exhausted by a transport error');
@@ -289,7 +289,7 @@ describe('split-stitch L1 fallback', () => {
     assert.equal(subs.length, rejected + 1, 'nothing after it: no retry of raw-1, no later piece');
   });
 
-  it("the window cap is a local throttle: a rung that would contend with earlier calls waits for room, recording nothing and exhausting nothing, then runs whole (sheet I4)", async () => {
+  it("the window cap is a local throttle: a rung that would contend with earlier calls waits for room, recording nothing and exhausting nothing, then runs whole", async () => {
     const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
     const fx = await build(membrane, { split: true, placeholder: true, windowCap: 2, n: 2 });
     const window = fx.strategy as unknown as { splitCallTimes: number[] };
@@ -311,7 +311,7 @@ describe('split-stitch L1 fallback', () => {
     assert.equal(fx.strategy.entries().length, 1, 'and installs its one L1');
   });
 
-  it("a piece's call that the caller's provider admission defers takes no window slot and counts as no call (sheet I14)", async () => {
+  it("a piece's call that the caller's provider admission defers takes no window slot and counts as no call", async () => {
     const deferred = Object.assign(new Error('Provider wait: same-model is held; no call was made'), { type: 'rate_limit', retryable: true, providerAdmission: 'deferred' });
     const membrane = {
       complete: async (request: NormalizedRequest) => {
@@ -326,7 +326,7 @@ describe('split-stitch L1 fallback', () => {
     assert.equal(fx.strategy.attempted()!.calls, 0, 'and no call counted');
   });
 
-  it("a piece whose answer is classified as a provider error ends the rung with that error's type (sheet I20)", async () => {
+  it("a piece whose answer is classified as a provider error ends the rung with that error's type", async () => {
     const membrane = {
       complete: async (request: NormalizedRequest) => {
         const targets = texts(request).filter((t) => /^raw-\d+ /.test(t));
@@ -367,7 +367,7 @@ describe('split-stitch L1 fallback', () => {
     fx.manager.close();
   });
 
-  it('a window of 0 ends the rung before any piece is sent, as a cap trip (cm138-r4 I8)', async () => {
+  it('a window of 0 ends the rung before any piece is sent, as a cap trip', async () => {
     const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
     const fx = await build(membrane, { split: true, windowCap: 0, n: 2 });
     await fx.strategy.run(fx.target, managerContext(fx.manager));

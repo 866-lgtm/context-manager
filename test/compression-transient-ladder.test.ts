@@ -9,7 +9,7 @@ import { createHash } from 'node:crypto';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext, SummaryEntry } from '../src/types/index.js';
 
-// Transient failures never spend the ladder (room-225 L3, brosefo incident).
+// Transient failures never spend the ladder.
 //
 // A provider failure that is not evidence about the request (capacity,
 // transport, credentials, anything unclassified) used to be recorded as a
@@ -361,7 +361,7 @@ describe('compression ladder: transient failures never spend it', () => {
     assert.equal(streak().failures, 3, 'a deferral is no failure');
     // The landing before the deferral wasn't spent: the timeout counts against it.
     await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz timeout failure/);
-    assert.equal(streak().failures, 4, 'another class extends the run (sheet I10)');
+    assert.equal(streak().failures, 4, 'another class extends the run');
     fx.manager.close();
   });
 
@@ -452,7 +452,7 @@ describe('compression lane pacing', () => {
   const requeueLast = (fx: Awaited<ReturnType<typeof queued>>) =>
     fx.strategy.onNewMessage(fx.manager.queryMessages({}).messages.at(-1)!, managerContext(fx.manager));
 
-  it('one failure with no stated wait holds the lane 5 s, and a landing resets the run (Anarchid R1-1)', async () => {
+  it('one failure with no stated wait holds the lane 5 s, and a landing resets the run', async () => {
     const mock = scripted([{ throw: failure('network') }, OK('landed'), { throw: failure('network') }]);
     const fx = await queued(mock.membrane);
     const start = Date.now();
@@ -598,11 +598,10 @@ describe('compression lane pacing', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Corrective round (Wren-1021's review of 3398926, room-225 #46214, #46271,
-// #46345, #46385; Ruth-1049's surrogate-cut gap).
+// Progress, pauses, releases and the plain-prose rung.
 // ---------------------------------------------------------------------------
 
-describe('progress is a shared record, not an instance snapshot (#46214 #1)', () => {
+describe('progress is a shared record, not an instance snapshot', () => {
   /** A second strategy and manager on the same JsStore and namespace. */
   async function sibling(store: ReturnType<ContextManager['getStore']>, membrane: unknown, opts: Opts = {}) {
     const strategy = new ProbeStrategy(config(opts));
@@ -654,7 +653,7 @@ describe('progress is a shared record, not an instance snapshot (#46214 #1)', ()
   });
 });
 
-describe('the pause holds an unusable deadline explicitly (#46214 #2)', () => {
+describe('the pause holds an unusable deadline explicitly', () => {
   it('a finite retry-after past the last Date instant is an indefinite hold: the provider error is what throws, and readiness says so', async () => {
     const mock = scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 1e20 }) }, OK('after the release')]);
     const fx = await queued(mock.membrane);
@@ -674,7 +673,7 @@ describe('the pause holds an unusable deadline explicitly (#46214 #2)', () => {
   });
 });
 
-describe('the pause belongs to the call that failed (#46271 #3)', () => {
+describe('the pause belongs to the call that failed', () => {
   it('a failure dispatched to model A, landing after the model changed to B, pauses A, not B', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -695,7 +694,7 @@ describe('the pause belongs to the call that failed (#46271 #3)', () => {
   });
 });
 
-describe("releasing the provider's wait keeps the lane's own backoff (#46385)", () => {
+describe("releasing the provider's wait keeps the lane's own backoff", () => {
   async function pausedByStatedWait() {
     const mock = scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: 120_000 }) }, OK('after')]);
     const fx = await queued(mock.membrane);
@@ -745,7 +744,7 @@ describe("releasing the provider's wait keeps the lane's own backoff (#46385)", 
   });
 });
 
-describe('the plain-prose retry is a rung of the durable ladder (#46345 #6)', () => {
+describe('the plain-prose retry is a rung of the durable ladder', () => {
   const THINKING = { content: [text('<thinking>all of it went here</thinking>')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
   const isProse = (request: NormalizedRequest): boolean => JSON.stringify(request).includes('plain prose');
 
@@ -805,7 +804,7 @@ function exhaustedRecordLabels(strategy: unknown): string[] {
   return records[0]!.outcomes.map((outcome) => outcome.curveLabel);
 }
 
-describe('every rung keeps its own identity across a resume (#47653)', () => {
+describe('every rung keeps its own identity across a resume', () => {
   const THINKING = { content: [text('<thinking>all of it went here</thinking>')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
   const TOOL_USE = { content: [use('t9', 'skip_reply', { reason: 'later' })], stopReason: 'tool_use', usage: { inputTokens: 80, outputTokens: 5 } };
   it('an empty no-tools answer is recorded as no-tools: a resume pays only for the prose retry', async () => {
@@ -822,7 +821,7 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
     fx.manager.close();
   });
 
-  it("an exhausted canonical stage keeps each request's answer in the ledger, and the span counts them all (Anarchid R1-4)", async () => {
+  it("an exhausted canonical stage keeps each request's answer in the ledger, and the span counts them all", async () => {
     const mock = scripted([TOOL_USE as never, TOOL_USE as never, REFUSAL as never]);
     const fx = await build(mock.membrane);
     await fx.strategy.run(fx.target(), managerContext(fx.manager));
@@ -859,7 +858,7 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
     fx.manager.close();
   });
 
-  it("and so does source-only-final's answer that strips to empty (cm138-r11 I4)", async () => {
+  it("and so does source-only-final's answer that strips to empty", async () => {
     const mock = scripted([REFUSAL as never, THINKING as never]);
     const fx = await build(mock.membrane, { sourceOnlyFallback: true });
     await fx.strategy.run(fx.target(), managerContext(fx.manager));
@@ -916,7 +915,7 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
     fx.manager.close();
   });
 
-  it("a carrier rejection counts in the exhausted family's record whichever exit ends it (cm138-r11 I2)", async () => {
+  it("a carrier rejection counts in the exhausted family's record whichever exit ends it", async () => {
     const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
     // The refusal ladder's exit: the carrier request is rejected, and its stripped retry is refused.
     const refused = scripted([{ throw: rejected }, REFUSAL as never]);
@@ -936,7 +935,7 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
     b.manager.close();
   });
 
-  it("the stripped request's failures are its own: with work landing between them, the eighth ends it, the carrier request paid once (#48315)", async () => {
+  it("the stripped request's failures are its own: with work landing between them, the eighth ends it, the carrier request paid once", async () => {
     const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
     const first = scripted([{ throw: rejected }, { throw: failure('server', { httpStatus: 503 }) }]);
     const a = await build(first.membrane);
@@ -979,7 +978,7 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
   });
 });
 
-describe("a caller's admission deferral is an external wait, not a failed call (#47927)", () => {
+describe("a caller's admission deferral is an external wait, not a failed call", () => {
   /** agent-framework's refusal of a held model: no provider call was made. */
   const deferred = (retryAfterMs?: number) => Object.assign(
     new Error('Provider wait: same-model is held for resident (recorded earlier: zz 429); no call was made'),
@@ -1036,7 +1035,7 @@ describe("a caller's admission deferral is an external wait, not a failed call (
     fx.manager.close();
   });
 
-  it('a deferral with no deadline is rechecked, not cached: refusals count nothing, and recovery runs the pending chunk with no release (#49105)', async () => {
+  it('a deferral with no deadline is rechecked, not cached: refusals count nothing, and recovery runs the pending chunk with no release', async () => {
     // An unreadable wait journal: the admission defers with no deadline, and
     // keeps deferring after the first recheck. Then the journal reads again
     // and reveals a later real wait (10 min), then that wait passes.
@@ -1086,7 +1085,7 @@ describe("a caller's admission deferral is an external wait, not a failed call (
   });
 });
 
-describe('pending work stays discoverable after a transient failure or a deferral (#48424, #48444)', () => {
+describe('pending work stays discoverable after a transient failure or a deferral', () => {
   const deferred = (retryAfterMs?: number) => Object.assign(
     new Error('Provider wait: same-model is held for resident; no call was made'),
     { type: 'rate_limit', retryable: true, providerAdmission: 'deferred', ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) },
@@ -1118,7 +1117,7 @@ describe('pending work stays discoverable after a transient failure or a deferra
     fx.manager.close();
   });
 
-  it('a chunk a newer queue decision withdrew while its call was in flight stays withdrawn (#48739)', async () => {
+  it('a chunk a newer queue decision withdrew while its call was in flight stays withdrawn', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const mock = scripted([{ gate, then: { throw: failure('network') } }, OK('should not be called')]);
@@ -1140,7 +1139,7 @@ describe('pending work stays discoverable after a transient failure or a deferra
   });
 
   for (const fate of ['compressed', 'gone'] as const) {
-    it(`a chunk ${fate} meanwhile is not resurrected (sheet I40)`, async () => {
+    it(`a chunk ${fate} meanwhile is not resurrected`, async () => {
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
       const mock = scripted([{ gate, then: { throw: failure('network') } }]);
@@ -1167,7 +1166,7 @@ describe('pending work stays discoverable after a transient failure or a deferra
 });
 
 // ---------------------------------------------------------------------------
-// Evidence, not streaks (room-203 #70846, #70922, #70929; room-383 #74877):
+// Evidence, not streaks:
 // a failure counts against its request only while other compression lands on
 // its route and model; a failed request goes behind the work that hasn't
 // failed.
@@ -1200,7 +1199,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
-  it('a failed chunk stays behind the others through the rebuilds an inbound message makes, during its call or after it (sheet I1, I24)', async () => {
+  it('a failed chunk stays behind the others through the rebuilds an inbound message makes, during its call or after it', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const mock = scripted([{ gate, then: { throw: failure('server', { httpStatus: 503 }) } }, OK('the second chunk')]);
@@ -1224,7 +1223,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
-  it('a failed chunk gives its turn to a queued merge that has not failed since, so the merge runs and lands (review miss on I1)', async () => {
+  it('a failed chunk gives its turn to a queued merge that has not failed since, so the merge runs and lands', async () => {
     const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }, OK('the merged memory')]);
     const fx = await queued(mock.membrane, { config: { hierarchical: true } });
     const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
@@ -1306,7 +1305,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
-  it('a NaN retryAfterMs states no wait: the pause ends with the lane\'s own backoff (sheet I17)', async () => {
+  it('a NaN retryAfterMs states no wait: the pause ends with the lane\'s own backoff', async () => {
     const mock = scripted([{ throw: failure('rate_limit', { httpStatus: 429, retryAfterMs: Number.NaN }) }]);
     const fx = await queued(mock.membrane);
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
@@ -1327,7 +1326,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
-  it('readiness reports a pause only while it binds the configured model (sheet I29)', async () => {
+  it('readiness reports a pause only while it binds the configured model', async () => {
     const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
     const fx = await queued(mock.membrane);
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)));
@@ -1337,7 +1336,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
-  it('a hole that a pending retry will fill keeps the run before it waiting, among summaries of the level its answer makes or above; an entry that names no live chunk holds nothing (sheet I18, I44; cm138-r15 I7)', async () => {
+  it('a hole that a pending retry will fill keeps the run before it waiting, among summaries of the level its answer makes or above; an entry that names no live chunk holds nothing', async () => {
     const fx = await queued(scripted([OK('unused')]).membrane);
     for (let i = 8; i < 10; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
     const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
@@ -1376,7 +1375,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
-  it('past the speculative cap, the run before a hole a retry will fill merges at two as a last resort, and tick takes no chunk there, the retry among them (Greptile P1, cm138-r14 I10)', async () => {
+  it('past the speculative cap, the run before a hole a retry will fill merges at two as a last resort, and tick takes no chunk there, the retry among them', async () => {
     const mock = scripted([OK('unused')]);
     const fx = await queued(mock.membrane);
     for (let i = 8; i < 10; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
@@ -1408,7 +1407,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
-  it('past the speculative cap, a run at the threshold merges ahead of a waiting run before it, as below the cap (cm138-r14 I4)', async () => {
+  it('past the speculative cap, a run at the threshold merges ahead of a waiting run before it, as below the cap', async () => {
     const fx = await queued(scripted([OK('unused')]).membrane);
     for (let i = 8; i < 14; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
     const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
@@ -1432,7 +1431,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
-  it('past the speculative cap, a waiting run above L1 keeps waiting, since the cap counts L1s alone (cm138-r14 I6)', async () => {
+  it('past the speculative cap, a waiting run above L1 keeps waiting, since the cap counts L1s alone', async () => {
     const fx = await queued(scripted([OK('unused')]).membrane);
     for (let i = 8; i < 10; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
     const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
@@ -1616,7 +1615,7 @@ describe('a failure is evidence only against landings on its own route and model
     }
   });
 
-  it("a recorded answer is reused on any route until an operator's clear: after a route change it can exhaust a family the new route would answer, and the clear recovers it (room-383 #75066)", async () => {
+  it("a recorded answer is reused on any route until an operator's clear: after a route change it can exhaust a family the new route would answer, and the clear recovers it", async () => {
     const old = scripted([{ throw: failure('invalid_request') }, { throw: failure('network') }]);
     const nextCalls: NormalizedRequest[] = [];
     const next = { complete: async (request: NormalizedRequest) => { nextCalls.push(structuredClone(request)); return isCanonical(request) ? OK('full-context memory') : REFUSAL; } };
@@ -1639,7 +1638,7 @@ describe('a failure is evidence only against landings on its own route and model
   });
 });
 
-// ── The review's further cases (sw-cm138) ──────────────────────────────────
+// ── Further cases ───────────────────────────────────────────────────────────
 
 /** The strategy's hash of a chunk's message ids (chunkSourceHash). */
 const idsHash = (ids: string[]): string => createHash('sha256').update(JSON.stringify(ids), 'utf8').digest('hex');
@@ -1660,7 +1659,7 @@ const l1RunsOf = (strategy: unknown): Array<{ key: string; failures: number }> =
     .compressionFailureRuns.values()].map((entry) => entry.run);
 const DAY = 24 * 60 * 60_000;
 
-describe('an abort is neither evidence nor a reason to pause (sw-cm138 I8)', () => {
+describe('an abort is neither evidence nor a reason to pause', () => {
   for (const [label, error] of [
     ['an AbortError', Object.assign(new Error('zz aborted'), { name: 'AbortError' })],
     ["a membrane error of type 'abort'", failure('abort')],
@@ -1682,7 +1681,7 @@ describe('an abort is neither evidence nor a reason to pause (sw-cm138 I8)', () 
   }
 });
 
-describe('ladder progress goes when its debt is paid, and is swept on its own cadence (sw-cm138)', () => {
+describe('ladder progress goes when its debt is paid, and is swept on its own cadence', () => {
   /** Two persisted chunk records (messages 1-4 compressed, 5-8 raw), an L1 over 5-6, and seven families. */
   async function sweepFixture() {
     const mock = scripted([{ throw: failure('network') }]);
@@ -1708,7 +1707,7 @@ describe('ladder progress goes when its debt is paid, and is swept on its own ca
     return { ...fx, mock, store };
   }
 
-  it('from tick, with the quarantine alarm off and the lane paused: covered, gone and abandoned spans go; live ones stay, a missing record included (I5, I20, I34, I36)', async () => {
+  it('from tick, with the quarantine alarm off and the lane paused: covered, gone and abandoned spans go; live ones stay, a missing record included', async () => {
     const fx = await sweepFixture();
     const ctx = managerContext(fx.manager);
     fx.strategy.notePause(failure('network'), ctx); // tick returns at the pause, after the sweep
@@ -1750,7 +1749,7 @@ describe('ladder progress goes when its debt is paid, and is swept on its own ca
     fx.manager.close();
   });
 
-  it("a ladder never writes back a family dropped while it ran (I4)", async () => {
+  it("a ladder never writes back a family dropped while it ran", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const mock = scripted([REFUSAL, { throw: failure('network') }, { gate, then: { throw: failure('network') } }]);
@@ -1772,7 +1771,7 @@ describe('ladder progress goes when its debt is paid, and is swept on its own ca
     fx.manager.close();
   });
 
-  it('nor does a fresh ladder, once it has written the family and the family is dropped (I4)', async () => {
+  it('nor does a fresh ladder, once it has written the family and the family is dropped', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const mock = scripted([REFUSAL, { gate, then: { throw: failure('network') } }]);
@@ -1792,7 +1791,7 @@ describe('ladder progress goes when its debt is paid, and is swept on its own ca
     fx.manager.close();
   });
 
-  it('the dedup guard pays off the span\'s progress (I25)', async () => {
+  it('the dedup guard pays off the span\'s progress', async () => {
     const mock = scripted([OK('never called')]);
     const fx = await build(mock.membrane);
     const target = fx.target();
@@ -1811,7 +1810,7 @@ describe('ladder progress goes when its debt is paid, and is swept on its own ca
     fx.manager.close();
   });
 
-  it('an exact-match adoption pays off the span\'s progress (sheet I15)', async () => {
+  it('an exact-match adoption pays off the span\'s progress', async () => {
     const mock = scripted([OK('never called')]);
     const fx = await build(mock.membrane);
     const target = fx.target();
@@ -1828,7 +1827,7 @@ describe('ladder progress goes when its debt is paid, and is swept on its own ca
     fx.manager.close();
   });
 
-  it('the thin-chunk stub pays off the span\'s progress, and is no landing (sheet I12, I32)', async () => {
+  it('the thin-chunk stub pays off the span\'s progress, and is no landing', async () => {
     const mock = scripted([OK('never called')]);
     const fx = await build(mock.membrane);
     (fx.strategy as unknown as { config: { minChunkCharsForLLM: number } }).config.minChunkCharsForLLM = 200;
@@ -1852,7 +1851,7 @@ describe('ladder progress goes when its debt is paid, and is swept on its own ca
     fx.manager.close();
   });
 
-  it("an operator's clear takes the family's progress with it (I27)", async () => {
+  it("an operator's clear takes the family's progress with it", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const mock = scripted([REFUSAL, { gate, then: REFUSAL }]);
@@ -1870,7 +1869,7 @@ describe('ladder progress goes when its debt is paid, and is swept on its own ca
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'exhausted');
     // A crash between exhaustion's ledger write and its progress drop leaves this.
     fx.manager.getStore().setStateJson(PROGRESS_SLOT, progress);
-    // The progress goes before the clear event (sheet I28): a crash between
+    // The progress goes before the clear event: a crash between
     // them leaves the quarantine standing, never a cleared family with its
     // old answers.
     const self = fx.strategy as unknown as { appendCompressionQuarantineEvent(event: { kind: string }): unknown };
@@ -1888,7 +1887,7 @@ describe('ladder progress goes when its debt is paid, and is swept on its own ca
   });
 });
 
-describe("an admission hold warns once (sw-cm138 I24)", () => {
+describe("an admission hold warns once", () => {
   const deferred = (retryAfterMs?: number) => Object.assign(
     new Error('Provider wait: same-model is held for resident; no call was made'),
     { type: 'rate_limit', retryable: true, providerAdmission: 'deferred', ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) },
@@ -1923,7 +1922,7 @@ describe("an admission hold warns once (sw-cm138 I24)", () => {
   });
 });
 
-describe('the quarantine-skip warning is per branch (sw-cm138 I28)', () => {
+describe('the quarantine-skip warning is per branch', () => {
   it('a branch switch clears what was warned on the old branch', async () => {
     const fx = await queued(scripted([OK('unused')]).membrane);
     fx.strategy.warnedSkips().add('zz-chunk-hash');
@@ -1935,7 +1934,7 @@ describe('the quarantine-skip warning is per branch (sw-cm138 I28)', () => {
   });
 });
 
-// ── Round 4 (cm138-r3's sheet; Andrew-2310's review, room-203 #78444) ─────────
+// ── More cases ──────────────────────────────────────────────────────────────
 
 describe("a run's evidence belongs to the chunk's sources", () => {
   const runsOf = (strategy: unknown): number[] => l1RunsOf(strategy).map((run) => run.failures);
@@ -1944,7 +1943,7 @@ describe("a run's evidence belongs to the chunk's sources", () => {
     sourceIds: ids.slice(first, last + 1), sourceRange: { first: ids[first]!, last: ids[last]! }, created: 1,
   });
 
-  it("a source edited in place starts a new run: the seven failures before the edit don't decide it (Andrew-2310's boundary 1)", async () => {
+  it("a source edited in place starts a new run: the seven failures before the edit don't decide it", async () => {
     const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
     const fx = await build(mock.membrane);
     for (let i = 0; i < 7; i++) {
@@ -1961,7 +1960,7 @@ describe("a run's evidence belongs to the chunk's sources", () => {
     fx.manager.close();
   });
 
-  it("a late failure of a source's old content leaves the run of its new content: each content is its own subject (Andrew-2310's late-old-source case)", async () => {
+  it("a late failure of a source's old content leaves the run of its new content: each content is its own subject", async () => {
     let hold: Promise<void> | null = null;
     let release: () => void = () => {};
     const calls: NormalizedRequest[] = [];
@@ -2011,7 +2010,7 @@ describe("a run's evidence belongs to the chunk's sources", () => {
     fx.manager.close();
   });
 
-  it("a decision ends the chunk's run: a later family starts again (Andrew-2310's boundary 2, sheet I13)", async () => {
+  it("a decision ends the chunk's run: a later family starts again", async () => {
     const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
     const fx = await build(mock.membrane);
     for (let i = 0; i < 7; i++) {
@@ -2035,7 +2034,7 @@ describe("a run's evidence belongs to the chunk's sources", () => {
 
 });
 
-describe("an answer resumes only its own route's pause (Andrew-2310's boundary 4)", () => {
+describe("an answer resumes only its own route's pause", () => {
   it("another membrane's answer leaves the pause; the same route's answer ends it", async () => {
     const stated = failure('rate_limit', { httpStatus: 429, retryAfterMs: 3 * HOUR });
     const routeA = scripted([OK('answered on A')]);
@@ -2052,7 +2051,7 @@ describe("an answer resumes only its own route's pause (Andrew-2310's boundary 4
     otherModel.strategy.notePause(stated, managerContext(otherModel.manager));
     otherModel.strategy.setCompressionModel('zz-other-model');
     await otherModel.strategy.run(otherModel.target(), managerContext(otherModel.manager));
-    assert.ok(otherModel.strategy.paused(), 'an answer naming another model leaves the pause (cm138-r4 I15)');
+    assert.ok(otherModel.strategy.paused(), 'an answer naming another model leaves the pause');
     otherModel.manager.close();
 
     const control = await build(routeA.membrane);
@@ -2077,7 +2076,7 @@ describe("a chunk no longer pending leaves its run", () => {
   });
 });
 
-describe("a preview keeps the lane's failure orders, runs and window waits (cm138-r4 I3)", () => {
+describe("a preview keeps the lane's failure orders, runs and window waits", () => {
   it('the dry rebuild prunes them against its own cut, and the select puts them back', async () => {
     const fx = await queued(scripted([OK('unused')]).membrane);
     const lane = fx.strategy as unknown as {
@@ -2100,7 +2099,7 @@ describe("a preview keeps the lane's failure orders, runs and window waits (cm13
   });
 });
 
-describe("a dry select during a call leaves the call's chunk to be put back (sheet I3)", () => {
+describe("a dry select during a call leaves the call's chunk to be put back", () => {
   it('a transient failure after a preview puts the chunk back in the queue', async () => {
     let release: () => void = () => {};
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -2118,7 +2117,7 @@ describe("a dry select during a call leaves the call's chunk to be put back (she
   });
 });
 
-describe("a split-window wait skips its chunk for the wait and lets the tick go on (sheet I4, I21)", () => {
+describe("a split-window wait skips its chunk for the wait and lets the tick go on", () => {
   it('the chunk behind it runs in the same tick, and the waiting one is skipped until its wait ends', async () => {
     const mock = scripted([OK('the next chunk')]);
     const fx = await queued(mock.membrane);
@@ -2160,7 +2159,7 @@ describe("a split-window wait skips its chunk for the wait and lets the tick go 
   });
 });
 
-describe("another instance's split-window wait holds nothing here (cm138-r11 I1)", () => {
+describe("another instance's split-window wait holds nothing here", () => {
   it('rethrown to this tick, as a joined call rethrows it, it leaves the chunk unheld at the head and the lane unpaused, and the next tick attempts the chunk', async () => {
     const mock = scripted([OK('the next chunk'), OK('its own attempt')]);
     const fx = await queued(mock.membrane);
@@ -2193,7 +2192,7 @@ describe("another instance's split-window wait holds nothing here (cm138-r11 I1)
   });
 });
 
-describe('a family dropped while its ladder ran is not quarantined by its exhaustion (cm138-r11 I10)', () => {
+describe('a family dropped while its ladder ran is not quarantined by its exhaustion', () => {
   const THINKING = { content: [text('<thinking>all of it went here</thinking>')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
   /** scripted's answers, with the family's progress dropped as the call at `dropAt` arrives, as a clear, a mint or a sweep drops it. */
   function dropping(steps: Step[], dropAt: number, strategy: () => ProbeStrategy) {
@@ -2264,7 +2263,7 @@ describe('a family dropped while its ladder ran is not quarantined by its exhaus
     return (await logged(run)).map((line) => line.event);
   }
 
-  it("an exhaustion at the empty answer's exit logs it, with the record it wrote, as the refusal ladder's exit does (cm138-r13 I5)", async () => {
+  it("an exhaustion at the empty answer's exit logs it, with the record it wrote, as the refusal ladder's exit does", async () => {
     const TOOL_USE = { content: [use('t9', 'skip_reply', { reason: 'later' })], stopReason: 'tool_use', usage: { inputTokens: 80, outputTokens: 5 } };
     const mock = scripted([TOOL_USE as never, THINKING as never, THINKING as never]);
     const fx = await build(mock.membrane);
@@ -2276,7 +2275,7 @@ describe('a family dropped while its ladder ran is not quarantined by its exhaus
     fx.manager.close();
   });
 
-  it("an exhaustion at the refusal ladder's exit logs it, with the record it wrote (cm138-r14 I8)", async () => {
+  it("an exhaustion at the refusal ladder's exit logs it, with the record it wrote", async () => {
     const mock = scripted([REFUSAL as never]);
     const fx = await build(mock.membrane, { sourceOnlyFallback: true });
     const lines = await logged(() => fx.strategy.run(fx.target(), managerContext(fx.manager)));
@@ -2289,7 +2288,7 @@ describe('a family dropped while its ladder ran is not quarantined by its exhaus
   });
 
   for (const dropped of [false, true]) {
-    it(`an exhaustion whose key another process quarantined meanwhile writes nothing, forgets the progress and logs neither event${dropped ? ", though that process dropped the family's progress too" : ''} (cm138-r14 I2, I5)`, async () => {
+    it(`an exhaustion whose key another process quarantined meanwhile writes nothing, forgets the progress and logs neither event${dropped ? ", though that process dropped the family's progress too" : ''}`, async () => {
       const LEDGER = 'default/autobio:compression-refusal-quarantine-events';
       type LedgerEvent = { kind: string; key?: string; eventId?: string; record?: Record<string, unknown>; outcomes?: unknown[] };
       const ledger = (manager: ContextManager): LedgerEvent[] => {
@@ -2345,7 +2344,7 @@ describe('a family dropped while its ladder ran is not quarantined by its exhaus
   }
 });
 
-describe('a chunk a plan demands goes ahead of the chunks that failed (cm138-r11 I7)', () => {
+describe('a chunk a plan demands goes ahead of the chunks that failed', () => {
   it('enqueueL1ForRange queues it ahead of a failed chunk', async () => {
     const fx = await queued(scripted([OK('unused')]).membrane);
     const lane = fx.strategy as unknown as {
@@ -2365,7 +2364,7 @@ describe('a chunk a plan demands goes ahead of the chunks that failed (cm138-r11
   });
 });
 
-describe('a window wait after a branch switch ends the scan (cm138-r4 I14)', () => {
+describe('a window wait after a branch switch ends the scan', () => {
   it('no chunk behind it runs under the old branch', async () => {
     const fx = await queued(scripted([OK('the next chunk')]).membrane);
     assert.ok(fx.strategy.compressionQueueView().length >= 2, 'two chunks pending');
@@ -2666,7 +2665,7 @@ describe('the span table, read from records the test writes', () => {
     fx.manager.close();
   });
 
-  it('counts no rung its failures decided as an answer, though the line still names it last (Anarchid R1-4)', async () => {
+  it('counts no rung its failures decided as an answer, though the line still names it last', async () => {
     const fx = await build(scripted([]).membrane);
     const recent = fx.ids.slice(10);
     fx.strategy.adopt(fx.target());
