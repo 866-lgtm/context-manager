@@ -228,7 +228,10 @@ describe('compression ladder: transient failures never spend it', () => {
     const fx = await build(mock.membrane, { hoist: true });
     await fx.strategy.run(fx.target(), managerContext(fx.manager));
     assert.equal(mock.calls.length, 1);
-    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'the family is exhausted');
+    const status = fx.strategy.getCompressionQuarantineStatus();
+    assert.equal(status.count, 1, 'the family is exhausted');
+    assert.equal(status.spans[0]!.answeredAttempts, 1, 'its record keeps the rejection, an answer');
+    assert.equal(status.spans[0]!.latestOutcome, 'provider_error:invalid_request');
     assert.equal(progressSlot(fx.manager).length, 0, 'the quarantine ledger holds it now, not progress');
     await fx.strategy.run(fx.target(), managerContext(fx.manager));
     assert.equal(mock.calls.length, 1, 'and stays exhausted');
@@ -294,6 +297,46 @@ describe('compression ladder: transient failures never spend it', () => {
     assert.deepEqual(outcomes.map((o) => [o.curveLabel, o.outcome, o.errorType]), [['canonical', 'provider_error', 'persistent-server:503']],
       'the decision is recorded as the canonical\'s answer');
     assert.equal(b.strategy.getCompressionQuarantineStatus().count, 0, 'source-only-final is still owed');
+    b.manager.close();
+  });
+
+  it('a canonical its failures decided, with no source-only rung, exhausts its family with no answer counted', async () => {
+    const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }]);
+    const fx = await build(mock.membrane);
+    // The first failure starts the run; each of the next seven follows a landing.
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+    for (let i = 0; i < 6; i++) {
+      fx.strategy.land(mock.membrane);
+      await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+    }
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'the premise: seven failures decide nothing');
+    fx.strategy.land(mock.membrane);
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    const status = fx.strategy.getCompressionQuarantineStatus();
+    assert.equal(status.count, 1, 'the eighth decides the canonical, and with no source-only rung the family exhausts');
+    assert.equal(status.spans[0]!.answeredAttempts, 0, 'its record keeps the decision, which no provider gave as an answer');
+    assert.equal(status.spans[0]!.latestOutcome, 'provider_error:persistent-server:503');
+    fx.manager.close();
+  });
+
+  it("a resumed ladder keeps each rung's answer once: a fallback's answer kept in progress isn't counted again", async () => {
+    const path = freshPath();
+    const first = scripted([REFUSAL, REFUSAL, { throw: failure('network') }]);
+    const a = await build(first.membrane, { hoist: true, sourceOnlyFallback: true, path });
+    await assert.rejects(a.strategy.run(a.target(), managerContext(a.manager)), /zz network failure/);
+    const kept = (progressSlot(a.manager) as Array<{ outcomes: Array<{ curveLabel: string }> }>)[0]!.outcomes.map((o) => o.curveLabel);
+    assert.equal(kept.length, 2, 'the premise: the canonical and one fallback answered before the failure');
+    assert.ok(kept[0] === 'canonical' && !['canonical', 'canonical-no-tools', 'canonical-toolless'].includes(kept[1]!),
+      `the premise: progress holds a fallback's answer (${kept.join(', ')})`);
+    a.manager.close();
+
+    const second = scripted([REFUSAL]);
+    const b = await build(second.membrane, { hoist: true, sourceOnlyFallback: true, path });
+    await b.strategy.run(b.target(), managerContext(b.manager));
+    assert.ok(second.calls.length >= 1 && !isCanonical(second.calls[0]!), 'the resume reuses both answers and asks only what came after');
+    const status = b.strategy.getCompressionQuarantineStatus();
+    assert.equal(status.count, 1, 'the family exhausted');
+    assert.equal(status.spans[0]!.answeredAttempts, kept.length + second.calls.length, 'each answer once: the two kept, and each asked on the resume');
     b.manager.close();
   });
 
@@ -484,12 +527,16 @@ describe('compression lane pacing', () => {
         assert.ok(await settlesWithin(tick), 'a tick during a call returns without waiting on it');
       }
       assert.equal(mock.calls.length, 1, 'no second call while one is in flight');
+      // Date stands still from the failure on, so its 5 s backoff can't run
+      // out while a loaded run stalls before the tick that checks it.
+      testMock.timers.enable({ apis: ['Date'], now: Date.now() });
       release();
       await assert.rejects(first, /zz network failure/);
       await requeueLast(fx);
       await fx.strategy.tick(managerContext(fx.manager));
       assert.equal(mock.calls.length, 1, 'and none until its backoff ends');
     } finally {
+      testMock.timers.reset();
       // A failure above would otherwise leave the call held open and the store
       // with it, and the run would hang instead of failing.
       release();
@@ -660,21 +707,28 @@ describe("releasing the provider's wait keeps the lane's own backoff (#46385)", 
 
   it('wait 120 s, backoff 5 s, release at 2 s: the remaining 3 s of backoff still pace the lane', async () => {
     const { mock, fx } = await pausedByStatedWait();
-    const shiftedAt = Date.now();
-    fx.strategy.shiftPause(3_000, 118_000); // 2 s have passed
-    assert.equal(fx.strategy.releaseCompressionPause('zz-other-model'), false, 'a release for another model leaves it');
-    assert.equal(fx.strategy.releaseCompressionPause('same-model'), true);
-    const pause = fx.strategy.pause()!;
-    assert.equal(pause.statedUntil, null, 'only the provider-derived constraint is gone');
-    assert.ok(pause.until >= shiftedAt + 3_000 && pause.until <= Date.now() + 3_000, 'the backoff, from when it was shifted');
-    await requeue(fx);
-    await fx.strategy.tick(managerContext(fx.manager));
-    assert.equal(mock.calls.length, 1, 'still paced by the backoff');
-    assert.equal(fx.strategy.releaseCompressionPause(), false, 'nothing provider-derived left to release');
-    fx.strategy.expirePause();
-    await fx.strategy.tick(managerContext(fx.manager));
-    assert.equal(mock.calls.length, 2, 'and calls once the backoff has passed');
-    fx.manager.close();
+    // Date stands still from here, so the 3 s left can't run out while a
+    // loaded run stalls before the tick that checks them.
+    testMock.timers.enable({ apis: ['Date'], now: Date.now() });
+    try {
+      const shiftedAt = Date.now();
+      fx.strategy.shiftPause(3_000, 118_000); // 2 s have passed
+      assert.equal(fx.strategy.releaseCompressionPause('zz-other-model'), false, 'a release for another model leaves it');
+      assert.equal(fx.strategy.releaseCompressionPause('same-model'), true);
+      const pause = fx.strategy.pause()!;
+      assert.equal(pause.statedUntil, null, 'only the provider-derived constraint is gone');
+      assert.equal(pause.until, shiftedAt + 3_000, 'the backoff, from when it was shifted');
+      await requeue(fx);
+      await fx.strategy.tick(managerContext(fx.manager));
+      assert.equal(mock.calls.length, 1, 'still paced by the backoff');
+      assert.equal(fx.strategy.releaseCompressionPause(), false, 'nothing provider-derived left to release');
+      fx.strategy.expirePause();
+      await fx.strategy.tick(managerContext(fx.manager));
+      assert.equal(mock.calls.length, 2, 'and calls once the backoff has passed');
+    } finally {
+      testMock.timers.reset();
+      fx.manager.close();
+    }
   });
 
   it('release after the backoff has elapsed: the lane resumes at once', async () => {
@@ -769,6 +823,30 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
     assert.equal(status.count, 1, 'the family exhausted');
     assert.equal(status.spans[0]!.answeredAttempts, 3, 'each of the three requests was answered');
     assert.equal(status.spans[0]!.latestOutcome, 'refusal', 'the tools-less answer came last');
+    fx.manager.close();
+  });
+
+  it("an answer that strips to empty keeps the canonical stage's earlier answers in the exhausted family's ledger", async () => {
+    const mock = scripted([TOOL_USE as never, THINKING as never, THINKING as never]);
+    const fx = await build(mock.membrane);
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 3, 'the canonical, its no-tools retry, and the plain-prose retry');
+    const status = fx.strategy.getCompressionQuarantineStatus();
+    assert.equal(status.count, 1, 'the family exhausted');
+    assert.equal(status.spans[0]!.answeredAttempts, 3, "the canonical's tool_use answer, the empty no-tools answer and the empty prose answer");
+    assert.equal(status.spans[0]!.latestOutcome, 'unusable_empty');
+    fx.manager.close();
+  });
+
+  it("so does a fallback's answer that strips to empty: the canonical's refusal stays in the ledger", async () => {
+    const mock = scripted([REFUSAL as never, THINKING as never]);
+    const fx = await build(mock.membrane, { hoist: true });
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.deepEqual(mock.calls.map(toolNames), ['skip_reply', 'journal+skip_reply'], 'the premise: the canonical, then the tool-prose hoist');
+    const status = fx.strategy.getCompressionQuarantineStatus();
+    assert.equal(status.count, 1, 'the family exhausted');
+    assert.equal(status.spans[0]!.answeredAttempts, 2, "the canonical's refusal and the hoist's empty answer");
+    assert.equal(status.spans[0]!.latestOutcome, 'unusable_empty');
     fx.manager.close();
   });
 

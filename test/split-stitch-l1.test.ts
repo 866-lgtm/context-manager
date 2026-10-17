@@ -341,6 +341,30 @@ describe('split-stitch L1 fallback', () => {
     assert.deepEqual([split?.outcome, split?.errorType], ['provider_error', 'provider-error:malformed_response']);
   });
 
+  it('a rung its failures decided is recorded as the decision, so the span counts it as no answer', async () => {
+    const { membrane } = cumulativeMembrane({ refuseAt: 2, throwOn: 'raw-1' });
+    const fx = await build(membrane, { split: true, placeholder: true });
+    const lane = fx.strategy as unknown as { noteCompressionLanded(membrane: object, model: string | undefined): void };
+    // The first failure starts the rung's run; each of the next seven follows a landing.
+    await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /transport-down/);
+    for (let i = 0; i < 6; i++) {
+      lane.noteCompressionLanded(membrane, 'same-model');
+      await assert.rejects(fx.strategy.run(fx.target, managerContext(fx.manager)), /transport-down/);
+    }
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'the premise: seven failures decide nothing');
+    lane.noteCompressionLanded(membrane, 'same-model');
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    const projection = (fx.strategy as unknown as { readCompressionQuarantineProjection(): Map<string, { outcomes: Array<{ curveLabel: string; outcome: string; errorType?: string }> }> }).readCompressionQuarantineProjection();
+    const outcomes = [...projection.values()][0]?.outcomes ?? [];
+    const split = outcomes.find((outcome) => outcome.curveLabel === 'split-stitch');
+    assert.equal(split?.outcome, 'provider_error', 'the eighth decides the rung, and the family exhausts');
+    assert.match(split?.errorType ?? '', /^persistent-/, 'recorded as the decision, persistent-<class>');
+    const status = fx.strategy.getCompressionQuarantineStatus();
+    assert.equal(status.spans[0]!.answeredAttempts, outcomes.length - 1, 'every answer counts but the decision');
+    assert.equal(status.spans[0]!.latestOutcome, `provider_error:${split!.errorType}`, 'and the line names the decision once');
+    fx.manager.close();
+  });
+
   it('a window of 0 ends the rung before any piece is sent, as a cap trip (cm138-r4 I8)', async () => {
     const { calls, membrane } = cumulativeMembrane({ refuseAt: 2 });
     const fx = await build(membrane, { split: true, windowCap: 0, n: 2 });

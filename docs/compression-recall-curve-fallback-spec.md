@@ -49,7 +49,7 @@ This demonstrates a prefix/KV-shape boundary, not a content-presence boundary. E
 7. **No future leakage.** The alternate request must retain the same as-of boundary; no tail-after-chunk.
 8. **Coverage proof.** A replacement is valid only if recursively expanded leaf message IDs exactly equal the parent’s leaf coverage.
 9. **Store once.** Only the first successful response may become the chunk’s L1 summary. Refused/aborted diagnostic outputs are never persisted as memory.
-10. **Bounded where it is decided.** A deterministic outcome (an answer, a rejection attributable to the request, or a rung decided by `COMPRESSION_PERSISTENT_FAILURES` transient failures, each after compression landed on the same membrane and model) is recorded durably and never requested again, and the family exhausts after its bounded curve. A transient failure decides nothing by itself: it is paced by the lane's backoff and any wait the provider stated, and counted only within the process. So an outage, or a restart before the bound, retries the same request with pacing for as long as it lasts, and never spends the ladder.
+10. **Bounded where it is decided.** A deterministic outcome (an answer, a rejection attributable to the request, or a rung decided by `COMPRESSION_PERSISTENT_FAILURES` transient failures: its first, and each later one after compression landed on the same membrane and model since the one before) is recorded durably and never requested again, and the family exhausts after its bounded curve. A transient failure decides nothing by itself: it is paced by the lane's backoff and any wait the provider stated, and counted only within the process. So an outage, or a restart before the bound, retries the same request with pacing for as long as it lasts, and never spends the ladder.
 
 ## Fallback algorithm
 
@@ -128,8 +128,9 @@ failure (capacity, transport, credentials, or anything unclassified) is not by
 itself evidence about the variant: the curve stops there, keeps the family's
 durable progress, pauses the compression lane, and a later tick resumes at that
 variant without repeating requests whose outcomes are recorded. Only
-`COMPRESSION_PERSISTENT_FAILURES` of them on one rung, each after compression
-landed on the same membrane and model, decide it: their outcome,
+`COMPRESSION_PERSISTENT_FAILURES` of them on one rung decide it, the first and
+each later one after compression landed on the same membrane and model since
+the one before: their outcome,
 `provider_error:persistent-<class>`, is recorded like a rejection. A canonical rejection
 attributable to the request skips the variants and the canonical hoist: it goes
 to source-only-final once when that rung is configured, and otherwise exhausts

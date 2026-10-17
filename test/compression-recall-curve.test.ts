@@ -1666,6 +1666,37 @@ describe('compression refusal recall curves', () => {
     }
   });
 
+  it('a skipped quarantined chunk that a rebuild queues again during its yield still waits behind fresh work', async () => {
+    const fx = await queuedRawFixture();
+    const quarantinedIds = fx.chunks[0].messages.map((m) => m.id).join(':');
+    const rebuilds: Promise<void>[] = [];
+    try {
+      fx.strategy.afterCompression((chunk) => {
+        if (chunk.compressed || chunk.messages.map((m) => m.id).join(':') !== quarantinedIds) return;
+        // Inbound traffic during the skip's yield: its rebuild queues the
+        // quarantined chunk again, beside the chunks the new messages close,
+        // before tick has given it a failure order.
+        rebuilds.push(new Promise<void>((resolve) => setTimeout(() => {
+          for (let i = 0; i < 8; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`fresh-${i} ` + 'word '.repeat(30))]);
+          resolve();
+        }, 0)));
+      });
+      await fx.strategy.tick(fx.ctx);
+      await Promise.all(rebuilds);
+      assert.equal(rebuilds.length, 1, 'the premise: the rebuild ran during the skip');
+      assert.equal(fx.mock.calls.length, 2, 'the tick skipped the quarantined chunk and compressed the next');
+      const chunks = fx.strategy.chunksView();
+      const quarantined = chunks.findIndex((chunk) => chunk.messages.map((m) => m.id).join(':') === quarantinedIds);
+      const queue = fx.strategy.compressionQueueView();
+      assert.ok(quarantined >= 0 && queue.includes(quarantined), 'the quarantined chunk is queued again');
+      assert.ok(queue.some((index) => index !== quarantined && !chunks[index]!.compressed), 'fresh chunks are queued');
+      assert.equal(queue.at(-1), quarantined, 'it waits behind the fresh chunks, so they are built first');
+    } finally {
+      await Promise.all(rebuilds);
+      fx.manager.close();
+    }
+  });
+
   it('a rebuilt scan resolves original source identities at their current queue indexes (#55)', async () => {
     const fx = await queuedRawFixture();
     const rebuilt = fx.chunks.map((chunk, index) => ({ ...chunk, index: 1 - index })).reverse();
@@ -2260,8 +2291,14 @@ describe('compression refusal recall curves', () => {
     first.manager.close();
   });
 
-  /** Two instances on one store, the second joining the first's in-flight call, which fails with `error`. */
-  async function coalescedFailure(error: Error) {
+  type LanePause = { statedUntil: number | null; statedBy: string | null; backoffUntil: number; failures: number } | null;
+  const lanePause = (strategy: unknown): LanePause => (strategy as { compressionPause: LanePause }).compressionPause;
+
+  /**
+   * Two instances on one store, the second joining the first's in-flight call,
+   * which fails with `error`. `seed` runs on the second before it joins.
+   */
+  async function coalescedFailure(error: Error, seed?: (strategy: ProbeStrategy, ctx: StrategyContext) => void) {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let calls = 0;
@@ -2289,6 +2326,7 @@ describe('compression refusal recall curves', () => {
       (message) => secondCtx.messageStore.get(message.id),
     ).filter(Boolean) as StoredMessage[];
     const secondChunk = { ...first.target, messages: secondMessages, compressed: false };
+    seed?.(second, secondCtx);
     const joins = observeInFlightJoins();
     const before = Date.now();
     let runs: Promise<PromiseSettledResult<unknown>[]>;
@@ -2307,12 +2345,10 @@ describe('compression refusal recall curves', () => {
     assert.equal(producer!.status, 'rejected');
     assert.equal(waiter!.status, 'rejected');
     assert.equal((waiter as PromiseRejectedResult).reason, error, "the waiter rethrows the producer's failure");
-    const pause = (second as unknown as {
-      compressionPause: { statedUntil: number | null; backoffUntil: number; failures: number } | null;
-    }).compressionPause;
     return {
       before,
-      pause,
+      pause: lanePause(second),
+      producerPause: lanePause(first.strategy),
       close: () => {
         secondManager.close();
         first.manager.close();
@@ -2334,6 +2370,37 @@ describe('compression refusal recall curves', () => {
     const unavailable = Object.assign(new Error('zz overloaded'), { type: 'server', httpStatus: 503, retryable: true });
     const { pause, close } = await coalescedFailure(unavailable);
     assert.equal(pause, null, 'nothing to hold for: its own calls failed none, and the provider stated no wait');
+    close();
+  });
+
+  it("a waiter with a backoff of its own keeps it, and its failure count, when it takes another instance's stated wait (Anarchid R1-3)", async () => {
+    const limited = Object.assign(new Error('zz rate limited'), { type: 'rate_limit', httpStatus: 429, retryAfterMs: 120_000 });
+    const backoffUntil = Date.now() + 600_000;
+    const { before, pause, close } = await coalescedFailure(limited, (strategy, ctx) => {
+      (strategy as unknown as { compressionPause: unknown }).compressionPause = {
+        backoffUntil, statedUntil: null, statedBy: null, failures: 4, membrane: ctx.membrane, model: MODEL, reason: 'zz its own earlier failure',
+      };
+    });
+    assert.ok(pause && pause.statedUntil !== null && pause.statedUntil >= before + 120_000, 'it takes the stated wait');
+    assert.equal(pause!.backoffUntil, backoffUntil, 'its own backoff stands');
+    assert.equal(pause!.failures, 4, 'and so does its failure count');
+    close();
+  });
+
+  it("a deferral by the producer's provider admission gives the waiter's lane no pause, since no call was made", async () => {
+    const deferral = Object.assign(new Error('zz held; no call was made'), {
+      type: 'rate_limit', retryable: true, providerAdmission: 'deferred', retryAfterMs: 120_000,
+    });
+    const { pause, producerPause, close } = await coalescedFailure(deferral);
+    assert.equal(producerPause?.statedBy, 'admission', "the premise: the producer's own lane holds the admission's answer");
+    assert.equal(pause, null, "no provider stated a wait: the waiter's next attempt asks the admission itself");
+    close();
+  });
+
+  it("an aborted call gives the waiter's lane no pause, even with a stated wait on its error", async () => {
+    const aborted = Object.assign(new Error('zz aborted'), { name: 'AbortError', retryAfterMs: 60_000 });
+    const { pause, close } = await coalescedFailure(aborted);
+    assert.equal(pause, null, "only a real call's transient failure paces the waiter");
     close();
   });
 

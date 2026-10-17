@@ -980,8 +980,8 @@ const CANONICAL_STAGE_LABELS = new Set(['canonical', 'canonical-no-tools', 'cano
 
 /**
  * A rung decided by its failures (COMPRESSION_PERSISTENT_FAILURES transient
- * failures, each after a landing): the policy's outcome, `persistent-<class>`,
- * not an answer any provider gave.
+ * failures, the first and each later one after a landing): the policy's
+ * outcome, `persistent-<class>`, not an answer any provider gave.
  */
 function isFailureDecision(entry: { outcome: string; errorType?: string }): boolean {
   return entry.outcome === 'provider_error' && typeof entry.errorType === 'string' && entry.errorType.startsWith('persistent-');
@@ -4427,11 +4427,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * caller's provider admission warns and logs (compression:lane-held-by-
    * admission) once per hold, and again when its deadline changes.
    *
-   * `madeNoCall`: the failure was another instance's, on a request this one
-   * joined (a coalesced wait). It paces this lane by the provider's stated
-   * wait, so this instance doesn't send the same request inside it, and
-   * keeps the failure count and the backoff as they were: no call of this
-   * instance's failed. With no stated wait it installs nothing.
+   * `madeNoCall`: the failure was another instance's call, on a request this
+   * one joined (a coalesced wait). It paces this lane by the provider's
+   * stated wait, so this instance doesn't send the same request inside it,
+   * and keeps the failure count and the backoff as they were: no call of
+   * this instance's failed. With no stated wait it installs nothing. The
+   * join passes no deferral here, since a deferral made no call.
    */
   private pauseCompressionLane(
     source: CompressionOperationBranch,
@@ -5848,11 +5849,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       if (quarantineSkipped) {
-        // Skipped: quarantined, still raw, and pending at every rebuild.
-        // Ordered like a failed chunk, behind the work that hasn't failed, so
-        // a rebuild (every inbound message) doesn't put it, and the request
-        // build that finds its quarantine, ahead of fresh chunks.
+        // Skipped: quarantined, still raw, and queued again at every rebuild
+        // (every inbound message). It takes a failure order, as a failed
+        // chunk does, so the queue keeps it behind the chunks that haven't
+        // failed, and tick builds their requests before it builds this one's
+        // only to find its quarantine again. A rebuild during the yield above
+        // may have queued it before it had that order, so the queue is sorted
+        // now.
         this.compressionFailureOrder.set(key, ++this.compressionFailureSequence);
+        this.orderCompressionQueue();
       } else {
         // Decided (landed, or exhausted): no longer failing.
         this.compressionFailureOrder.delete(key);
@@ -7691,9 +7696,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       if (result.error) {
         // The producer's transient failure was on the very request this
-        // instance would send next: take the provider's stated wait from it,
-        // counting no failure, since none of this instance's calls failed.
-        if (compressionFailureKind(result.error) === 'transient') {
+        // instance would send next: take the wait the provider stated after
+        // that call, counting no failure, since none of this instance's calls
+        // failed. A deferral made no call (the producer's admission refused
+        // it, or its split rung's window had no room), so no provider stated
+        // a wait for this lane to take.
+        if (compressionFailureKind(result.error) === 'transient' && !isNoCallDeferral(result.error)) {
           this.pauseCompressionLane(
             sourceBranch, ctx, result.error, 'l1',
             `the chunk of ${chunk.messages.length} message(s) from ${chunk.messages[0]?.id ?? '?'}`,
@@ -8512,6 +8520,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           let modelReportedLeaves = 0;
           const splitStart = Date.now();
           let abortReason: string | undefined;
+          /** The rung's outcome when its failures decided it, recorded as interrupt() gives it. */
+          let splitDecision: CompressionRefusalOutcomeRecord | undefined;
           const MAX_SPLIT_CALLS = this.config.compressionSplitMaxCallsPerChunk ?? 40;
           const WINDOW_MS = 10 * 60_000;
           const MAX_WINDOW_CALLS = this.config.compressionSplitMaxCallsPer10Min ?? 80;
@@ -8633,8 +8643,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // whole rung runs again on a later tick, its per-attempt caps
             // applying again. When the failures decide the request
             // (COMPRESSION_PERSISTENT_FAILURES), the rung ends here instead.
-            const persistent = interrupt(error, 'split-stitch', leafHash);
-            abortReason = `provider-error:${persistent.errorType ?? 'persistent'}`;
+            splitDecision = interrupt(error, 'split-stitch', leafHash);
+            abortReason = `provider-error:${splitDecision.errorType ?? 'persistent'}`;
           }
           this.lastSplitAttempted = { ...attempted, complete };
           if (complete && lastGood && parts.some((p) => p.kind === 'fold')) {
@@ -8688,7 +8698,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             logCompressionCall({ event: 'compression:split-stitch', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, composite_hash: compositeHash, content_hash: contentHash, parts: partsMeta, placeholders, calls, attempted } });
           } else {
             const reason = abortReason ?? 'refused';
-            const splitOutcome: CompressionRefusalOutcomeRecord = { curveLabel: 'split-stitch', requestHash: leafHash, outcome: reason.startsWith('provider-error') ? 'provider_error' : 'refusal', ...(abortReason ? { errorType: abortReason } : {}) };
+            // A decision keeps its own errorType (persistent-<class>), as every
+            // other rung's does, so the quarantine status reads it as one.
+            const splitOutcome: CompressionRefusalOutcomeRecord = splitDecision ?? { curveLabel: 'split-stitch', requestHash: leafHash, outcome: reason.startsWith('provider-error') ? 'provider_error' : 'refusal', ...(abortReason ? { errorType: abortReason } : {}) };
             outcomes.push(splitOutcome);
             noteOutcome(splitOutcome);
             console.error(`[autobiographical] split-stitch abandoned for chunk ${chunk.index}: ${reason} after ${calls} call(s), ${parts.length} piece(s) discarded (receipts only)`);
@@ -8813,7 +8825,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // exhaustion path as the refusal curves; the record is sticky by
         // chunk hash and clears via success-clear / sweep / operator.
         if (this.isCompressionBranchCurrent(sourceBranch)) {
-          const emptyOutcomes: CompressionRefusalOutcomeRecord[] = toolProseWonTrace
+          // The empty answers that ended the family, noted beside every
+          // answer it was given before them (the canonical stage's among
+          // them), so the record keeps them all, each rung once.
+          const ended: CompressionRefusalOutcomeRecord[] = toolProseWonTrace
             ? [{
                 curveLabel: toolProseWonTrace.curveLabel,
                 outcome: 'unusable_empty',
@@ -8829,7 +8844,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 { ...(emptyRung ?? { curveLabel: 'canonical', requestHash: canonicalRequestHash }), outcome: 'unusable_empty' },
                 proseOutcome ?? { curveLabel: 'canonical-plain-prose', outcome: 'unusable_empty', requestHash: proseRequestHash },
               ];
-          await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, emptyOutcomes);
+          for (const outcome of ended) noteOutcome(outcome);
+          await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, [...progressOutcomes]);
           if (this.isCompressionBranchCurrent(sourceBranch)) {
             this.forgetCompressionFamilyProgress((entry) => entry.familyKey === quarantineRecord.familyKey);
           }
