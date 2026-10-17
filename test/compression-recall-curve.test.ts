@@ -4028,6 +4028,7 @@ describe("a host's withdrawal of a compression call (CompressionWithdrawn)", () 
     assert.equal(mock.calls.length, limit + 8, 'each tick made the merge call');
     assert.deepEqual(fx.strategy.mergeQueueView(), before, 'the merge is still at the head');
     assert.equal(fx.strategy.getMergeQuarantineStatus().count, 0, 'nothing quarantined');
+    assert.equal((fx.strategy as unknown as { mergeFailureRuns: Map<string, unknown> }).mergeFailureRuns.size, 0, 'no run of failures');
     fx.manager.close();
   });
 
