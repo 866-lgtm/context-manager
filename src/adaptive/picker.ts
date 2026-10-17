@@ -75,8 +75,10 @@ export interface OverBudgetDiagnostics {
  *   compile renders the rest raw whatever summary covers them. A chunk's
  *   messages are its own, a merge's are the leaves of its sources in
  *   memory, and the work in flight's are those of the chunk or merge `tick`
- *   is working on. When the work in flight folds nothing, the count goes on
- *   to the queue, passing over the merge in flight, and it goes past a
+ *   is working on. The work in flight counts only while no compression hold
+ *   placed since reaches it, since its landing checks the hold and discards
+ *   what the call returns. When it doesn't count, the count goes on to the
+ *   queue, where a merge in flight is still the head, and it goes past a
  *   queued merge that folds nothing, which `tick` runs before it takes the
  *   next. A merge counts even when `tick` will drop it as stale without a
  *   model call: a source

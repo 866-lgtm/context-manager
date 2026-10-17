@@ -2493,9 +2493,10 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
-  // Round 19: the count walks the merge queue as tick takes it, past a merge that folds nothing and the
-  // merge in flight, ending at one a hold blocks; and it goes on to the queue past work in flight that
-  // folds nothing, below the cap.
+  // Rounds 19 and 20: the count walks the merge queue as tick takes it, past a merge that folds nothing,
+  // ending at one a hold blocks, a merge in flight still the head; it goes on to the queue past work in
+  // flight that folds nothing, below the cap; and work in flight that a hold placed since reaches
+  // doesn't count, since its landing discards what the call returns.
 
   /** Four messages, each an L1's source (L1-a to L1-d), parented to the named L2s when given. */
   const fourSummaries = (manager: ContextManager, strategy: DiagnosticStrategy, parents: (string | undefined)[] = []): string[] => {
@@ -2534,7 +2535,7 @@ describe('OverBudgetError.clearedBy', () => {
     }, { membrane: model.membrane });
   });
 
-  it('names compression for a folding merge queued behind a merge in flight that a hold placed since blocks, since tick has already taken it', async () => {
+  it('names nothing for a folding merge queued behind a merge in flight that a hold placed since blocks, since tick discards what the call returns and stops at the held head', async () => {
     const strategy = mergeOfTwo();
     const model = waitingMembrane();
     await withManager(strategy, async (manager) => {
@@ -2548,10 +2549,55 @@ describe('OverBudgetError.clearedBy', () => {
       // tick takes only the head merge, which the pin leaves folding nothing.
       assert.equal(model.calls.n, 1, 'premise: tick asked the model for the head merge, and waits');
       manager.holdCompression([ids[3]!], { timeoutMs: 60_000 });
-      assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      assert.deepEqual((await refusal(manager)).clearedBy, []);
+      const { indices, holdStart } = strategy.placement(ids);
+      assert.ok(indices[1]! < holdStart && indices[3]! >= holdStart, 'premise: the hold reaches the merge in flight and not the merge behind it');
       model.release();
       await ticking;
       manager.releaseCompression([ids[3]!]);
+    }, { membrane: model.membrane });
+  });
+
+  it('names nothing while tick runs a folding merge that a hold placed since blocks, since its landing discards the L2 and the merge stays at the head', async () => {
+    const strategy = mergeOfTwo();
+    const model = waitingMembrane();
+    await withManager(strategy, async (manager) => {
+      const ids = twoSummariesMerged(manager, strategy);
+      const ticking = manager.tick().then(() => undefined, (error: unknown) => error);
+      await Promise.race([model.called, ticking]);
+      assert.equal(model.calls.n, 1, 'premise: tick asked the model for the merge, and waits');
+      manager.holdCompression([ids[1]!], { timeoutMs: 60_000 });
+      assert.deepEqual((await refusal(manager)).clearedBy, []);
+      const { indices, headEnd, holdStart } = strategy.placement(ids);
+      assert.ok(indices[0]! >= headEnd && indices[0]! < holdStart && indices[1]! >= holdStart,
+        'premise: the merge would fold its first message, and the hold reaches its second');
+      model.release();
+      await ticking;
+      manager.releaseCompression([ids[1]!]);
+    }, { membrane: model.membrane });
+  });
+
+  it('names nothing while tick compresses a chunk that a hold placed since reaches, since its landing discards the L1', async () => {
+    const strategy = modelCallChunks();
+    const model = waitingMembrane();
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      const ticking = manager.tick().then(() => undefined, (error: unknown) => error);
+      await Promise.race([model.called, ticking]);
+      assert.equal(model.calls.n, 1, 'premise: tick asked the model for the first chunk, and waits');
+      assert.deepEqual(strategy.chunkInFlight(), queued[0], 'premise: the chunk in flight is the first queued');
+      // A hold on the chunk's last message reaches it, and every chunk queued after it, while its
+      // earlier messages stay foldable, so the hold is what keeps it from counting.
+      const last = queued[0]![queued[0]!.length - 1]!;
+      manager.holdCompression([last], { timeoutMs: 60_000 });
+      assert.deepEqual((await refusal(manager)).clearedBy, []);
+      const { indices, headEnd, holdStart } = strategy.placement(queued[0]!);
+      assert.ok(indices[0]! >= headEnd && indices[0]! < holdStart && indices.at(-1)! >= holdStart,
+        'premise: the chunk would fold its first message, and the hold reaches its last');
+      model.release();
+      assert.match(String(await ticking), /released by the test/);
+      manager.releaseCompression([last]);
     }, { membrane: model.membrane });
   });
 

@@ -1126,15 +1126,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected pendingCompression: Promise<void> | null = null;
   /**
    * What the compression in flight works on, for compressionWorkQueued: the
-   * messages of the chunk tick took, or the queue entry of the merge it runs,
-   * which tick leaves at the head of the merge queue until it lands. tick
-   * sets it before each call and clears it with pendingCompression. A call
-   * whose synchronous start finds the branch gone can clear it with the
+   * messages of the chunk tick took, or the source summaries of the merge it
+   * runs, which tick leaves at the head of the merge queue until it lands.
+   * tick sets it before each call and clears it with pendingCompression. A
+   * call whose synchronous start finds the branch gone can clear it with the
    * mirrors first (requireLoadedBranch does unless an initializer is still
    * current), and pendingCompression is then set with nothing recorded
    * beside it until tick's finally.
    */
-  protected pendingCompressionWork: { messageIds: readonly MessageId[] } | { merge: { readonly sourceIds: readonly string[] } } | null = null;
+  protected pendingCompressionWork: { messageIds: readonly MessageId[] } | { sourceIds: readonly string[] } | null = null;
   protected compressionQueue: number[] = [];
   /** The context initialize was given; its `tools` getter follows the host's declarations. */
   private hostContext: StrategyContext | null = null;
@@ -5033,7 +5033,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this.mergeBlockedByHold(merge.sourceIds, ctx.messageStore)) return;
       this._drainProgress++; // executing a merge is real work, even if a
       // follow-on merge gets enqueued and the queue length nets out unchanged
-      this.pendingCompressionWork = { merge };
+      this.pendingCompressionWork = { sourceIds: [...merge.sourceIds] };
       this.pendingCompression = this.executeMerge(merge.level, merge.sourceIds, ctx);
 
       try {
@@ -8812,8 +8812,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * call, or a drop with none when it's stale) and then takes the next, and
    * returns at a head a hold blocks. So the walk goes past a merge that
    * folds nothing and ends at one a hold blocks. The merge in flight stays at
-   * the head while it runs, and the walk passes over it, since the work in
-   * flight answers for it. A queued merge counts even when executeMerge will
+   * the head until it lands, and the walk reads it there: a hold placed since
+   * ends the walk at it, since tick discards what its call returns and stops
+   * at that head. A queued merge counts even when executeMerge will
    * drop it as stale without a model call (a source not loaded or already
    * parented, or a group its topology check refuses, which it quarantines),
    * when a source in memory covers such a message: tick drops one such entry
@@ -8897,12 +8898,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * selectHierarchical expands them, and for the work in flight: the
    * messages of the chunk tick took, or the leaves of the merge it runs
    * (pendingCompressionWork). Work in flight that folds nothing doesn't
-   * count, and the count goes on to the queue, since tick takes the next item
-   * once the call ends. A pendingCompression with nothing recorded beside it
-   * counts as it did: tick can leave one for a moment when a call's
-   * synchronous start finds the branch gone (requireLoadedBranch can clear
-   * the record with the mirrors before it throws), until tick's finally, and
-   * a subclass that sets the field itself can leave one. The count assumes
+   * count, nor does work a compression hold placed since reaches (for a
+   * chunk, one of its messages held, chunkHasHeldMessage's rule; for a merge,
+   * mergeBlockedByHold), since its landing checks the hold and discards what
+   * the call returns. Either way the count goes on to the queue: tick takes
+   * the next chunk once the call ends, and a merge in flight is still the
+   * head, where the walk reads it. A pendingCompression with nothing
+   * recorded beside it counts as it did: tick can leave one for a moment
+   * when a call's synchronous start finds the branch gone
+   * (requireLoadedBranch can clear the record with the mirrors before it
+   * throws), until tick's finally, and a subclass that sets the field itself
+   * can leave one. The count assumes
    * the host keeps ticking: one that ticks a
    * fixed number of times between compiles reaches work only within that
    * many queued chunks, since each compile queues the skipped ones again.
@@ -8932,17 +8938,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (const leaf of leaves) if (foldable.has(leaf)) return true;
       return false;
     };
-    // Work in flight counts when it folds something now. When it folds
-    // nothing, tick takes the next item once its call ends, so the count goes
-    // on to the queue, passing over the merge in flight, which tick leaves at
-    // the head of the merge queue while it runs. A pendingCompression with
-    // nothing recorded beside it counts as it did: tick can leave one for a
-    // moment when a call's synchronous start finds the branch gone, and a
-    // subclass that sets the field itself can leave one.
-    const work = this.pendingCompression ? this.pendingCompressionWork : null;
+    // Work in flight counts when it folds something now and no compression
+    // hold placed since reaches it, since its landing checks the hold and
+    // discards what the call returns: a chunk's L1, tick then taking the next
+    // chunk, or a merge's L2, the merge staying at the head, where tick then
+    // stops. Otherwise the count goes on to the queue, where a merge in
+    // flight is still the head. A pendingCompression with nothing recorded
+    // beside it counts as it did: tick can leave one for a moment when a
+    // call's synchronous start finds the branch gone, and a subclass that
+    // sets the field itself can leave one.
+    const held = this.holdBlockedIds(store);
     if (this.pendingCompression) {
+      const work = this.pendingCompressionWork;
       if (work === null) return true;
-      if ('messageIds' in work ? work.messageIds.some((id) => foldable.has(id)) : mergeFolds(work.merge.sourceIds)) return true;
+      if ('messageIds' in work) {
+        // chunkHasHeldMessage's rule, over the ids tick recorded.
+        const reached = held !== null && work.messageIds.some((id) => held.has(id));
+        if (!reached && work.messageIds.some((id) => foldable.has(id))) return true;
+      } else if (!this.mergeBlockedByHold([...work.sourceIds], store) && mergeFolds(work.sourceIds)) {
+        return true;
+      }
     }
     // Without a compression model no merge counts: tick drops a stale head
     // merge without a model call, and throws at the first merge it would make
@@ -8952,13 +8967,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (a model call, or a drop with none when it's stale) and then takes the
     // next, and returns at a head a hold blocks. So the walk goes past a merge
     // that folds nothing and ends at one a hold blocks; a stale merge counts
-    // until tick has dropped it, if it folds something now.
+    // until tick has dropped it, if it folds something now. A merge in flight
+    // is still the head: a hold placed since ends the walk there, since tick
+    // discards what its call returns and stops at it.
     const modelled = Boolean(this.config.compressionModel);
-    const mergeInFlight = work !== null && 'merge' in work ? work.merge : undefined;
     let mergeCounts = false;
     if (this.config.hierarchical && modelled) {
       for (const merge of this.mergeQueue) {
-        if (merge === mergeInFlight) continue;
         if (this.mergeBlockedByHold(merge.sourceIds, store)) break;
         if (mergeFolds(merge.sourceIds)) {
           mergeCounts = true;
@@ -8967,7 +8982,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     if (this.compressionQueue.length === 0 || this.isAtSpeculativeCap()) return mergeCounts;
-    const held = this.holdBlockedIds(store);
     const adoptionShrinks = path === 'hierarchical' && this.chunkPersistenceEnabled;
     const coveredByL1 = new Set<string>();
     const exactL1 = new Set<string>();
