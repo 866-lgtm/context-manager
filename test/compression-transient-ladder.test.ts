@@ -797,6 +797,14 @@ describe('the log bound never splits a surrogate pair at either cut', () => {
   });
 });
 
+/** The rungs of the one exhausted record's answers, in the order the record keeps them. */
+function exhaustedRecordLabels(strategy: unknown): string[] {
+  const lane = strategy as { readCompressionQuarantineProjection(): Map<string, { outcomes: Array<{ curveLabel: string }> }> };
+  const records = [...lane.readCompressionQuarantineProjection().values()];
+  assert.equal(records.length, 1, 'one exhausted record');
+  return records[0]!.outcomes.map((outcome) => outcome.curveLabel);
+}
+
 describe('every rung keeps its own identity across a resume (#47653)', () => {
   const THINKING = { content: [text('<thinking>all of it went here</thinking>')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
   const TOOL_USE = { content: [use('t9', 'skip_reply', { reason: 'later' })], stopReason: 'tool_use', usage: { inputTokens: 80, outputTokens: 5 } };
@@ -835,6 +843,7 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
     assert.equal(status.count, 1, 'the family exhausted');
     assert.equal(status.spans[0]!.answeredAttempts, 3, "the canonical's tool_use answer, the empty no-tools answer and the empty prose answer");
     assert.equal(status.spans[0]!.latestOutcome, 'unusable_empty');
+    assert.deepEqual(exhaustedRecordLabels(fx.strategy), ['canonical', 'canonical-no-tools', 'canonical-plain-prose'], 'in the order the ladder asked them');
     fx.manager.close();
   });
 
@@ -915,6 +924,7 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
     await a.strategy.run(a.target(), managerContext(a.manager));
     assert.ok(carriesThinking(refused.calls[0]!) && !carriesThinking(refused.calls[1]!) && refused.calls.length === 2, 'the premise: the carrier request, then its stripped retry');
     assert.equal(a.strategy.getCompressionQuarantineStatus().spans[0]!.answeredAttempts, 2, "the carrier rejection and the stripped retry's refusal");
+    assert.deepEqual(exhaustedRecordLabels(a.strategy), ['canonical:carrier-rejected', 'canonical'], 'in the order the ladder met them');
     a.manager.close();
     // The empty answer's exit: the stripped retry answers with nothing usable, and so does the plain-prose retry.
     const empty = scripted([{ throw: rejected }, THINKING as never, THINKING as never]);
@@ -922,6 +932,7 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
     await b.strategy.run(b.target(), managerContext(b.manager));
     assert.equal(empty.calls.length, 3, 'the premise: the carrier request, its stripped retry and the plain-prose retry');
     assert.equal(b.strategy.getCompressionQuarantineStatus().spans[0]!.answeredAttempts, 3, 'the carrier rejection counts here too');
+    assert.deepEqual(exhaustedRecordLabels(b.strategy), ['canonical:carrier-rejected', 'canonical', 'canonical-plain-prose'], 'in the order the ladder met them');
     b.manager.close();
   });
 
@@ -2061,7 +2072,7 @@ describe("a split-window wait skips its chunk for the wait and lets the tick go 
 });
 
 describe("another instance's split-window wait holds nothing here (cm138-r11 I1)", () => {
-  it('rethrown through a joined call, it leaves the chunk unheld at the head and the lane unpaused, and the next tick attempts the chunk', async () => {
+  it('rethrown to this tick, as a joined call rethrows it, it leaves the chunk unheld at the head and the lane unpaused, and the next tick attempts the chunk', async () => {
     const mock = scripted([OK('the next chunk'), OK('its own attempt')]);
     const fx = await queued(mock.membrane);
     assert.ok(fx.strategy.compressionQueueView().length >= 2, 'two chunks pending');
@@ -2142,13 +2153,161 @@ describe('a family dropped while its ladder ran is not quarantined by its exhaus
     // The canonical's empty answer is written; the family is dropped as the plain-prose retry's call arrives.
     const mock = dropping([THINKING as never, THINKING as never, OK('a fresh memory')], 1, () => fx.strategy);
     fx = await build(mock.membrane);
-    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    const events = await loggedEvents(() => fx.strategy.run(fx.target(), managerContext(fx.manager)));
     assert.equal(mock.calls.length, 2, 'the premise: the canonical, then the plain-prose retry');
     assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'nothing is quarantined');
+    assert.ok(events.includes('compression:family-dropped') && !events.includes('compression:curve-exhausted'), 'the log says the family was dropped, not exhausted');
     assert.deepEqual(progressSlot(fx.manager), [], 'and nothing writes the progress back');
     await fx.strategy.run(fx.target(), managerContext(fx.manager));
     assert.equal(mock.calls.length, 3, 'the next attempt pays for the canonical again');
     assert.ok(fx.strategy.summariesView().some((s) => s.content === 'a fresh memory'));
+    fx.manager.close();
+  });
+
+  const PROGRESS_ID = 'default/autobio:compression-family-progress';
+  const OTHER = { curveLabel: 'zz-other', outcome: 'refusal', requestHash: 'zz-other-hash' };
+  type Lane = {
+    forgetCompressionFamilyProgress(matches: () => boolean): void;
+    appendCompressionQuarantineEvent(event: Record<string, unknown>): unknown;
+    takeCompressionFamilyDropTracker(familyKey: string): { drops: number; taken: number } | undefined;
+    readCompressionQuarantineProjection(): Map<string, { record: { familyKey: string }; outcomes: Array<{ curveLabel: string; outcome: string; requestHash: string }> }>;
+  };
+  /** Runs `run` with the compression log in a file of its own, and returns the events it logged. */
+  async function loggedEvents(run: () => Promise<void>): Promise<string[]> {
+    const log = `${freshPath()}-calls.jsonl`;
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+    try {
+      await run();
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+    }
+    if (!existsSync(log)) return [];
+    return readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((line) => (JSON.parse(line) as { event: string }).event);
+  }
+  /** scripted's answers, with `before(calls so far)` run as each call arrives. */
+  function hooked(steps: Step[], before: (count: number) => void) {
+    const inner = scripted(steps);
+    const complete = (inner.membrane as { complete(request: NormalizedRequest): Promise<unknown> }).complete;
+    return {
+      calls: inner.calls,
+      membrane: { complete: async (request: NormalizedRequest) => { before(inner.calls.length); return complete(request); } } as never,
+    };
+  }
+
+  it('a ladder that began with no progress reads a family another strategy wrote and dropped meanwhile as dropped (cm138-r12 I1)', async () => {
+    let fx!: Awaited<ReturnType<typeof build>>;
+    let written: unknown;
+    let otherWriter = false;
+    const mock = hooked([REFUSAL as never], (count) => {
+      if (count === 1 && written === undefined) written = progressSlot(fx.manager)[0];
+      if (!otherWriter) return;
+      otherWriter = false;
+      // Another strategy on the store writes the family's progress, and a mint, a sweep or a clear drops it.
+      fx.manager.getStore().setStateJson(PROGRESS_ID, [written]);
+      (fx.strategy as unknown as Lane).forgetCompressionFamilyProgress(() => true);
+    });
+    fx = await build(mock.membrane, { sourceOnlyFallback: true });
+    // A first ladder exhausts the family, and an operator's clear drops its record and progress.
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'the premise: the first ladder exhausts it');
+    assert.ok(written, "the premise: the first ladder's progress, as another strategy would write it");
+    await fx.strategy.clearCompressionRefusalQuarantine();
+    assert.deepEqual(progressSlot(fx.manager), [], 'the premise: no progress when the next ladder begins');
+    otherWriter = true;
+    const events = await loggedEvents(() => fx.strategy.run(fx.target(), managerContext(fx.manager)));
+    assert.equal(mock.calls.length, 4, 'the premise: the next ladder asks both rungs again');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'nothing is quarantined');
+    assert.ok(events.includes('compression:family-dropped') && !events.includes('compression:curve-exhausted'));
+    assert.deepEqual(progressSlot(fx.manager), [], 'and nothing writes the progress back');
+    fx.manager.close();
+  });
+
+  for (const exit of ['refusal ladder', 'empty answer'] as const) {
+    it(`a family dropped and written again by another strategy while its ladder ran is left as the other wrote it, at the ${exit}'s exit (cm138-r12 I1, I4)`, async () => {
+      let fx!: Awaited<ReturnType<typeof build>>;
+      let rewritten: unknown;
+      const mock = hooked((exit === 'refusal ladder' ? [REFUSAL, REFUSAL] : [THINKING, THINKING]) as never, (count) => {
+        if (count !== 1) return;
+        // The family is dropped, then another strategy on the store writes its progress afresh.
+        const [entry] = progressSlot(fx.manager) as Array<Record<string, unknown>>;
+        (fx.strategy as unknown as Lane).forgetCompressionFamilyProgress(() => true);
+        rewritten = { ...entry, outcomes: [OTHER], updated: Date.now() };
+        fx.manager.getStore().setStateJson(PROGRESS_ID, [rewritten]);
+      });
+      fx = await build(mock.membrane, exit === 'refusal ladder' ? { sourceOnlyFallback: true } : {});
+      const events = await loggedEvents(() => fx.strategy.run(fx.target(), managerContext(fx.manager)));
+      assert.equal(mock.calls.length, 2, 'the premise: two calls');
+      assert.ok(rewritten, 'the premise: the family was written afresh during the second');
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'nothing is quarantined');
+      assert.ok(events.includes('compression:family-dropped'), 'the log says the family was dropped');
+      assert.deepEqual(progressSlot(fx.manager), [rewritten], "the other strategy's progress stands, with nothing of this ladder's merged in or forgotten");
+      fx.manager.close();
+    });
+  }
+
+  it('a ladder holding a tracker let go after a day reads its family as dropped, the safe side (cm138-r12 I1)', async () => {
+    let fx!: Awaited<ReturnType<typeof build>>;
+    const mock = hooked([REFUSAL as never], (count) => {
+      if (count !== 1) return;
+      // The ladder's tracker was last taken over a day ago, and the next ladder to take one lets it go.
+      const [entry] = progressSlot(fx.manager) as Array<{ familyKey: string }>;
+      const lane = fx.strategy as unknown as Lane;
+      const tracker = lane.takeCompressionFamilyDropTracker(entry!.familyKey)!;
+      tracker.taken = Date.now() - 25 * 60 * 60 * 1000;
+      lane.takeCompressionFamilyDropTracker('zz-another-family');
+    });
+    fx = await build(mock.membrane, { sourceOnlyFallback: true });
+    const events = await loggedEvents(() => fx.strategy.run(fx.target(), managerContext(fx.manager)));
+    assert.equal(mock.calls.length, 2, 'the premise: the canonical, then source-only-final');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'nothing is quarantined');
+    assert.ok(events.includes('compression:family-dropped'));
+    fx.manager.close();
+  });
+
+  it('a family another strategy exhausted under this key meanwhile is left as it is, not reported as dropped (cm138-r12 I2)', async () => {
+    let fx!: Awaited<ReturnType<typeof build>>;
+    let other: { key: string; record: unknown; outcomes: unknown[] } | undefined;
+    let otherExhausts = false;
+    const mock = hooked([REFUSAL as never], (count) => {
+      if (!otherExhausts || count !== 3) return;
+      otherExhausts = false;
+      // Another strategy on the store exhausts the family under the same key, and its exit forgets the progress.
+      const lane = fx.strategy as unknown as Lane;
+      lane.appendCompressionQuarantineEvent({ kind: 'exhausted', key: other!.key, record: other!.record, outcomes: other!.outcomes, created: Date.now() });
+      lane.forgetCompressionFamilyProgress(() => true);
+    });
+    fx = await build(mock.membrane, { sourceOnlyFallback: true });
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    const [[key, active]] = [...(fx.strategy as unknown as Lane).readCompressionQuarantineProjection()];
+    other = { key: key!, record: active!.record, outcomes: active!.outcomes };
+    await fx.strategy.clearCompressionRefusalQuarantine();
+    otherExhausts = true;
+    const events = await loggedEvents(() => fx.strategy.run(fx.target(), managerContext(fx.manager)));
+    assert.equal(mock.calls.length, 4, 'the premise: the next ladder asks both rungs again');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, "the other strategy's record stands, once");
+    assert.ok(!events.includes('compression:family-dropped'), 'and the family is not reported as dropped');
+    assert.deepEqual(progressSlot(fx.manager), []);
+    fx.manager.close();
+  });
+
+  it('the exhausted record keeps an outcome another strategy noted to the family meanwhile, after its own (cm138-r12 I5)', async () => {
+    let fx!: Awaited<ReturnType<typeof build>>;
+    const mock = hooked([REFUSAL as never], (count) => {
+      if (count !== 1) return;
+      // Another strategy on the store notes an answer, merged into the family's progress.
+      const [entry] = progressSlot(fx.manager) as Array<{ outcomes: unknown[] }>;
+      fx.manager.getStore().setStateJson(PROGRESS_ID, [{ ...entry, outcomes: [...entry!.outcomes, OTHER] }]);
+    });
+    fx = await build(mock.membrane, { sourceOnlyFallback: true });
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2, 'the premise: the canonical, then source-only-final');
+    const [active] = [...(fx.strategy as unknown as Lane).readCompressionQuarantineProjection().values()];
+    const labels = active!.outcomes.map((outcome) => outcome.curveLabel);
+    assert.equal(labels.at(-1), 'zz-other', "the other strategy's answer, last");
+    assert.ok(labels.includes('canonical') && labels.includes('source-only-final'), "after this ladder's own");
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().spans[0]!.answeredAttempts, labels.length, 'every answer counts');
     fx.manager.close();
   });
 });

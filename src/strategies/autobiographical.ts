@@ -1126,6 +1126,18 @@ function sha256Json(value: unknown): string {
  */
 const compressionStateLocks = new WeakMap<JsStore, Map<string, Promise<void>>>();
 const compressionInFlight = new WeakMap<JsStore, Map<string, Promise<CompressionInFlightResult>>>();
+/**
+ * Per store in this process, a tracker for each family a refusal ladder has
+ * begun on, counting the drops of the family's progress (minted, exhausted,
+ * cleared or swept) since: a ladder takes its family's tracker before it reads
+ * the progress, and reads its family as dropped once that tracker is no
+ * longer the family's or its count has moved. forgetCompressionFamilyProgress,
+ * which every drop goes through, counts them. A tracker no ladder has taken
+ * for a day is let go when the next ladder takes one; a ladder still holding
+ * it would read its family as dropped, the safe side.
+ */
+const compressionFamilyDropTrackers = new WeakMap<JsStore, Map<string, { drops: number; taken: number }>>();
+const COMPRESSION_FAMILY_DROP_TRACKER_MS = 24 * 60 * 60 * 1000;
 const COMPRESSION_BUDGET_ACCOUNTING_VERSION = 2;
 const COMPRESSION_BUDGET_ACCOUNTING_SOURCE =
   'provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v2';
@@ -4264,11 +4276,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Quarantine a family whose ladder ended with no summary, with its record
-   * (`outcomes`). `familyOpen` is asked under the ledger's lock, the lock an
-   * operator's clear drops a family's progress under: a family dropped while
-   * its ladder ran (minted, cleared or swept) is not brought back, and true
-   * is returned with nothing written. A family already quarantined under this
-   * key is left as it is.
+   * (`outcomes`), and after it every outcome another strategy sharing the
+   * store noted to the family meanwhile. A family already quarantined under
+   * this key is left as it is. Otherwise `familyOpen` is asked, under the
+   * ledger's lock, the lock an operator's clear drops a family's progress
+   * under: a family dropped since its ladder began (minted, exhausted,
+   * cleared or swept) is not brought back, and true is returned with nothing
+   * written.
    */
   private async exhaustCompressionRequestFamily(
     source: CompressionOperationBranch,
@@ -4284,14 +4298,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.compressionRefusalQuarantineLedgerStateId,
       () => {
       if (!this.isCompressionBranchCurrent(source)) return;
+      const current = this.readCompressionQuarantineProjection();
+      if (current.has(record.key)) return;
       if (!familyOpen()) {
         dropped = true;
         return;
       }
-      const current = this.readCompressionQuarantineProjection();
-      if (current.has(record.key)) return;
+      const answerKey = (outcome: CompressionRefusalOutcomeRecord): string => `${outcome.curveLabel}\u0000${outcome.requestHash}`;
+      const recorded = new Set(outcomes.map(answerKey));
+      const notedElsewhere = (this.readCompressionFamilyProgress().get(record.familyKey)?.outcomes ?? [])
+        .filter((outcome) => !recorded.has(answerKey(outcome)));
       const exhausted = this.appendCompressionQuarantineEvent({
-        kind: 'exhausted', key: record.key, record, outcomes, created: Date.now(),
+        kind: 'exhausted', key: record.key, record, outcomes: [...outcomes, ...notedElsewhere], created: Date.now(),
       });
       if (!this.isCompressionBranchCurrent(source)) return;
       this.appendCompressionQuarantineEvent({
@@ -4310,11 +4328,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return dropped;
   }
 
-  /** A ladder ended with no summary on a family dropped while it ran: no record, and the chunk stays raw. */
+  /** A ladder ended with no summary on a family dropped since it began: it writes no record. */
   private logCompressionFamilyDropped(chunk: Chunk, record: CompressionRefusalQuarantineRecord): void {
     console.warn(
-      `[autobiographical] the chunk from ${chunk.messages[0]?.id ?? '?'} stays raw and unquarantined: ` +
-        'its family was dropped while its ladder ran (minted, cleared or swept)',
+      `[autobiographical] the ladder for the chunk from ${chunk.messages[0]?.id ?? '?'} ended with no summary ` +
+        'and quarantines nothing: its family was dropped while it ran (minted, exhausted, cleared or swept)',
     );
     logCompressionCall({
       event: 'compression:family-dropped',
@@ -4386,20 +4404,45 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Drop progress at a meaningful boundary (mint, exhaustion, paid-off
-   * sweep): read afresh, remove only the matching families, keep every
-   * other writer's.
+   * Drop progress at a meaningful boundary (mint, exhaustion, an operator's
+   * clear, an age or paid-off sweep): read afresh, remove only the matching
+   * families, keep every other writer's, and count the drop on each dropped
+   * family's tracker, so a ladder on it reads it as dropped.
    */
   private forgetCompressionFamilyProgress(matches: (entry: CompressionFamilyProgress) => boolean): void {
     if (!this.store) return;
     const progress = this.readCompressionFamilyProgress();
+    const trackers = compressionFamilyDropTrackers.get(this.store);
     let changed = false;
     for (const [key, entry] of progress) {
       if (!matches(entry)) continue;
       progress.delete(key);
+      const tracker = trackers?.get(key);
+      if (tracker) tracker.drops++;
       changed = true;
     }
     if (changed) this.writeCompressionFamilyProgress(progress);
+  }
+
+  /** The drop tracker a ladder on this family compares against (compressionFamilyDropTrackers); none without a store. */
+  private takeCompressionFamilyDropTracker(familyKey: string): { drops: number; taken: number } | undefined {
+    if (!this.store) return undefined;
+    let trackers = compressionFamilyDropTrackers.get(this.store);
+    if (!trackers) {
+      trackers = new Map();
+      compressionFamilyDropTrackers.set(this.store, trackers);
+    }
+    const now = Date.now();
+    for (const [key, tracker] of trackers) {
+      if (now - tracker.taken > COMPRESSION_FAMILY_DROP_TRACKER_MS) trackers.delete(key);
+    }
+    let tracker = trackers.get(familyKey);
+    if (!tracker) {
+      tracker = { drops: 0, taken: now };
+      trackers.set(familyKey, tracker);
+    }
+    tracker.taken = now;
+    return tracker;
   }
 
   /**
@@ -4467,9 +4510,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * stated wait, so this instance doesn't send the same request inside it,
    * and keeps the failure count and the backoff as they were: no call of
    * this instance's failed. With no stated wait, a failure installs nothing.
-   * It isn't for a deferral, which the admission's hold above would still
-   * install: the join, its only caller, passes none, since a deferral made
-   * no call.
+   * The join is the one caller that passes it, and it passes it for no
+   * deferral: a deferral made no call, and the admission's hold above would
+   * still install.
    */
   private pauseCompressionLane(
     source: CompressionOperationBranch,
@@ -5883,9 +5926,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this.compressionQueueGeneration !== queueGeneration,
           );
         }
-        // The chunk's split-stitch rung waits for its window: nothing failed
-        // and no call was made, so the scan goes on to the work behind it,
-        // unless the branch switched meanwhile.
+        // A split-stitch window wait, this instance's own or one a joined call
+        // rethrew: nothing failed here and no call was made, so the scan goes
+        // on to the work behind it, unless the branch switched meanwhile. The
+        // chunk waits out the window only when the window is its own (above);
+        // a joined call's wait puts it back at the head, unheld.
         if (error instanceof CompressionSplitWindowWait) {
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
           continue;
@@ -5907,7 +5952,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.compressionFailureOrder.set(key, ++this.compressionFailureSequence);
         this.orderCompressionQueue();
       } else {
-        // Decided (landed, or exhausted): no longer failing.
+        // Decided (landed, exhausted, or its family dropped while its ladder
+        // ran): no longer failing. A dropped family's failures say nothing
+        // about the next attempt: a clear asks for a fresh one, and after a
+        // mint or a sweep the span needs none.
         this.compressionFailureOrder.delete(key);
       }
       // Attempts, including fresh refusals, still consume the tick. Existing
@@ -7939,6 +7987,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // rung's call, so a ladder interrupted by an outage resumes at the
       // interrupted rung without paying again for what it already knows.
       // Read afresh: another strategy on this store may have advanced it.
+      // The family's drop tracker is taken first, so a drop between the two
+      // reads as a drop.
+      const dropTracker = this.takeCompressionFamilyDropTracker(quarantineRecord.familyKey);
+      const dropsAtStart = dropTracker?.drops ?? 0;
       const progress = this.readCompressionFamilyProgress().get(quarantineRecord.familyKey);
       const knownOutcomes = new Map<string, CompressionRefusalOutcomeRecord>();
       for (const known of progress?.outcomes ?? []) {
@@ -7950,19 +8002,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
        * writes: each outcome the family noted, in the order noted (an earlier
        * ladder's answers and carrier rejections among them), and this
        * ladder's admission rejections, which no call answered and progress
-       * doesn't keep, where the ladder made them.
+       * doesn't keep, where the ladder made them. The exhaustion adds, after
+       * them, any outcome another strategy sharing the store noted to the
+       * family meanwhile.
        */
       const familyRecord: CompressionRefusalOutcomeRecord[] = [...progressOutcomes];
       let progressCanonicalInputTokens = progress?.canonicalProviderInputTokens;
       // Whether this family's progress has been in the slot during this
       // ladder: found there when it began, or written by it since.
       let progressSeen = progress !== undefined;
-      // A family whose progress was in the slot during this ladder, and is
-      // gone from it now, was dropped meanwhile (minted, exhausted, cleared
-      // or swept, here or by another strategy on this store): this ladder
-      // must not bring it back, by a progress write or by an exhaustion,
-      // whether it began with progress or wrote the first.
-      const familyOpen = (): boolean => !progressSeen || this.readCompressionFamilyProgress().has(quarantineRecord.familyKey);
+      // A family dropped since this ladder began is closed to it: this ladder
+      // must not bring it back, by a progress write or by an exhaustion. A
+      // drop any strategy sharing this store in this process made counts
+      // (minted, exhausted, cleared or swept), whether the ladder began with
+      // progress or not, and whatever was written there since; so does
+      // progress the ladder had seen gone from the slot, whoever removed it.
+      const familyOpen = (): boolean => (
+        dropTracker === undefined || (
+          compressionFamilyDropTrackers.get(this.store!)?.get(quarantineRecord.familyKey) === dropTracker &&
+          dropTracker.drops === dropsAtStart
+        )
+      ) && (!progressSeen || this.readCompressionFamilyProgress().has(quarantineRecord.familyKey));
       const persistProgress = (): void => {
         // The check and the write are synchronous, with no await between them.
         if (!familyOpen()) return;
