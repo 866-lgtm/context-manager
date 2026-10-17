@@ -62,18 +62,26 @@ export interface OverBudgetDiagnostics {
  * The strategy that refuses sets it, since it knows which part of the
  * context is over and what can shrink that part:
  * - `'compression'`: compression work that would shrink this context is
- *   running or queued for the drain to take: a compression in flight, the
- *   first queued merge unless a compression hold blocks it, or a queued
- *   chunk the drain would compress while it runs chunks at all (below the
- *   speculative cap). Such a chunk is still uncompressed, holds no held
- *   message, and has no message an L1 in memory already covers, since the
- *   adaptive picker already folds through that L1. For the hierarchical
+ *   running or queued, as `tick` would take it: a compression in flight;
+ *   the queued chunks, in `tick`'s order, while the speculative cap lets it
+ *   take one; and after them, with a compression model, the first queued
+ *   merge, unless a compression hold blocks it. A queued chunk counts when
+ *   `tick` would adopt an L1 for it, stub it or compress it. One the
+ *   compression quarantine holds, or one `tick` defers until the host
+ *   declares its tools, doesn't, and the count goes on past it, as `tick`
+ *   does. The count stops at a chunk `tick` would throw at, as a host's
+ *   tick loop does: one that needs a model call without a compression
+ *   model, or while the quarantine can't be read. A chunk that counts is
+ *   still uncompressed, holds no held message, and has no message an L1 in
+ *   memory already covers, since the adaptive picker already folds through
+ *   that L1. For the hierarchical
  *   selector, a chunk an L1 matches exactly counts too while chunk
  *   persistence is on, since adopting that L1 ends the raw fallback the
  *   selector renders for an uncompressed chunk. It assumes the
  *   manager has a membrane to run compression. For the adaptive picker's
  *   refusals, its plan must also still have summaries to produce. Whether
- *   that work is enough to fit isn't checked.
+ *   that work is enough to fit isn't checked, so a host can tell an agent
+ *   that compression may make room, not that it will.
  * - `'newer-message'`: the newest message alone is over the budget, and a
  *   newer message that fits moves the window past it.
  * - `'smaller-recent-window'`: the raw recent window, which compression never
