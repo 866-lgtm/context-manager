@@ -1828,6 +1828,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
+  /**
+   * The manager is done with this strategy (ContextStrategy.detach). A new
+   * generation fails every compression and merge still in flight at its next
+   * isCompressionBranchCurrent() check, so each discards its result instead
+   * of writing. The loaded identity no longer matches either, so the
+   * entrypoints fail closed and a drain tick already scheduled does nothing.
+   * initialize() starts afresh.
+   */
+  detach(): void {
+    this.compressionBranchGeneration++;
+  }
+
   /** Drop every branch-derived mirror without touching durable state. */
   private clearBranchMirrors(): void {
     this.chunks = [];
@@ -4908,7 +4920,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // turn start while a post-restart drain ground ~10 compiles). A
         // macrotask hop lets pending sockets/timers run between ticks,
         // capping the added wake latency at ~one tick's compile.
-        setTimeout(() => this.driveSpeculativeDrain(ctx), 0);
+        // The next tick runs only for a strategy still loaded on the
+        // current branch: once detached, or after the store's branch moved,
+        // the drain stops here instead of throwing from requireLoadedBranch()
+        // inside a timer callback, where no caller could catch it.
+        setTimeout(() => {
+          if (this.isLoadedBranchCurrent()) this.driveSpeculativeDrain(ctx);
+        }, 0);
       })
       .catch((err) => {
         console.error('AutobiographicalStrategy: speculative-drain error:', err);

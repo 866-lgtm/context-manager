@@ -1434,12 +1434,25 @@ export class ContextManager {
 
   /**
    * Set the context management strategy and initialize it on the selected branch.
+   * The strategy it replaces is detached first (ContextStrategy.detach).
    * Also recovers a manager after failed initialization. A failure leaves work
    * fenced until another successful initialization; it does not restore the old strategy.
    */
   async setStrategy(strategy: ContextStrategy): Promise<void> {
+    if (strategy !== this.strategy) this.detachStrategy(this.strategy);
     this.strategy = strategy;
     await this.initializeStrategy();
+  }
+
+  /** Tell a strategy the manager is done with it (ContextStrategy.detach). */
+  private detachStrategy(strategy: ContextStrategy): void {
+    try {
+      strategy.detach?.();
+    } catch (err) {
+      // The manager lets go either way: a replacement still initializes and
+      // close() still closes the store.
+      console.error('Strategy detach failed:', err);
+    }
   }
 
   /**
@@ -1910,11 +1923,13 @@ export class ContextManager {
   /**
    * Close the context manager.
    *
+   * The strategy is detached first (ContextStrategy.detach).
    * If the manager owns the store (created via path config), this closes the store.
    * If the app owns the store (passed via store config), this is a no-op;
    * the app is responsible for closing the store when done.
    */
   close(): void {
+    this.detachStrategy(this.strategy);
     if (this.ownsStore) {
       this.store.close();
     }
