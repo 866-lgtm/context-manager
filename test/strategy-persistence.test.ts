@@ -84,8 +84,8 @@ class TestableStrategy extends AutobiographicalStrategy {
   }
 
   /** The merge the queue runs, over these sources, now. */
-  merge(level: SummaryLevel, sourceIds: string[], manager: ContextManager): Promise<void> {
-    return this.executeMerge(level, sourceIds, (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext());
+  async merge(level: SummaryLevel, sourceIds: string[], manager: ContextManager): Promise<void> {
+    await this.executeMerge(level, sourceIds, (manager as unknown as { createStrategyContext(): StrategyContext }).createStrategyContext());
   }
 
   persistRawSummaries(entries: unknown[]): void {
