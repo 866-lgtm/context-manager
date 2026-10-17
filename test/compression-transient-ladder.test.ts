@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import type { ContentBlock, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
 
-import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, CompressionWithdrawn } from '../src/index.js';
 import { boundFailureLogText } from '../src/strategies/autobiographical.js';
 import { createHash } from 'node:crypto';
 import type { Chunk } from '../src/strategies/autobiographical.js';
@@ -2744,4 +2744,36 @@ describe('the span table, read from records the test writes', () => {
     ].join('; '));
     fx.manager.close();
   });
+});
+
+describe("a host's withdrawal is taken as an abort (CompressionWithdrawn)", () => {
+  class MaintenanceWithdrawn extends CompressionWithdrawn {
+    constructor() {
+      super('zz maintenance call withdrawn');
+      this.name = 'MaintenanceWithdrawn';
+    }
+  }
+  const fromAnotherCopy = (): Error => Object.assign(new Error('zz withdrawn by another copy'), {
+    [Symbol.for('@animalabs/context-manager:compression-withdrawn')]: true,
+  });
+  const shapes: Array<[string, () => Error]> = [
+    ['CompressionWithdrawn', () => new CompressionWithdrawn()],
+    ['a subclass with a name of its own', () => new MaintenanceWithdrawn()],
+    ["another copy's brand", fromAnotherCopy],
+  ];
+  for (const [label, shape] of shapes) {
+    it(`pauses nothing, starts no run of failures and keeps the chunk at the head of the queue: ${label}`, async () => {
+      const withdrawn = shape();
+      const mock = scripted([{ throw: withdrawn }]);
+      const fx = await queued(mock.membrane);
+      const head = fx.strategy.compressionQueueView()[0];
+      assert.ok(fx.strategy.compressionQueueView().length >= 2, 'the premise: chunks are queued behind it');
+      await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), (error) => error === withdrawn);
+      assert.equal(mock.calls.length, 1, 'the premise: the canonical call was withdrawn');
+      assert.equal(fx.strategy.pause(), null, 'no pause');
+      assert.deepEqual(l1RunsOf(fx.strategy), [], 'no run of failures');
+      assert.equal(fx.strategy.compressionQueueView()[0], head, 'the chunk keeps its place at the head');
+      fx.manager.close();
+    });
+  }
 });

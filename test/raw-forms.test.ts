@@ -377,8 +377,9 @@ describe('raw forms: the strategies\' edits', () => {
     const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
     const results = compiled.messages.flatMap((m) => m.content).filter((x) => x.type === 'tool_result');
     const byId = new Map(results.map((r) => [(r as { toolUseId: string }).toolUseId, r]));
-    assert.match(String((byId.get('a') as { content: unknown }).content), /Result truncated/);
-    assert.match(String((byId.get('b') as { content: unknown }).content), /Result truncated/);
+    // Both older results say the same: the limit, not a count of what follows.
+    assert.equal((byId.get('a') as { content: unknown }).content, "[result of tool 'fs:read' left out: this context shows only the tool's last result]");
+    assert.equal((byId.get('b') as { content: unknown }).content, "[result of tool 'fs:read' left out: this context shows only the tool's last result]");
     assert.equal(rawOf(byId.get('a')!).rawXml, undefined);
     assert.equal(rawOf(byId.get('b')!).rawXml, undefined);
     assert.equal(rawOf(byId.get('c')!).rawXml, lateResults, 'the kept result replays verbatim');
@@ -416,7 +417,9 @@ describe('raw forms: the strategies\' edits', () => {
     manager.addMessage('user', [xmlResult('a', 'z'.repeat(400)), xmlResult('b', 'small file')]);
     const compiled = await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
     const results = compiled.messages.flatMap((m) => m.content).filter((x) => x.type === 'tool_result');
-    assert.ok(results.some((r) => /truncated|omitted/.test(String((r as { content: unknown }).content))), 'the cap applied');
+    const contents = results.map((r) => String((r as { content: unknown }).content));
+    assert.match(contents[0]!, /\[truncated — original was \d+ tokens\]$/, 'the first result is cut at the cap');
+    assert.equal(contents[1], '[content omitted: this message reached its token limit before this result]', 'the second is left out');
     for (const r of results) assert.equal(rawOf(r).rawXml, undefined);
     const uses = compiled.messages.flatMap((m) => m.content).filter((x) => x.type === 'tool_use');
     for (const u of uses) assert.equal(rawOf(u).rawXml, CALLS_XML, 'the untouched calls replay verbatim');
