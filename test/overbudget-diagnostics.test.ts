@@ -2516,7 +2516,7 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
-  it('names compression for a folding merge queued behind a merge in flight that folds nothing, which the walk passes over', async () => {
+  it('names compression for a folding merge queued behind a merge in flight that folds nothing, since tick takes the next merge once that call ends', async () => {
     const strategy = mergeOfTwo();
     const model = waitingMembrane();
     await withManager(strategy, async (manager) => {
