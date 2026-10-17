@@ -10,7 +10,7 @@ It's part of the Connectome ecosystem, with [chronicle](https://github.com/anima
 npm install @animalabs/context-manager
 ```
 
-It needs Node 20 or later, and depends on `@animalabs/chronicle` and `@animalabs/membrane`. To compress with the autobiographical strategy you'll construct a `Membrane` yourself, so install `@animalabs/membrane` alongside it.
+It needs Node 22.12 or later, as its `package.json` declares, and depends on `@animalabs/chronicle` and `@animalabs/membrane`. To compress with the autobiographical strategy you'll construct a `Membrane` yourself, so install `@animalabs/membrane` alongside it.
 
 ## Quick start
 
@@ -84,7 +84,7 @@ How it works, with each option's default in parentheses:
 - With `adaptiveResolution: true` (false), each compile chooses how deeply to fold each part of history to fit the budget. `foldingStrategy` names the solver: `flat-profile` (the default), `oldest-first`, `kv-stable` or `kv-unified`. `kv-unified` needs an explicit `kvUnified` policy.
 
 With a strategy that supports them, as this one does, the manager also offers:
-- `pinRange` and `markDocument` keep messages at their place in the conversation, raw by default. A pin that sets `level` or `maxLevel` holds its messages at that level, or no deeper than it, only with `adaptiveResolution` and the `kv-stable` or `kv-unified` solver. The other solvers fold those messages like any others, and without adaptive resolution the pin keeps them raw. `listPins` and `unpin` manage the pins.
+- `pinRange` and `markDocument` keep messages at their place in the conversation, raw by default. A pin that sets `level` or `maxLevel` holds its messages at that level, or no deeper than it, only with `adaptiveResolution` and the `kv-stable` or `kv-unified` solver. Under the other solvers, and without adaptive resolution, the pin keeps them raw. `listPins` and `unpin` manage the pins.
 - `holdCompression` keeps messages out of compression until `releaseCompression`, or until an optional `timeoutMs` passes, for content you'll still edit. Holds live in memory, so a reopened manager starts with none, and a hold that's never released stalls compression of everything after it.
 - `searchSummaries`, `getSummary` and `getSummariesInRange` read the summaries, for memory tools an agent can call.
 - `setToolDefinitions` and `setSystemPrompt` give the summarizer's calls the agent's own tools and system prompt. A chunk whose messages hold tool calls or results waits to be compressed until tool definitions are set.
