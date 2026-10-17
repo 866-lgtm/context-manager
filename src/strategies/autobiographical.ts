@@ -6895,8 +6895,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       sourceBranch.generation,
       quarantineRecord.familyKey,
     ].join('\u0000');
-    let existingInFlight = inFlight.get(inFlightKey);
-    while (existingInFlight) {
+    const existingInFlight = inFlight.get(inFlightKey);
+    if (existingInFlight) {
       const result = await existingInFlight;
       if (!this.isCompressionBranchCurrent(sourceBranch)) {
         this.logCompressionBranchDiscard(sourceBranch, 'coalesced_wait', quarantineRecord);
@@ -6916,12 +6916,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         chunk.summaryId = coalescedSummary.id;
         return;
       }
-      // A producer let go of before it wrote (its strategy detached, or
-      // reinitialized) left no L1: do the work here, unless another waiter
-      // has already taken it up. From this check to registering below
-      // nothing awaits, so only one waiter takes it.
-      if (!result.discarded) return;
-      existingInFlight = inFlight.get(inFlightKey);
+      // A producer whose strategy was let go of (detached, or reinitialized)
+      // wrote no L1, but it may have quarantined the chunk's request family
+      // first. The waiter takes the chunk over by compressing it afresh,
+      // through every check a new compression makes: the quarantine skip,
+      // and this coalescing, which waits on a waiter that took it over
+      // first. Nothing awaits from a compression's start to registering
+      // below, so only one waiter takes it.
+      if (result.discarded) return this.compressChunkHierarchical(chunk, ctx);
+      return;
     }
 
     // The warnings for the layout sent: section 1's ownership, the recall
@@ -7046,10 +7049,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ): Promise<unknown> => {
         attemptRequest = this.prepareCompressionCandidate(attemptRequest, curveLabel);
         // Each attempt, a ladder's next rung included, checks before it calls
-        // the provider: a strategy let go of between two attempts makes no
+        // the provider: a strategy let go of between two attempts starts no
         // further call.
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
-          this.logCompressionBranchDiscard(sourceBranch, curveLabel, quarantineRecord);
+          this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:before_call`, quarantineRecord);
           throw Object.assign(new Error('Compression result crossed a branch boundary'), {
             name: 'CompressionBranchDiscard',
           });
@@ -7900,6 +7903,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
       }
 
+      // The summary is written. A strategy let go of, or loaded again, while
+      // the clear above waited leaves the merge check to the strategy that
+      // holds the branch now.
+      if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       this.checkMergeThreshold();
     } catch (error) {
       if (error instanceof Error && error.name === 'CompressionBranchDiscard') return;

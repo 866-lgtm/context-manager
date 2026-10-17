@@ -469,7 +469,14 @@ export class ContextManager {
     );
     if (config.now) manager.now = config.now;
 
-    await manager.initializeStrategy();
+    try {
+      await manager.initializeStrategy();
+    } catch (error) {
+      // open() fails with the manager unreturned, so nothing could close()
+      // it: the strategy is let go of here, as close() would.
+      manager.detachStrategy(manager.strategy);
+      throw error;
+    }
     return manager;
   }
 
@@ -1702,7 +1709,15 @@ export class ContextManager {
     expectedBranch ??= observeStoreBranch(this.store);
     const branchId = this.store.currentBranch().id;
     if (strategy.initialize) {
-      await strategy.initialize(this.createStrategyContext());
+      try {
+        await strategy.initialize(this.createStrategyContext());
+      } catch (error) {
+        // An initialize() that rejects after close() or a replacement let go
+        // of the strategy is detached again too, as below; its own error is
+        // the one the caller sees.
+        if (this.closed || strategy !== this.strategy) this.detachStrategy(strategy);
+        throw error;
+      }
     }
     // close() ran while the strategy initialized: the call that started this
     // fails rather than leave a closed manager's strategy marked initialized.
@@ -1959,21 +1974,21 @@ export class ContextManager {
    * go through the strategy, such as getSummary() and isReady(), included,
    * and a setStrategy(), switchBranch() or fork() still initializing the
    * strategy when close() runs rejects. Inspection of messages, branches and
-   * receipts, which reads the store while it's open, and the manager's own
-   * setters, such as setSystemPrompt(), remain available, and
-   * releaseCompression() still doesn't throw. A second close() detaches
-   * nothing more, and closes a store the manager owns only if an earlier
-   * close() left it open.
+   * receipts reads the store, so it answers while the store is open: after
+   * close() with an app-owned store, not with one the manager owned, which
+   * close() closes. describeRenderedForms(), which reads the strategy's
+   * declared forms, and the manager's own setters, such as
+   * setSystemPrompt(), still answer, and releaseCompression() still doesn't
+   * throw. A second close() does nothing.
    * If the manager owns the store (created via path config), this closes the store.
    * If the app owns the store (passed via store config), the store stays open;
    * the app is responsible for closing it when done.
    */
   close(): void {
-    if (!this.closed) {
-      this.closed = true;
-      this.detachStrategy(this.strategy);
-    }
-    if (this.ownsStore && !this.store.isClosed()) {
+    if (this.closed) return;
+    this.closed = true;
+    this.detachStrategy(this.strategy);
+    if (this.ownsStore) {
       this.store.close();
     }
   }
