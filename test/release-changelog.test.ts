@@ -209,6 +209,8 @@ const invocations: Array<[string, { args?: string[]; env?: Record<string, string
     /npm_command is 'run' and npm_lifecycle_event is 'version'/],
   ["to run through `bun run version`, which bumps nothing", { env: { npm_command: "run-script" } },
     /npm_command is 'run-script' and npm_lifecycle_event is 'version'/],
+  ["to run with an npm command other than version, as npx gives a command it starts", { env: { npm_command: "exec" } },
+    /npm_command is 'exec' and npm_lifecycle_event is 'version'\)\. A version bump made before it ran stays in package\.json\./],
   ["to run as npm version's preversion hook, before the bump", { env: { npm_lifecycle_event: "preversion" } },
     /npm_command is 'version' and npm_lifecycle_event is 'preversion'/],
   ["an argument it doesn't take", { args: ["--dry-run"] },
@@ -235,6 +237,28 @@ test("releases as the hook of a version command that sets no npm command, as `bu
   assert.equal(r.status, 0, r.stderr);
   assert.equal(section(changelog(dir), "1.1.0"), "### Fixed\n\n- Fixed thing.");
   assert.deepEqual(pending(dir), ["README.md"], "the folded fragment is deleted");
+});
+
+// The same environment comes from `yarn run version`, which bumps nothing, so
+// a version that already has a section is what stops it.
+test("refuses a version that already has a section with no npm command too, without touching anything", () => {
+  const dir = setup({ version: "1.0.0", fragments: { "a.fixed.md": "- x\n" } });
+  const before = { changelog: changelog(dir), pending: pending(dir) };
+  const r = run(dir, { env: { npm_command: undefined } });
+  assert.equal(r.status, 1, `expected refusal, got exit ${r.status}:\n${r.stdout}${r.stderr}`);
+  assert.match(r.stderr, /^release-changelog: refused, and this script changed nothing: a '## 1\.0\.0' section already exists/);
+  assert.equal(changelog(dir), before.changelog, "CHANGELOG.md must be untouched");
+  assert.deepEqual(pending(dir), before.pending, "no fragment may be deleted on refusal");
+});
+
+test("--help wins over any other argument and changes nothing", () => {
+  const dir = setup({});
+  const before = { changelog: changelog(dir), pending: pending(dir) };
+  const r = run(dir, { args: ["--dry-run", "--help"] });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^Usage: npm version <patch\|minor\|major>\n/);
+  assert.equal(changelog(dir), before.changelog, "CHANGELOG.md must be untouched");
+  assert.deepEqual(pending(dir), before.pending, "no fragment may be deleted");
 });
 
 // Help reads nothing: each case runs on a fixture the release would refuse
