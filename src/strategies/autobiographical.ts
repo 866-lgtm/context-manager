@@ -8815,15 +8815,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * and stubs a thin one, all without a model call; then it defers for the
    * host's tools, needs a compression model, and skips a chunk the
    * compression quarantine holds. The count walks the queue the same way and
-   * stops at the first chunk tick throws at, since a host's tick loop ends
-   * at a throw: one that needs a model call, without a compression model or
-   * while the quarantine can't be read, where tick's own read throws
-   * (quarantinedChunkSources). So a chunk tick adopts an L1 for or stubs
-   * counts, whatever the tools or the quarantine say, unless such a chunk is
-   * ahead of it, and so does a merge behind chunks tick only skips. Without
-   * a compression model, tick runs no merge, and the chunks it settles for
-   * good are those it adopts an L1 for or stubs (its drop of a covered chunk
-   * doesn't last, as above). Until the host declares its tools, tick defers
+   * stops at the first chunk that needs a model call without a compression
+   * model, or while the quarantine can't be read (where tick's own read
+   * throws, quarantinedChunkSources): tick throws at such a chunk unless it
+   * defers it for the host's tools first, and a host's tick loop ends at a
+   * throw. So a chunk tick adopts an L1 for or stubs counts, whatever the
+   * tools or the quarantine say, unless such a chunk is ahead of it, and so
+   * does a merge behind chunks tick only skips. Without a compression model,
+   * tick throws at the first queued merge it reaches (executeMerge needs the
+   * model), so no merge counts, and the chunks it settles for good are those
+   * it adopts an L1 for or stubs (its drop of a covered chunk doesn't last,
+   * as above). Until the host declares its tools, tick defers
    * any other chunk whose request carries a tool block, and every other
    * chunk when the summarizer refuses requests without them (Fable and
    * Mythos), so those don't count; the tools are read from the context
@@ -8831,8 +8833,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * as stored (requestCarriesToolBlocks), where tick strips unpaired tool
    * blocks first, so one whose only tool blocks are unpaired is left out
    * too: the count can under-name here, but never names a chunk tick defers.
-   * For the same reason the walk stops at a chunk tick throws at before it
-   * asks about tools, which under-names a chunk tick would defer and pass.
+   * For the same reason the walk stops at a chunk that needs a model call,
+   * without a model or a readable quarantine, before it asks about tools:
+   * where tick would defer such a chunk and go on, the count leaves out the
+   * work behind it.
    * A chunk the quarantine holds doesn't count, and the walk goes past it,
    * as tick does. The count assumes the host keeps ticking: one that ticks a
    * fixed number of times between compiles reaches work only within that
@@ -8844,8 +8848,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected compressionWorkQueued(store: MessageStoreView, path: 'adaptive' | 'hierarchical'): boolean {
     if (this.pendingCompression) return true;
-    // Without a compression model, tick runs no merge. It reaches a merge
-    // only once it has taken every queued chunk, or at the cap.
+    // Without a compression model, tick throws at a merge it reaches
+    // (executeMerge needs the model), so none counts. It reaches a merge only
+    // once it has taken every queued chunk, or at the cap.
     const modelled = Boolean(this.config.compressionModel);
     const merge = this.config.hierarchical && modelled ? this.mergeQueue[0] : undefined;
     const mergeCounts = merge !== undefined && !this.mergeBlockedByHold(merge.sourceIds, store);

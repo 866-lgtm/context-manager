@@ -69,14 +69,15 @@ export interface OverBudgetDiagnostics {
  *   blocks it. A queued chunk counts when `tick` would adopt an L1 for it,
  *   stub it or compress it. One the compression quarantine holds, or one
  *   `tick` defers until the host declares its tools, doesn't, and the count
- *   goes on past it, as `tick` does. The count stops at a chunk `tick`
- *   would throw at, as a host's tick loop does: one that needs a model call
- *   without a compression model, or while the quarantine can't be read,
- *   even when `tick` would defer that chunk for the host's tools first. The
- *   count reads a chunk's tool blocks as stored, where `tick` strips
- *   unpaired ones first, so it can leave out a chunk `tick` would compress
- *   and the work behind a chunk `tick` would defer, but never counts a
- *   chunk `tick` defers or throws at. A chunk that counts is still
+ *   goes on past it, as `tick` does. The count reads a chunk's tool blocks
+ *   as stored, where `tick` strips unpaired ones first, so it can leave out
+ *   a chunk `tick` would compress, but never counts one `tick` defers. It
+ *   stops at a chunk that needs a model call without a compression model,
+ *   or while the quarantine can't be read, where `tick` throws and a host's
+ *   tick loop ends. It stops there even where `tick` would defer that chunk
+ *   for the host's tools and go on, since its stored read can't tell, so
+ *   it can leave out the work behind such a chunk, but never counts a
+ *   chunk `tick` throws at. A chunk that counts is still
  *   uncompressed, holds no held message, and has no message an L1 in memory
  *   already covers, since the adaptive picker already folds through that
  *   L1, unless the selector is the hierarchical one with chunk persistence

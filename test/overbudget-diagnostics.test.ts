@@ -93,6 +93,16 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     this.config.headWindowTokens = tokens;
   }
 
+  /** Turns hierarchical merging on or off, as a host restarted with another configuration does. */
+  setHierarchical(on: boolean): void {
+    this.config.hierarchical = on;
+  }
+
+  /** How many merges are queued. */
+  queuedMergeCount(): number {
+    return this.mergeQueue.length;
+  }
+
   /** Makes the durable compression quarantine unreadable, as a ledger state that won't parse does. */
   breakQuarantineRead(): void {
     const store = this.store!;
@@ -118,15 +128,46 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     return super.compressionWorkQueued(this.countedView, 'hierarchical');
   }
 
-  /** Each message's index in the store view the last refusal read, with the head window's start and end there. */
-  placement(ids: string[]): { indices: number[]; headStart: number; headEnd: number } {
+  /**
+   * Each message's index in the store view the last refusal read, with the
+   * head window's start and end there, and where the hold region begins
+   * (the store's length with nothing held).
+   */
+  placement(ids: string[]): { indices: number[]; headStart: number; headEnd: number; holdStart: number } {
     assert.ok(this.countedView, 'a refusal has counted');
     const all = this.countedView.getAll();
     return {
       indices: ids.map((id) => all.findIndex((message) => message.id === id)),
       headStart: this.getHeadWindowStartIndex(this.countedView),
       headEnd: this.getHeadWindowEnd(this.countedView),
+      holdStart: this.holdBoundary(this.countedView),
     };
+  }
+
+  /** The ids of the messages in the chunk holding the given one. */
+  chunkHolding(id: string): string[] {
+    const chunk = (this as unknown as { chunks: Array<{ messages: Array<{ id: string }> }> }).chunks.find((c) => c.messages.some((m) => m.id === id));
+    assert.ok(chunk, `a chunk holds ${id}`);
+    return chunk.messages.map((m) => m.id);
+  }
+
+  /**
+   * Whether tick's request carries a tool block, as the count reads it, for
+   * the chunk holding each given message, asked in this order of one
+   * reading, over the store view the last refusal read.
+   */
+  carriesToolBlocks(messageIds: string[]): boolean[] {
+    assert.ok(this.countedView, 'a refusal has counted');
+    const self = this as unknown as {
+      requestCarriesToolBlocks(store: Parameters<AutobiographicalStrategy['compressionWorkQueued']>[0]): (chunk: { messages: Array<{ id: string }> }) => boolean;
+      chunks: Array<{ messages: Array<{ id: string }> }>;
+    };
+    const carries = self.requestCarriesToolBlocks(this.countedView);
+    return messageIds.map((id) => {
+      const chunk = self.chunks.find((c) => c.messages.some((m) => m.id === id));
+      assert.ok(chunk, `a chunk holds ${id}`);
+      return carries(chunk);
+    });
   }
 
   /**
@@ -1405,6 +1446,80 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
+  it('reads the pins before each chunk: a pinned tool cycle before the head window\'s start is carried for a chunk after it, not for one before it, in either order of asking', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: false,
+      targetChunkTokens: 40,
+      headWindowTokens: 60,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+      minChunkCharsForLLM: 0,
+    });
+    await withManager(strategy, async (manager) => {
+      const text = (i: number): string => manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const before = [0, 1, 2, 3, 4, 5, 6, 7].map(text);
+      const cycle = [
+        manager.addMessage('assistant', [{ type: 'tool_use', id: 'zz-between', name: 'zz_tool', input: { q: 'zz' } } as ContentBlock]),
+        manager.addMessage('user', [{ type: 'tool_result', toolUseId: 'zz-between', content: 'zz result' } as ContentBlock]),
+      ];
+      const after = [8, 9, 10, 11, 12, 13, 14, 15].map(text);
+      strategy.resetHeadWindow(after[6]!);
+      manager.pinRange(cycle[0]!, cycle[1]!, { name: 'zz-pin' });
+      await refusal(manager);
+      const { indices, headStart } = strategy.placement([before[1]!, ...cycle, after[1]!]);
+      assert.ok(indices.every((i) => i >= 0 && i < headStart), 'the premise: all of them sit before the head window\'s start');
+      for (const id of [before[1]!, after[1]!]) {
+        assert.ok(!strategy.chunkHolding(id).some((m) => cycle.includes(m)), `the premise: the chunk holding ${id} holds none of the cycle`);
+      }
+      // One reading answers each count of pins before a chunk once: the chunk before the pin sees none,
+      // the chunk after it sees the pinned cycle, whichever is asked first.
+      assert.deepEqual(strategy.carriesToolBlocks([before[1]!, after[1]!]), [false, true]);
+      assert.deepEqual(strategy.carriesToolBlocks([after[1]!, before[1]!]), [true, false]);
+    });
+  });
+
+  it('ends the head at a compression hold, as tick\'s request does: a tool cycle the hold protects inside the head window isn\'t carried for a chunk before its start', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: false,
+      targetChunkTokens: 40,
+      headWindowTokens: 200,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+      minChunkCharsForLLM: 0,
+    });
+    const calls = { n: 0 };
+    await withManager(strategy, async (manager) => {
+      const text = (i: number): string => manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const early = [0, 1, 2, 3, 4, 5, 6, 7].map(text);
+      const head = text(8);
+      // What the hold protects is short, so the raw head and the held messages fit the budget, and the refusal is the middle's.
+      const held = manager.addMessage('user', [{ type: 'text', text: 'held' }]);
+      const cycle = [
+        manager.addMessage('assistant', [{ type: 'tool_use', id: 'zz-held', name: 'zz_tool', input: { q: 'zz' } } as ContentBlock]),
+        manager.addMessage('user', [{ type: 'tool_result', toolUseId: 'zz-held', content: 'zz' } as ContentBlock]),
+      ];
+      strategy.resetHeadWindow(head);
+      manager.holdCompression([held], { timeoutMs: 60_000 });
+      const error = await refusal(manager);
+      const { indices, headStart, headEnd, holdStart } = strategy.placement([early[0]!, held, ...cycle]);
+      const [chunkAt, heldAt, ...cycleAt] = indices as [number, number, number, number];
+      assert.ok(chunkAt < headStart, 'the premise: the chunk lies before the head window\'s start');
+      assert.equal(holdStart, heldAt, 'the premise: the hold region begins at the held message, inside the head window');
+      assert.ok(cycleAt.every((i) => i > holdStart && i < headEnd), `the premise: the cycle lies past the hold, inside the head window as it would end without it: ${JSON.stringify({ cycleAt, holdStart, headEnd })}`);
+      assert.ok(error.clearedBy.includes('compression'), `names compression: ${JSON.stringify(error.clearedBy)}`);
+      // The premise: tick's request ends the head at the hold, so tick asks the model, and the counting membrane throws.
+      await assert.rejects(async () => {
+        for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+      }, /no model in this test/);
+      assert.equal(calls.n, 1, 'tick asked the model');
+      manager.releaseCompression([held]);
+    }, { membrane: countingMembrane(calls) });
+  });
+
   for (const fable of [false, true]) {
     it(`names nothing for chunks tick defers until the host declares its tools (${fable ? 'a Fable summarizer, text alone' : 'chunks holding tool blocks'}), and compression once it has`, async () => {
       const strategy = new DiagnosticStrategy({
@@ -1746,6 +1861,33 @@ describe('OverBudgetError.clearedBy', () => {
       });
     });
   }
+
+  it('counts no queued merge with hierarchical merging off, since tick runs merges only with it on', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: false,
+      hierarchical: true,
+      positionedRecallPairs: true,
+      targetChunkTokens: 100_000,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    await withManager(strategy, async (manager) => {
+      const ids = Array.from({ length: 2 }, (_, i) =>
+        manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+      strategy.seedL1('L1-a', [ids[0]!]);
+      strategy.seedL1('L1-b', [ids[1]!]);
+      strategy.queueMergeOf(['L1-a', 'L1-b']);
+      assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'the premise: with it on, the merge counts');
+      strategy.setHierarchical(false);
+      assert.equal(strategy.countsCompressionWork(), false);
+      // The premise: tick leaves the merge queued.
+      await manager.tick();
+      assert.equal(strategy.queuedMergeCount(), 1, 'tick ran no merge');
+    });
+  });
 
   it('names compression for a queued chunk behind a merge a hold blocks, since tick takes chunks before any merge', async () => {
     const strategy = new DiagnosticStrategy({
