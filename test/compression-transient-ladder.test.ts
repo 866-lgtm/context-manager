@@ -1373,8 +1373,9 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
-  it('at the speculative cap, the run before a hole a retry will fill merges at two: tick takes no chunk at the cap, the retry among them (Greptile P1)', async () => {
-    const fx = await queued(scripted([OK('unused')]).membrane);
+  it('past the speculative cap, the run before a hole a retry will fill merges at two as a last resort, and tick takes no chunk there, the retry among them (Greptile P1, cm138-r14 I10)', async () => {
+    const mock = scripted([OK('unused')]);
+    const fx = await queued(mock.membrane);
     for (let i = 8; i < 10; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
     const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
     const hole = fx.strategy.chunksView().find((chunk) => !chunk.compressed && chunk.messages[0]!.id === ids[4]);
@@ -1391,9 +1392,70 @@ describe('compression lane: failures are evidence only by the company they keep'
     assert.equal(fx.strategy.mergeCandidates(unmerged, 4), null, 'premise: below the cap, the run waits for the retry');
     const lane = fx.strategy as unknown as { config: { maxSpeculativeL1s?: number }; summaries: SummaryEntry[]; isAtSpeculativeCap(): boolean };
     lane.config.maxSpeculativeL1s = lane.summaries.filter((s) => s.level === 1 && !s.mergedInto).length - 1;
-    assert.ok(lane.isAtSpeculativeCap(), 'premise: the unmerged L1s are over the cap');
+    assert.ok(lane.isAtSpeculativeCap(), 'premise: the unmerged L1s are past the cap');
     assert.deepEqual(fx.strategy.mergeCandidates(unmerged, 4)?.map((s) => s.id), ['L1-a', 'L1-b'],
-      'at the cap the interior run merges, so the count can fall back under the cap and the retry run');
+      'past the cap, with no other run eligible, the interior run merges, so the count can fall back under the cap and the retry run');
+    const queueBefore = fx.strategy.compressionQueueView();
+    assert.ok(queueBefore.length > 0, 'premise: chunks are queued');
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.deepEqual(fx.strategy.compressionQueueView(), queueBefore, 'tick took no chunk past the cap');
+    assert.equal(mock.calls.length, 0, 'and asked the model nothing');
+    assert.ok(fx.strategy.chunksView().some((chunk) => !chunk.compressed && chunk.messages[0]!.id === ids[4]),
+      'the chunk over the hole is still pending');
+    fx.manager.close();
+  });
+
+  it('past the speculative cap, a run at the threshold merges ahead of a waiting run before it, as below the cap (cm138-r14 I4)', async () => {
+    const fx = await queued(scripted([OK('unused')]).membrane);
+    for (let i = 8; i < 14; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
+    const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
+    const hole = fx.strategy.chunksView().find((chunk) => !chunk.compressed && chunk.messages[0]!.id === ids[4]);
+    assert.ok(hole && hole.messages.at(-1)!.id === ids[7], 'a pending chunk over messages 4-7');
+    const summary = (id: string, first: number, last: number): SummaryEntry => ({
+      id, level: 1, content: id, tokens: 10, sourceLevel: 0,
+      sourceIds: ids.slice(first, last + 1), sourceRange: { first: ids[first]!, last: ids[last]! }, created: 1,
+    });
+    // A pair before the hole, and a run of four, the threshold, after it.
+    const unmerged = [summary('L1-a', 0, 1), summary('L1-b', 2, 3), summary('L1-c', 8, 8), summary('L1-d', 9, 9), summary('L1-e', 10, 10), summary('L1-f', 11, 11)];
+    for (const entry of unmerged) fx.strategy.seed(entry);
+    const run = { key: 'zz-request', domain: 'zz', failures: 1, atLanded: 0 };
+    (fx.strategy as unknown as { compressionFailureRuns: Map<string, { run: typeof run; chunkKey: string }> }).compressionFailureRuns
+      .set('zz-subject', { run, chunkKey: hole!.messages.map((m) => m.id).join(':') });
+    const lane = fx.strategy as unknown as { config: { maxSpeculativeL1s?: number }; summaries: SummaryEntry[]; isAtSpeculativeCap(): boolean };
+    lane.config.maxSpeculativeL1s = lane.summaries.filter((s) => s.level === 1 && !s.mergedInto).length - 1;
+    assert.ok(lane.isAtSpeculativeCap(), 'premise: the unmerged L1s are past the cap');
+    assert.deepEqual(fx.strategy.mergeCandidates(unmerged, 4)?.map((s) => s.id), ['L1-c', 'L1-d', 'L1-e', 'L1-f'],
+      'the run at the threshold merges first; the waiting pair is only a last resort');
+    fx.manager.close();
+  });
+
+  it('past the speculative cap, a waiting run above L1 keeps waiting, since the cap counts L1s alone (cm138-r14 I6)', async () => {
+    const fx = await queued(scripted([OK('unused')]).membrane);
+    for (let i = 8; i < 10; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
+    const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
+    const summary = (id: string, level: number, first: number, last: number): SummaryEntry => ({
+      id, level, content: id, tokens: 10, sourceLevel: level - 1,
+      sourceIds: ids.slice(first, last + 1), sourceRange: { first: ids[first]!, last: ids[last]! }, created: 1,
+    });
+    // L2s with a hole over messages 4-7, which a failing merge of two L1s will fill with its parent.
+    const level2 = [summary('L2-a', 2, 0, 1), summary('L2-b', 2, 2, 3), summary('L2-c', 2, 8, 8), summary('L2-d', 2, 9, 9)];
+    for (const entry of level2) fx.strategy.seed(entry);
+    fx.strategy.seed(summary('L1-x', 1, 4, 5));
+    fx.strategy.seed(summary('L1-y', 1, 6, 7));
+    // Messages 8 and 9 joined no chunk, so the merge positions know them only through the merged L1s
+    // under the L2s after the hole.
+    fx.strategy.seed({ ...summary('L1-p', 1, 8, 8), mergedInto: 'L2-c' });
+    fx.strategy.seed({ ...summary('L1-q', 1, 9, 9), mergedInto: 'L2-d' });
+    assert.deepEqual(fx.strategy.mergeCandidates(level2, 4)?.map((s) => s.id), ['L2-a', 'L2-b'],
+      'premise: with nothing to fill the hole, the interior L2 run merges at two');
+    const run = { key: 'zz-request', domain: 'zz', failures: 1, atLanded: 0 };
+    (fx.strategy as unknown as { mergeQueue: unknown[] }).mergeQueue.push({ level: 2, sourceIds: ['L1-x', 'L1-y'] });
+    (fx.strategy as unknown as { mergeFailureRuns: Map<string, typeof run> }).mergeFailureRuns.set(`2\u0000L1-x\u0000L1-y`, run);
+    assert.equal(fx.strategy.mergeCandidates(level2, 4), null, 'premise: below the cap, the L2 run waits for the merge');
+    const lane = fx.strategy as unknown as { config: { maxSpeculativeL1s?: number }; summaries: SummaryEntry[]; isAtSpeculativeCap(): boolean };
+    lane.config.maxSpeculativeL1s = lane.summaries.filter((s) => s.level === 1 && !s.mergedInto).length - 1;
+    assert.ok(lane.isAtSpeculativeCap(), 'premise: the unmerged L1s are past the cap');
+    assert.equal(fx.strategy.mergeCandidates(level2, 4), null, 'past the cap the L2 run still waits, since merging it relieves nothing');
     fx.manager.close();
   });
 
@@ -2210,6 +2272,74 @@ describe('a family dropped while its ladder ran is not quarantined by its exhaus
     assert.deepEqual(exhausted[0]!.metadata?.outcomes?.map((outcome) => outcome.curveLabel), exhaustedRecordLabels(fx.strategy), 'with the outcomes of the record it wrote');
     fx.manager.close();
   });
+
+  it("an exhaustion at the refusal ladder's exit logs it, with the record it wrote (cm138-r14 I8)", async () => {
+    const mock = scripted([REFUSAL as never]);
+    const fx = await build(mock.membrane, { sourceOnlyFallback: true });
+    const lines = await logged(() => fx.strategy.run(fx.target(), managerContext(fx.manager)));
+    assert.equal(mock.calls.length, 2, 'the premise: the canonical, then source-only-final');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'the premise: the family exhausted at the refusal ladder');
+    const exhausted = lines.filter((line) => line.event === 'compression:curve-exhausted');
+    assert.equal(exhausted.length, 1, 'one exhaustion logged');
+    assert.deepEqual(exhausted[0]!.metadata?.outcomes?.map((outcome) => outcome.curveLabel), exhaustedRecordLabels(fx.strategy), 'with the outcomes of the record it wrote');
+    fx.manager.close();
+  });
+
+  for (const dropped of [false, true]) {
+    it(`an exhaustion whose key another process quarantined meanwhile writes nothing, forgets the progress and logs neither event${dropped ? ", though that process dropped the family's progress too" : ''} (cm138-r14 I2, I5)`, async () => {
+      const LEDGER = 'default/autobio:compression-refusal-quarantine-events';
+      type LedgerEvent = { kind: string; key?: string; eventId?: string; record?: Record<string, unknown>; outcomes?: unknown[] };
+      const ledger = (manager: ContextManager): LedgerEvent[] => {
+        const value = manager.getStore().getStateJson(LEDGER);
+        return Array.isArray(value) ? value : [];
+      };
+      let fx!: Awaited<ReturnType<typeof build>>;
+      let first: LedgerEvent | undefined;
+      let progressAtWrite: number | undefined;
+      const inner = scripted([REFUSAL as never]);
+      const complete = (inner.membrane as { complete(request: NormalizedRequest): Promise<unknown> }).complete;
+      const membrane = {
+        complete: async (request: NormalizedRequest) => {
+          // As the second ladder's source-only-final call arrives, another process exhausts the
+          // family as a ladder does: the key's record with its outcomes and its alert, sent; then,
+          // in one case, it drops the family's progress.
+          if (first && inner.calls.length === 3) {
+            progressAtWrite = progressSlot(fx.manager).length;
+            const store = fx.manager.getStore();
+            const key = String(first.key);
+            const exhausted = store.appendToStateJsonWithIdentity(
+              LEDGER, { kind: 'exhausted', key, record: first.record, outcomes: first.outcomes, created: Date.now() }, 'eventId', 'sequence');
+            const pending = store.appendToStateJsonWithIdentity(
+              LEDGER, { kind: 'alert_pending', key, targetClaimId: exhausted.id, alertKey: key, created: Date.now() }, 'eventId', 'sequence');
+            store.appendToStateJsonWithIdentity(
+              LEDGER, { kind: 'alert_sent', key, targetClaimId: exhausted.id, alertKey: key, pendingEventId: pending.id, created: Date.now() }, 'eventId', 'sequence');
+            if (dropped) {
+              (fx.strategy as unknown as { forgetCompressionFamilyProgress(matches: () => boolean): void }).forgetCompressionFamilyProgress(() => true);
+            }
+          }
+          return complete(request);
+        },
+      } as never;
+      fx = await build(membrane, { sourceOnlyFallback: true });
+      await fx.strategy.run(fx.target(), managerContext(fx.manager));
+      assert.equal(inner.calls.length, 2, 'the premise: the first ladder asked the canonical, then source-only-final');
+      first = ledger(fx.manager).find((event) => event.kind === 'exhausted');
+      assert.ok(first?.record && Array.isArray(first.outcomes), 'the premise: the first ladder exhausted the family, with its outcomes');
+      await fx.strategy.clearCompressionRefusalQuarantine(String(first.key));
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'the premise: an operator cleared it');
+      const before = ledger(fx.manager).length;
+      const events = await loggedEvents(() => fx.strategy.run(fx.target(), managerContext(fx.manager)));
+      assert.equal(inner.calls.length, 4, 'the premise: the second ladder asked both again');
+      assert.equal(progressAtWrite, 1, "the premise: the second ladder's progress was in the slot when the other process wrote");
+      assert.deepEqual(ledger(fx.manager).slice(before).map((event) => event.kind), ['exhausted', 'alert_pending', 'alert_sent'],
+        "only the other process's record and its alert: this ladder appended nothing");
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'the record stands');
+      assert.deepEqual(progressSlot(fx.manager), [], 'the progress is forgotten');
+      assert.ok(!events.includes('compression:family-dropped') && !events.includes('compression:curve-exhausted'),
+        'and neither the drop nor an exhaustion is logged: the held key is read first');
+      fx.manager.close();
+    });
+  }
 });
 
 describe('a chunk a plan demands goes ahead of the chunks that failed (cm138-r11 I7)', () => {

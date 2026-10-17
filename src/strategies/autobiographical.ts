@@ -4266,35 +4266,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Quarantine a family whose ladder ended with no summary, with its record
-   * (`outcomes`). `familyOpen` is asked under the ledger's lock, the lock an
-   * operator's clear drops a family's progress under: a family dropped while
-   * its ladder ran (minted, cleared or swept) is not brought back, and true
-   * is returned with nothing written. A family already quarantined under this
-   * key is left as it is.
+   * (`outcomes`), and say what became of it:
+   *  - 'written': the record is written, with its alert;
+   *  - 'held': the ledger already holds a record under this key, which
+   *    stands, and nothing is written. In this process a ladder never runs
+   *    for a quarantined chunk, so only another process can have written it;
+   *  - 'dropped': `familyOpen` says the family was dropped while its ladder
+   *    ran (minted, cleared or swept), and it isn't brought back.
+   * Both are asked under the ledger's lock, the lock an operator's clear
+   * drops a family's progress under, the held key first, so a family another
+   * process quarantined isn't reported dropped. A drop before the ladder
+   * first saw its family's progress isn't seen (see familyOpen's comment).
+   * Undefined when nothing was decided: with no store, or when the branch
+   * stopped being current, which the caller checks after.
    */
   private async exhaustCompressionRequestFamily(
     source: CompressionOperationBranch,
     record: CompressionRefusalQuarantineRecord,
     outcomes: CompressionRefusalOutcomeRecord[],
     familyOpen: () => boolean,
-  ): Promise<boolean> {
-    if (!this.store) return false;
-    let dropped = false;
+  ): Promise<'written' | 'held' | 'dropped' | undefined> {
+    if (!this.store) return undefined;
+    let exhaustion: 'written' | 'held' | 'dropped' | undefined;
     await withCompressionStateLock(
       this.store,
       source.name,
       this.compressionRefusalQuarantineLedgerStateId,
       () => {
       if (!this.isCompressionBranchCurrent(source)) return;
-      if (!familyOpen()) {
-        dropped = true;
+      const current = this.readCompressionQuarantineProjection();
+      if (current.has(record.key)) {
+        exhaustion = 'held';
         return;
       }
-      const current = this.readCompressionQuarantineProjection();
-      if (current.has(record.key)) return;
+      if (!familyOpen()) {
+        exhaustion = 'dropped';
+        return;
+      }
       const exhausted = this.appendCompressionQuarantineEvent({
         kind: 'exhausted', key: record.key, record, outcomes, created: Date.now(),
       });
+      exhaustion = 'written';
       if (!this.isCompressionBranchCurrent(source)) return;
       this.appendCompressionQuarantineEvent({
         kind: 'alert_pending',
@@ -4309,7 +4321,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.isCompressionBranchCurrent(source)) {
       await this.deliverPendingCompressionQuarantineAlerts(source);
     }
-    return dropped;
+    return exhaustion;
   }
 
   /** A ladder ended with no summary on a family dropped while it ran: it writes no record. */
@@ -5746,8 +5758,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Whether the count of *produced, unmerged* L1 summaries has reached the cap
-   * configured by `maxSpeculativeL1s`. If no cap is set, always false.
+   * Whether the count of *produced, unmerged* L1 summaries is past the cap
+   * configured by `maxSpeculativeL1s`: more of them than it allows. If no cap
+   * is set, always false.
    *
    * The cap bounds how many L1 summaries may sit un-consolidated before the
    * strategy must merge them into L_{k+1} (bounding prefix churn / merge debt).
@@ -5911,11 +5924,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.compressionFailureOrder.set(key, ++this.compressionFailureSequence);
         this.orderCompressionQueue();
       } else {
-        // Decided (landed, exhausted, or its family dropped while its ladder
-        // ran): no longer failing. A dropped family's failures say nothing
-        // about the next attempt, which starts afresh: a clear asks for one, a
-        // mint leaves the span nothing to do, and a sweep drops only progress
-        // nothing advanced for 30 days or that a summary already paid off.
+        // Decided (landed, exhausted, held by another process's record, or
+        // its family dropped while its ladder ran): no longer failing. A
+        // dropped family's failures say nothing about the next attempt, which
+        // starts afresh: a clear asks for one, a mint leaves the span nothing
+        // to do, and a sweep drops only progress nothing advanced for 30 days,
+        // progress a summary already paid off, and progress whose span can't
+        // be cut again (a message of it is gone from the store, or an entry
+        // older releases wrote carries no ids and no chunk record matches it).
         this.compressionFailureOrder.delete(key);
       }
       // Attempts, including fresh refusals, still consume the tick. Existing
@@ -7754,11 +7770,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // The producer's transient failure was on the very request this
         // instance would send next: take the wait the provider stated after
         // that call, counting no failure, since none of this instance's calls
-        // failed. Only on the producer's route: a waiter whose membrane is
-        // another was refused nothing, and the request it shares is its own
-        // to send there. A deferral made no call (the producer's admission
-        // refused it, or its split rung's window had no room), so no provider
-        // stated a wait for this lane to take.
+        // failed. Only on the producer's route: no provider stated a wait to a
+        // waiter whose membrane is another, so it takes none. Every waiter
+        // rethrows the failure, and tick puts its chunk back as after a
+        // failure of its own: after a transient one, at the back of its queue,
+        // to be asked again on its own route. A deferral made no call (the
+        // producer's admission refused it, or its split rung's window had no
+        // room), so no provider stated a wait for this lane to take.
         if (
           compressionFailureKind(result.error) === 'transient' && !isNoCallDeferral(result.error) &&
           result.membrane === ctx.membrane
@@ -7973,12 +7991,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // A family whose progress was in the slot during this ladder, and is
       // gone from it now, was dropped meanwhile (minted, cleared or swept):
       // this ladder must not bring it back, by a progress write or by an
-      // exhaustion. Presence decides, because in this process nothing else
-      // writes the family's progress while this ladder runs: only a ladder
-      // writes it, and only while its branch is current, and a ladder on the
-      // same namespace, branch and family joins this one (compressionInFlight)
-      // instead of running. So a ladder that hasn't written yet has nothing a
-      // drop could take. Across processes nothing coordinates.
+      // exhaustion. Presence decides for progress the ladder saw, because in
+      // this process nothing else writes the family's progress while this
+      // ladder runs: only a ladder writes it, and only while its branch is
+      // current, and a ladder on the same namespace, branch and family joins
+      // this one (compressionInFlight) instead of running. A drop before the
+      // ladder first sees its family's progress isn't seen: a mint of the
+      // span by another family drops progress by span and finds none of this
+      // one's, and this ladder can then write progress, or an exhausted
+      // record and its one-shot alert, for a span that's covered. That takes
+      // sibling strategies with different families over one store, and the
+      // paid-off sweeps clear both before the klaxon reads. Across processes
+      // nothing coordinates.
       const familyOpen = (): boolean => !progressSeen || this.readCompressionFamilyProgress().has(quarantineRecord.familyKey);
       /** The opt-in compression log's line for an exhaustion, at either exit: the record the ladder wrote. */
       const logExhausted = (): void => logCompressionCall({
@@ -7994,6 +8018,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           outcomes: familyRecord,
         },
       });
+      /**
+       * What either exhaustion exit does once the family's exhaustion is
+       * decided: a family dropped meanwhile is reported; one whose record the
+       * ledger now holds, this ladder's or another process's, has its
+       * progress forgotten; and only a record this ladder wrote is logged.
+       */
+      const settleExhaustion = (exhaustion: 'written' | 'held' | 'dropped' | undefined): void => {
+        if (exhaustion === undefined) return;
+        if (exhaustion === 'dropped') {
+          this.logCompressionFamilyDropped(chunk, quarantineRecord);
+          return;
+        }
+        this.forgetCompressionFamilyProgress((entry) => entry.familyKey === quarantineRecord.familyKey);
+        if (exhaustion === 'written') logExhausted();
+      };
       const persistProgress = (): void => {
         // The check and the write are synchronous, with no await between them.
         if (!familyOpen()) return;
@@ -8791,15 +8830,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this.logCompressionBranchDiscard(sourceBranch, 'before_exhaustion', quarantineRecord);
             return;
           }
-          const dropped = await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, familyRecord, familyOpen);
+          const exhaustion = await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, familyRecord, familyOpen);
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
-          if (dropped) {
-            this.logCompressionFamilyDropped(chunk, quarantineRecord);
-            return;
-          }
-          // The quarantine ledger now holds this family's outcome.
-          this.forgetCompressionFamilyProgress((entry) => entry.familyKey === quarantineRecord.familyKey);
-          logExhausted();
+          settleExhaustion(exhaustion);
           return;
         }
       }
@@ -8916,14 +8949,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 proseOutcome ?? { curveLabel: 'canonical-plain-prose', outcome: 'unusable_empty', requestHash: proseRequestHash },
               ];
           for (const outcome of ended) noteOutcome(outcome);
-          const dropped = await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, familyRecord, familyOpen);
-          if (this.isCompressionBranchCurrent(sourceBranch)) {
-            if (dropped) this.logCompressionFamilyDropped(chunk, quarantineRecord);
-            else {
-              this.forgetCompressionFamilyProgress((entry) => entry.familyKey === quarantineRecord.familyKey);
-              logExhausted();
-            }
-          }
+          const exhaustion = await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, familyRecord, familyOpen);
+          if (this.isCompressionBranchCurrent(sourceBranch)) settleExhaustion(exhaustion);
         }
         return;
       }
@@ -9291,18 +9318,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // produced behind the live end, so the run before it is not stranded and
     // waits too, rather than merging lopsided before the summary lands. Once
     // that work is decided (minted, or exhausted into quarantine), its hole
-    // is filled or stranded for good, and the rule above applies. At the
-    // speculative cap (maxSpeculativeL1s) no run waits: tick takes no chunk
-    // there, the retry that would fill the hole among them, so only a merge
-    // can bring the count back under the cap.
-    const atCap = this.isAtSpeculativeCap();
-    for (let i = 0; i < runs.length; i++) {
-      const r = runs[i];
-      const isNewest = i === runs.length - 1;
-      if (r.length >= threshold) return r.slice(0, threshold).map((x) => x.s);
-      if (!isNewest && (!waiting[i] || atCap) && r.length >= 2) return r.slice(0, threshold).map((x) => x.s);
-    }
-    return null;
+    // is filled or stranded for good, and the rule above applies. Past the
+    // speculative cap (more unmerged L1s than maxSpeculativeL1s) tick takes
+    // no chunk, the retry that would fill the hole among them, so only a
+    // merge can bring the count back under the cap. There a waiting L1 run
+    // merges at two as a last resort, when no run is eligible without that,
+    // so a run at the threshold after it still merges first. The cap counts
+    // L1s alone, so a waiting run of a higher level keeps waiting. Past the
+    // cap no merge forms where fewer unmerged summaries than the threshold
+    // remain, or where no run before the newest holds two and the newest
+    // holds fewer than the threshold: compression then stops for good,
+    // unless something outside tick changes the count or the cap.
+    const pick = (lastResort: boolean): SummaryEntry[] | null => {
+      for (let i = 0; i < runs.length; i++) {
+        const r = runs[i]!;
+        const isNewest = i === runs.length - 1;
+        if (r.length >= threshold) return r.slice(0, threshold).map((x) => x.s);
+        const mayMerge = !waiting[i] || (lastResort && r[0]!.s.level === 1);
+        if (!isNewest && mayMerge && r.length >= 2) return r.slice(0, threshold).map((x) => x.s);
+      }
+      return null;
+    };
+    return pick(false) ?? (this.isAtSpeculativeCap() ? pick(true) : null);
   }
 
   protected checkMergeThreshold(): void {
