@@ -41,13 +41,16 @@
   compile. A fold decides the same way: a listed leaf of another lineage,
   which the fold doesn't move, no longer vetoes it with its pin-max-level or
   its fold-depth cap.
-- kv-stable: where a leaf's lineage has no summary at the level just below
-  a summary the solve's un-fold pass un-folds (a summary in its lineage
-  names a parent more than one level up), the pass now moves the leaf on to
-  the next level whose summary lists it, as the projection lowers it, and
-  weighs the un-fold there. It counted the leaf as raw at the level with no
-  summary, so it could decline an un-fold that would have brought the plan
-  closer to its target.
+- kv-stable: the solve's un-fold pass now weighs each leaf it moves where the
+  projection will put it: one level down, or deeper, past a level where the
+  leaf's lineage has no summary and past a summary that a leaf below it
+  vetoes, down to the next level whose summary of the leaf's own lineage lists
+  it and isn't vetoed, or to raw. It weighed every leaf one level down. Where
+  a summary in the leaf's lineage names a parent more than one level up, so
+  its lineage has no summary there, it counted the leaf as raw and could
+  decline an un-fold that would have brought the plan closer to its target.
+  Where a leaf below vetoed the summary there, the plan it took wasn't the one
+  the projection rendered, and a compile could end exhausted where a plan fit.
 - kv-stable: `[kv-overlap]` now reads the frontier the plan emits. It warns
   for every plan whose frontier renders a summary whose listing disagrees with
   the lineage of a leaf in the window, and only then: the summary lists a leaf

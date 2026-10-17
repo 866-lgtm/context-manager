@@ -440,8 +440,9 @@ test('phase C prices an un-fold where the projection leaves each leaf, and keeps
   for (let compile = 1; compile <= 3; compile++) {
     const { result } = quietOverlap(() =>
       new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 100, slack: 0.1 }));
-    assert.deepEqual(unitsOf(renderLayout(inputs, tree, result.finalResolutions)), ['recall:P'], `compile ${compile}`);
-    assert.equal(result.finalTokens, 20);
+    const layout = renderLayout(inputs, tree, result.finalResolutions);
+    assert.deepEqual(unitsOf(layout), ['recall:P'], `compile ${compile}`);
+    assert.equal(layout.totalTokens, 20);
     assert.equal(result.exhausted, false);
     for (const c of inputs.chunks) c.currentResolution = result.finalResolutions.get(c.id) ?? 0;
   }
@@ -458,8 +459,9 @@ test('phase C moves a declined un-fold\'s leaves back from the levels they went 
   );
   const { result } = quietOverlap(() =>
     new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 100, slack: 0.1 }));
-  assert.deepEqual(unitsOf(renderLayout(inputs, tree, result.finalResolutions)), ['raw:g0', 'raw:g1', 'recall:P']);
-  assert.equal(result.finalTokens, 80);
+  const layout = renderLayout(inputs, tree, result.finalResolutions);
+  assert.deepEqual(unitsOf(layout), ['raw:g0', 'raw:g1', 'recall:P']);
+  assert.equal(layout.totalTokens, 80);
 });
 
 // y's own L1 N names T, an L3, as its parent, so y's lineage skips L2, and T
@@ -477,8 +479,86 @@ test('phase C prices a leaf whose lineage skips the level below the summary wher
   );
   const { result } = quietOverlap(() =>
     new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 60, targetBudget: 30, slack: 0.1 }));
-  assert.deepEqual(unitsOf(renderLayout(inputs, tree, result.finalResolutions)), ['recall:M', 'recall:N']);
-  assert.equal(result.finalTokens, 35);
+  const layout = renderLayout(inputs, tree, result.finalResolutions);
+  assert.deepEqual(unitsOf(layout), ['recall:M', 'recall:N']);
+  assert.equal(layout.totalTokens, 35);
+});
+
+// From the internal review of the round answering Greptile: N, an L3, lists
+// only c. c's own L1 C1 lists d alone, and c's own L2 B lists c through E1 and
+// x through A1. x has a pin-max-level of 1, so B can't fold, and the solve
+// folds c to N. Un-folding N lands c at B, but x, at L1 below B, vetoes it, so
+// the projection lowers c past B, and past C1, which doesn't list it, to raw.
+// Priced at B's recall, the un-fold was taken and every compile ended
+// exhausted. Priced where the projection puts c, it's declined, and the plan
+// spends the headroom on x and d instead.
+test('phase C passes a landing summary that a leaf below it vetoes, as the projection does', () => {
+  const x = message('x', 0, 100, 'A1');
+  x.pinMaxLevel = 1;
+  const { inputs, tree } = store(
+    [x, message('c', 1, 1_000, 'C1'), message('d', 2, 10, 'C1')],
+    [
+      summary('A1', 1, ['x'], 10, 'B'), summary('E1', 1, ['c'], 20, 'F2'), summary('C1', 1, ['d'], 5, 'B'),
+      summary('B', 2, ['A1', 'E1'], 30, 'N'), summary('F2', 2, ['E1'], 15, 'N'), summary('N', 3, ['F2'], 8),
+    ],
+  );
+  for (let compile = 1; compile <= 2; compile++) {
+    const { result } = quietOverlap(() =>
+      new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 100, slack: 0.1 }));
+    const layout = renderLayout(inputs, tree, result.finalResolutions);
+    assert.deepEqual(unitsOf(layout), ['raw:x', 'recall:N', 'raw:d'], `compile ${compile}`);
+    assert.equal(layout.totalTokens, 118);
+    assert.equal(result.exhausted, false);
+    for (const c of inputs.chunks) c.currentResolution = result.finalResolutions.get(c.id) ?? 0;
+  }
+});
+
+// The same links, with x locked at L1 rather than capped. A lock is
+// hard-protected, so x, below B, doesn't veto it, for the projection or for
+// phase C: the solve folds c to N, and phase C's un-fold lands c at B, 45
+// tokens against a target of 40, where counting x's veto would have sent c to
+// raw and kept N.
+test('phase C doesn\'t count a hard-protected leaf below a landing summary as a veto, as the projection doesn\'t', () => {
+  const x = message('x', 0, 100, 'A1');
+  x.lockedByAgent = true;
+  x.currentResolution = 1;
+  const { inputs, tree } = store(
+    [x, message('c', 1, 1_000, 'C1'), message('d', 2, 10, 'C1')],
+    [
+      summary('A1', 1, ['x'], 10, 'B'), summary('E1', 1, ['c'], 20, 'F2'), summary('C1', 1, ['d'], 5, 'B'),
+      summary('B', 2, ['A1', 'E1'], 30, 'N'), summary('F2', 2, ['E1'], 15, 'N'), summary('N', 3, ['F2'], 8),
+    ],
+  );
+  const { result } = quietOverlap(() =>
+    new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 40, slack: 0.1 }));
+  const layout = renderLayout(inputs, tree, result.finalResolutions);
+  assert.deepEqual(unitsOf(layout), ['recall:A1', 'recall:B', 'recall:C1']);
+  assert.equal(layout.totalTokens, 45);
+});
+
+// From the follow-up review: past a vetoed landing summary, phase C lands the
+// leaves at the next summary of their own lineage that lists them, and the
+// second leaf takes both verdicts from the un-fold's memo. c and e name C2 as
+// their L1, which lists both, under B, which lists them and x, held at L1 by
+// a pin-max-level of 1. N, an L3, lists c and e. The solve folds both to N,
+// and phase C's un-fold passes B, which x vetoes, for C2: 50 tokens against a
+// target of 45. Sending the leaves to raw at the veto, or landing e at B on a
+// wrong verdict, would decline the un-fold and keep N's 18.
+test('phase C lands leaves past a vetoed summary at the next summary of their lineage that lists them', () => {
+  const x = message('x', 0, 100, 'A1');
+  x.pinMaxLevel = 1;
+  const { inputs, tree } = store(
+    [x, message('c', 1, 1_000, 'C2'), message('e', 2, 1_000, 'C2')],
+    [
+      summary('A1', 1, ['x'], 10, 'B'), summary('C2', 1, ['c', 'e'], 40, 'B'),
+      summary('B', 2, ['A1', 'C2'], 30, 'N'), summary('F2', 2, ['C2'], 15, 'N'), summary('N', 3, ['F2'], 8),
+    ],
+  );
+  const { result } = quietOverlap(() =>
+    new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 45, slack: 0.1 }));
+  const layout = renderLayout(inputs, tree, result.finalResolutions);
+  assert.deepEqual(unitsOf(layout), ['recall:A1', 'recall:C2']);
+  assert.equal(layout.totalTokens, 50);
 });
 
 // [kv-overlap] reads the frontier the plan emits, not which folds the solve

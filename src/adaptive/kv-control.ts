@@ -386,6 +386,17 @@ function relevanceCut(
     return false;
   };
 
+  // Hard-protected leaves (−1 caps) are exempt from group unanimity here too —
+  // without this, the final projection undoes every boundary-cut fold the
+  // phases just made (monotone-lowering the whole group back toward carried).
+  // A leaf whose lineage disagrees with a group needs no entry: the
+  // projection leaves out of a group's unanimity every leaf whose own lineage
+  // at that level isn't the group, and every leaf above the group's level,
+  // the rule the carried frontier and suffix adoption are projected by.
+  // Phase C reads the same set where it weighs an un-fold's landing levels.
+  const projectionExempt = new Set<ChunkId>();
+  for (const [id, cap] of caps) if (cap < 0) projectionExempt.add(id);
+
   // FOLD → PROJECT FIXPOINT (2026-08-03). The validity projection at the end
   // can only LOWER levels; on a non-nested tree its repairs add tokens after
   // the phases stopped at target, and a single projection pass used to be
@@ -445,24 +456,40 @@ function relevanceCut(
         // renderLayout, and every later accept decision is made on corrupt
         // arithmetic (observed: phase C walked an L3 fold all the way back to
         // carried while its ledger believed it sat on target).
-        // Each leaf moves one level down, or deeper while the summary of its
-        // own lineage there is missing or doesn't list it, down to raw, as
-        // projectToValidCut lowers an unheld leaf, so the accept below weighs
-        // the leaf where the projection will put it for want of a summary that
-        // lists it. Moved one level down regardless, a leaf that summary
-        // doesn't list was priced at a recall the projection then took away:
-        // an un-fold the ledger said fit was accepted, then rendered the leaf
-        // raw.
+        // Each leaf moves one level down, or deeper, down to raw, while the
+        // summary of its own lineage there is missing, doesn't list it, or is
+        // vetoed by a leaf below it, as projectToValidCut lowers an unheld
+        // leaf, so the accept below weighs each leaf where the projection will
+        // put it. Moved one level down regardless, a leaf that summary doesn't
+        // list, or that a leaf below vetoes, was priced at a recall the
+        // projection then took away: an un-fold the ledger said fit was
+        // accepted, then rendered the leaf lower, raw where no summary of its
+        // lineage below lists it. Only a leaf a summary lists, whose own
+        // lineage there is that summary, can make it vetoed by dropping below
+        // it, and below the summary being un-folded this loop, like the
+        // projection, takes a leaf past such a summary only where the summary
+        // is vetoed already. So the landing verdicts don't change while the
+        // un-fold moves its leaves, or when the projection runs after it.
+        // Eligibility put every leaf moved here at `level`.
+        const vetoMemo = new Map<string, boolean>();
+        const landingVetoed = (own: { id: string; leafChunkIds: readonly ChunkId[] }, at: number): boolean => {
+          const key = `${own.id}:${at}`;
+          let verdict = vetoMemo.get(key);
+          if (verdict === undefined) {
+            verdict = vetoed(tree, own, at, F, projectionExempt);
+            vetoMemo.set(key, verdict);
+          }
+          return verdict;
+        };
         const moved: Array<[ChunkId, number, number]> = [];
         for (const leafId of node.leafChunkIds) {
           if (rawZone.has(leafId) || immovable.has(leafId)) continue; // protected: not part of the fold
           if (tree.ancestorAt(leafId, level)?.id !== node.id) continue; // rendered by another node
           const from = F.get(leafId) ?? 0;
-          if (from <= level - 1) continue; // already at/below the destination
           let to = level - 1;
           for (; to > 0; to--) {
             const own = tree.ancestorAt(leafId, to);
-            if (own && lists(listedBy, own, leafId)) break;
+            if (own && lists(listedBy, own, leafId) && !landingVetoed(own, to)) break;
           }
           const leaf = byId.get(leafId);
           if (leaf) ledger.move(leaf, byId, from, to);
@@ -497,15 +524,6 @@ function relevanceCut(
   }
 
   const _tp = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
-  // Hard-protected leaves (−1 caps) are exempt from group unanimity here too —
-  // without this, the final projection undoes every boundary-cut fold the
-  // phases just made (monotone-lowering the whole group back toward carried).
-  // A leaf whose lineage disagrees with a group needs no entry: the
-  // projection leaves out of a group's unanimity every leaf whose own lineage
-  // at that level isn't the group, and every leaf above the group's level,
-  // the rule the carried frontier and suffix adoption are projected by.
-  const projectionExempt = new Set<ChunkId>();
-  for (const [id, cap] of caps) if (cap < 0) projectionExempt.add(id);
   projectToValidCut(F, tree, ordered, frozen, fixedLevels, projectionExempt, listedBy);
   if (_tp) console.error(`[kv-timing] cut-projection ${Date.now() - _tp}ms`);
   // One authoritative render at the end (the ledger tracks it exactly, but the
@@ -695,18 +713,7 @@ function projectToValidCut(
         if (hit !== undefined) {
           unanimous = hit;
         } else {
-          unanimous = true;
-          for (const leafId of node.leafChunkIds) {
-            if (exempt.has(leafId)) continue;
-            // A leaf vetoes the node only if it renders in more detail than
-            // the node (below its level) and the node is its own lineage at
-            // this level. A leaf above renders through a coarser summary of
-            // its own lineage, which that summary's unanimity decides.
-            if ((F.get(leafId) ?? 0) < lvl && tree.ancestorAt(leafId, lvl)?.id === node.id) {
-              unanimous = false;
-              break;
-            }
-          }
+          unanimous = !vetoed(tree, node, lvl, F, exempt);
           unanimityMemo.set(key, unanimous);
         }
       }
@@ -731,6 +738,28 @@ function lists(
   let listed = listedBy.get(node.id);
   if (!listed) { listed = new Set(node.leafChunkIds); listedBy.set(node.id, listed); }
   return listed.has(chunkId);
+}
+
+/**
+ * Whether a leaf the node lists vetoes the node at a level: a leaf below that
+ * level, rendered in more detail than the node, whose own lineage there is
+ * the node, and that no hard protection exempts. The node's recall would
+ * render over it. A leaf above the node renders through a coarser summary of
+ * its own lineage, which that summary's verdict decides. projectToValidCut
+ * lowers a vetoed node's leaves, and phase C passes such a node by.
+ */
+function vetoed(
+  tree: SummaryTree,
+  node: { id: string; leafChunkIds: readonly ChunkId[] },
+  level: number,
+  F: ReadonlyMap<ChunkId, number>,
+  exempt: ReadonlySet<ChunkId>,
+): boolean {
+  for (const leafId of node.leafChunkIds) {
+    if (exempt.has(leafId)) continue;
+    if ((F.get(leafId) ?? 0) < level && tree.ancestorAt(leafId, level)?.id === node.id) return true;
+  }
+  return false;
 }
 
 /**

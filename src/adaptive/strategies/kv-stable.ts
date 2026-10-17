@@ -108,7 +108,8 @@ export class KvStableStrategy implements FoldingSolver {
       } else if (c.pinLevel !== undefined) {
         // Pin-at-level-k: fix exactly at k (0 = raw). k=0 is equivalent to a
         // classic raw pin, so route it through the raw zone; k>0 is resolved to
-        // its whole L_k node below (group-consistent — see the loop after).
+        // its whole L_k node below, or to the chunk alone where its lineage
+        // has no summary at that level (group-consistent — see the loop after).
         if (c.pinLevel <= 0) rawZone.add(c.id);
         else fixedPins.push({ id: c.id, level: c.pinLevel });
       } else if (c.pinMaxLevel !== undefined) {
@@ -132,9 +133,9 @@ export class KvStableStrategy implements FoldingSolver {
     // nothing pins and leave this one raw. If its lineage has no summary at
     // the level (a parent more than one level up skips it), fix just the
     // chunk there: the base keeps that level, and the chunk renders raw. Skip
-    // leaves already forced raw (head/tail/classic pin). Where two pins
-    // overlap a chunk, the finest level wins, whichever pin comes first and
-    // whether or not a summary holds the chunk there.
+    // leaves already forced raw (head/tail/classic pin). Where two
+    // pins-at-level overlap a chunk, the finest level wins, whichever pin
+    // comes first and whether or not a summary holds the chunk there.
     const listedBy = new Map<string, ReadonlySet<ChunkId>>();
     const hold = (leaf: ChunkId, level: number): void => {
       const prev = fixedLevels.get(leaf);
