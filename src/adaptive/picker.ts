@@ -66,16 +66,20 @@ export interface OverBudgetDiagnostics {
  *   the queued chunks, in `tick`'s order, while the speculative cap lets it
  *   take one, the cap read as it stands when the count is asked (an L1
  *   `tick` makes on the way can bring the drain to the cap before it reaches
- *   a chunk that counts); and after them, with `hierarchical` merging on
- *   and a compression model, the first queued merge, unless a compression
- *   hold blocks it. Each counts only when the compile can fold now one of
- *   the messages its summary would cover: one outside the head and recent
- *   windows that no pin keeps raw, since the compile renders the rest raw
- *   whatever summary covers them. A chunk's messages are its own, a merge's
- *   are the leaves of its sources in memory, and the work in flight's are
- *   those of the chunk or merge `tick` is working on. When the work in
- *   flight folds nothing, the count goes on to the queue. The merge counts
- *   even when `tick` will drop it as stale without a model call: a source
+ *   a chunk that counts, and a merge that folds nothing can relieve the cap
+ *   when it lands); and after them, with `hierarchical` merging on and a
+ *   compression model, the queued merges, in `tick`'s order up to one a
+ *   compression hold blocks, where `tick` stops. Each counts only when the
+ *   compile can fold now one of the messages its summary would cover: one
+ *   outside the head and recent windows that no pin keeps raw, since the
+ *   compile renders the rest raw whatever summary covers them. A chunk's
+ *   messages are its own, a merge's are the leaves of its sources in
+ *   memory, and the work in flight's are those of the chunk or merge `tick`
+ *   is working on. When the work in flight folds nothing, the count goes on
+ *   to the queue, passing over the merge in flight, and it goes past a
+ *   queued merge that folds nothing, which `tick` runs before it takes the
+ *   next. A merge counts even when `tick` will drop it as stale without a
+ *   model call: a source
  *   isn't loaded or is already merged into another summary, or its sources
  *   fail the merge's topology check, in which case `tick` quarantines it.
  *   So the count can name compression for such a merge until `tick`
