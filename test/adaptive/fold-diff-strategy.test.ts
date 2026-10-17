@@ -309,6 +309,31 @@ describe('AutobiographicalStrategy — [fold-diff] wiring', () => {
     manager.close();
   });
 
+  it('after a branch switch, the divergence compares with the last request returned, the other branch\'s', async () => {
+    const { manager, strategy } = await open();
+    await manager.compile(BIG);
+    const onMain = strategy.placed.at(-1)!;
+    // A fork carries the same messages and saved levels, and its first
+    // compile raises the last folded chunk.
+    await manager.fork('fold-diff-fork');
+    errors = [];
+    strategy.plan = (c, inputs) => {
+      const folded = inputs.chunks.filter((x) => x.currentResolution === 1);
+      return c.id === folded.at(-1)?.id ? 0 : c.currentResolution;
+    };
+    await manager.compile(BIG);
+    assert.equal(foldLines().length, 1);
+    const diff = stats(manager)!.planVsActual!.foldDiff!;
+    assert.notEqual(diff.divergenceOffset, null, 'not a first compile: the request main returned is the previous one');
+    const now = strategy.placed.at(-1)!;
+    const first = firstDifference(onMain, now);
+    assert.ok(first > 0 && first < now.length, `fixture: the change falls inside the request (entry ${first} of ${now.length})`);
+    const tokens = now.map((e) => strategy.estimate(e.content));
+    const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
+    assert.equal(diff.divergenceOffset, sum(tokens.slice(0, first)));
+    manager.close();
+  });
+
   it('a compile that changes no saved level logs nothing, though its solver moved a locked chunk', async () => {
     const { manager, strategy } = await open();
     await manager.compile(BIG);
