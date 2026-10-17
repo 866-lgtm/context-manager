@@ -499,7 +499,7 @@ describe('Merge terminal-disposition gate', () => {
     // call, writing nothing, and tick drops it from the queue. A skip says
     // nothing about the provider: it must not be a landing (in an outage,
     // each stale entry would let a failing request's next failure count) or
-    // end the pause (the next failure would back off from 30 s again instead
+    // end the pause (the next failure would back off from 5 s again instead
     // of doubling from the genuine count).
     const network = Object.assign(new Error('zz network down'), { type: 'network', retryable: true });
     const mock = scripted([{ error: network }]);

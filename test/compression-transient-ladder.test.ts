@@ -1,4 +1,4 @@
-import { after, describe, it } from 'node:test';
+import { after, describe, it, mock as testMock } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, rmSync } from 'node:fs';
 import type { ContentBlock, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
@@ -139,6 +139,16 @@ async function firstCall(calls: unknown[], ms = 10_000): Promise<void> {
   while (calls.length === 0) {
     if (Date.now() > deadline) assert.fail('the provider was never called');
     await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+/** Whether a promise settles within `ms`: a wait that would otherwise hang the run becomes an assertion that fails. */
+async function settlesWithin(promise: Promise<unknown>, ms = 10_000): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), ms); });
+  try {
+    return await Promise.race([promise.then(() => true, () => true), expired]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 /** Wait until more than `count` provider calls have been made. */
@@ -358,7 +368,7 @@ describe('compression lane pacing', () => {
     await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz rate_limit failure/);
     assert.equal(mock.calls.length, 1);
     const pause = fx.strategy.pause()!;
-    assert.ok(pause.until >= before + 120_000, 'the stated wait outlasts the 30 s backoff and is honoured whole');
+    assert.ok(pause.until >= before + 120_000, 'the stated wait outlasts the 5 s backoff and is honoured whole');
     assert.equal(pause.source, 'retry-after');
 
     const queue = fx.strategy.compressionQueueView();
@@ -375,10 +385,10 @@ describe('compression lane pacing', () => {
     fx.manager.close();
   });
 
-  it('the backoff doubles per failure from 30 s and caps at 10 minutes', async () => {
+  it('the backoff doubles per failure from 5 s and caps at 10 minutes', async () => {
     const mock = scripted([{ throw: failure('network') }]);
     const fx = await queued(mock.membrane);
-    const expected = [30, 60, 120, 240, 480, 600, 600];
+    const expected = [5, 10, 20, 40, 80, 160, 320, 600, 600];
     for (let i = 0; i < expected.length; i++) {
       // Each failure consumes the chunk it tried; requeue to keep the lane busy.
       await fx.strategy.onNewMessage(fx.manager.queryMessages({}).messages.at(-1)!, managerContext(fx.manager));
@@ -393,6 +403,117 @@ describe('compression lane pacing', () => {
       assert.equal(pause.source, 'backoff');
       fx.strategy.expirePause();
     }
+    fx.manager.close();
+  });
+
+  const requeueLast = (fx: Awaited<ReturnType<typeof queued>>) =>
+    fx.strategy.onNewMessage(fx.manager.queryMessages({}).messages.at(-1)!, managerContext(fx.manager));
+
+  it('one failure with no stated wait holds the lane 5 s, and a landing resets the run (Anarchid R1-1)', async () => {
+    const mock = scripted([{ throw: failure('network') }, OK('landed'), { throw: failure('network') }]);
+    const fx = await queued(mock.membrane);
+    const start = Date.now();
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz network failure/);
+    const end = Date.now();
+    const pause = fx.strategy.pause()!;
+    assert.equal(pause.source, 'backoff');
+    assert.equal(pause.failures, 1);
+    assert.ok(pause.until - end <= 5_000 && 5_000 <= pause.until - start, `a 5 s hold (${pause.until - end}..${pause.until - start} ms)`);
+    fx.strategy.expirePause();
+    await requeueLast(fx);
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2);
+    assert.equal(fx.strategy.pause(), null, 'the landing ends the pause');
+    await requeueLast(fx);
+    const start2 = Date.now();
+    await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), /zz network failure/);
+    const end2 = Date.now();
+    const again = fx.strategy.pause()!;
+    assert.equal(again.failures, 1, 'the next failure starts a run of one');
+    assert.ok(again.until - end2 <= 5_000 && 5_000 <= again.until - start2, 'and holds 5 s again, not 10');
+    fx.manager.close();
+  });
+
+  it('immediate failures, with inbound messages and ticks throughout: one call per backoff, 5, 10, 20 … s apart, reaching 10 minutes and holding there (negative control)', async () => {
+    const mock = scripted([{ throw: failure('network') }]);
+    const fx = await queued(mock.membrane);
+    const t0 = Date.now();
+    testMock.timers.enable({ apis: ['Date'], now: t0 });
+    try {
+      const callAt: number[] = [];
+      // A message every second through the first 160 s, then every 5 s, each
+      // followed by two maintenance passes: a call per message, or a burst
+      // when a hold ends, would show as a gap shorter than the backoff.
+      for (let t = 0; t <= 1835; t += t < 160 ? 1 : 5) {
+        testMock.timers.setTime(t0 + t * 1_000);
+        await requeueLast(fx);
+        for (let pass = 0; pass < 2; pass++) {
+          const before = mock.calls.length;
+          await fx.strategy.tick(managerContext(fx.manager)).catch(() => {});
+          if (mock.calls.length > before) callAt.push(t);
+        }
+      }
+      const gaps = callAt.slice(1).map((t, i) => t - callAt[i]!);
+      assert.deepEqual(gaps, [5, 10, 20, 40, 80, 160, 320, 600, 600], `calls at ${callAt.join(', ')} s`);
+      assert.equal(fx.strategy.pause()!.failures, 10, 'every failure counted: nothing landed');
+    } finally {
+      testMock.timers.reset();
+      fx.manager.close();
+    }
+  });
+
+  it('one call at a time: ticks and inbound messages during a call send nothing more, and its failure paces what follows', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const mock = scripted([{ gate, then: { throw: failure('network') } }, OK('after')]);
+    const fx = await queued(mock.membrane);
+    const first = fx.strategy.tick(managerContext(fx.manager));
+    // Settled below; a failed assertion before then mustn't leave it unhandled.
+    first.catch(() => {});
+    try {
+      for (let i = 0; i < 200 && mock.calls.length === 0; i++) await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(mock.calls.length, 1, 'the call is in flight');
+      for (let i = 0; i < 5; i++) {
+        // Each is bounded: one that waited on the held call would otherwise
+        // hang the run here, before the assertions and the cleanup below.
+        const inbound = Promise.resolve(requeueLast(fx));
+        inbound.catch(() => {});
+        assert.ok(await settlesWithin(inbound), 'an inbound message during a call returns without waiting on it');
+        const tick = fx.strategy.tick(managerContext(fx.manager));
+        tick.catch(() => {});
+        assert.ok(await settlesWithin(tick), 'a tick during a call returns without waiting on it');
+      }
+      assert.equal(mock.calls.length, 1, 'no second call while one is in flight');
+      release();
+      await assert.rejects(first, /zz network failure/);
+      await requeueLast(fx);
+      await fx.strategy.tick(managerContext(fx.manager));
+      assert.equal(mock.calls.length, 1, 'and none until its backoff ends');
+    } finally {
+      // A failure above would otherwise leave the call held open and the store
+      // with it, and the run would hang instead of failing.
+      release();
+      fx.manager.close();
+    }
+  });
+
+  it("a rejection pauses nothing, and no family it exhausted is asked again, however often the lane runs", async () => {
+    const mock = scripted([{ throw: failure('invalid_request', { httpStatus: 400 }) }]);
+    const fx = await queued(mock.membrane);
+    for (let i = 0; i < 30; i++) {
+      await requeueLast(fx);
+      await fx.strategy.tick(managerContext(fx.manager)).catch(() => {});
+      assert.equal(fx.strategy.pause(), null, 'a rejection is no transient failure: the lane takes no pause');
+    }
+    const asked = mock.calls.length;
+    const exhausted = fx.strategy.getCompressionQuarantineStatus().count;
+    assert.ok(asked > 0 && exhausted > 0, `${asked} call(s), ${exhausted} family(ies) exhausted`);
+    for (let i = 0; i < 10; i++) {
+      await requeueLast(fx);
+      await fx.strategy.tick(managerContext(fx.manager)).catch(() => {});
+    }
+    assert.equal(mock.calls.length, asked, 'no exhausted family is asked again');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, exhausted);
     fx.manager.close();
   });
 
@@ -537,15 +658,15 @@ describe("releasing the provider's wait keeps the lane's own backoff (#46385)", 
   const requeue = (fx: Awaited<ReturnType<typeof queued>>) =>
     fx.strategy.onNewMessage(fx.manager.queryMessages({}).messages.at(-1)!, managerContext(fx.manager));
 
-  it('wait 120 s, backoff 30 s, release at 10 s: the remaining 20 s of backoff still pace the lane', async () => {
+  it('wait 120 s, backoff 5 s, release at 2 s: the remaining 3 s of backoff still pace the lane', async () => {
     const { mock, fx } = await pausedByStatedWait();
     const shiftedAt = Date.now();
-    fx.strategy.shiftPause(20_000, 110_000); // 10 s have passed
+    fx.strategy.shiftPause(3_000, 118_000); // 2 s have passed
     assert.equal(fx.strategy.releaseCompressionPause('zz-other-model'), false, 'a release for another model leaves it');
     assert.equal(fx.strategy.releaseCompressionPause('same-model'), true);
     const pause = fx.strategy.pause()!;
     assert.equal(pause.statedUntil, null, 'only the provider-derived constraint is gone');
-    assert.ok(pause.until >= shiftedAt + 20_000 && pause.until <= Date.now() + 20_000, 'the backoff, from when it was shifted');
+    assert.ok(pause.until >= shiftedAt + 3_000 && pause.until <= Date.now() + 3_000, 'the backoff, from when it was shifted');
     await requeue(fx);
     await fx.strategy.tick(managerContext(fx.manager));
     assert.equal(mock.calls.length, 1, 'still paced by the backoff');
@@ -791,7 +912,7 @@ describe("a caller's admission deferral is an external wait, not a failed call (
     const end = Date.now();
     assert.equal(fx.strategy.pause()!.failures, 2);
     const backoffUntil = fx.strategy.pause()!.backoffUntil;
-    assert.ok(backoffUntil - end <= 60_000 && 60_000 <= backoffUntil - start, 'doubling continues from the genuine count: 60 s');
+    assert.ok(backoffUntil - end <= 10_000 && 10_000 <= backoffUntil - start, 'doubling continues from the genuine count: 10 s');
     fx.manager.close();
   });
 
@@ -1072,7 +1193,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     const pause = fx.strategy.pause()!;
     assert.equal(pause.statedUntil, null, 'no stated wait');
     assert.equal(pause.source, 'backoff');
-    assert.ok(pause.until - Date.now() <= 30_000, 'the 30 s backoff, not a hold');
+    assert.ok(pause.until - Date.now() <= 5_000, 'the 5 s backoff, not a hold');
     fx.manager.close();
   });
 

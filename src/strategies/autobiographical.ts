@@ -747,7 +747,7 @@ interface CompressionFamilyProgress {
  * deadline is the caller's (agent-framework's provider admission).
  */
 interface CompressionLanePause {
-  /** The lane's own backoff: 30 s doubling per failure, capped at 10 min. */
+  /** The lane's own backoff: 5 s doubling per failure, capped at 10 min. */
   backoffUntil: number;
   /**
    * The external constraint, kept apart from the backoff so a release of it
@@ -1505,7 +1505,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   static readonly COMPRESSION_PERSISTENT_FAILURES = 8;
   /** First compression-lane pause after a transient failure; doubles per failure. */
-  static readonly COMPRESSION_PAUSE_BASE_MS = 30_000;
+  static readonly COMPRESSION_PAUSE_BASE_MS = 5_000;
   /** Cap on the lane's own backoff. A provider's stated wait is never capped. */
   static readonly COMPRESSION_PAUSE_MAX_BACKOFF_MS = 10 * 60_000;
   /** How long a no-call deferral by the caller's provider admission is
@@ -4414,7 +4414,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Pause compression calls after a failure that says nothing about the
-   * request, until both constraints have passed: the lane's own backoff (30 s
+   * request, until both constraints have passed: the lane's own backoff (5 s
    * doubling to 10 min) and the provider's stated wait, which is never
    * shortened. A stated wait is a non-negative `retryAfterMs`; NaN, or any
    * other value, states none (a garbage value must not hold the lane until a
