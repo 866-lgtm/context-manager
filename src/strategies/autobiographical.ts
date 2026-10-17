@@ -8781,8 +8781,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Whether the drain has compression work it will take that would shrink the
    * context, as tick takes it: compression in flight; the first queued merge,
-   * unless a compression hold blocks it (tick runs no merge until the
-   * release, though it takes queued chunks first); or a queued chunk tick
+   * with `hierarchical` on and a compression model, unless a compression
+   * hold blocks it (tick runs no merge until the release, though it takes
+   * queued chunks first; merges can queue with `hierarchical` off, but tick
+   * runs none then); or a queued chunk tick
    * would compress while it runs chunks at all (below
    * the speculative cap). A chunk counts when it's still uncompressed, holds
    * no held message, and has no message an L1 in memory already covers: its
@@ -8884,8 +8886,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Any other chunk needs a model call. Tick throws at it without a
       // model, or when the quarantine can't be read, unless it defers it for
       // the host's tools first. deferredForTools reads the request as
-      // stored, which can hold a tool block tick strips, so the walk stops
-      // here either way.
+      // stored, which can hold a tool block tick strips, so without a model
+      // or a readable quarantine the walk stops here whatever it says: going
+      // on could count work behind a chunk tick throws at.
       if (!modelled || quarantined === undefined) return false;
       if (deferredForTools(chunk) || quarantined.has(sha256Json(chunk.messages.map((m) => m.id)))) continue;
       return true;
@@ -8900,13 +8903,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * reads with the pins before the chunk (recallCoverage). From the lower of
    * the head window's start and headEnd (headEnd clipped at a hold as tick
    * clips it, and 0 with the head window off, headWindowTokens <= 0), that's
-   * every message no recall pair covers, up to the chunk or to headEnd,
-   * whichever is later. Before it, only what pins keep raw: the messages of
-   * an L1 a pin opens, and a pinned message before headEnd. Tick lays its
+   * every message the coverage leaves uncovered, up to the chunk or to
+   * headEnd, whichever is later. Before it, only what pins keep raw: the
+   * messages of an L1 a pin opens, and a pinned message. Tick lays its
    * history out without the pins when the raw they add doesn't fit, so the
    * pins can only add raw here that tick leaves out; and tick strips unpaired
    * tool blocks first. So this can say yes where tick's request has none,
-   * never the reverse. The test it returns takes one chunk.
+   * never the reverse. The test it returns takes one chunk. Chunks with the
+   * same pins before them read the same coverage, so each coverage is read
+   * once, for the first message its request carries raw with a tool block,
+   * and a chunk's answer is whether that message comes before the later of
+   * the chunk's start and headEnd.
    */
   private requestCarriesToolBlocks(store: MessageStoreView): (chunk: Chunk) => boolean {
     const all = store.getAll();
@@ -8915,27 +8922,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const from = Math.min(this.getHeadWindowStartIndex(store), headEnd);
     const position = new Map(all.map((message, i) => [message.id, i]));
     const pins = sourceOnly ? [] : [...this.forceRawPinPositions(all)].sort((a, b) => a - b);
-    // Chunks with the same pins before them read the same coverage.
-    const coverage = new Map<number, ReturnType<AutobiographicalStrategy['recallCoverage']>>();
+    // For each count of pins before a chunk, the index of the first message
+    // that request carries raw with a tool block, or all.length for none.
+    const firstToolBlock = new Map<number, number>();
     return (chunk) => {
       if (chunk.messages.some((m) => hasToolBlocks(m.content))) return true;
       if (sourceOnly) return false;
       const start = position.get(chunk.messages[0]?.id ?? '') ?? -1;
       const pinned = pins.filter((i) => i < start);
-      let seen = coverage.get(pinned.length);
-      if (seen === undefined) {
-        seen = this.recallCoverage(new Set(pinned.map((i) => all[i].id)));
-        coverage.set(pinned.length, seen);
+      let first = firstToolBlock.get(pinned.length);
+      if (first === undefined) {
+        const pinnedIds = new Set(pinned.map((i) => all[i].id));
+        const seen = this.recallCoverage(pinnedIds);
+        // Before `from`, the request carries only what pins keep raw: an L1 a
+        // pin opens, and a pinned message (which lies before headEnd, since
+        // from is at most headEnd).
+        const carried = (message: StoredMessage, i: number): boolean =>
+          !seen.coveredMessageIds.has(message.id)
+          && (i >= from || seen.openedMessageIds.has(message.id) || pinnedIds.has(message.id));
+        const found = all.findIndex((message, i) => carried(message, i) && hasToolBlocks(message.content));
+        first = found === -1 ? all.length : found;
+        firstToolBlock.set(pinned.length, first);
       }
-      const pinnedIds = new Set(pinned.map((i) => all[i].id));
-      const end = Math.max(headEnd, start);
-      for (let i = 0; i < end && i < all.length; i++) {
-        const id = all[i].id;
-        if (seen.coveredMessageIds.has(id)) continue;
-        if (i < from && !seen.openedMessageIds.has(id) && !(i < headEnd && pinnedIds.has(id))) continue;
-        if (hasToolBlocks(all[i].content)) return true;
-      }
-      return false;
+      return first < Math.max(headEnd, start);
     };
   }
 
@@ -11008,11 +11017,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * What tick's chunk request represents by recall pairs, for the messages
    * pins keep raw before the chunk (`forceRawMessageIds`, empty for none): the
-   * recall frontier, unsorted, the messages of the L1s a pin opens, and the
-   * message ids the recall pairs cover, down to their leaves. A covered
-   * message is never sent raw. compressionWorkQueued's count reads the same
-   * coverage, so the raw it checks for tool blocks is the raw tick's request
-   * carries.
+   * recall frontier, unsorted; the messages of the L1s a pin opens; and the
+   * covered message ids: the leaves of every L1 except those a pin opens, and
+   * of every summary in the frontier, whether or not tick sends a recall
+   * pair for each. A covered message is never sent raw. compressionWorkQueued's
+   * count reads this coverage with the pins before the chunk, so the raw it
+   * checks for tool blocks is the raw tick's request carries, or more where
+   * tick lays its history out without the pins.
    */
   protected recallCoverage(forceRawMessageIds: ReadonlySet<MessageId>): {
     frontier: SummaryEntry[];

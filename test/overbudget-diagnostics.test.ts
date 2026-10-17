@@ -118,6 +118,17 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     return super.compressionWorkQueued(this.countedView, 'hierarchical');
   }
 
+  /** Each message's index in the store view the last refusal read, with the head window's start and end there. */
+  placement(ids: string[]): { indices: number[]; headStart: number; headEnd: number } {
+    assert.ok(this.countedView, 'a refusal has counted');
+    const all = this.countedView.getAll();
+    return {
+      indices: ids.map((id) => all.findIndex((message) => message.id === id)),
+      headStart: this.getHeadWindowStartIndex(this.countedView),
+      headEnd: this.getHeadWindowEnd(this.countedView),
+    };
+  }
+
   /**
    * Rewrites the durable compression quarantine as a store an older release
    * wrote holds it: each record under budget accounting version 1. A record's
@@ -1328,12 +1339,63 @@ describe('OverBudgetError.clearedBy', () => {
         if (place === 'reset head') strategy.resetHeadWindow(texts[6]!);
         strategy.seedL1('L1-cycle', cycle);
         assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'the premise: covered, the cycle holds no chunk back');
+        const { indices, headStart, headEnd } = strategy.placement(cycle);
+        if (place === 'head window') assert.ok(indices.every((i) => i >= headStart && i < headEnd), 'the premise: the cycle sits in the head window');
+        else assert.ok(indices.every((i) => i >= 0 && i < headStart), 'the premise: the cycle sits before the head window\'s start');
         // A pin on the call opens the L1 for every chunk after it, so tick's request carries the cycle raw.
         manager.pinRange(cycle[0]!, cycle[0]!, { name: 'zz-pin' });
         const error = await refusal(manager);
         assert.ok(strategy.queuedChunkIds().length > 0, 'text chunks are queued');
         assert.deepEqual(error.clearedBy, [], 'nothing tick will do clears it');
         // The premise: tick defers every queued chunk, with no model call.
+        for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+        assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
+        assert.equal(calls.n, 0, 'tick asked no model');
+        manager.setToolDefinitions([{ name: 'zz_tool', description: 'zz', inputSchema: { type: 'object' } }]);
+        assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'with the tools declared, they count');
+      }, { membrane: countingMembrane(calls) });
+    });
+  }
+
+  for (const pinned of [false, true]) {
+    it(`names ${pinned ? 'nothing' : 'compression'} before the host declares its tools for text chunks after a tool cycle no L1 covers, before the head window's start, ${pinned ? 'pinned, which tick\'s request then carries raw' : 'which tick\'s request leaves out'}`, async () => {
+      const strategy = new DiagnosticStrategy({
+        adaptiveResolution: false,
+        targetChunkTokens: 40,
+        headWindowTokens: 60,
+        recentWindowTokens: 0,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+        minChunkCharsForLLM: 0,
+      });
+      const calls = { n: 0 };
+      await withManager(strategy, async (manager) => {
+        // The conversation opens with a tool cycle, and the head window starts after it.
+        const cycle = [
+          manager.addMessage('assistant', [{ type: 'tool_use', id: 'zz-before-head', name: 'zz_tool', input: { q: 'zz' } } as ContentBlock]),
+          manager.addMessage('user', [{ type: 'tool_result', toolUseId: 'zz-before-head', content: 'zz result' } as ContentBlock]),
+        ];
+        const texts: string[] = [];
+        for (let i = 0; i < 12; i++) texts.push(manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+        strategy.resetHeadWindow(texts[6]!);
+        if (pinned) manager.pinRange(cycle[0]!, cycle[1]!, { name: 'zz-pin' });
+        const error = await refusal(manager);
+        const { indices, headStart } = strategy.placement(cycle);
+        assert.ok(indices.every((i) => i >= 0 && i < headStart), 'the premise: the cycle sits before the head window\'s start');
+        const queued = strategy.queuedChunkIds();
+        assert.ok(queued.some((ids) => !ids.some((id) => cycle.includes(id))), 'text chunks are queued');
+        if (!pinned) {
+          assert.deepEqual(error.clearedBy, ['compression']);
+          // The premise: tick's request leaves the cycle out, so tick asks the model, and the counting membrane throws.
+          await assert.rejects(async () => {
+            for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+          }, /no model in this test/);
+          assert.equal(calls.n, 1, 'tick asked the model');
+          return;
+        }
+        assert.deepEqual(error.clearedBy, [], 'nothing tick will do clears it');
+        // The premise: tick's request carries the pinned cycle raw, so tick defers every queued chunk, with no model call.
         for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
         assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
         assert.equal(calls.n, 0, 'tick asked no model');
