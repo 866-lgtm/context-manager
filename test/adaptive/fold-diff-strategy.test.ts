@@ -312,10 +312,18 @@ describe('AutobiographicalStrategy — [fold-diff] wiring', () => {
   it('after a branch switch, the divergence compares with the last request returned, the other branch\'s', async () => {
     const { manager, strategy } = await open();
     await manager.compile(BIG);
+    const main = manager.currentBranch().name;
     const onMain = strategy.placed.at(-1)!;
-    // A fork carries the same messages and saved levels, and its first
-    // compile raises the last folded chunk.
+    // The fork raises its first folded chunk, which main's saved levels keep folded.
     await manager.fork('fold-diff-fork');
+    strategy.plan = (c, inputs) => {
+      const folded = inputs.chunks.filter((x) => x.currentResolution === 1);
+      return c.id === folded[0]?.id ? 0 : c.currentResolution;
+    };
+    await manager.compile(BIG);
+    const onFork = strategy.placed.at(-1)!;
+    // Back on main, raise its last folded chunk.
+    await manager.switchBranch(main);
     errors = [];
     strategy.plan = (c, inputs) => {
       const folded = inputs.chunks.filter((x) => x.currentResolution === 1);
@@ -324,13 +332,13 @@ describe('AutobiographicalStrategy — [fold-diff] wiring', () => {
     await manager.compile(BIG);
     assert.equal(foldLines().length, 1);
     const diff = stats(manager)!.planVsActual!.foldDiff!;
-    assert.notEqual(diff.divergenceOffset, null, 'not a first compile: the request main returned is the previous one');
     const now = strategy.placed.at(-1)!;
-    const first = firstDifference(onMain, now);
-    assert.ok(first > 0 && first < now.length, `fixture: the change falls inside the request (entry ${first} of ${now.length})`);
+    const fromFork = firstDifference(onFork, now);
+    const fromMain = firstDifference(onMain, now);
+    assert.ok(fromFork < fromMain, `fixture: the fork's request and main's own first differ from this one at different entries (${fromFork}, ${fromMain})`);
     const tokens = now.map((e) => strategy.estimate(e.content));
     const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
-    assert.equal(diff.divergenceOffset, sum(tokens.slice(0, first)));
+    assert.equal(diff.divergenceOffset, sum(tokens.slice(0, fromFork)), "measured from the fork's request, the last one returned");
     manager.close();
   });
 
@@ -345,6 +353,7 @@ describe('AutobiographicalStrategy — [fold-diff] wiring', () => {
     strategy.plan = (c) => (c.id === locked ? 0 : c.currentResolution);
     await manager.compile(BIG);
     assert.equal(strategy.pickedMoves, 1, 'fixture: the solver moved the locked chunk');
+    assert.ok(stats(manager)?.planVsActual, 'planVsActual reported');
     assert.deepEqual(foldLines(), []);
     assert.equal(stats(manager)?.planVsActual?.foldDiff, undefined);
     manager.close();
