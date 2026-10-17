@@ -49,7 +49,7 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     this.pendingCompression = Promise.resolve();
   }
 
-  /** Queues a merge, as a merge produce op or the merge threshold does. */
+  /** Queues a merge of summaries that aren't in memory, as a merge queued before its sources were dropped is. */
   queueMerge(): void {
     this.enqueueMerge({ level: 2, sourceIds: ['L1-queued-a', 'L1-queued-b'] });
   }
@@ -281,6 +281,25 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
 /** A membrane whose every model call is counted and fails. */
 function countingMembrane(calls: { n: number }): Membrane {
   return { complete: async () => { calls.n++; throw new Error('no model in this test'); } } as unknown as Membrane;
+}
+
+/**
+ * A membrane whose model call waits until the test lets it go: `called` settles at its first call,
+ * `calls` counts them, and `release` rejects every call still waiting.
+ */
+function waitingMembrane(): { membrane: Membrane; called: Promise<void>; calls: { n: number }; release: () => void } {
+  let first!: () => void;
+  const called = new Promise<void>((resolve) => { first = resolve; });
+  const calls = { n: 0 };
+  const waiting: Array<(error: Error) => void> = [];
+  const membrane = {
+    complete: () => new Promise((_, reject) => {
+      calls.n++;
+      waiting.push(reject);
+      first();
+    }),
+  } as unknown as Membrane;
+  return { membrane, called, calls, release: () => { for (const reject of waiting.splice(0)) reject(new Error('released by the test')); } };
 }
 
 async function withManager(
@@ -2042,7 +2061,8 @@ describe('OverBudgetError.clearedBy', () => {
             manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
           strategy.seedPyramid(positionedRecallPairs ? ids : ids.slice(1), 1);
           if (work === 'running') strategy.startCompressing();
-          else strategy.queueMerge();
+          // A merge whose source in memory covers a message the compile can fold.
+          else strategy.queueMergeOf(['L1-diagnostic']);
           const error = await refusal(manager);
           assert.match(error.message, positionedRecallPairs
             ? /selected middle representations=1, attempted representation level=L1/
@@ -2104,7 +2124,8 @@ describe('OverBudgetError.clearedBy', () => {
         const ids = Array.from({ length: 2 }, (_, i) =>
           manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
         strategy.seedPyramid(positionedRecallPairs ? ids : ids.slice(1), 1);
-        strategy.queueMerge();
+        // A merge whose source in memory covers a message the compile can fold, so only the hold stops it.
+        strategy.queueMergeOf(['L1-diagnostic']);
         assert.equal(strategy.checkReadiness().ready, false, 'the merge is queued');
         const error = await refusal(manager);
         assert.match(error.message, /^Hierarchical emission overran the budget/);
@@ -2127,8 +2148,14 @@ describe('OverBudgetError.clearedBy', () => {
       });
       strategy.atCap = true;
       await withManager(strategy, async (manager) => {
-        for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
-        if (merge) strategy.queueMerge();
+        const ids = Array.from({ length: 12 }, (_, i) =>
+          manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+        if (merge) {
+          // A merge whose sources in memory cover messages the compile can fold.
+          strategy.seedL1('L1-a', [ids[0]!]);
+          strategy.seedL1('L1-b', [ids[1]!]);
+          strategy.queueMergeOf(['L1-a', 'L1-b']);
+        }
         assert.equal(strategy.checkReadiness().ready, false, 'chunks are queued');
         const error = await refusal(manager);
         assert.match(error.message, /^Hierarchical emission overran the budget/);
@@ -2318,5 +2345,130 @@ describe('OverBudgetError.clearedBy', () => {
       assert.deepEqual(strategy.queuedChunkIds(), queued.slice(1), 'tick took the first chunk only');
       assert.equal(calls.n, 0, 'no model call');
     }, { membrane: countingMembrane(calls) });
+  });
+
+  // Round 18: a queued merge, and the work in flight, count only when they fold something now, as a
+  // queued chunk does; and the walk goes past a chunk that folds nothing wherever tick moves on.
+  const mergeOfTwo = () => new DiagnosticStrategy({
+    adaptiveResolution: false,
+    hierarchical: true,
+    positionedRecallPairs: true,
+    targetChunkTokens: 100_000,
+    headWindowTokens: 0,
+    recentWindowTokens: 0,
+    overBudgetGraceRatio: 0.25,
+    autoTickOnNewMessage: false,
+    speculativeProduction: false,
+  });
+
+  /** Two messages, each an L1's source, and a merge of the two L1s queued. */
+  const twoSummariesMerged = (manager: ContextManager, strategy: DiagnosticStrategy): string[] => {
+    const ids = Array.from({ length: 2 }, (_, i) =>
+      manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(60) }]));
+    strategy.seedL1('L1-a', [ids[0]!]);
+    strategy.seedL1('L1-b', [ids[1]!]);
+    strategy.queueMergeOf(['L1-a', 'L1-b']);
+    return ids;
+  };
+
+  for (const pinned of [false, true]) {
+    it(`names ${pinned ? 'nothing' : 'compression'} for a queued merge of real summaries${pinned ? ' whose messages a pin keeps raw, since its L2 would fold nothing' : ' whose messages the compile can fold'}`, async () => {
+      const strategy = mergeOfTwo();
+      await withManager(strategy, async (manager) => {
+        const ids = twoSummariesMerged(manager, strategy);
+        if (pinned) manager.pinRange(ids[0]!, ids[1]!, { name: 'zz-pin' });
+        assert.deepEqual((await refusal(manager)).clearedBy, pinned ? [] : ['compression']);
+      });
+    });
+  }
+
+  it('names nothing for a queued merge none of whose sources is in memory, since it covers no message', async () => {
+    const strategy = mergeOfTwo();
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 2; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(60) }]);
+      strategy.queueMerge();
+      assert.equal(strategy.queuedMergeCount(), 1, 'the merge is queued');
+      assert.deepEqual((await refusal(manager)).clearedBy, []);
+    });
+  });
+
+  for (const pinned of [false, true]) {
+    it(`names ${pinned ? 'nothing' : 'compression'} at the cap while tick compresses a chunk${pinned ? ' every message of which a pin keeps raw' : ''}, the work in flight being all that can count`, async () => {
+      const strategy = modelCallChunks();
+      const model = waitingMembrane();
+      await withManager(strategy, async (manager) => {
+        for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+        const queued = await settledQueue(manager, strategy);
+        if (pinned) pinChunks(manager, queued);
+        const ticking = manager.tick().then(() => undefined, (error: unknown) => error);
+        await Promise.race([model.called, ticking]);
+        assert.equal(model.calls.n, 1, 'premise: tick asked the model for the first chunk, and waits');
+        // At the cap the walk takes no queued chunk, so only the work in flight can count.
+        strategy.atCap = true;
+        assert.deepEqual((await refusal(manager)).clearedBy, pinned ? [] : ['compression']);
+        model.release();
+        assert.match(String(await ticking), /released by the test/);
+      }, { membrane: model.membrane });
+    });
+  }
+
+  for (const pinned of [false, true]) {
+    it(`names ${pinned ? 'nothing' : 'compression'} while tick runs a merge${pinned ? ' whose messages a pin keeps raw' : ''}, with a hold on the queued merge leaving the work in flight all that can count`, async () => {
+      const strategy = mergeOfTwo();
+      const model = waitingMembrane();
+      await withManager(strategy, async (manager) => {
+        const ids = twoSummariesMerged(manager, strategy);
+        if (pinned) manager.pinRange(ids[0]!, ids[1]!, { name: 'zz-pin' });
+        const ticking = manager.tick().then(() => undefined, (error: unknown) => error);
+        await Promise.race([model.called, ticking]);
+        assert.equal(model.calls.n, 1, 'premise: tick asked the model for the merge, and waits');
+        // The merge stays queued while it runs; a hold on it stops the queued merge counting.
+        strategy.holdBlocksMerges = true;
+        assert.deepEqual((await refusal(manager)).clearedBy, pinned ? [] : ['compression']);
+        model.release();
+        await ticking;
+      }, { membrane: model.membrane });
+    });
+  }
+
+  it('names compression on the hierarchical path for a chunk an exact L1 in memory covers, queued behind one a pin keeps wholly raw, since the walk goes past the first where tick adopts it', async () => {
+    const strategy = queuedChunks();
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      assert.ok(queued.length >= 2, 'two chunks or more are queued');
+      queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids));
+      pinChunks(manager, queued.slice(0, 1));
+      const error = await refusal(manager);
+      assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assert.deepEqual(error.clearedBy, ['compression']);
+    }, { membrane: true });
+  });
+
+  it('names compression for a chunk whose exact L1 only the store holds, queued behind one a pin keeps wholly raw, since the walk goes past the first where tick adopts it', async () => {
+    const strategy = queuedChunks();
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      assert.ok(queued.length >= 2, 'two chunks or more are queued');
+      queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
+      pinChunks(manager, queued.slice(0, 1));
+      const error = await refusal(manager);
+      assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assert.deepEqual(error.clearedBy, ['compression']);
+    }, { membrane: true });
+  });
+
+  it('names compression for a chunk that needs a model call, queued behind one a pin keeps wholly raw, since the walk goes past the first where tick compresses it', async () => {
+    const strategy = modelCallChunks();
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      assert.ok(queued.length >= 2, 'two chunks or more are queued');
+      pinChunks(manager, queued.slice(0, 1));
+      const error = await refusal(manager);
+      assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assert.deepEqual(error.clearedBy, ['compression']);
+    });
   });
 });

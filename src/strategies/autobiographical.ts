@@ -1124,6 +1124,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private unreportedEffectiveConfig: EffectiveConfigReport | null;
   protected chunks: Chunk[] = [];
   protected pendingCompression: Promise<void> | null = null;
+  /**
+   * What the compression in flight works on, for compressionWorkQueued: the
+   * messages of the chunk tick took, or the source summaries of the merge it
+   * runs. tick sets and clears it with pendingCompression.
+   */
+  protected pendingCompressionWork: { messageIds: readonly MessageId[] } | { sourceIds: readonly string[] } | null = null;
   protected compressionQueue: number[] = [];
   /** The context initialize was given; its `tools` getter follows the host's declarations. */
   private hostContext: StrategyContext | null = null;
@@ -1848,6 +1854,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private clearBranchMirrors(): void {
     this.chunks = [];
     this.pendingCompression = null;
+    this.pendingCompressionWork = null;
     this.compressionQueue = [];
     this._compressionCount = 0;
     this._drainProgress = 0;
@@ -4992,12 +4999,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the fact) waits; the rebuild after release re-queues it.
       if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) return;
 
+      this.pendingCompressionWork = { messageIds: chunk.messages.map((m) => m.id) };
       this.pendingCompression = this.compressChunkHierarchical(chunk, ctx);
 
       try {
         await this.pendingCompression;
       } finally {
         this.pendingCompression = null;
+        this.pendingCompressionWork = null;
       }
       return;
     }
@@ -5019,6 +5028,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this.mergeBlockedByHold(merge.sourceIds, ctx.messageStore)) return;
       this._drainProgress++; // executing a merge is real work, even if a
       // follow-on merge gets enqueued and the queue length nets out unchanged
+      this.pendingCompressionWork = { sourceIds: [...merge.sourceIds] };
       this.pendingCompression = this.executeMerge(merge.level, merge.sourceIds, ctx);
 
       try {
@@ -5105,6 +5115,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         throw error;
       } finally {
         this.pendingCompression = null;
+        this.pendingCompressionWork = null;
       }
     }
   }
@@ -8790,11 +8801,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * queued chunks first; merges can queue with `hierarchical` off, but tick
    * runs none then); or a queued chunk tick
    * would compress while it runs chunks at all (below
-   * the speculative cap). The first queued merge counts even when
-   * executeMerge will drop it as stale without a model call (a source not
-   * loaded or already parented, or a group its topology check refuses,
-   * which it quarantines): tick drops one such entry a call, so the count
-   * can name compression for it until tick reaches it. A chunk counts when
+   * the speculative cap). Each counts only when its summary would fold a
+   * message the selection can fold now (below). The first queued merge
+   * counts even when executeMerge will drop it as stale without a model
+   * call (a source not loaded or already parented, or a group its topology
+   * check refuses, which it quarantines), when a source in memory covers
+   * such a message: tick drops one such entry a call, so the count can name
+   * compression for it until tick reaches it. A merge none of whose sources
+   * is in memory covers no message, and names nothing. A chunk counts when
    * it's still uncompressed, holds no held message, has a message the
    * selection can fold now, and has no message an L1 in memory already
    * covers: its L1 shrinks the context on either path. An L1 only the store
@@ -8813,7 +8827,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * neither counts on either path. shouldCompressPreflight isn't consulted:
    * it gates only the speculative drain, and a host's tick (as a refusal's
    * recovery runs it) takes a queued chunk whatever it says. At the cap, tick
-   * runs only merges, and a merge is what relieves the cap. A held chunk
+   * runs only merges, and a merge is what relieves the cap. The count reads
+   * the cap once, as it stands when it's asked: an L1 tick makes for a chunk
+   * the walk goes past can bring the drain to the cap first, and tick then
+   * merges before it takes the chunk that counts, reaching it once merges
+   * relieve the cap, or never at a cap no merge relieves. Following the cap
+   * through the walk would take the merges tick queues on the way, which the
+   * count can't know. A held chunk
    * can be queued: select's rebuild leaves one out, but a produce op queues
    * the chunks it demands, held or not. Tick drops a held one from the queue
    * without compressing it, and its next call takes the next chunk, so a
@@ -8831,11 +8851,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * throw. So a chunk tick adopts an L1 for or stubs counts, if the selection
    * can fold one of its messages, whatever the tools or the quarantine say,
    * unless such a chunk is ahead of it, and so does a merge behind chunks
-   * tick only skips or takes without making room. Without a compression model,
-   * tick throws at the first merge it would make (executeMerge needs the
-   * model), so no merge counts, and the chunks it settles for good are those
-   * it adopts an L1 for or stubs (its drop of a covered chunk doesn't last,
-   * as above). Until the host declares its tools, tick defers
+   * tick only skips or takes without making room. Without a compression model
+   * no merge counts: tick drops a stale head merge without a model call, and
+   * throws at the first merge it would make (executeMerge needs the model).
+   * The chunks it settles for good then are those it adopts an L1 for or
+   * stubs (its drop of a covered chunk doesn't last, as above). Until the
+   * host declares its tools, tick defers
    * any other chunk whose request carries a tool block, and every other
    * chunk when the summarizer refuses requests without them (Fable and
    * Mythos), so those don't count; the tools are read from the context
@@ -8847,16 +8868,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * readable quarantine, before it asks about tools, since that stored read
    * can't always tell whether tick would defer the chunk: where tick would
    * defer such a chunk and go on, the count leaves out the work behind it.
-   * A chunk the quarantine holds doesn't count, and the walk goes past it,
-   * as tick does. Nor does a chunk with no message the selection can fold
-   * now, one outside the head and recent windows that no pin keeps raw
-   * (getCompressibleMessages, the chunker's own reading): both selectors
-   * render the head, the recent window and a message such a pin keeps as
-   * raw, so its L1 frees no room. Tick still takes it in turn, so the walk
-   * goes past it where tick moves on (after adopting an L1 for it, stubbing
-   * it, or compressing it with a model), and stops at it where tick throws,
-   * as at any chunk that needs a model call without a model or a readable
-   * quarantine. The count assumes the host keeps ticking: one that ticks a
+   * A chunk that needs a model call while the quarantine holds it doesn't
+   * count, and the walk goes past it, as tick does; one tick adopts an L1 for
+   * or stubs counts though the quarantine holds it, since tick does both
+   * before it reads the quarantine. Nor does a chunk with no message the
+   * selection can fold now, one outside the head and recent windows that no
+   * pin keeps raw (getCompressibleMessages, the chunker's own reading): both
+   * selectors render the head, the recent window and a message such a pin
+   * keeps as raw, so its L1 frees no room. Tick still takes it in turn, so
+   * the walk goes past it where tick moves on (after adopting an L1 for it,
+   * stubbing it, or compressing it with a model), and stops at it where tick
+   * throws, as at any chunk that needs a model call without a model or a
+   * readable quarantine. The same holds for a merge, whose messages are the
+   * leaves of its sources, expanded through the summaries in memory as
+   * selectHierarchical expands them, and for the work in flight: the
+   * messages of the chunk tick took, or the leaves of the merge it runs
+   * (pendingCompressionWork). Work in flight that folds nothing doesn't
+   * count, and the count goes on to the queue, since tick takes the next item
+   * once the call ends; a pendingCompression tick didn't record, which only a
+   * subclass that sets it itself can leave, counts as it did. The count
+   * assumes the host keeps ticking: one that ticks a
    * fixed number of times between compiles reaches work only within that
    * many queued chunks, since each compile queues the skipped ones again.
    * Like tick, this assumes the manager has a membrane to run it.
@@ -8865,15 +8896,44 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summary, and a merge folds summaries into one.
    */
   protected compressionWorkQueued(store: MessageStoreView, path: 'adaptive' | 'hierarchical'): boolean {
-    if (this.pendingCompression) return true;
-    // Without a compression model, tick throws at the first merge it would
-    // make (executeMerge needs the model), so none counts. It reaches a merge
-    // only once it has taken every queued chunk, or at the cap. A stale head
+    // Work frees room only where its summary folds a message the selection
+    // can fold now: both selectors keep the head and recent windows raw, and
+    // a message a pin keeps raw. That's the chunker's own reading of what's
+    // compressible (getCompressibleMessages).
+    const foldable = new Set(this.getCompressibleMessages(store).map((m) => m.id));
+    const foldsNothing = (chunk: Chunk): boolean => !chunk.messages.some((m) => foldable.has(m.id));
+    // A merge's messages are the leaves of its sources, expanded through the
+    // summaries in memory as the selectors expand them; a source not loaded
+    // gives none.
+    let summariesById: Map<string, SummaryEntry> | undefined;
+    const mergeFolds = (sourceIds: readonly string[]): boolean => {
+      summariesById ??= new Map(this.summaries.map((s) => [s.id, s]));
+      const leaves = new Set<MessageId>();
+      for (const id of sourceIds) {
+        const source = summariesById.get(id);
+        if (source) this.expandSummaryToLeafMessageIds(source, summariesById, leaves);
+      }
+      for (const leaf of leaves) if (foldable.has(leaf)) return true;
+      return false;
+    };
+    // Work in flight counts when it folds something now. When it folds
+    // nothing, tick takes the next item once its call ends, so the count goes
+    // on to the queue. Work tick didn't record, as a subclass that sets
+    // pendingCompression itself may leave, counts as it did.
+    if (this.pendingCompression) {
+      const work = this.pendingCompressionWork;
+      if (work === null) return true;
+      if ('messageIds' in work ? work.messageIds.some((id) => foldable.has(id)) : mergeFolds(work.sourceIds)) return true;
+    }
+    // Without a compression model no merge counts: tick drops a stale head
+    // merge without a model call, and throws at the first merge it would make
+    // (executeMerge needs the model). It reaches a merge only once it has
+    // taken every queued chunk, or at the cap. With a model, a stale head
     // merge, which executeMerge drops without a model call, counts until
-    // tick has dropped it.
+    // tick has dropped it, if it folds something now.
     const modelled = Boolean(this.config.compressionModel);
     const merge = this.config.hierarchical && modelled ? this.mergeQueue[0] : undefined;
-    const mergeCounts = merge !== undefined && !this.mergeBlockedByHold(merge.sourceIds, store);
+    const mergeCounts = merge !== undefined && !this.mergeBlockedByHold(merge.sourceIds, store) && mergeFolds(merge.sourceIds);
     if (this.compressionQueue.length === 0 || this.isAtSpeculativeCap()) return mergeCounts;
     const held = this.holdBlockedIds(store);
     const adoptionShrinks = path === 'hierarchical' && this.chunkPersistenceEnabled;
@@ -8897,13 +8957,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         : isToolsLessRefusingSummarizer(this.config.compressionModel ?? '') ? () => true
           : this.requestCarriesToolBlocks(store);
     const quarantined = this.quarantinedChunkSources();
-    // A chunk with no message the selection can fold now frees no room once
-    // it has an L1: both selectors keep the head and recent windows raw, and
-    // a message a pin keeps raw. That's the chunker's own reading of what's
-    // compressible (getCompressibleMessages). Tick still takes such a chunk
-    // in turn, so the walk goes past it where tick does.
-    const foldable = new Set(this.getCompressibleMessages(store).map((m) => m.id));
-    const foldsNothing = (chunk: Chunk): boolean => !chunk.messages.some((m) => foldable.has(m.id));
+    // A chunk that folds nothing frees no room once it has an L1. Tick still
+    // takes such a chunk in turn, so the walk goes past it where tick does.
     // Tick takes the queued chunks in order, one a call, and a host's tick
     // loop ends at the first call that throws.
     for (const index of this.compressionQueue) {

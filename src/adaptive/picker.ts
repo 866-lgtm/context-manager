@@ -64,19 +64,27 @@ export interface OverBudgetDiagnostics {
  * - `'compression'`: compression work that would shrink this context is
  *   running or queued, as `tick` would take it: a compression in flight;
  *   the queued chunks, in `tick`'s order, while the speculative cap lets it
- *   take one; and after them, with `hierarchical` merging on and a
- *   compression model, the first queued merge, unless a compression hold
- *   blocks it. That merge counts even when `tick` will drop it as stale
- *   without a model call: a source isn't loaded or is already merged into
- *   another summary, or its sources fail the merge's topology check, in
- *   which case `tick` quarantines it. So the count can name compression for
- *   such a merge until `tick` reaches it and drops it. A queued chunk counts
- *   when `tick` would adopt an L1 for it, stub it or compress it, and the
- *   compile can fold one of its messages now: one outside the head and
- *   recent windows that no pin keeps raw, since the compile renders the
- *   rest raw whatever summary covers them. One the compression quarantine
- *   holds, one `tick` defers until the host declares its tools, or one the
- *   compile can fold none of, doesn't, and the count goes on past it, as
+ *   take one, the cap read as it stands when the count is asked (an L1
+ *   `tick` makes on the way can bring the drain to the cap before it reaches
+ *   a chunk that counts); and after them, with `hierarchical` merging on
+ *   and a compression model, the first queued merge, unless a compression
+ *   hold blocks it. Each counts only when the compile can fold now one of
+ *   the messages its summary would cover: one outside the head and recent
+ *   windows that no pin keeps raw, since the compile renders the rest raw
+ *   whatever summary covers them. A chunk's messages are its own, a merge's
+ *   are the leaves of its sources in memory, and the work in flight's are
+ *   those of the chunk or merge `tick` is working on. When the work in
+ *   flight folds nothing, the count goes on to the queue. The merge counts
+ *   even when `tick` will drop it as stale without a model call: a source
+ *   isn't loaded or is already merged into another summary, or its sources
+ *   fail the merge's topology check, in which case `tick` quarantines it.
+ *   So the count can name compression for such a merge until `tick`
+ *   reaches it and drops it, while a source in memory covers a message the
+ *   compile can fold; one with no source in memory names nothing. A queued
+ *   chunk counts when `tick` would adopt an L1 for it, stub it or compress
+ *   it. One that needs a model call while the compression quarantine holds
+ *   it, one `tick` defers until the host declares its tools, or one the
+ *   compile can fold none of, doesn't, and the count goes on past it where
  *   `tick` does. The count reads a chunk's tool blocks
  *   as stored, where `tick` strips unpaired ones first, so it can leave out
  *   a chunk `tick` would compress, but never counts one `tick` defers. It
