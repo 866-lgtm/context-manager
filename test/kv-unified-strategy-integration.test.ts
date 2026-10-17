@@ -191,6 +191,31 @@ test('kv-unified places token-weighted 33/66/100 history markers plus tail', () 
   );
 });
 
+test('kv-unified measures where its entries first differ from the previous compile’s, as other strategies do, and marks them as before', () => {
+  const selected = strategy() as unknown as {
+    placeCacheMarkers: (
+      entries: ContextEntry[],
+      head: ReadonlySet<string>,
+      tail: ReadonlySet<string>,
+    ) => number | null;
+  };
+  const entries = (edited?: number) => Array.from({ length: 12 }, (_, index) => ({
+    index,
+    sourceMessageId: `m${index}`,
+    sourceRelation: 'copy' as const,
+    participant: 'user',
+    content: [{ type: 'text' as const, text: (index === edited ? 'y' : 'x').repeat(index === 2 ? 400 : 40) }],
+  })) as ContextEntry[];
+  const place = (es: ContextEntry[]) => selected.placeCacheMarkers(es, new Set(['m0']), new Set(['m9', 'm10', 'm11']));
+  const marks = (es: ContextEntry[]) => es.flatMap((entry, index) => (entry.cacheMarker ? [index] : []));
+  const first = entries();
+  assert.equal(place(first), null, 'no earlier compile');
+  const second = entries(6); // the same length, other bytes
+  assert.equal(place(second), 6);
+  assert.deepEqual(marks(second), marks(first));
+  assert.deepEqual(marks(first), [1, 2, 8, 11]);
+});
+
 test('kv-unified reconciles folded, composite, and tail markers to atomic layout units', () => {
   const selected = strategy() as unknown as {
     reconcileKvUnifiedMarkerIndices: (

@@ -55,6 +55,7 @@ import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { KvUnifiedStrategy, type KvUnifiedReuse } from '../adaptive/strategies/kv-unified.js';
 import { SummaryTree } from '../adaptive/summary-tree.js';
 import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
+import { describeFoldDiff, formatFoldDiff, type FoldDiff, type RequestDivergence } from '../adaptive/fold-diff.js';
 import {
   KvUnifiedReceiptChain,
   type SerializedReceiptChain,
@@ -72,6 +73,7 @@ import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms } from '../raw-forms.js';
+import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
@@ -4939,6 +4941,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         setTimeout(() => this.driveSpeculativeDrain(ctx), 0);
       })
       .catch((err) => {
+        // A host's withdrawal stops the drain quietly: the host asked for it.
+        if (isCompressionWithdrawn(err)) return;
         console.error('AutobiographicalStrategy: speculative-drain error:', err);
       });
   }
@@ -5004,11 +5008,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the fact) waits; the rebuild after release re-queues it.
       if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) return;
 
+      const table = this.chunks;
       this.pendingCompressionWork = { messageIds: chunk.messages.map((m) => m.id) };
       this.pendingCompression = this.compressChunkHierarchical(chunk, ctx);
 
       try {
         await this.pendingCompression;
+      } catch (error) {
+        // Withdrawn by the host: the chunk goes back to the head of the
+        // queue, for the next tick after the host lets calls through. A
+        // rebuild while the call was out made a new chunk table, where the
+        // index may name another chunk, and decided the queue afresh: it
+        // queued the chunk again if it may be compressed, and left it out if
+        // overlap blocks it, a fail-closed halt stopped compression, or a
+        // hold covers a chunk it reads from a record, so its queue stands. A
+        // held chunk it closes anew is queued, and tick drops it at its
+        // turn, as it drops a chunk put back here when a hold placed during
+        // the call came with no rebuild. A dry run's rebuild puts the table
+        // and the queue back, so after a preview the chunk still goes back.
+        // Queued again meanwhile without a rebuild, as a plan's demand does
+        // at the tail, it moves to the head, once. A withdrawal on a branch
+        // that moved during the call never reaches here: the call discards
+        // it, as it does any error, and the queue belongs to the branch the
+        // store left.
+        if (isCompressionWithdrawn(error) && this.chunks === table) {
+          const queued = this.compressionQueue.indexOf(chunkIndex);
+          if (queued !== -1) this.compressionQueue.splice(queued, 1);
+          this.compressionQueue.unshift(chunkIndex);
+        }
+        throw error;
       } finally {
         this.pendingCompression = null;
         this.pendingCompressionWork = null;
@@ -5047,6 +5075,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.dequeueMerge();
         }
       } catch (error) {
+        // Withdrawn by the host: no attempt, no streak; the merge stays at the
+        // head of the queue for the next tick.
+        if (isCompressionWithdrawn(error)) throw error;
         // Terminal-disposition rejection: the LLM answered, but with a
         // refusal / truncation / tool call / empty — bounded-retry policy,
         // not a crash. Anything else (429, network, timeout) keeps the
@@ -5163,7 +5194,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (opts?.dryRun !== true) {
       this.rebuildChunks(store);
       if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
-      return this.selectPath(store, budget, opts);
+      // The cache-marker baseline is the last request this strategy returned.
+      // A select refused after it placed its markers (assertMiddleCoverage,
+      // kv-unified's marker reconcile) returns none, so its keys go back, and
+      // the next compile's stable prefix and fold diff are measured against
+      // the request before it.
+      const prevCacheKeys = this._prevCacheKeys;
+      try {
+        return this.selectPath(store, budget, opts);
+      } catch (err) {
+        this._prevCacheKeys = prevCacheKeys;
+        throw err;
+      }
     }
     // A dry run commits nothing, and that includes what a select leaves for
     // the next one and for observers: the cache-marker baseline the next
@@ -5764,6 +5806,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._emittedSummaryIds = new Set();
     this._plannedTokens = null;
     this._plannedMeta = null;
+    this._lastFoldDiff = null;
     this._rs = {
       head: { messages: 0, tokens: 0 },
       tail: { messages: 0, tokens: 0 },
@@ -5794,6 +5837,54 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** The picker's projected total for this compile (planner side). */
   private _plannedTokens: number | null = null;
   private _plannedMeta: { budgetMet: boolean; exhausted: boolean; moves: number; solver: string } | null = null;
+  /** Fold diff of THIS compile, for `planVsActual`: reset with the other
+   *  figures of the pass (`rsBegin`, dry runs included) and set only when a
+   *  compile that changed at least one saved level commits. It describes the
+   *  compile it is attached to, so a quiet compile has none. */
+  private _lastFoldDiff: FoldDiff | null = null;
+
+  /**
+   * `[fold-diff]` for a compile that has just committed saved-level changes:
+   * which chunks moved between which levels, and where its request first
+   * differs from the last one returned, in its entries' tokens
+   * (`firstChanged`, the entry index `placeCacheMarkers` measured; null with
+   * no earlier compile). Logged
+   * once and returned for `planVsActual`. Observability never fails a
+   * compile: a throw is reported, and the compile goes on without it.
+   */
+  private logFoldDiff(
+    inputs: PickerInputs,
+    middleChunkCount: number,
+    levelAt: (sequence: number, id: ChunkId) => number,
+    entries: ContextEntry[],
+    firstChanged: number | null,
+  ): FoldDiff | null {
+    try {
+      // The middle chunks are the prefix of the inputs' chunks. Each carries
+      // the level it was planned from, and `levelAt` answers the level this
+      // compile gave it without materializing the solver's frontier map.
+      const middle = inputs.chunks.slice(0, middleChunkCount);
+      const carried = new Map<ChunkId, number>(middle.map((c) => [c.id, c.currentResolution]));
+      const next = new Map<ChunkId, number>(middle.map((c) => [c.id, levelAt(c.sequence, c.id)]));
+      let divergence: RequestDivergence | null = null;
+      if (firstChanged !== null) {
+        let offset = 0;
+        let suffixTokens = 0;
+        entries.forEach((entry, index) => {
+          const tokens = this.estimateTokens(entry.content);
+          if (index < firstChanged) offset += tokens;
+          else suffixTokens += tokens;
+        });
+        divergence = { offset, suffixTokens };
+      }
+      const diff = describeFoldDiff(inputs, new SummaryTree(inputs), carried, next, divergence);
+      console.error(formatFoldDiff(diff));
+      return diff;
+    } catch (err) {
+      console.warn('[fold-diff] unavailable for this compile:', err);
+      return null;
+    }
+  }
 
   protected rsSummary(level: number, tokens: number, id?: string): void {
     if (id) this._emittedSummaryIds.add(id);
@@ -5840,6 +5931,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         exhausted: m?.exhausted ?? false,
         moves: m?.moves ?? 0,
         ...(m?.solver !== undefined ? { solver: m.solver } : {}),
+        ...(this._lastFoldDiff ? { foldDiff: this._lastFoldDiff } : {}),
       };
       // Loud only when the emitter OVERRUNS the plan — that is the direction
       // that costs the tail. Under-spend is harmless slack.
@@ -6910,6 +7002,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const callStart = Date.now();
     let logResponse: string | undefined;
     let logError: string | undefined;
+    let logWithdrawn = false;
     let logSummaryId: string | undefined;
     const attemptTraces: CompressionAttemptTrace[] = [];
     let successfulTrace: CompressionAttemptTrace | undefined;
@@ -6960,8 +7053,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         } catch (error) {
           // Degraded mode: the transport rejected the carrier blocks
           // themselves (invalid_request about thinking — never a refusal).
-          // Retry this attempt once with text-only recall pairs, loudly.
-          if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(attemptRequest)) {
+          // Retry this attempt once with text-only recall pairs, loudly. A
+          // host's withdrawal is never a transport rejection, whatever it
+          // carries.
+          if (isCompressionWithdrawn(error) || !isCarrierTransportRejection(error) || !requestCarriesReasoning(attemptRequest)) {
             throw error;
           }
           console.error(
@@ -7146,6 +7241,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             }
             logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
           } catch (error) {
+            // A host's withdrawal is no outcome of this rung: rethrow it.
+            if (isCompressionWithdrawn(error)) throw error;
             if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
             const errorType = error && typeof error === 'object' && 'type' in error
               ? String((error as { type: unknown }).type)
@@ -7236,6 +7333,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               variant.children.map((child) => child.id),
             );
           } catch (error) {
+            // A host's withdrawal is no outcome of this rung: rethrow it.
+            if (isCompressionWithdrawn(error)) throw error;
             if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
             if (!this.isCompressionBranchCurrent(sourceBranch)) {
               this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:error`, quarantineRecord);
@@ -7354,6 +7453,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             }
             logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
           } catch (error) {
+            // A host's withdrawal is no outcome of this rung: rethrow it.
+            if (isCompressionWithdrawn(error)) throw error;
             if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
             const errorType = error && typeof error === 'object' && 'type' in error
               ? String((error as { type: unknown }).type)
@@ -7451,11 +7552,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const label = `split:${a}-${b}`;
             calls++;
             attempted.calls++;
-            this.splitCallTimes.push(Date.now());
+            const stamp = Date.now();
+            this.splitCallTimes.push(stamp);
             let res: unknown;
             try {
               res = await runAttempt(sub, label, [], [], leafHash);
             } catch (error) {
+              // A host's withdrawal is no outcome of this part: it gives the
+              // part's slot in the split window back once its call returns
+              // (until then the slot counts), so withdrawn parts don't
+              // accumulate in the window, and is rethrown. A part sends one
+              // call: its request carries no reasoning (buildSub strips the
+              // raw thinking and adds no recall pairs), so the carrier
+              // fallback never sends a second.
+              if (isCompressionWithdrawn(error)) {
+                const slot = this.splitCallTimes.lastIndexOf(stamp);
+                if (slot !== -1) this.splitCallTimes.splice(slot, 1);
+                throw error;
+              }
               attempted.errors++;
               if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
               abortReason = `provider-error:${error instanceof Error ? error.name : typeof error}`;
@@ -7783,12 +7897,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.checkMergeThreshold();
     } catch (error) {
       if (error instanceof Error && error.name === 'CompressionBranchDiscard') return;
+      // A host's withdrawal isn't a failure: the host asked for it, so its
+      // receipts say withdrawn rather than carrying an error, a moved
+      // branch's included. On a current branch a coalesced waiter gets it
+      // (inFlightError) and rethrows it. On a moved branch the call
+      // discards it, as it discards any error, so nothing is rethrown and a
+      // waiter resolves.
+      if (isCompressionWithdrawn(error)) logWithdrawn = true;
       if (!this.isCompressionBranchCurrent(sourceBranch)) {
-        this.logCompressionBranchDiscard(sourceBranch, 'canonical_error', quarantineRecord);
+        this.logCompressionBranchDiscard(sourceBranch, logWithdrawn ? 'canonical_withdrawn' : 'canonical_error', quarantineRecord);
         return;
       }
-      console.error('Failed to compress chunk (hierarchical):', error);
-      logError = error instanceof Error ? error.message : String(error);
+      if (!logWithdrawn) {
+        console.error('Failed to compress chunk (hierarchical):', error);
+        logError = error instanceof Error ? error.message : String(error);
+      }
       inFlightError = error;
       throw error;
     } finally {
@@ -7836,6 +7959,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           model,
           latency_ms: Date.now() - callStart,
           summary_id: logSummaryId,
+          ...(logWithdrawn ? { withdrawn: true } : {}),
         },
         response: summarizeTelemetryText(logResponse),
         error: logError,
@@ -8577,6 +8701,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const callStart = Date.now();
     let logResponse: string | undefined;
     let logError: string | undefined;
+    let logWithdrawn = false;
     let logNewSummaryId: string | undefined;
     // The request last sent: `dispatchRequest`, or after a carrier
     // rejection its copy with the reasoning stripped. When the call
@@ -8590,8 +8715,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         response = await ctx.membrane.complete(dispatchRequest, { formatter: this.nativeFormatter });
       } catch (error) {
         // Same degraded-mode fallback as the L1 ladder: transport rejected
-        // the carrier blocks → retry once text-only, loudly.
-        if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(dispatchRequest)) throw error;
+        // the carrier blocks → retry once text-only, loudly. A host's
+        // withdrawal is never a transport rejection, whatever it carries.
+        if (isCompressionWithdrawn(error) || !isCarrierTransportRejection(error) || !requestCarriesReasoning(dispatchRequest)) throw error;
         console.error(
           `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
             `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -8732,10 +8858,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } catch (error) {
       // Disposition rejections already warned + receipted above — don't
       // double-log them as crashes; tick() consumes them for retry policy.
-      if (!(error instanceof MergeDispositionRejection)) {
+      if (!(error instanceof MergeDispositionRejection) && !isCompressionWithdrawn(error)) {
         console.error(`Failed to merge summaries into L${targetLevel}:`, error);
       }
-      logError = error instanceof Error ? error.message : String(error);
+      // A withdrawal's receipt says withdrawn rather than carrying an error.
+      if (isCompressionWithdrawn(error)) logWithdrawn = true;
+      else logError = error instanceof Error ? error.message : String(error);
       throw error;
     } finally {
       logCompressionCall({
@@ -8758,6 +8886,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           model: this.requireCompressionModel(),
           latency_ms: Date.now() - callStart,
           summary_id: logNewSummaryId,
+          ...(logWithdrawn ? { withdrawn: true } : {}),
         },
         response: summarizeTelemetryText(logResponse),
         error: logError,
@@ -10035,7 +10164,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // single head marker the cache hit is ~2%; well-placed breakpoints take the
     // real strategy to ~50% (docs/kv-stable-context-control.md — marker
     // placement is the dominant KV lever).
-    this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
+    const firstChanged = this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
     // A dry run made no draft of its own (see the draft's creation), so the
     // draft here is the last real compile's, which a dry layout must not
     // re-mark.
@@ -10055,6 +10184,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (const [id, level] of pendingResolutionChanges) this.resolutions.set(id, level);
       this.persistResolutions();
       selectionCause = 'budget-fit';
+      // The fold is now real: say once what it moved and where this request
+      // first differs from the last one returned. A plan refused before here
+      // logs nothing, so a retry doesn't log the same moves twice, and a
+      // compile that changes no saved level logs nothing either, however many
+      // locked chunks its solver moved (PR #157 review).
+      this._lastFoldDiff = this.logFoldDiff(pickerInputs, middleChunkCount, levelAt, merged, firstChanged);
     }
     if (!dryRun) this.pendingSelectionCause = selectionCause;
     // Same commit point for the receipt left behind by kv-unified: a real
@@ -10545,9 +10680,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Previous compile's per-entry cache identities (participant + content
-   * bytes), used to find the measured stable-prefix boundary. In-memory only:
-   * after a restart the first compile falls back to seam placement.
+   * Per-entry cache identities (participant + content bytes) of the last
+   * request this strategy returned, used to find the measured stable-prefix
+   * boundary, which the fold diff also reports. A select that throws puts the
+   * previous ones back (select). In-memory only: after a restart the first
+   * compile falls back to seam placement.
    */
   protected _prevCacheKeys?: string[];
 
@@ -10598,16 +10735,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * degradation (Rhys, 2026-07-26: "A maximum of 4 blocks with
    * cache_control may be provided. Found 5.").
    *
-   * Idempotent; clears any pre-existing markers first.
+   * Returns the index of this compile's first entry whose bytes differ from
+   * the previous compile's entry at the same position, or that has none there
+   * (the first appended one): the measurement behind the stable-prefix mark,
+   * which the fold diff reports. It is the entry count only when these
+   * entries are the previous compile's or a prefix of them, and null with no
+   * earlier compile to compare or no entries.
+   *
+   * Clears any pre-existing markers first. It records these entries' keys for
+   * the next compile to compare with, so a second call on the same entries
+   * returns their count.
    */
   protected placeCacheMarkers(
     entries: ContextEntry[],
     headMessageIds: ReadonlySet<MessageId>,
     tailMessageIds: ReadonlySet<MessageId>,
-  ): void {
+  ): number | null {
     for (const e of entries) if (e.cacheMarker) e.cacheMarker = false;
     const n = entries.length;
-    if (n === 0) return;
+    if (n === 0) return null;
+
+    // Measured stable prefix: first index where this compile's entry bytes
+    // diverge from the previous compile's. Measured for every strategy, since
+    // the fold diff reports it; kv-unified places its markers without it.
+    const keys = entries.map(
+      (e) => `${e.participant}\0${JSON.stringify(e.content)}`,
+    );
+    let firstDiff = n;
+    const prev = this._prevCacheKeys;
+    if (prev) {
+      let i = 0;
+      while (i < n && i < prev.length && keys[i] === prev[i]) i++;
+      firstDiff = i;
+    }
+    this._prevCacheKeys = keys;
+    const firstChanged = prev ? firstDiff : null;
 
     let lastHead = -1;
     let firstTail = n;
@@ -10675,25 +10837,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         );
       }
       for (const idx of marks) entries[idx]!.cacheMarker = true;
-      return;
+      return firstChanged;
     }
 
-    // Measured stable prefix: first index where this compile's entry bytes
-    // diverge from the previous compile's. No previous compile → seam
+    // The measured stable prefix's last entry. No previous compile → seam
     // placement, the old bounded cold-start behavior. Later pure appends mark
     // the previous endpoint itself so reuse never depends on Anthropic finding
     // it within the new end marker's 20-block backward-search window.
-    const keys = entries.map(
-      (e) => `${e.participant}\0${JSON.stringify(e.content)}`,
-    );
-    let firstDiff = n;
-    const prev = this._prevCacheKeys;
-    if (prev) {
-      let i = 0;
-      while (i < n && i < prev.length && keys[i] === prev[i]) i++;
-      firstDiff = i;
-    }
-    this._prevCacheKeys = keys;
     const stableEnd = prev ? firstDiff - 1 : historyEnd;
 
     const marks = new Set<number>();
@@ -10714,6 +10864,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     for (const idx of marks) if (idx >= 0 && idx < n) entries[idx].cacheMarker = true;
+    return firstChanged;
   }
 
   /** Convert emitted message markers back to atomic solver-layout boundaries.

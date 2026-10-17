@@ -23,6 +23,7 @@ import { existsSync, rmSync } from 'node:fs';
 import {
   ContextManager,
   AutobiographicalStrategy,
+  CompressionWithdrawn,
   getMintRequestByHash,
   getMintRequestPreimageBytes,
   MintPreimageMaterializationError,
@@ -407,6 +408,43 @@ const acceptedRequestCases: Array<{ label: string; script: ScriptedAttemptOutcom
   { label: 'tool_use rejection then the no-tools retry', script: ['tool_use', 'accept'] },
   { label: 'carrier-400 rejection then the stripped retry', script: ['carrier_reject', 'accept'] },
 ];
+
+describe("a host's withdrawal of an L1 call shaped like a carrier rejection (CompressionWithdrawn)", () => {
+  after(cleanup);
+
+  const carrierShape = { httpStatus: 400, message: 'invalid_request: thinking blocks cannot be modified' };
+  const carriesReasoning = (request: NormalizedRequest): boolean =>
+    request.messages.some((message) => message.content.some((block) => block.type === 'thinking'));
+
+  it('rethrows a withdrawal without the stripped retry that the same shape gets unbranded', async () => {
+    // The premise: without the brand, this shape is a transport rejection of the request's carriers.
+    const controlRequests: NormalizedRequest[] = [];
+    const control = await acceptedRequestFixture({
+      complete: async (request: NormalizedRequest) => {
+        controlRequests.push(structuredClone(request));
+        if (controlRequests.length === 1) throw Object.assign(new Error(), carrierShape);
+        return { stopReason: 'end_turn', content: [t('zz-l1-memory-2')], usage: { inputTokens: 100, outputTokens: 20 } };
+      },
+    });
+    await control.strategy.run(control.target, ctx(control.manager));
+    assert.equal(controlRequests.length, 2, 'the premise: unbranded, this shape gets the stripped retry');
+    assert.ok(carriesReasoning(controlRequests[0]!) && !carriesReasoning(controlRequests[1]!), 'the premise: the retry is the request stripped of its reasoning');
+    await control.manager.close();
+
+    const withdrawn = Object.assign(new CompressionWithdrawn(), carrierShape);
+    const requests: NormalizedRequest[] = [];
+    const fx = await acceptedRequestFixture({
+      complete: async (request: NormalizedRequest) => {
+        requests.push(structuredClone(request));
+        throw withdrawn;
+      },
+    });
+    await assert.rejects(fx.strategy.run(fx.target, ctx(fx.manager)), (error) => error === withdrawn);
+    assert.ok(carriesReasoning(requests[0]!), 'setup: the request carries reasoning blocks (the carrier path needs them)');
+    assert.equal(requests.length, 1, 'no stripped retry: a withdrawal is never a transport rejection');
+    await fx.manager.close();
+  });
+});
 
 describe('Mint preimages follow the accepted request', () => {
   after(cleanup);

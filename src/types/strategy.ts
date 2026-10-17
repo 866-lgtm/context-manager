@@ -1,6 +1,7 @@
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
+import type { FoldDiff } from '../adaptive/fold-diff.js';
 import type {
   ContextEntry,
   TokenBudget,
@@ -661,6 +662,11 @@ export interface RenderStats {
      *  'flat-profile'). Surfaces the policy actually in force — a config
      *  clobber that silently downgrades the solver is invisible without it. */
     solver?: string;
+    /** Which chunks moved between which levels, and where this request's
+     *  entries first differ from those of the last request the strategy
+     *  returned, past which no cached prefix reaches. Present only when a
+     *  compile that changed at least one saved level committed. */
+    foldDiff?: FoldDiff;
   };
 }
 
