@@ -62,7 +62,13 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   /** The message ids tick recorded for the chunk it's compressing, or undefined when no chunk is in flight. */
   chunkInFlight(): readonly string[] | undefined {
     const work = this.pendingCompressionWork;
-    return work !== null && 'messageIds' in work ? work.messageIds : undefined;
+    return work !== null && 'chunk' in work ? work.chunk.messages.map((m) => m.id) : undefined;
+  }
+
+  /** Whether the chunk tick is compressing has landed its result (its compressed flag), or undefined when no chunk is in flight. */
+  chunkInFlightCompressed(): boolean | undefined {
+    const work = this.pendingCompressionWork;
+    return work !== null && 'chunk' in work ? work.chunk.compressed : undefined;
   }
 
   /** Queues a merge of summaries that aren't in memory, as a merge queued before its sources were dropped is. */
@@ -2741,6 +2747,37 @@ describe('OverBudgetError.clearedBy', () => {
       await ticking;
       manager.releaseCompression([later]);
     }, { membrane: model.membrane });
+  });
+
+  it('names nothing while tick finishes a chunk whose L1 has landed, though its call hasn\'t ended, since the compile folds through that L1', async () => {
+    const strategy = modelCallChunks();
+    const { membrane } = answeringMembrane(() => undefined);
+    let landed!: () => void;
+    const atLanding = new Promise<void>((resolve) => { landed = resolve; });
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      assert.ok(queued.length >= 2, 'two chunks or more are queued');
+      // Every chunk after the first is pinned wholly raw, so the first is all that can count.
+      pinChunks(manager, queued.slice(1));
+      assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'before tick, the first chunk counts');
+      // The success path's quarantine clean-up, held open as a store write for a matching record holds it.
+      (strategy as unknown as { clearQuarantineForCompressedChunk: () => Promise<void> }).clearQuarantineForCompressedChunk = () => {
+        landed();
+        return gate;
+      };
+      const ticking = manager.tick();
+      await atLanding;
+      assert.deepEqual(strategy.chunkInFlight(), queued[0], 'premise: the chunk in flight is the first queued');
+      assert.equal(strategy.chunkInFlightCompressed(), true, 'premise: its result has landed, the chunk compressed');
+      assert.equal(strategy.summaryIds().length, 1, 'premise: and its L1 is in memory');
+      assert.deepEqual((await refusal(manager)).clearedBy, []);
+      open();
+      await ticking;
+      assert.deepEqual((await refusal(manager)).clearedBy, [], 'nor once the call has ended');
+    }, { membrane });
   });
 
   it('names nothing while tick compresses a chunk that a hold placed since reaches, since its landing discards the L1', async () => {

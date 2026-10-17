@@ -1128,15 +1128,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected pendingCompression: Promise<void> | null = null;
   /**
    * What the compression in flight works on, for compressionWorkQueued: the
-   * messages of the chunk tick took, or the source summaries of the merge it
-   * runs, which tick leaves at the head of the merge queue until it lands.
+   * chunk tick took, whose compressed flag says once its result has landed
+   * (set on that object, which a rebuild leaves alone, before the call's own
+   * end), or the source summaries of the merge it runs, which tick leaves at
+   * the head of the merge queue until it lands.
    * tick sets it before each call and clears it with pendingCompression. A
    * call whose synchronous start finds the branch gone can clear it with the
    * mirrors first (requireLoadedBranch does unless an initializer is still
    * current), and pendingCompression is then set with nothing recorded
    * beside it until tick's finally.
    */
-  protected pendingCompressionWork: { messageIds: readonly MessageId[] } | { sourceIds: readonly string[] } | null = null;
+  protected pendingCompressionWork: { chunk: Chunk } | { sourceIds: readonly string[] } | null = null;
   protected compressionQueue: number[] = [];
   /** The context initialize was given; its `tools` getter follows the host's declarations. */
   private hostContext: StrategyContext | null = null;
@@ -5009,7 +5011,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) return;
 
       const table = this.chunks;
-      this.pendingCompressionWork = { messageIds: chunk.messages.map((m) => m.id) };
+      this.pendingCompressionWork = { chunk };
       this.pendingCompression = this.compressChunkHierarchical(chunk, ctx);
 
       try {
@@ -9035,9 +9037,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * count, nor does work a compression hold placed since reaches (for a
    * chunk, one of its messages held, chunkHasHeldMessage's rule; for a merge,
    * mergeBlockedByHold), since its landing checks the hold and discards what
-   * the call returns. Either way the count goes on to the queue: tick takes
-   * the next chunk once the call ends, and a merge in flight is still the
-   * head, where the walk reads it. A pendingCompression with nothing
+   * the call returns. Nor does a chunk whose result has landed before the
+   * call ends, its compressed flag set, since the compile folds through its
+   * summary from then: its success and adoption paths set the flag and then
+   * await a quarantine clean-up (clearQuarantineForCompressedChunk), a store
+   * write when a record matches the chunk. A merge's L2 lands with no await
+   * left before its call ends, so the moment between its landing and tick's
+   * finally is a microtask, and the count can name compression for a merge
+   * then, as the walk reads it at the head until tick dequeues it. Either
+   * way the count goes on to the queue: tick takes the next chunk once the
+   * call ends, and a merge in flight is still the head, where the walk reads
+   * it. A pendingCompression with nothing
    * recorded beside it counts as it did: tick can leave one for a moment
    * when a call's synchronous start finds the branch gone
    * (requireLoadedBranch can clear the record with the mirrors before it
@@ -9085,10 +9095,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.pendingCompression) {
       const work = this.pendingCompressionWork;
       if (work === null) return true;
-      if ('messageIds' in work) {
-        // chunkHasHeldMessage's rule, over the ids tick recorded.
-        const reached = held !== null && work.messageIds.some((id) => held.has(id));
-        if (!reached && work.messageIds.some((id) => foldable.has(id))) return true;
+      if ('chunk' in work) {
+        // Its result has landed once the chunk is compressed; until then,
+        // chunkHasHeldMessage's rule over its messages.
+        const ids = work.chunk.messages.map((m) => m.id);
+        const reached = held !== null && ids.some((id) => held.has(id));
+        if (!work.chunk.compressed && !reached && ids.some((id) => foldable.has(id))) return true;
       } else if (!this.mergeBlockedByHold([...work.sourceIds], store, held) && mergeFolds(work.sourceIds)) {
         return true;
       }
