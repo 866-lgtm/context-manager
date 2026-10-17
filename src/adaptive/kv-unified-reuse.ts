@@ -1,6 +1,7 @@
 import type { CanonicalSummaryForest } from './kv-unified.js';
 import type { SummaryTree } from './summary-tree.js';
 import type { CertificateDag } from './kv-unified-certificate.js';
+import type { SubtreeMemo } from './kv-unified-subtree.js';
 
 /**
  * Mutable holder a host keeps across compiles so structures that depend only
@@ -14,5 +15,10 @@ export interface KvUnifiedReuse {
   forest?: CanonicalSummaryForest;
   tree?: SummaryTree;
   certificate?: CertificateDag;
+  /** The subtree engine's delta sets per summary id, validated against the
+   * summary's structure and its leaves on every read, so they survive a
+   * full forest rebuild (see kv-unified-subtree.ts). What-if holders share
+   * the live one. */
+  subtree?: SubtreeMemo;
   whatIf?: Map<string, KvUnifiedReuse>;
 }

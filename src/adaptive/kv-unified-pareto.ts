@@ -4,6 +4,7 @@ import { tailUnits } from './render-offsets.js';
 import { certifyCarriedLayout, type HysteresisCertificate } from './kv-unified-certificate.js';
 import { TerminalPolicyEvaluator } from './kv-unified-terminal.js';
 import { PackedDagSolver } from './kv-unified-packed.js';
+import { SubtreeMemoSolver, type SubtreeSolveStats } from './kv-unified-subtree.js';
 import {
   CanonicalSummaryForest,
   SparseLabelCeilingError,
@@ -105,7 +106,9 @@ export type ParetoSolveOptions = ExactPolicySolveOptions & {
   tokenBucketSize?: number;
   continuityBucketSize?: number;
   fidelityBucketSize?: number;
-  engine?: 'auto' | 'leaf' | 'dag';
+  /** `auto` (absent) and `subtree` run the subtree-memoized engine, `dag`
+   * the packed DAG engine; `leaf` is the exact reference path. */
+  engine?: 'auto' | 'leaf' | 'dag' | 'subtree';
   /** Opt-in prototype: prove the hysteresis selection before propagating labels. */
   hysteresisCertificate?: boolean;
   /** Diagnostic reference path; the normal DAG path uses packed storage. */
@@ -129,6 +132,9 @@ export class ParetoKvUnifiedPolicySolver {
   private bufferGapEmissions = false;
   /** Wall time of the last certificate attempt, succeeded or not. */
   lastCertificateMs = 0;
+  /** Set when the last solve ran the subtree-memoized engine; null when
+   * another engine (or the certificate) decided. */
+  lastSubtreeStats: SubtreeSolveStats | null = null;
 
   constructor(private readonly inputs: PickerInputs, forest?: CanonicalSummaryForest) {
     this.forest = forest ?? new CanonicalSummaryForest(inputs);
@@ -154,6 +160,7 @@ export class ParetoKvUnifiedPolicySolver {
     // presentation map edited in between, must not be served the old read.
     options = { ...options };
     this.summaryMetricCache = new WeakMap();
+    this.lastSubtreeStats = null;
     const internalHoles = this.forest.hasInternalProtectedHoles();
     const gapBearingOwnership = this.forest.gapBearingSummaryIds.length > 0;
     if (options.hysteresisCertificate) {
@@ -166,8 +173,15 @@ export class ParetoKvUnifiedPolicySolver {
       if (options.storage !== 'objects') {
         const feasibility = this.forest.minimumTokens(options.maxTokens);
         if (!feasibility.feasible) return { feasible: false, feasibility };
-        return new PackedDagSolver(this.inputs, this.forest, options, gapBearingOwnership || internalHoles,
-          (error) => this.approximationBound(options, normalizePolicy(options.policy), error), feasibility).solve();
+        const buffered = gapBearingOwnership || internalHoles;
+        const bound = (error: ApproximationEnvelope) => this.approximationBound(options, normalizePolicy(options.policy), error);
+        if (options.engine !== 'dag') {
+          const subtree = new SubtreeMemoSolver(this.inputs, this.forest, options, buffered, bound, feasibility);
+          const result = subtree.solve();
+          this.lastSubtreeStats = subtree.lastStats;
+          return result;
+        }
+        return new PackedDagSolver(this.inputs, this.forest, options, buffered, bound, feasibility).solve();
       }
       this.bufferGapEmissions = gapBearingOwnership || internalHoles;
       try {
