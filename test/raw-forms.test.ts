@@ -641,7 +641,7 @@ describe('raw forms: the recall envelope', () => {
     assert.deepEqual(refs, [{ id: 'L1-a', level: 1 }]);
   });
 
-  describe("the combined answer's layout of blank blocks (capmark-r5 I2, I5, I7, I10)", () => {
+  describe("the combined answer's layout of blank blocks", () => {
     class Exposed extends AutobiographicalStrategy {
       render(entries: SummaryEntry[], cap: number) { return this.renderCombinedRecallAnswer(entries, cap); }
       truncate(content: ContentBlock[], cap: number) { return this.truncateContent(content, cap); }
@@ -650,7 +650,7 @@ describe('raw forms: the recall envelope', () => {
     const plain = (t: string): ContentBlock => ({ type: 'text', text: t });
     const listed = (refs: Array<{ id: string; partial?: true }>) => refs.map((r) => r.id + (r.partial ? '~' : ''));
 
-    it("doesn't name a summary whose only survivor is a blank part that came back as a copy, since it shows none of the summary (capmark-r8 read)", () => {
+    it("doesn't name a summary whose only survivor is a blank part that came back as a copy, since it shows none of the summary", () => {
       const itemA = { ...MESSAGE_ITEM, id: 'msg_a' };
       // The blank part spends a cap of 200 characters exactly and is kept. The next part, of the same
       // item, is past the cap: it's dropped for the marker, and the item is given up, so the blank part
@@ -663,7 +663,7 @@ describe('raw forms: the recall envelope', () => {
       assert.deepEqual(listed(refs), [], 'its blank copy shows nothing, and it lost its next part');
     });
 
-    it("doesn't name a summary whose only survivor is a blank part kept as it was, since it shows none of the summary (capmark-r8 read)", () => {
+    it("doesn't name a summary whose only survivor is a blank part kept as it was, since it shows none of the summary", () => {
       // The blank part spends a cap of 200 characters exactly and is kept as the same block; the next
       // part is past the cap and dropped for the marker.
       const a = { ...summary, id: 'L1-a', responseContent: [plain(' '.repeat(200)), plain('the rest of the answer')] };
@@ -673,7 +673,7 @@ describe('raw forms: the recall envelope', () => {
       assert.deepEqual(listed(refs), [], 'its blank part shows nothing, and it lost its next part');
     });
 
-    it("in the xml answer, doesn't admit a summary of which only blank blocks reach the cap, whether kept or across it (capmark-r8 read)", () => {
+    it("in the xml answer, doesn't admit a summary of which only blank blocks reach the cap, whether kept or across it", () => {
       const strategy = new Exposed({ recallEnvelope: 'xml' });
       // 'first answer' spends 3 tokens of a cap of 25, and the separator 2, so the second summary's
       // prose has 20 tokens, 80 characters: its blank block spends them exactly and is kept, and
@@ -705,7 +705,7 @@ describe('raw forms: the recall envelope', () => {
       assert.deepEqual(listed(refs), ['L1-a', 'L1-b', 'L1-c~'], 'the blank summary is in the answer as it is, and lost nothing');
     });
 
-    it('in the xml answer, admits a summary whose prose holds nothing, kept before the cap, and names it whole (capmark-r9 I1)', () => {
+    it('in the xml answer, admits a summary whose prose holds nothing, kept before the cap, and names it whole', () => {
       const a = { ...summary, id: 'L1-a', responseContent: [plain('first answer')] };
       const blank = { ...summary, id: 'L1-b', responseContent: [plain('   ')] };
       const c = { ...summary, id: 'L1-c', responseContent: [plain('x'.repeat(800))] };
@@ -714,7 +714,7 @@ describe('raw forms: the recall envelope', () => {
       assert.ok(content.some((b) => b.type === 'text' && b.text.includes('   ')), 'its blank block is sent');
     });
 
-    it('takes a block of a summary whose text equals the marker, come back as a copy, for that block and not the marker (capmark-r9 I4)', () => {
+    it('takes a block of a summary whose text equals the marker, come back as a copy, for that block and not the marker', () => {
       const itemA = { ...MESSAGE_ITEM, id: 'msg_a' };
       // A blank part and a part whose text is the marker's spend a cap of 56 characters exactly, so the
       // next part, of the same item, is dropped for the marker, and both kept parts come back as copies.
@@ -757,7 +757,7 @@ describe('raw forms: the recall envelope', () => {
       assert.equal((after.content.at(-1) as { text: string }).text, OMITTED, 'and the marker says the summary after it was left out');
     });
 
-    it('in the xml answer, a cap that admits no summary gives the marker alone and lists none (capmark-r6 I1)', () => {
+    it('in the xml answer, a cap that admits no summary gives the marker alone and lists none', () => {
       const strategy = new Exposed({ recallEnvelope: 'xml' });
       // The first summary's 400 characters of whitespace cross the cap's 100, so the cap ends at it.
       const blank = { ...summary, id: 'L1-1', responseContent: [plain(' '.repeat(400))] };
@@ -770,7 +770,7 @@ describe('raw forms: the recall envelope', () => {
       }
     });
 
-    it("names a summary partial when the blank part it left out was its message item's only part, so the reasoning paired with that item gives up its id (capmark-r6 I10)", () => {
+    it("names a summary partial when the blank part it left out was its message item's only part, so the reasoning paired with that item gives up its id", () => {
       const think = reasoning();
       // The blank part's 400 characters cross the cap's 200, and no other part carries its message item.
       const a = { ...summary, id: 'L1-a', responseContent: [think, itemText(' '.repeat(400))] };
@@ -781,7 +781,7 @@ describe('raw forms: the recall envelope', () => {
       assert.deepEqual(listed(refs), ['L1-a~'], 'so the summary is partial, as after a cut');
     });
 
-    it("in the xml answer, names a summary partial when the blank part it left out was its message item's only part, so the reasoning paired with that item gives up its id (capmark-r7 I3)", () => {
+    it("in the xml answer, names a summary partial when the blank part it left out was its message item's only part, so the reasoning paired with that item gives up its id", () => {
       const think = reasoning();
       // The blank part's 400 characters cross the cap's 200, and no other part carries its message item.
       const a = { ...summary, id: 'L1-a', responseContent: [think, itemText(' '.repeat(400))] };
@@ -792,7 +792,7 @@ describe('raw forms: the recall envelope', () => {
       assert.deepEqual(listed(refs), ['L1-a~'], 'so the summary is partial, as in the plain answer');
     });
 
-    it('in the plain answer, a summary whose blocks all hold nothing and that the cap cuts gives the marker alone and lists none, as the xml answer does (capmark-r7 I2)', () => {
+    it('in the plain answer, a summary whose blocks all hold nothing and that the cap cuts gives the marker alone and lists none, as the xml answer does', () => {
       // A blank block that fits the cap's 100 characters, and one after it that crosses them: every
       // survivor would hold nothing, so the content is the marker alone, which carries none of the summary.
       const blank = { ...summary, id: 'L1-a', responseContent: [plain('  '), plain(' '.repeat(400))] };
@@ -802,7 +802,7 @@ describe('raw forms: the recall envelope', () => {
     });
   });
 
-  it("a single recall answer whose prose holds nothing past the cap is the marker alone, listed whole: it answers for its summary, so it can't leave it out or be empty (capmark-r6 I2)", () => {
+  it("a single recall answer whose prose holds nothing past the cap is the marker alone, listed whole: it answers for its summary, so it can't leave it out or be empty", () => {
     class Exposed extends AutobiographicalStrategy {
       render(entry: SummaryEntry, cap: number) { return this.renderSummaryAnswer(entry, cap); }
     }

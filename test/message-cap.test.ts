@@ -117,17 +117,17 @@ describe('capContent', () => {
     assert.deepEqual(out.map(textOf), ['a'.repeat(399), CAP_OMISSION_TEXT], 'the next block that holds anything is past the cap, and marked');
   });
 
-  it('brings content the cap leaves nothing of back as the marker alone, so a message is never emptied (capmark-r5 I8)', () => {
+  it('brings content the cap leaves nothing of back as the marker alone, so a message is never emptied', () => {
     assert.deepEqual(capContent([text(' '.repeat(1000))], 100, textEstimate).map(textOf), [CAP_OMISSION_TEXT]);
     assert.deepEqual(capContent([text('\n'.repeat(500)), text(' '.repeat(10))], 100, textEstimate).map(textOf), [CAP_OMISSION_TEXT]);
   });
 
-  it('brings content of blank blocks back as the marker alone when one fits and a later one crosses the cap, so it is not whitespace alone (capmark-r6 I3)', () => {
+  it('brings content of blank blocks back as the marker alone when one fits and a later one crosses the cap, so it is not whitespace alone', () => {
     const fits = text(' '.repeat(10));
     assert.deepEqual(capContent([fits, text(' '.repeat(1000))], 100, textEstimate).map(textOf), [CAP_OMISSION_TEXT]);
   });
 
-  it('leaves out a blank block that crosses the cap with no marker when nothing after it holds anything (capmark-r6 I8)', () => {
+  it('leaves out a blank block that crosses the cap with no marker when nothing after it holds anything', () => {
     // 'a' x 300 leaves 100 of the cap's 400 characters, and the blank block after it is 200 long.
     const out = capContent([text('a'.repeat(300)), text(' '.repeat(200))], 100, textEstimate);
     assert.deepEqual(out.map(textOf), ['a'.repeat(300)], 'the text as it was, and no marker: what was left out held nothing');
