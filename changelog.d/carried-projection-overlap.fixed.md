@@ -28,6 +28,11 @@
   other leaves. It used to hold the leaves of the summary that doesn't list
   the chunk, which nothing pins, and leave the pinned chunk unheld, so it
   rendered raw when there was room.
+- kv-stable: where two pins-at-level overlap a chunk and one of them holds it
+  at a level where its lineage has no summary, the finer level now holds it.
+  The other pin used to replace the finer level when kv-stable read it
+  second, and the chunk rendered raw, with the picker reporting a level it
+  can't realize.
 - kv-stable: on a store whose summary tree isn't nested, the solve's
   un-fold pass now moves the leaves a summary renders, decided by each
   leaf's own lineage as the projection decides. It used to leave out any

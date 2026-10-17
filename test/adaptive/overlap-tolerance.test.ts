@@ -634,6 +634,44 @@ test('a pin-at-level lowered to a level its own lineage skips is held there, and
   assert.equal(result.finalResolutions.get('x') ?? 0, 0, 'x, which nothing pins, renders raw');
 });
 
+// From Greptile's second review of #186: N, the L1 of x and y, names T, an L3,
+// as its parent, so their lineage skips L2, and T, written from M alone, lists
+// neither. x is pinned at L1, which holds N's leaves there, y among them. y is
+// pinned at L2, or at L3 and lowered to L2, and either way held at L2 alone,
+// since its lineage has no summary there. The finer level, x's, holds y in
+// either order. When y's pin came second, its L2 replaced x's L1, and y
+// rendered raw beside N's recall: 143 tokens against a window of 60, and the
+// picker reported y's level as one it can't realize.
+for (const yPin of [2, 3]) {
+  for (const order of ['x first', 'y first'] as const) {
+    test(`a pin at L${yPin} that holds y at L2, which y's lineage skips, leaves y at a finer pin's level (${order})`, () => {
+      const x = message('x', 0, 100, 'N'), y = message('y', 1, 100, 'N'), z = message('z', 2, 10, 'Z');
+      x.pinLevel = 1;
+      y.pinLevel = yPin;
+      const chunks = order === 'x first' ? [x, y, z] : [y, x, z];
+      chunks.forEach((c, i) => { c.sequence = i; });
+      const { inputs, tree } = store(chunks, [
+        summary('N', 1, chunks.slice(0, 2).map((c) => c.id), 40, 'T'),
+        summary('Z', 1, ['z'], 5, 'M'), summary('M', 2, ['Z'], 4, 'T'), summary('T', 3, ['M'], 3),
+      ]);
+      const original = console.error;
+      const lines: string[] = [];
+      console.error = (...args: unknown[]) => { lines.push(String(args[0])); };
+      let result;
+      try {
+        result = new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 60, targetBudget: 55, slack: 0.1 });
+      } finally {
+        console.error = original;
+      }
+      assert.equal(result.finalResolutions.get('y'), 1, 'y is held at L1, with x');
+      const units = unitsOf(renderLayout(inputs, tree, result.finalResolutions));
+      assert.ok(units.includes('recall:N') && !units.includes('raw:y'), `y renders in N's recall: ${units.join(' ')}`);
+      assert.equal(result.exhausted, false);
+      assert.deepEqual(lines.filter((l) => l.includes('[picker-unrealizable]')), []);
+    });
+  }
+}
+
 // m0 is held at L1, where its own A renders it, and the plan folds m1 and m2
 // to their L2 P, which lists m0 too and is m0's own lineage there. So m0 is
 // in A's recall and P's. Every summary the plan renders lists exactly the

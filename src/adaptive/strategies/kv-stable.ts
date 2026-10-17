@@ -132,18 +132,22 @@ export class KvStableStrategy implements FoldingSolver {
     // nothing pins and leave this one raw. If its lineage has no summary at
     // the level (a parent more than one level up skips it), fix just the
     // chunk there: the base keeps that level, and the chunk renders raw. Skip
-    // leaves already forced raw (head/tail/classic pin).
+    // leaves already forced raw (head/tail/classic pin). Where two pins
+    // overlap a chunk, the finest level wins, whichever pin comes first and
+    // whether or not a summary holds the chunk there.
     const listedBy = new Map<string, ReadonlySet<ChunkId>>();
+    const hold = (leaf: ChunkId, level: number): void => {
+      const prev = fixedLevels.get(leaf);
+      fixedLevels.set(leaf, prev === undefined ? level : Math.min(prev, level));
+    };
     for (const { id, level } of fixedPins) {
       const eff = renderableLevel(tree, id, Math.min(level, tree.maxLevel(id)), listedBy);
       if (eff <= 0) { rawZone.add(id); continue; }
       const node = tree.ancestorAt(id, eff);
-      if (!node) { fixedLevels.set(id, eff); continue; }
+      if (!node) { hold(id, eff); continue; }
       for (const leaf of node.leafChunkIds) {
         if (rawZone.has(leaf)) continue;
-        // Finest requirement wins if two pins overlap a leaf.
-        const prev = fixedLevels.get(leaf);
-        fixedLevels.set(leaf, prev === undefined ? eff : Math.min(prev, eff));
+        hold(leaf, eff);
       }
     }
 
