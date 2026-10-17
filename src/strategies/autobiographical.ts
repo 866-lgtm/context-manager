@@ -608,6 +608,16 @@ interface CompressionRefusalOutcomeRecord {
   budgetTokens?: number;
 }
 
+/** One request's admission against compressionContextBudgetTokens (see compressionAdmission). */
+interface CompressionAdmission {
+  expansionDeltaTokens: number;
+  boundedInputTokens: number;
+  outputReserveTokens: number;
+  admittedTokens: number;
+  budgetTokens: number;
+  disposition: 'provider_attempt' | 'admission_rejected';
+}
+
 interface CompressionRefusalPlanRecord extends CompressionRefusalVariantRecord {
   curveLabel: string;
   accountingSource:
@@ -3387,12 +3397,70 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Admission for a request the refusal ladder sends after the canonical, one
+   * rule for the recall-curve variants and both tool-prose hoists: the
+   * provider's count of the request it rewrites (its base), plus what the
+   * rewrite adds in the complete normalized bound, plus the output reserve,
+   * against compressionContextBudgetTokens. Each base is a request the
+   * provider has just answered: the canonical, for the variants after a
+   * refusal or an incomplete answer and for the canonical's hoist after a
+   * refusal, and source-only-final, for its own hoist after a refusal.
+   * Where the base has no count, or the provider counted only its
+   * carrier-stripped copy, the rewrite is admitted on its own complete
+   * bound. Source-only-final and the split parts aren't admitted: they send
+   * the canonical's chunk, whole (source-only-final sends the canonical's own
+   * messages from the chunk on) or in parts, without the recall pairs, and
+   * the provider has just taken the canonical, which sends all of it.
+   * Admission prices what a rung adds to the request it rewrites, by that
+   * request's count, and the rung's own bound where there's none.
+   */
+  private compressionAdmission(
+    baseBoundTokens: number,
+    rewriteBoundTokens: number,
+    maxTokens: number,
+    baseProviderInputTokens: number | undefined,
+  ): CompressionAdmission {
+    const budgetTokens = this.normalizedCompressionContextBudget();
+    // When the provider reports the base's input, it is authoritative and
+    // must dominate admission even if our serialization happens to be
+    // smaller. The positive delta keeps a nominally smaller or identical
+    // serialization from treating an expansion as free.
+    const expansionDeltaTokens = Math.max(1, rewriteBoundTokens - baseBoundTokens);
+    // Once the provider has counted the base, that observed token total is
+    // the baseline. The complete normalized UTF-8 bound remains the
+    // fail-closed fallback when usage is absent, but must not override real
+    // token accounting: large invariant tool schemas can be megabytes of JSON
+    // while occupying a much smaller token window. The positive byte delta is
+    // deliberately conservative for what the rewrite changed; what it left
+    // unchanged was accepted and counted with the base. Each message adds 128
+    // to the bound (compressionRequestInputBoundTokens), so a rewrite that adds
+    // messages, as a hoist adds two for each argument it moves, pays for them
+    // before its bytes, and near the budget it can be skipped where it would
+    // have fit.
+    const boundedInputTokens = baseProviderInputTokens === undefined
+      ? rewriteBoundTokens
+      : baseProviderInputTokens + expansionDeltaTokens;
+    const outputReserveTokens = Math.max(0, Math.ceil(maxTokens));
+    const admittedTokens = boundedInputTokens + outputReserveTokens;
+    return {
+      expansionDeltaTokens,
+      boundedInputTokens,
+      outputReserveTokens,
+      admittedTokens,
+      budgetTokens,
+      disposition: admittedTokens > budgetTokens ? 'admission_rejected' : 'provider_attempt',
+    };
+  }
+
+  /**
    * Freeze the exact fallback/admission plan. Before canonical inference this
    * supplies a deterministic family identity; after a refusal it is rebuilt
    * with authoritative canonical provider usage. When complete provider usage
-   * is absent or not authoritative, admission retains the conservative complete
+   * is absent or not authoritative, as a count of the canonical's
+   * carrier-stripped copy isn't, admission retains the conservative complete
    * normalized-request bound; otherwise the unchanged canonical request is
-   * already represented by provider usage and only positive expansion is added.
+   * already represented by provider usage and only positive expansion is added
+   * (compressionAdmission).
    */
   private compressionRefusalPlan(
     canonicalRequest: NormalizedRequest,
@@ -3401,42 +3469,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): CompressionRefusalPlanRecord[] {
     const fallbackLimit = this.normalizedCompressionFallbackLimit();
     if (fallbackLimit === 0) return [];
-    const budgetTokens = this.normalizedCompressionContextBudget();
     const canonicalRequestBoundTokens = this.compressionRequestInputBoundTokens(canonicalRequest);
+    const accountingSource = canonicalProviderInputTokens !== undefined
+      ? 'canonical_provider_usage_plus_expansion' as const
+      : 'complete_normalized_request_bound' as const;
     const plan: CompressionRefusalPlanRecord[] = [];
     let providerAttempts = 0;
     for (const variant of variants) {
       if (providerAttempts >= fallbackLimit) break;
-      // A recall-curve variant is an expansion of the canonical prompt. When
-      // the provider reports canonical input usage, it is authoritative and
-      // must dominate admission even if our serialization happens to be
-      // smaller. The positive delta prevents a nominally smaller/identical
-      // serialization from treating an expansion as free.
-      const expansionDeltaTokens = Math.max(
-        1,
-        variant.deterministicInputBoundTokens - canonicalRequestBoundTokens,
+      // A recall-curve variant is an expansion of the canonical prompt.
+      const admission = this.compressionAdmission(
+        canonicalRequestBoundTokens,
+        variant.deterministicInputBoundTokens,
+        variant.request.config.maxTokens,
+        canonicalProviderInputTokens,
       );
-      const providerExpandedInputTokens = canonicalProviderInputTokens === undefined
-        ? undefined
-        : canonicalProviderInputTokens + expansionDeltaTokens;
-      // Once the provider has counted the canonical request, that observed
-      // token total is the authoritative baseline. The complete normalized
-      // UTF-8 bound remains the fail-closed fallback when usage is absent, but
-      // must not override real token accounting: large invariant tool schemas
-      // can be megabytes of JSON while occupying a much smaller token window.
-      // The positive byte-delta below is deliberately conservative for the
-      // changed recall pair; unchanged head/tools/raw/config were physically
-      // accepted and counted by the canonical provider call.
-      const boundedInputTokens = providerExpandedInputTokens
-        ?? variant.deterministicInputBoundTokens;
-      const accountingSource = providerExpandedInputTokens !== undefined
-        ? 'canonical_provider_usage_plus_expansion' as const
-        : 'complete_normalized_request_bound' as const;
-      const outputReserveTokens = Math.max(0, Math.ceil(variant.request.config.maxTokens));
-      const admittedTokens = boundedInputTokens + outputReserveTokens;
-      const disposition = admittedTokens > budgetTokens
-        ? 'admission_rejected' as const
-        : 'provider_attempt' as const;
+      // The record's fields in their stored order: the quarantine key hashes
+      // the plan as serialized.
       plan.push({
         curveLabel: `expand:${variant.parent.id}`,
         parentId: variant.parent.id,
@@ -3445,14 +3494,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         accountingSource,
         canonicalRequestBoundTokens,
         deterministicInputBoundTokens: variant.deterministicInputBoundTokens,
-        expansionDeltaTokens,
-        boundedInputTokens,
-        outputReserveTokens,
-        admittedTokens,
-        budgetTokens,
-        disposition,
+        expansionDeltaTokens: admission.expansionDeltaTokens,
+        boundedInputTokens: admission.boundedInputTokens,
+        outputReserveTokens: admission.outputReserveTokens,
+        admittedTokens: admission.admittedTokens,
+        budgetTokens: admission.budgetTokens,
+        disposition: admission.disposition,
       });
-      if (disposition === 'provider_attempt') providerAttempts++;
+      if (admission.disposition === 'provider_attempt') providerAttempts++;
     }
     return plan;
   }
@@ -6348,6 +6397,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // alone outside adaptive selection).
     const tokensOf = (content: ContentBlock[]): number =>
       ctx.messageStore.estimateTokens({ content } as unknown as StoredMessage);
+    // A stored message as a compression request sends it (sentTokensOf below).
+    const sentTokensOf = (content: ContentBlock[]): number => this.sentTokensOf(content, ctx);
 
     // Residence-scoped source-only L1 compression (see `compressionSourceOnly`
     // in strategy config). When on, sections 1 (head) and 2 (recall pairs and
@@ -6462,7 +6513,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!sourceOnly) {
         const addPinnedRaw = (position: number, message: StoredMessage): void => {
           pinnedRaw.push(position);
-          pinnedRawTokens += tokensOf(stripThinkingBlocks(message.content));
+          pinnedRawTokens += sentTokensOf(message.content);
         };
         // The head window renders in section 1; an opened chunk there is raw
         // that pins add.
@@ -6633,13 +6684,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return { llmMessages, sourceOnlyStartIndex, cleaned, headCoveredSkipped };
     };
 
-    // The store's price of a request: each message's content, the system
-    // prompt, the tools and the output reserve.
+    // The store's price of a built request as it is sent: each message with
+    // its serialized media replaced, as runAttempt prepares it. Its thinking
+    // is priced as it stands: the raw messages' was stripped as the request
+    // was built, and a recall answer's signed reasoning is sent. Then the
+    // system prompt and the tools, which are sent as they are, and the
+    // output reserve.
     const priceRequest = (messages: ReadonlyArray<{ content: ContentBlock[] }>): number => {
       let total = outputReserveTokens +
         (ctx.systemPrompt ? tokensOf([{ type: 'text', text: ctx.systemPrompt }]) : 0) +
         (ctx.tools && ctx.tools.length > 0 ? tokensOf([{ type: 'text', text: JSON.stringify(ctx.tools) }]) : 0);
-      for (const message of messages) total += tokensOf(message.content);
+      for (const message of messages) total += this.preparedTokensOf(message.content, ctx);
       return total;
     };
 
@@ -6654,9 +6709,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let built = assemble(history, recall.kept);
     // Pins are honored here only if the raw they add fits the recall budget
     // and the request with it fits compressionContextBudgetTokens, priced as
-    // the store prices the messages it would send (the image cap below only
-    // replaces images with placeholders), with the system prompt, tools and
-    // output reserve. A request without pins is always attempted, as before.
+    // the store prices the messages it would send (priceRequest), with the
+    // system prompt, tools and output reserve. Images are priced at the
+    // store's estimate in both, though the request's inline image cap can
+    // replace some with placeholders. The raw's charge against the recall
+    // budget also counts a pinned tool block whose partner isn't in the
+    // request, which the request drops; the request's own price, of
+    // built.cleaned, doesn't. So the gate errs toward recall. A request
+    // without pins is always attempted, as before.
     // Otherwise this compression lays history out as if no pin applied,
     // recalling the summaries the pins override, and says so once it goes
     // ahead. Waiting for the pins to fit would stall every later L1 too,
@@ -7030,6 +7090,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
      * compression log.
      */
     const attemptRequestsByHash = new Map<string, NormalizedRequest>();
+    /** Responses the provider gave for a carrier-stripped copy (runAttempt's
+     *  degraded path), whose count is the copy's, not the planned request's. */
+    const countedStripped = new WeakSet<object>();
     /** Split-stitch only: the accepted request hash of every fold part, so a
      *  stitched mint persists each leaf's preimage (its own `requestHash` is
      *  a composite over the parts, not a request). */
@@ -7084,6 +7147,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             acceptedRequest,
             { formatter: this.nativeFormatter },
           );
+          if (response && typeof response === 'object') countedStripped.add(response);
         }
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
           this.logCompressionBranchDiscard(sourceBranch, curveLabel, quarantineRecord);
@@ -7114,6 +7178,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         attemptRequestsByHash.set(trace.requestHash, acceptedRequest);
         return response;
       };
+
+      // The provider's count of a request the ladder rewrites, its base, only
+      // where the provider counted the request as planned. After a carrier
+      // rejection the count is the stripped copy's, while the rewrite is built
+      // from the request with its carriers and first sent with them, so that
+      // base gives no count and admission prices the rewrite by its complete
+      // bound (compressionAdmission).
+      const baseInputTokens = (counted: unknown): number | undefined =>
+        counted && typeof counted === 'object' && countedStripped.has(counted)
+          ? undefined
+          : this.compressionResponseInputTokens(counted);
 
       const summariesById = this.persistedCanonicalSummariesById();
       const messagePosition = new Map(allMessages.map((message, index) => [message.id, index]));
@@ -7185,7 +7260,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (canonicalStopReason !== 'end_turn') {
         const canonicalOutcome: CompressionAttemptOutcome =
           canonicalStopReason === 'refusal' ? 'refusal' : 'incomplete';
-        const canonicalProviderInputTokens = this.compressionResponseInputTokens(response);
+        const canonicalProviderInputTokens = baseInputTokens(response);
         fallbackPlan = this.compressionRefusalPlan(
           request,
           variants,
@@ -7220,9 +7295,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         let fallbackResponse: NormalizedResponse | undefined;
 
         // One bounded attempt of a tool-prose-hoisted request. Same receipts
-        // as the source-only final rung; provider errors never escalate.
+        // as the source-only final rung; provider errors never escalate. It
+        // is admitted as a recall variant is, against the request it rewrites
+        // (`base`), which the provider has just counted and whose answer was a
+        // refusal or came back incomplete (compressionAdmission): a rejection
+        // is recorded as a variant's is, and nothing is sent.
         const runToolProseRung = async (
           hoistedRequest: NormalizedRequest,
+          base: { request: NormalizedRequest; providerInputTokens: number | undefined },
           curveLabel: string,
           recallIds: string[],
           recallLevels: number[],
@@ -7231,6 +7311,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // Hashed as prepared; runAttempt logs what was replaced as it sends it.
           hoistedRequest = this.prepareCompressionAhead(hoistedRequest);
           const requestHash = sha256Json(hoistedRequest);
+          const admission = this.compressionAdmission(
+            this.compressionRequestInputBoundTokens(base.request),
+            this.compressionRequestInputBoundTokens(hoistedRequest),
+            hoistedRequest.config.maxTokens,
+            base.providerInputTokens,
+          );
+          if (admission.disposition === 'admission_rejected') {
+            const trace: CompressionAttemptTrace = {
+              curveLabel,
+              recallIds,
+              recallLevels,
+              leafCoverageHash: coverageHash,
+              requestHash,
+              messageCount: hoistedRequest.messages.length,
+              estimatedTokens: this.estimateCompressionRequestTokens(hoistedRequest),
+              latencyMs: 0,
+              persisted: false,
+              outcome: 'admission_rejected',
+              admittedTokens: admission.admittedTokens,
+              budgetTokens: admission.budgetTokens,
+            };
+            attemptTraces.push(trace);
+            outcomes.push({
+              curveLabel,
+              requestHash,
+              outcome: 'admission_rejected',
+              admittedTokens: admission.admittedTokens,
+              budgetTokens: admission.budgetTokens,
+            });
+            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
+            return;
+          }
           try {
             const rungResponse = await runAttempt(hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash);
             const trace = attemptTraces[attemptTraces.length - 1]!;
@@ -7273,6 +7385,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (hoistedCanonical) {
             await runToolProseRung(
               hoistedCanonical,
+              { request, providerInputTokens: canonicalProviderInputTokens },
               'tool-prose-hoist',
               keptSummaries.map((summary) => summary.id),
               keptSummaries.map((summary) => summary.level),
@@ -7432,6 +7545,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // (Sol, #106 review: a thrown server_error on source-only-final still
         // bought a fourth call).
         let sourceOnlyOutcome: CompressionAttemptOutcome | 'incomplete' | undefined;
+        // Its count, the base its hoist is admitted against.
+        let sourceOnlyProviderInputTokens: number | undefined;
         if (!fallbackResponse && sourceOnlyFallbackRequest) {
           const curveLabel = 'source-only-final';
           const requestHash = sha256Json(sourceOnlyFallbackRequest);
@@ -7442,6 +7557,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             );
             const trace = attemptTraces[attemptTraces.length - 1]!;
             const assessment = this.assessFallbackCompressionResponse(sourceOnlyResponse);
+            sourceOnlyProviderInputTokens = baseInputTokens(sourceOnlyResponse);
             if (assessment.outcome === 'valid') {
               trace.outcome = 'success';
               fallbackResponse = assessment.response;
@@ -7478,6 +7594,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (hoistedSourceOnly) {
             await runToolProseRung(
               hoistedSourceOnly,
+              { request: sourceOnlyFallbackRequest, providerInputTokens: sourceOnlyProviderInputTokens },
               'source-only-tool-prose-hoist',
               [], [],
               sha256Json(chunk.messages.map((message) => message.id)),
@@ -7524,7 +7641,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             } as NormalizedRequest;
           };
           type SplitPart = { range: [number, number]; kind: 'fold' | 'placeholder'; tokens: number; inputTokens?: number; requestHash?: string; responseContentHash?: string; contentHash: string; text: string };
-          const chunkChars = Math.max(1, chunk.messages.reduce((n, m) => n + textOf(m).length, 0));
+          // Each part's share of the target is weighed by what it sends,
+          // priced as the store prices it, images, tool calls and tool
+          // results included: each message as buildSub sends it, thinking
+          // stripped, with its serialized media replaced as runAttempt
+          // replaces it before dispatch. So a data URL counts as its marker,
+          // not as its payload: otherwise the part holding it takes nearly
+          // the whole target and its siblings fall to the floor. Each message
+          // is stripped once, on a copy.
+          const sentTokens = chunk.messages.map((m) => sentTokensOf(m.content));
+          const chunkTokens = Math.max(1, sentTokens.reduce((n, c) => n + c, 0));
           const parts: SplitPart[] = [];
           let lastGood: NormalizedResponse | undefined;
           let calls = 0;
@@ -7549,8 +7675,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             if (attempt) {
             if (calls >= MAX_SPLIT_CALLS) { abortReason = 'chunk-call-cap'; return false; }
             if (this.splitCallTimes.length >= MAX_WINDOW_CALLS) { abortReason = 'window-call-cap'; return false; }
-            const chars = subset.reduce((n, m) => n + textOf(m).length, 0);
-            const target = Math.max(100, Math.round(targetTokens * chars / chunkChars));
+            const partTokens = sentTokens.slice(a, b + 1).reduce((n, c) => n + c, 0);
+            const target = Math.max(100, Math.round(targetTokens * partTokens / chunkTokens));
             const sub = buildSub(subset, target);
             const label = `split:${a}-${b}`;
             calls++;
@@ -11528,10 +11654,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * A message's content priced as the store prices a message, with its
+   * serialized media replaced on a copy, as runAttempt prepares a request
+   * before it is sent. So a data URL is priced as its marker, not its
+   * payload.
+   */
+  protected preparedTokensOf(content: ContentBlock[], ctx: StrategyContext): number {
+    const copy = { content: [...content] };
+    this.stripSerializedCompressionMedia([copy]);
+    return ctx.messageStore.estimateTokens({ content: copy.content } as unknown as StoredMessage);
+  }
+
+  /**
+   * A stored message's content priced as a compression request sends it: its
+   * thinking stripped, as a request's messages are built from raw messages,
+   * then priced as prepared (preparedTokensOf). Images count at the store's
+   * estimate, though a request's inline image cap can replace some with
+   * placeholders.
+   */
+  protected sentTokensOf(content: ContentBlock[], ctx: StrategyContext): number {
+    return this.preparedTokensOf(stripThinkingBlocks(content), ctx);
+  }
+
+  /**
    * The one sharded body every given message belongs to, with its total
    * tokens, or null when they don't all belong to one. A body is one
    * ingestion: another ingestion of the same text shares the group id, and
-   * counting it too doubled the document (see body-runs.ts).
+   * counting it too doubled the document (see body-runs.ts). Each message is
+   * priced as a compression request sends it (sentTokensOf).
    */
   protected shardedBodyOf(
     ids: Iterable<string>,
@@ -11545,8 +11695,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const messages = allMessages.slice(from, to + 1);
     const inBody = new Set(messages.map((m) => m.id));
     if (!wanted.every((id) => inBody.has(id))) return null;
+    // Priced as a compression request sends each message, so a payload that
+    // preparation replaces doesn't count toward the reading total.
     let totalTokens = 0;
-    for (const m of messages) totalTokens += ctx.messageStore.estimateTokens(m);
+    for (const m of messages) totalTokens += this.sentTokensOf(m.content, ctx);
     return { totalTokens };
   }
 
@@ -11572,10 +11724,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const body = this.shardedBodyOf(chunk.messages.map((m) => m.id), ctx.messageStore.getAll(), ctx);
     if (!body) return null;
     const totalTokens = body.totalTokens;
-    // Tokens in this chunk specifically.
+    // Tokens in this chunk specifically, priced as the body is.
     let chunkTokens = 0;
     for (const m of chunk.messages) {
-      chunkTokens += ctx.messageStore.estimateTokens(m);
+      chunkTokens += this.sentTokensOf(m.content, ctx);
     }
     // Reading-mode threshold: the original message must be substantially
     // larger than this chunk. 2× means the chunk is at most half of the
@@ -11722,7 +11874,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const MAX_HEAD_CHARS = 8000;
     let headContent = '';
     for (const m of headMessages) {
-      const entry = `${m.participant}: ${this.extractText(m.content)}`;
+      // Counted as the request sends it: its serialized media replaced on a
+      // copy, as prepareCompressionCandidate replaces it below, so a payload
+      // doesn't spend the cap.
+      const copy = { content: [...m.content] };
+      this.stripSerializedCompressionMedia([copy]);
+      const entry = `${m.participant}: ${this.extractText(copy.content)}`;
       if (headContent.length + entry.length > MAX_HEAD_CHARS) {
         headContent += '\n\n[...truncated...]';
         break;
@@ -12509,8 +12666,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * image is about 1.4 million base64 characters). It replaces each given
    * message's content array and copies the blocks it changes, so a caller
    * passes message wrappers it owns, as prepareCompressionRequest does, and
-   * stored Chronicle messages are never mutated. The marker keeps the media
-   * type and the payload's length.
+   * stored Chronicle messages are never mutated. The marker keeps the
+   * payload's length in the text, and the media type when the decoded type
+   * reads as one.
    */
   protected stripSerializedCompressionMedia(messages: Array<{ content: ContentBlock[] }>): number {
     const minChars = AutobiographicalStrategy.SERIALIZED_DATA_URL_MIN_CHARS;
@@ -12530,50 +12688,117 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // slash, and a quoted parameter value holds no backslash or quote), so a
     // string that almost matches fails in linear time: overlapping choices
     // took time exponential in its number of parameters.
+    // Everything before the payload is bounded. The type's two names and
+    // each parameter name take at most 127 characters, as RFC 6838 bounds
+    // them. There are at most 16 parameters, with values of at most 1,024
+    // characters: RFC 6838 sets no such bounds, so these two are this
+    // matcher's own. A `\u` escape counts as one character, however many
+    // backslashes it carries. A data URL past a bound isn't matched, and its
+    // payload stays. An unbounded run overflowed V8's stack at about 8.45M
+    // characters of a string that almost matches (`data:` and a run with no
+    // slash, or one long parameter value), which the floor above couldn't
+    // help, since nothing matched.
     const dataUrl =
-      /data:((?:[A-Za-z0-9]|\\+u(?!002f)[0-9a-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u(?!002f)[0-9a-f]{4})*(?:\\*\/|\\+u002f)(?:[A-Za-z0-9]|\\+u(?!002f)[0-9a-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u(?!002f)[0-9a-f]{4})*)(?:;[A-Za-z0-9!#$&^_.+-]+=(?:\\*"(?:[^"\\]|\\+u[0-9a-f]{4})*\\*"|(?:[^;,:\s"\\]|\\+u[0-9a-f]{4})*))*;base64,([A-Za-z0-9+/_=\\-]+)/gi;
+      /data:((?:[A-Za-z0-9]|\\+u(?!002f)[0-9a-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u(?!002f)[0-9a-f]{4}){0,126}(?:\\*\/|\\+u002f)(?:[A-Za-z0-9]|\\+u(?!002f)[0-9a-f]{4})(?:[A-Za-z0-9!#$&^_.+-]|\\+u(?!002f)[0-9a-f]{4}){0,126})(?:;[A-Za-z0-9!#$&^_.+-]{1,127}=(?:\\*"(?:[^"\\]|\\+u[0-9a-f]{4}){0,1024}\\*"|(?:[^;,:\s"\\]|\\+u[0-9a-f]{4}){0,1024})){0,16};base64,([A-Za-z0-9+/_=\\-]+)/gi;
     let replaced = 0;
     // Every backslash run in a matched type ends in `u` and four hex digits
     // or in its slash, so one pass reads each run once.
     const unescapeType = (type: string) => type.replace(
       /\\+(?:u([0-9a-f]{4})|\/)/gi, (_, hex?: string) => (hex ? String.fromCharCode(parseInt(hex, 16)) : '/'),
     );
+    // A `\u` escape can spell any character into a matched type, so the
+    // marker names the type only once it reads as a media type.
+    const mediaTypeName = /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}$/;
     // A data URL's head, matched in place, to tell a run that reaches the
     // next data URL from one that runs into a word ending in `data`.
     const dataUrlAt = new RegExp(dataUrl.source, 'iy');
+    const base64Char = /[A-Za-z0-9+/=_-]/;
     const stripText = (text: string): string => {
+      // What the run of backslashes at `i` escapes: one base64 character,
+      // which is payload (`\/`, `\u002B`), a line break (`\n`, `\r\n`, `\r`
+      // and their `\u000a` and `\u000d` forms), or something else. A
+      // `\r\n` pair is one break when both halves carry the same run.
+      const escapeAt = (i: number): { kind: 'char' | 'break' | 'other'; next: number } => {
+        let j = i;
+        while (text[j] === '\\') j++;
+        const slashes = text.slice(i, j);
+        const c = text[j];
+        if (c === '/') return { kind: 'char', next: j + 1 };
+        if (c === 'n') return { kind: 'break', next: j + 1 };
+        if (c === 'r') {
+          return text.startsWith(slashes + 'n', j + 1)
+            ? { kind: 'break', next: j + 1 + slashes.length + 1 }
+            : { kind: 'break', next: j + 1 };
+        }
+        if ((c === 'u' || c === 'U') && /^[0-9a-f]{4}$/i.test(text.slice(j + 1, j + 5))) {
+          const code = parseInt(text.slice(j + 1, j + 5), 16);
+          if (base64Char.test(String.fromCharCode(code))) return { kind: 'char', next: j + 5 };
+          if (code === 0x0a) return { kind: 'break', next: j + 5 };
+          if (code === 0x0d) {
+            const pair = text.slice(j + 5, j + 5 + slashes.length + 5);
+            return pair.length === slashes.length + 5 && pair.startsWith(slashes) && /^u000a$/i.test(pair.slice(slashes.length))
+              ? { kind: 'break', next: j + 5 + slashes.length + 5 }
+              : { kind: 'break', next: j + 5 };
+          }
+        }
+        return { kind: 'other', next: j };
+      };
       let out = '';
       let copied = 0;
       dataUrl.lastIndex = 0;
       for (let m = dataUrl.exec(text); m; m = dataUrl.exec(text)) {
         const [match, mediaType, run] = m;
         const payloadStart = m.index + match.length - run.length;
-        let payloadEnd = m.index + match.length;
+        let runEnd = m.index + match.length;
         // A run that reaches the next data URL (`…AAAAdata:`, or `…\ndata:`
         // in JSON) ends before it. The scan resumes where the payload ends.
-        if (text[payloadEnd] === ':' && run.slice(-4).toLowerCase() === 'data') {
-          dataUrlAt.lastIndex = payloadEnd - 4;
-          if (dataUrlAt.test(text)) payloadEnd -= 4;
+        if (text[runEnd] === ':' && run.slice(-4).toLowerCase() === 'data') {
+          dataUrlAt.lastIndex = runEnd - 4;
+          if (dataUrlAt.test(text)) runEnd -= 4;
         }
-        // A payload never ends in an escape of a character base64 doesn't
-        // use, such as a `\n` or `\u0026` after its last line, so such
-        // escapes are trimmed from the end of every run, and so are
-        // backslashes that escape the character after the run (`\"`). An
-        // escaped base64 character (`\/`, `\u002B`) is payload.
-        for (;;) {
-          const escape = /\\(?:[bfnrt]|u([0-9a-f]{4}))$/i.exec(text.slice(Math.max(payloadStart, payloadEnd - 6), payloadEnd));
-          if (escape && !(escape[1] && /[A-Za-z0-9+/=_-]/.test(String.fromCharCode(parseInt(escape[1], 16))))) {
-            payloadEnd -= escape[0].length;
-          } else if (payloadEnd > payloadStart && text[payloadEnd - 1] === '\\') {
-            payloadEnd--;
+        // The payload is the run's base64 characters, an escaped one
+        // counting as one toward its line. An escaped line break continues it
+        // only after a full wrap line, 60 characters (Ruby's `pack('m')`), 64
+        // (PEM) or 76 (MIME), since a wrapped payload's last line is its short
+        // one; after any other line, and at any other escape, the payload
+        // ends. A raw line break isn't in the run, so it always ends the
+        // payload. So the text after a payload's escape stays
+        // (`…AAAA\nsome/path rest`), and a backslash that escapes the
+        // character after the run (`\"`) does too. A payload whose last line
+        // is 60, 64 or 76 characters long can't be told from one that goes on,
+        // so it takes the base64 characters after its break with it
+        // (`…\nword rest` loses `word`). A payload wrapped at any other width
+        // ends at its first break: with that first line under the floor it
+        // stays whole, and past the floor only that line is replaced. Its
+        // length, for the floor and the marker, is the characters it takes in
+        // the text, escapes and breaks included. One pass reads the run.
+        let payloadEnd = payloadStart;
+        let line = 0;
+        for (let i = payloadStart; i < runEnd;) {
+          if (text[i] !== '\\') {
+            i++;
+            line++;
+            payloadEnd = i;
+            continue;
+          }
+          const escape = escapeAt(i);
+          if (escape.next > runEnd) break;
+          if (escape.kind === 'char') {
+            i = escape.next;
+            line++;
+            payloadEnd = i;
+          } else if (escape.kind === 'break' && (line === 60 || line === 64 || line === 76)) {
+            i = escape.next;
+            line = 0;
           } else {
             break;
           }
         }
         const length = payloadEnd - payloadStart;
         if (length >= minChars) {
+          const type = unescapeType(mediaType);
           out += text.slice(copied, m.index) +
-            `[embedded ${unescapeType(mediaType)} data URL omitted from compression prompt: ` +
+            `[embedded ${mediaTypeName.test(type) ? `${type} ` : ''}data URL omitted from compression prompt: ` +
             `${length} serialized payload characters]`;
           copied = payloadEnd;
           replaced++;

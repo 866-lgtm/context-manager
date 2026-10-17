@@ -1177,7 +1177,11 @@ export interface AutobiographicalConfig {
    * argument moved into a call to `intoTool` — a note-taking tool the agent
    * really has — placed as its own round just before the original call, a short
    * stub left behind. If the source-only final rung is enabled and also refuses,
-   * it gets the same rewrite once. Nothing the agent wrote is dropped.
+   * it gets the same rewrite once. Nothing the agent wrote is dropped. Each
+   * rewrite is admitted against `compressionContextBudgetTokens` as a
+   * recall-curve variant is, measured against the request it rewrites; one
+   * over the budget is recorded as rejected and not sent. Each moved argument
+   * adds two messages, which the admission bound prices before their bytes.
    *
    * The rung is SKIPPED unless `intoTool` is among the tools the host declared:
    * the summarizer is the agent, and it must never be shown itself using a tool
@@ -1229,19 +1233,25 @@ export interface AutobiographicalConfig {
    * Total model context budget used to admit refusal-curve compression
    * requests, including the request input and the configured output reserve.
    * The canonical request remains unchanged and is always attempted first;
-   * only fallback variants are gated. Before authoritative canonical usage
-   * exists, admission uses a conservative complete normalized-request bound.
-   * After canonical refusal reports complete provider input usage, admission
-   * uses provider-total input plus a positive serialized expansion delta, then
-   * adds the output reserve. Zero, partial, or unknown usage contracts retain
-   * the conservative bound. Default: 200000.
+   * the recall-curve variants and the tool-prose hoists
+   * (`compressionToolProseFallback`) are gated. Before authoritative canonical
+   * usage exists, admission uses a conservative complete normalized-request
+   * bound. After a refusal reports complete provider input usage, a request
+   * is admitted on the provider-total input of the request it rewrites (the
+   * canonical, or the source-only fallback for that rung's hoist), plus a
+   * positive serialized expansion delta, then the output reserve. Zero,
+   * partial, or unknown usage contracts, and a count of the carrier-stripped
+   * copy a transport rejection made the request go as, retain the
+   * conservative bound of the request itself. Default: 200000.
    *
    * It also decides whether an L1 prompt shows pinned history raw: with the
    * raw that pins add, the canonical request must fit it, priced as the
    * message store prices the messages it would send (after splitting,
    * collapsing and dropping unpaired tool blocks, before the image cap,
-   * which only replaces images), with the system prompt, tools and output
-   * reserve. Otherwise that compression lays
+   * which only replaces images), with serialized media priced as the markers
+   * that replace them and thinking as the request carries it (the raw
+   * messages' stripped, a recall answer's signed reasoning kept), with the
+   * system prompt, tools and output reserve. Otherwise that compression lays
    * history out as it would without pins (see
    * `compressionRecallBudgetTokens`). A canonical request without pins is
    * still always attempted.
