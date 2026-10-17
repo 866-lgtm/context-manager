@@ -4,6 +4,10 @@ import assert from 'node:assert/strict';
 import {
   ExactKvUnifiedPolicySolver,
   KvUnifiedPolicyError,
+  bandedAge,
+  continuityLeafBase,
+  fidelityLeafBase,
+  normalizePolicy,
   type AcceptedPresentationReference,
   type ExactPolicyCandidate,
 } from '../../src/adaptive/kv-unified-policy.js';
@@ -1605,4 +1609,48 @@ test('latent demand what-if solves reuse their own forests across compiles witho
       assert.ok(holder.certificate === undefined || holder.certificate !== reuse.certificate);
     }
   }
+});
+
+test('bandedAge reads an age at the lower edge of its geometric band', () => {
+  for (const age of [0, 0.5, 1, 2, 3, 7, 8, 1000.5]) assert.equal(bandedAge(age, 0), age, 'steps 0 is exact');
+  for (const age of [0, 0.5]) assert.equal(bandedAge(age, 4), age, 'ages below 1 are not banded');
+  assert.deepEqual([1, 2, 3, 4, 7, 8, 15, 16, 17].map((age) => bandedAge(age, 1)), [1, 2, 2, 4, 4, 8, 8, 16, 16]);
+  const steps = 4;
+  const ratio = 2 ** (1 / steps);
+  let previous = 0;
+  for (let age = 1; age < 5000; age += 0.37) {
+    const edge = bandedAge(age, steps);
+    assert.ok(edge <= age && age < edge * ratio, `age ${age} sits in [${edge}, ${edge * ratio})`);
+    assert.ok(edge >= previous, 'bands do not run backwards');
+    previous = edge;
+  }
+  for (let power = 0; power < 20; power++) {
+    const age = 2 ** power;
+    assert.equal(bandedAge(age, steps), age, 'an age on a doubling is its own edge');
+    if (power > 0) assert.equal(bandedAge(age - 1e-9, steps), age / ratio, 'just below a doubling is the band under it');
+  }
+  assert.equal(bandedAge(2 ** 0.75 * 1.0000001, 4), 2 ** 0.75, 'just above an edge is that edge');
+});
+
+test('banded ages move a weight only when the age crosses a band edge', () => {
+  const chunk = { id: 'c', sequence: 100, rawTokens: 1000, currentResolution: 0, pinned: false, lockedByAgent: false };
+  const banded = normalizePolicy({ ageBandSteps: 1 });
+  const exact = normalizePolicy({ ageBandSteps: 0 });
+  // Ages 8..15 share a band at one step per doubling; 16 starts the next.
+  const fidelity = (newest: number, policy = banded) => fidelityLeafBase(chunk, newest, policy);
+  assert.equal(fidelity(100 + 7), fidelity(100 + 14), 'ages 8 and 15 price alike');
+  assert.notEqual(fidelity(100 + 14), fidelity(100 + 15), 'age 16 is the next band');
+  assert.equal(fidelity(100 + 7), fidelity(100 + 7, exact), 'an edge prices as the exact age does');
+  assert.notEqual(fidelity(100 + 14), fidelity(100 + 14, exact));
+  const previous = { repHash: 'raw:c', level: 0, lastChangedSeq: 100 };
+  const continuity = (midpointTokens: number, currentSeq: number, policy = banded) =>
+    continuityLeafBase(chunk, previous, currentSeq, midpointTokens, policy);
+  // Recency 8192..16383 tokens and stability 8..15 turns are one band each.
+  assert.equal(continuity(8_192, 108), continuity(16_383, 115), 'recency and stability share bands too');
+  assert.notEqual(continuity(8_192, 108), continuity(16_384, 108));
+  assert.notEqual(continuity(8_192, 108), continuity(8_192, 116));
+  assert.equal(continuity(8_192, 108), continuity(8_192, 108, exact));
+  assert.equal(normalizePolicy({}).ageBandSteps, 0, 'the solver-level default is exact');
+  assert.throws(() => normalizePolicy({ ageBandSteps: -1 }), KvUnifiedPolicyError);
+  assert.throws(() => normalizePolicy({ ageBandSteps: Number.NaN }), KvUnifiedPolicyError);
 });

@@ -807,6 +807,15 @@ export interface KvUnifiedConfig {
     continuityRecencyFloor: number;
     continuityStableHalfLife: number;
     continuityStableFloor: number;
+    /**
+     * Bands per doubling the solver reads ages at (fidelity age in
+     * sequences, continuity recency in tokens, stability in turns): an age
+     * is priced at the lower edge of its band, so a leaf's weight changes
+     * only when it crosses a band edge instead of on every append. 4 unless
+     * set (a band is a factor of 2^(1/4) ≈ 1.19 wide); 0 prices exact ages,
+     * which is what the solver itself does when the key is absent.
+     */
+    ageBandSteps?: number;
   };
   tokenBucketSize: number;
   continuityBucketSize: number;

@@ -51,6 +51,15 @@ export interface KvUnifiedWelfarePolicy {
   readonly continuityRecencyFloor: number;
   readonly continuityStableHalfLife: number;
   readonly continuityStableFloor: number;
+  /** Geometric bands the three age measures are read at, as bands per
+   * doubling: a leaf's fidelity age (sequences from the newest leaf), its
+   * continuity recency (tokens from the live edge) and its stability (turns
+   * since it last moved) are each priced at the lower edge of the band they
+   * fall in, so a weight changes only when the age crosses a band edge.
+   * Exact ages change every leaf's weight on every append, which is what
+   * keeps a solve from reusing anything from the compile before (#45). 0
+   * prices exact ages. */
+  readonly ageBandSteps: number;
 }
 
 export const DEFAULT_KV_UNIFIED_WELFARE_POLICY: KvUnifiedWelfarePolicy = {
@@ -69,7 +78,23 @@ export const DEFAULT_KV_UNIFIED_WELFARE_POLICY: KvUnifiedWelfarePolicy = {
   continuityRecencyFloor: 0.2,
   continuityStableHalfLife: 16,
   continuityStableFloor: 0.25,
+  // Exact at the solver level; the strategy built from a recipe fills in
+  // its own default (see KvUnifiedConfig.policy.ageBandSteps).
+  ageBandSteps: 0,
 };
+
+/** The lower edge of the geometric band `age` falls in, with `steps` bands
+ * per doubling: 2^(floor(log2(age) · steps) / steps). Ages below 1 and a
+ * `steps` of 0 are returned as given. */
+export function bandedAge(age: number, steps: number): number {
+  if (!(steps > 0) || !(age >= 1) || !Number.isFinite(age)) return age;
+  let k = Math.floor(Math.log2(age) * steps);
+  // Floating-point: log2 of an age at or beside an edge can floor a band
+  // off either way; the edges themselves decide.
+  if (2 ** (k / steps) > age) k--;
+  else if (2 ** ((k + 1) / steps) <= age) k++;
+  return 2 ** (k / steps);
+}
 
 export class KvUnifiedPolicyError extends Error {
   constructor(message: string) {
@@ -437,6 +462,9 @@ export function normalizePolicy(
   if (policy.budgetLowRatio > policy.budgetHighRatio) {
     throw new KvUnifiedPolicyError('budgetLowRatio must not exceed budgetHighRatio');
   }
+  if (!Number.isFinite(policy.ageBandSteps) || policy.ageBandSteps < 0) {
+    throw new KvUnifiedPolicyError('ageBandSteps must be finite and non-negative');
+  }
   return policy;
 }
 
@@ -447,7 +475,7 @@ export function fidelityLeafBase(
   newestSequence: number,
   policy: KvUnifiedWelfarePolicy,
 ): number {
-  const age = Math.max(1, newestSequence - chunk.sequence + 1);
+  const age = bandedAge(Math.max(1, newestSequence - chunk.sequence + 1), policy.ageBandSteps);
   const salience = clamp(chunk.salience ?? 1, 0.2, 1);
   return salience * age ** (-policy.alpha) * chunk.rawTokens;
 }
@@ -474,8 +502,8 @@ export function continuityLeafBase(
   const recency =
     policy.continuityRecencyFloor +
     (1 - policy.continuityRecencyFloor) *
-      2 ** (-midpointAgeTokens / positive(policy.continuityRecencyHalfLifeTokens));
-  const tau = Math.max(0, currentSeq - previous.lastChangedSeq);
+      2 ** (-bandedAge(midpointAgeTokens, policy.ageBandSteps) / positive(policy.continuityRecencyHalfLifeTokens));
+  const tau = bandedAge(Math.max(0, currentSeq - previous.lastChangedSeq), policy.ageBandSteps);
   const stability =
     policy.continuityStableFloor +
     (1 - policy.continuityStableFloor) *

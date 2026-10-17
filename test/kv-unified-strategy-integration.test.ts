@@ -686,6 +686,22 @@ test('the production shadow pick leaves plan-vs-actual on the live kv-unified so
   manager.close();
 });
 
+test('ages are banded at 4 steps per doubling unless the recipe policy says otherwise', async () => {
+  const stepsOf = async (kvUnified: Record<string, unknown>) => {
+    const selected = strategy({ kvUnified });
+    const manager = await ContextManager.open({ path: STORE, strategy: selected });
+    manager.addMessage('user', [{ type: 'text', text: 'hello' }]);
+    await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+    const solver = (selected as unknown as { _lastKvUnified: { options: { policy: { ageBandSteps?: number } } } })._lastKvUnified;
+    const steps = solver.options.policy.ageBandSteps;
+    manager.close();
+    rmSync(STORE, { recursive: true, force: true });
+    return steps;
+  };
+  assert.equal(await stepsOf({ ...KV_UNIFIED }), 4);
+  assert.equal(await stepsOf({ ...KV_UNIFIED, policy: { ...(KV_UNIFIED as { policy: object }).policy, ageBandSteps: 0 } }), 0);
+});
+
 test('the hysteresis certificate is on unless the recipe says false', async () => {
   // A kvUnified block without the key certifies the carried layout on an
   // append; the same block with `hysteresisCertificate: false` runs the full
