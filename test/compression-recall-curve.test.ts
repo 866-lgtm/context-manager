@@ -2824,6 +2824,50 @@ describe('tool-prose hoist admission', () => {
     fx.manager.close();
   });
 
+  it("prices what a hoist adds from the fields both requests send, so a raw replay form the edit releases isn't credited against it", async () => {
+    const counted = 50_000;
+    /** The same chunk, its call and result carrying the raw XML the XML formatter replays in their place. */
+    function withRawXml(fx: Fixture): void {
+      hoistableChunk(fx);
+      const reason = 'a private note '.repeat(40);
+      const xmlCall = `<function_calls>\n<invoke name="skip_reply">\n<parameter name="reason">${reason}</parameter>\n</invoke>\n</function_calls>`;
+      const xmlResult = '<function_results>\n<result>\n<tool_use_id>t</tool_use_id>\n<output>{"skipped":true}</output>\n</result>\n</function_results>';
+      fx.target.messages = fx.target.messages.map((m, i) => ({
+        ...m, content: m.content.map((b) => ({ ...b, rawXml: i ? xmlResult : xmlCall }) as ContentBlock),
+      }));
+    }
+    const stripped = (r: NormalizedRequest) => ({ ...r, messages: r.messages.map((m) => ({ ...m, content: m.content.map((b) => {
+      const c = { ...b } as Record<string, unknown>; delete c.rawXml; delete c.rawItem; return c as unknown as ContentBlock;
+    }) })) }) as NormalizedRequest;
+    // Room for it: the hoist is sent, and its edit released the call's raw form.
+    const open = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const roomy = await fixture(open.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: 1_000_000, ...PROSE });
+    withRawXml(roomy);
+    await roomy.strategy.run(roomy.target, managerContext(roomy.manager));
+    assert.equal(open.calls.length, 2);
+    const [base, hoist] = [open.calls[0]!.request, open.calls[1]!.request];
+    const reserve = base.config.maxTokens;
+    assert.ok(roomy.strategy.inputBound(hoist) < roomy.strategy.inputBound(base), "the complete bound falls: the released raw form's copy is gone");
+    const added = roomy.strategy.inputBound(stripped(hoist)) - roomy.strategy.inputBound(stripped(base));
+    assert.ok(added >= 256, `what the fields add (${added})`);
+    roomy.manager.close();
+
+    // A budget the hoist misses by what its fields add, though the complete
+    // bounds' difference would let it through.
+    const budget = counted + reserve + Math.floor(added / 2);
+    const tight = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const fx = await fixture(tight.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: budget, ...PROSE });
+    withRawXml(fx);
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(tight.calls.length, 1, 'only the canonical is sent');
+    const rejected = exhaustedOutcomes(fx).find(o => o.curveLabel === 'tool-prose-hoist');
+    assert.deepEqual(
+      { outcome: rejected?.outcome, admittedTokens: rejected?.admittedTokens, budgetTokens: rejected?.budgetTokens },
+      { outcome: 'admission_rejected', admittedTokens: counted + added + reserve, budgetTokens: budget },
+    );
+    fx.manager.close();
+  });
+
   it("admits the canonical's hoist on its own bound when the canonical's response carries no usage", async () => {
     // Room for it: the hoist is sent.
     const open = flexibleMembrane([{ stop: 'refusal', omitUsage: true }, { stop: 'refusal' }]);
@@ -2949,6 +2993,53 @@ describe('tool-prose hoist admission', () => {
       { admittedTokens: plan[0]!.admittedTokens, budgetTokens: plan[0]!.budgetTokens },
       { admittedTokens: bound + reserve, budgetTokens: budget },
     );
+    fx.manager.close();
+  });
+
+  it("prices a variant's added recall answers as their route sends them: a redacted_thinking block by its reasoning item alone, whose summary only the item holds", async () => {
+    const counted = 10_000;
+    // Only L2-201's children carry the item, so the variant that swaps
+    // L2-201's pair for theirs adds two of them, and L2-200's adds none.
+    const withItems = (fx: Fixture) => {
+      for (const entry of fx.strategy.summariesView()) {
+        if (entry.id !== 'L1-102' && entry.id !== 'L1-103') continue;
+        // Both Responses routes send the item alone in the block's place,
+        // its summary and its encrypted content; the block's own data
+        // doesn't go out beside it.
+        const encrypted = 'E'.repeat(4_000);
+        entry.responseContent = [{
+          type: 'redacted_thinking', data: encrypted,
+          rawItem: { type: 'reasoning', id: `rs_${entry.id}`, summary: [{ type: 'summary_text', text: 'S'.repeat(4_000) }], encrypted_content: encrypted },
+        } as unknown as ContentBlock, { type: 'text', text: entry.content }];
+      }
+      fx.strategy.flushSummaries();
+    };
+    const open = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'end_turn', text: 'the variant' }]);
+    const roomy = await fixture(open.membrane, { compressionRefusalCurveFallbacks: 1, compressionContextBudgetTokens: 1_000_000 });
+    withItems(roomy);
+    await roomy.strategy.run(roomy.target, managerContext(roomy.manager));
+    assert.equal(open.calls.length, 2, 'the canonical, then the first variant');
+    assert.ok(JSON.stringify(open.calls[1]!.request).includes('S'.repeat(100)), "the first variant is L2-201's, carrying the items");
+    const reserve = open.calls[1]!.request.config.maxTokens;
+    roomy.manager.close();
+
+    // A budget the two items overrun (16,000 and more), though the blocks'
+    // fields alone (8,000 and more) fit.
+    const budget = counted + reserve + 12_000;
+    const tight = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const fx = await fixture(tight.membrane, { compressionRefusalCurveFallbacks: 1, compressionContextBudgetTokens: budget });
+    withItems(fx);
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    // L2-201's variant is rejected and spends no attempt, so L2-200's goes.
+    assert.equal(tight.calls.length, 2);
+    assert.equal(JSON.stringify(tight.calls[1]!.request).includes('S'.repeat(100)), false, "L2-201's variant isn't sent");
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!.record as Record<string, unknown>;
+    const rejected = (record.plan as Array<Record<string, unknown>>).find((item) => item.curveLabel === 'expand:L2-201')!;
+    assert.equal(rejected.accountingSource, 'canonical_provider_usage_plus_expansion');
+    assert.equal(rejected.disposition, 'admission_rejected');
+    // The items, not the whole blocks, whose data adds 8,000 more.
+    const delta = rejected.expansionDeltaTokens as number;
+    assert.ok(delta >= 16_000 && delta < 24_000, `the two items are priced, not the whole blocks (${delta})`);
     fx.manager.close();
   });
 

@@ -1246,9 +1246,9 @@ export interface AutobiographicalConfig {
    *
    * It also decides whether an L1 prompt shows pinned history raw: with the
    * raw that pins add, the canonical request must fit it, priced as the
-   * message store prices the messages it would send (after splitting,
-   * collapsing and dropping unpaired tool blocks, before the image cap,
-   * which only replaces images), with serialized media priced as the markers
+   * message store prices each pinned message (its tool blocks included, even
+   * where the request drops one whose partner it lacks, and before the image
+   * cap, which only replaces images), with serialized media priced as the markers
    * that replace them and thinking as the request carries it (the raw
    * messages' stripped, a recall answer's signed reasoning kept), with the
    * system prompt, tools and output reserve. Otherwise that compression lays

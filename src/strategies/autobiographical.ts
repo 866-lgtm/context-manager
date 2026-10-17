@@ -72,7 +72,7 @@ import type {
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
-import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms } from '../raw-forms.js';
+import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
@@ -1096,6 +1096,36 @@ function defaultsForKeysLeftNullish(
     if (current === undefined || current === null) fills[key] = value;
   }
   return fills;
+}
+
+/**
+ * A block as a compression request's route sends it (sentBoundTokens), as
+ * membrane 0.5.86 sends it:
+ *   - Anthropic: the native formatter rebuilds each block from its fields,
+ *     raw forms dropped, except a redacted_thinking block, which it passes on
+ *     whole;
+ *   - Responses, API mode: membrane uses its openai-responses formatter
+ *     whatever formatter the request names (resolveActiveFormatter), which
+ *     sends a block's rawItem in its place, any type, once per message for an
+ *     item blocks share, and builds the rest from their fields;
+ *   - Responses, subscription mode: the native formatter, then
+ *     normalizeResponsesInput, which sends a redacted_thinking block's
+ *     reasoning item in its place and builds the rest from their fields.
+ * A redacted_thinking block carrying a reasoning item comes from a
+ * compression model on a Responses route and is replayed there, so it is
+ * priced as the item alone, which both of those routes send. Every other
+ * block is priced by its fields, its raw replay forms set aside as
+ * withoutRawForms sets them aside. No route sends rawXml. An opaque carrier
+ * never reaches a compression request: compression input drops it with the
+ * other empty text (stripEmptyTextBlocks), and validateRecallCurveRequest
+ * refuses one.
+ */
+function sentForm(block: ContentBlock): ContentBlock {
+  const item = (block as { rawItem?: unknown }).rawItem;
+  if (block.type === 'redacted_thinking' && item !== null && typeof item === 'object' && (item as { type?: unknown }).type === 'reasoning') {
+    return { type: block.type, rawItem: item } as unknown as ContentBlock;
+  }
+  return withoutRawForms(block);
 }
 
 /**
@@ -3011,6 +3041,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return Math.ceil(JSON.stringify(request).length / 4);
   }
 
+  /**
+   * A request's complete bound with each block priced as its route sends it
+   * (sentForm). Where a route sends more of a block than that, what the
+   * rung adds is priced low by the difference. Two such places are known:
+   *   - a redacted_thinking block carrying a reasoning item, on Anthropic,
+   *     which sends it whole: met only where a compression model moved from
+   *     a Responses route to Anthropic replays its earlier answers, and
+   *     whether Anthropic accepts such a block at all is unchecked;
+   *   - a block whose rawItem outweighs its fields, on the Responses API
+   *     route, which sends the item: the item's own overhead, such as its id
+   *     and status, unmeasured.
+   */
+  private sentBoundTokens(request: NormalizedRequest): number {
+    return this.compressionRequestInputBoundTokens({
+      ...request,
+      messages: request.messages.map((m) => ({ ...m, content: m.content.map(sentForm) })),
+    });
+  }
+
   private compressionRequestInputBoundTokens(request: NormalizedRequest): number {
     // Serialize the COMPLETE normalized request rather than maintaining a
     // hand-picked field list that can silently fall behind Membrane's request
@@ -3412,27 +3461,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * messages from the chunk on) or in parts, without the recall pairs, and
    * the provider has just taken the canonical, which sends all of it.
    * Admission prices what a rung adds to the request it rewrites, by that
-   * request's count, and the rung's own bound where there's none.
+   * request's count, and the rung's own bound where there's none. What a
+   * rung adds is read from both requests with each block priced as the most
+   * its route sends of it (sentBoundTokens). The complete bound counts a
+   * block's raw replay forms beside its fields, and an edit releases them,
+   * so the complete bounds' difference credited a released rawXml, which the
+   * native formatter never sends, against what the rewrite adds (a hoist's
+   * fell to -137 where what it sends grew by 592).
    */
   private compressionAdmission(
-    baseBoundTokens: number,
+    base: NormalizedRequest,
+    rewrite: NormalizedRequest,
     rewriteBoundTokens: number,
-    maxTokens: number,
     baseProviderInputTokens: number | undefined,
   ): CompressionAdmission {
     const budgetTokens = this.normalizedCompressionContextBudget();
+    const maxTokens = rewrite.config.maxTokens;
     // When the provider reports the base's input, it is authoritative and
     // must dominate admission even if our serialization happens to be
     // smaller. The positive delta keeps a nominally smaller or identical
     // serialization from treating an expansion as free.
-    const expansionDeltaTokens = Math.max(1, rewriteBoundTokens - baseBoundTokens);
+    const expansionDeltaTokens = Math.max(1, this.sentBoundTokens(rewrite) - this.sentBoundTokens(base));
     // Once the provider has counted the base, that observed token total is
     // the baseline. The complete normalized UTF-8 bound remains the
     // fail-closed fallback when usage is absent, but must not override real
     // token accounting: large invariant tool schemas can be megabytes of JSON
     // while occupying a much smaller token window. The positive byte delta is
-    // deliberately conservative for what the rewrite changed; what it left
-    // unchanged was accepted and counted with the base. Each message adds 128
+    // meant to be conservative for what the rewrite changed, short of the two
+    // gaps sentBoundTokens names; what it left unchanged was accepted and
+    // counted with the base. Each message adds 128
     // to the bound (compressionRequestInputBoundTokens), so a rewrite that adds
     // messages, as a hoist adds two for each argument it moves, pays for them
     // before its bytes, and near the budget it can be skipped where it would
@@ -3479,9 +3536,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (providerAttempts >= fallbackLimit) break;
       // A recall-curve variant is an expansion of the canonical prompt.
       const admission = this.compressionAdmission(
-        canonicalRequestBoundTokens,
+        canonicalRequest,
+        variant.request,
         variant.deterministicInputBoundTokens,
-        variant.request.config.maxTokens,
         canonicalProviderInputTokens,
       );
       // The record's fields in their stored order: the quarantine key hashes
@@ -7312,9 +7369,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           hoistedRequest = this.prepareCompressionAhead(hoistedRequest);
           const requestHash = sha256Json(hoistedRequest);
           const admission = this.compressionAdmission(
-            this.compressionRequestInputBoundTokens(base.request),
+            base.request,
+            hoistedRequest,
             this.compressionRequestInputBoundTokens(hoistedRequest),
-            hoistedRequest.config.maxTokens,
             base.providerInputTokens,
           );
           if (admission.disposition === 'admission_rejected') {
@@ -11677,6 +11734,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * A stored message's sentTokensOf, kept per message object and guarded, as
+   * the store guards its own estimates, by the identity of every block, the
+   * store and its calibration: a sharded body's total is read for every
+   * chunk of it, and pricing a shard scans its text for data URLs, which
+   * read the whole body once per chunk.
+   */
+  protected sentTokensOfStored(message: StoredMessage, ctx: StrategyContext): number {
+    const content = message.content;
+    const calibration = ctx.messageStore.getTokenCalibration?.();
+    const hit = this.sentTokensByMessage.get(message);
+    if (hit && hit.store === ctx.messageStore && hit.calibration === calibration &&
+      hit.blocks.length === content.length && hit.blocks.every((block, i) => block === content[i])) {
+      return hit.tokens;
+    }
+    const tokens = this.sentTokensOf(content, ctx);
+    this.sentTokensByMessage.set(message, { blocks: content.slice(), store: ctx.messageStore, calibration, tokens });
+    return tokens;
+  }
+
+  private readonly sentTokensByMessage = new WeakMap<StoredMessage, {
+    blocks: readonly ContentBlock[]; store: object; calibration: number | undefined; tokens: number;
+  }>();
+
+  /**
    * The one sharded body every given message belongs to, with its total
    * tokens, or null when they don't all belong to one. A body is one
    * ingestion: another ingestion of the same text shares the group id, and
@@ -11698,7 +11779,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Priced as a compression request sends each message, so a payload that
     // preparation replaces doesn't count toward the reading total.
     let totalTokens = 0;
-    for (const m of messages) totalTokens += this.sentTokensOf(m.content, ctx);
+    for (const m of messages) totalTokens += this.sentTokensOfStored(m, ctx);
     return { totalTokens };
   }
 
@@ -11727,7 +11808,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Tokens in this chunk specifically, priced as the body is.
     let chunkTokens = 0;
     for (const m of chunk.messages) {
-      chunkTokens += this.sentTokensOf(m.content, ctx);
+      chunkTokens += this.sentTokensOfStored(m, ctx);
     }
     // Reading-mode threshold: the original message must be substantially
     // larger than this chunk. 2× means the chunk is at most half of the
@@ -11873,18 +11954,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Format head content, truncated to ~2000 tokens (~8000 chars)
     const MAX_HEAD_CHARS = 8000;
     let headContent = '';
+    let headReplacements = 0;
     for (const m of headMessages) {
-      // Counted as the request sends it: its serialized media replaced on a
-      // copy, as prepareCompressionCandidate replaces it below, so a payload
-      // doesn't spend the cap.
-      const copy = { content: [...m.content] };
-      this.stripSerializedCompressionMedia([copy]);
+      // Counted as the request sends it: only the message's text blocks
+      // reach it, with their serialized media replaced on a copy, so a
+      // payload doesn't spend the cap. The request carries the markers, so
+      // what was replaced in the head is logged with it below.
+      const copy = { content: m.content.filter((block) => block.type === 'text') };
+      const replaced = this.stripSerializedCompressionMedia([copy]);
       const entry = `${m.participant}: ${this.extractText(copy.content)}`;
       if (headContent.length + entry.length > MAX_HEAD_CHARS) {
         headContent += '\n\n[...truncated...]';
         break;
       }
       headContent += (headContent ? '\n\n' : '') + entry;
+      headReplacements += replaced;
     }
 
     // Gather top summaries for broader context
@@ -11917,7 +12001,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       },
     };
 
-    const prepared = this.prepareCompressionCandidate(request, 'transition');
+    const preparation = this.prepareCompressionRequest(request);
+    this.logCompressionPreparation(
+      { ...preparation, serializedMediaReplacements: preparation.serializedMediaReplacements + headReplacements },
+      'transition',
+    );
+    const prepared = preparation.request;
     const response = await ctx.membrane.complete(prepared, { formatter: this.nativeFormatter });
     if (!this.isCompressionBranchCurrent(sourceBranch)) {
       throw new Error('Transition summary crossed a branch generation; reinitialize before retrying');

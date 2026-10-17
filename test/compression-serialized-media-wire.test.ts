@@ -586,6 +586,39 @@ describe('transition request preparation', () => {
     cm.close();
   });
 
+  it("logs the head's replaced payloads with the transition request it sends", async () => {
+    const { membrane, requests } = recorder();
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: 'm', headWindowTokens: 100000, recentWindowTokens: 100000,
+      autoTickOnNewMessage: false,
+    });
+    const cm = await ContextManager.open({ path: join(dir, 'transition-log'), strategy, membrane: membrane as never });
+    cm.addMessage('User', [{ type: 'text', text: 'data:image/png;base64,' + 'T'.repeat(5000) + ' and data:image/png;base64,' + 'V'.repeat(5000) }]);
+    cm.addMessage('Claude', [
+      { type: 'text', text: 'and data:image/png;base64,' + 'U'.repeat(5000) },
+      { type: 'tool_result', toolUseId: 't', content: 'data:image/png;base64,' + 'R'.repeat(5000) } as unknown as ContentBlock,
+    ]);
+    // Past the head's 8,000 characters, so the request doesn't carry it.
+    cm.addMessage('User', [{ type: 'text', text: 'x'.repeat(9_000) + ' data:image/png;base64,' + 'W'.repeat(5000) }]);
+    const ctx = (cm as unknown as { createStrategyContext(): never }).createStrategyContext();
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      await strategy.generateTransitionSummary(ctx);
+    } finally {
+      console.error = original;
+    }
+    // The two payloads of the first message and the one in the second's
+    // text: not the tool_result's, which the head's text never carries, nor
+    // the third message's, past the cap.
+    assert.deepEqual(lines.filter((l) => l.includes('[transition]')),
+      ['[autobiographical] compression prompt: replaced 3 serialized data URL(s) with markers [transition]']);
+    const sent = requests.at(-1)!;
+    for (const payload of ['T', 'V', 'U', 'R', 'W']) assert.ok(!sent.includes(payload.repeat(200)), `no ${payload} payload in the request`);
+    cm.close();
+  });
+
   it("counts a head message's payload as its marker, so it doesn't spend the head's 8,000 characters", async () => {
     const payload = 'T'.repeat(20_000);
     const { membrane, requests } = recorder();
@@ -602,6 +635,50 @@ describe('transition request preparation', () => {
     assert.ok(requests[0].includes('SECOND-HEAD-MESSAGE'), 'the head goes on past the payload');
     assert.ok(!requests[0].includes('[...truncated...]'));
     cm.close();
+  });
+});
+
+describe("a sharded body's price is read once per shard", () => {
+  it("prices each shard once across the body's chunks, and again once a block of it changes or is added", () => {
+    let scans = 0;
+    class Counted extends AutobiographicalStrategy {
+      docContext(chunk: unknown, ctx: unknown) { return this.detectDocContext(chunk as never, ctx as never); }
+      protected override stripSerializedCompressionMedia(messages: Array<{ content: ContentBlock[] }>): number {
+        scans += messages.length;
+        return super.stripSerializedCompressionMedia(messages);
+      }
+    }
+    const strategy = new Counted({ compressionModel: 'm' });
+    const words = 'word '.repeat(400);
+    const messages = [0, 1, 2, 3, 4].map((i) => ({ id: `s${i}`, bodyGroupId: 'g', shardIndex: i, participant: 'User', content: [{ type: 'text', text: `${i} ${words}` }] as ContentBlock[] }));
+    let calibration = 1;
+    const store = () => ({
+      getAll: () => messages,
+      getTokenCalibration: () => calibration,
+      estimateTokens: (m: { content: Array<{ text?: string }> }) => Math.ceil(calibration * m.content.reduce((n, b) => n + (b.text?.length ?? 0), 0) / 4),
+    });
+    const ctx = { messageStore: store() };
+    const totals = messages.map((m) => strategy.docContext({ messages: [m] }, ctx)?.totalTokens);
+    assert.equal(scans, messages.length, 'each shard priced once across five chunks');
+    assert.equal(new Set(totals).size, 1, 'every chunk reads the same total');
+    // A shard whose block is replaced is priced again, and the total follows.
+    messages[2]!.content = [{ type: 'text', text: 'short' }] as ContentBlock[];
+    const after = strategy.docContext({ messages: [messages[0]!] }, ctx)!.totalTokens;
+    assert.equal(scans, messages.length + 1, 'only the changed shard again');
+    assert.ok(after < totals[0]!, `the total follows the change (${totals[0]} -> ${after})`);
+    // A block appended to a shard in place, its others kept, is priced too.
+    messages[3]!.content.push({ type: 'text', text: words } as ContentBlock);
+    const grown = strategy.docContext({ messages: [messages[0]!] }, ctx)!.totalTokens;
+    assert.equal(scans, messages.length + 2, 'the grown shard again');
+    assert.ok(grown > after, `the total takes the appended block in (${after} -> ${grown})`);
+    // A recalibrated store prices every shard again, and the total follows it.
+    calibration = 2;
+    const recalibrated = strategy.docContext({ messages: [messages[0]!] }, ctx)!.totalTokens;
+    assert.equal(scans, 2 * messages.length + 2, 'every shard again after a recalibration');
+    assert.ok(recalibrated > grown, `the total follows the calibration (${grown} -> ${recalibrated})`);
+    // So does another store, as each strategy context's view is.
+    strategy.docContext({ messages: [messages[0]!] }, { messageStore: store() });
+    assert.equal(scans, 3 * messages.length + 2, 'every shard again for another store');
   });
 });
 
