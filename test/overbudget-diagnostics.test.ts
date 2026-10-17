@@ -40,8 +40,13 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     return this.atCap || super.isAtSpeculativeCap();
   }
 
-  protected mergeBlockedByHold(sourceIds: string[], store: Parameters<AutobiographicalStrategy['mergeBlockedByHold']>[1]): boolean {
-    return this.holdBlocksMerges || super.mergeBlockedByHold(sourceIds, store);
+  protected mergeBlockedByHold(...args: Parameters<AutobiographicalStrategy['mergeBlockedByHold']>): boolean {
+    return this.holdBlocksMerges || super.mergeBlockedByHold(...args);
+  }
+
+  /** How many times the hold boundary has been read with a hold in place (holdBoundaryScans). */
+  boundaryScans(): number {
+    return this.holdBoundaryScans;
   }
 
   /**
@@ -323,6 +328,25 @@ function waitingMembrane(): { membrane: Membrane; called: Promise<void>; calls: 
     }),
   } as unknown as Membrane;
   return { membrane, called, calls, release: () => { for (const reject of waiting.splice(0)) reject(new Error('released by the test')); } };
+}
+
+/**
+ * A membrane that answers end_turn. On its first call it yields a macrotask, so tick has set
+ * pendingCompression, then runs `during`, as a host acting while the request is out does.
+ */
+function answeringMembrane(during: () => void | Promise<void>): { membrane: Membrane; calls: { n: number } } {
+  const calls = { n: 0 };
+  const membrane = {
+    complete: async () => {
+      calls.n++;
+      if (calls.n === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        await during();
+      }
+      return { stopReason: 'end_turn', content: [{ type: 'text', text: `Summary #${calls.n}` }] };
+    },
+  } as unknown as Membrane;
+  return { membrane, calls };
 }
 
 async function withManager(
@@ -2598,9 +2622,78 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.atCap = false;
       strategy.breakQuarantineRead();
       assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
-      assert.deepEqual(strategy.queuedChunkIds()[0], queued[0], 'premise: the walk reaches the first queued chunk first, which needs a model call');
       model.release();
       await ticking;
+      // The control: with nothing in flight, the same fixture names nothing, since the walk stops at the
+      // first queued chunk, which needs a model call, ahead of the merge still queued.
+      assert.equal(strategy.queuedMergeCount(), 1, 'premise: the merge stays queued, its call rejected by the test');
+      assert.deepEqual((await refusal(manager)).clearedBy, []);
+    }, { membrane: model.membrane });
+  });
+
+  // The landing's hold check the rule for work in flight rests on: executeMerge reads the hold again once the
+  // model has answered. The chunk's landing is main's G1 test (compression-hold.test.ts).
+  for (const hold of [false, true]) {
+    it(hold
+      ? 'discards a merge\'s answer when a hold placed during its call reaches it: tick rejects, writes no L2 and keeps the merge at the head, and its next call makes no model call'
+      : 'lands a merge whose call no hold reaches, writing its L2 and leaving the queue (the control)', async () => {
+      const strategy = mergeOfTwo();
+      let manager!: ContextManager;
+      let ids: string[] = [];
+      const { membrane, calls } = answeringMembrane(() => {
+        if (hold) manager.holdCompression([ids[3]!], { timeoutMs: 60_000 });
+      });
+      await withManager(strategy, async (m) => {
+        manager = m;
+        ids = fourSummaries(manager, strategy);
+        strategy.queueMergeOf(['L1-c', 'L1-d']);
+        const summaries = strategy.summaryIds().length;
+        if (hold) {
+          await assert.rejects(manager.tick(), /discarded: a compression hold was placed on its span mid-request/);
+          assert.equal(strategy.summaryIds().length, summaries, 'no L2 is written');
+          assert.equal(strategy.queuedMergeCount(), 1, 'the merge stays at the head');
+          await manager.tick();
+          assert.equal(calls.n, 1, 'the next tick returns at the held head without a model call');
+          manager.releaseCompression([ids[3]!]);
+        } else {
+          await manager.tick();
+          assert.equal(calls.n, 1, 'premise: tick asked the model once');
+          assert.equal(strategy.summaryIds().length, summaries + 1, 'the L2 is written');
+          assert.equal(strategy.queuedMergeCount(), 0, 'and the merge leaves the queue');
+        }
+      }, { membrane });
+    });
+  }
+
+  it('reads the hold boundary no more often in a count that walks more merges, or with one in flight, since each merge\'s hold check takes the hold set the count read', async () => {
+    const strategy = mergeOfTwo();
+    const model = waitingMembrane();
+    await withManager(strategy, async (manager) => {
+      const ids = fourSummaries(manager, strategy);
+      const later = manager.addMessage('user', [{ type: 'text', text: 'message 4 ' + 'word '.repeat(60) }]);
+      // Every merge folds nothing, so the walk reads each, and a hold on a later message blocks none.
+      manager.pinRange(ids[0]!, ids[3]!, { name: 'zz-pin' });
+      manager.holdCompression([later], { timeoutMs: 60_000 });
+      strategy.queueMergeOf(['L1-a', 'L1-b']);
+      assert.deepEqual((await refusal(manager)).clearedBy, []);
+      const scans = (): number => {
+        const before = strategy.boundaryScans();
+        assert.equal(strategy.countsCompressionWork(), false);
+        return strategy.boundaryScans() - before;
+      };
+      const withOne = scans();
+      assert.ok(withOne > 0, 'premise: a count reads the boundary with the hold in place');
+      strategy.queueMergeOf(['L1-c', 'L1-d']);
+      strategy.queueMergeOf(['L1-b', 'L1-c']);
+      assert.equal(strategy.queuedMergeCount(), 3, 'premise: three merges are queued');
+      assert.equal(scans(), withOne, 'two merges more cost no read of the boundary');
+      const ticking = manager.tick().then(() => undefined, (error: unknown) => error);
+      await Promise.race([model.called, ticking]);
+      assert.equal(model.calls.n, 1, 'premise: tick asked the model for the head merge, and waits');
+      assert.equal(scans(), withOne, 'nor does the merge in flight');
+      model.release();
+      await ticking;
+      manager.releaseCompression([later]);
     }, { membrane: model.membrane });
   });
 

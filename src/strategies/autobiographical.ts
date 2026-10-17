@@ -8938,9 +8938,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the speculative cap). Each counts only when its summary would fold a
    * message the selection can fold now (below). Tick takes the merges in
    * order, the head each call: it runs a head that folds nothing (a model
-   * call, or a drop with none when it's stale) and then takes the next, and
-   * returns at a head a hold blocks. So the walk goes past a merge that
-   * folds nothing and ends at one a hold blocks. The merge in flight stays at
+   * call, or a drop with none when it's stale) and takes the next once that
+   * call lands or drops it, and returns at a head a hold blocks. So the walk
+   * goes past a merge that folds nothing and ends at one a hold blocks. A
+   * call that fails or that the host withdraws leaves the merge at the head
+   * for tick's next call, and a refused or non-retryable one leaves it there
+   * until mergeAttemptLimit's attempts quarantine it, so the count, which
+   * can't know how a call will end, can name work behind a merge that tick
+   * reaches only after that. The merge in flight stays at
    * the head until it lands, and the walk reads it there: a hold placed since
    * ends the walk at it, since tick discards what its call returns and stops
    * at that head. A queued merge counts even when executeMerge will
@@ -8974,8 +8979,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * merges before it takes the chunk that counts, reaching it once merges
    * relieve the cap, or never at a cap no merge relieves. Following the cap
    * through the walk would take the merges tick queues on the way, which the
-   * count can't know. So at the cap no queued chunk counts while a merge
-   * that folds nothing runs, though its landing may relieve the cap. A held
+   * count can't know. So at the cap no queued chunk counts, though a merge
+   * that folds nothing may relieve the cap when it lands. A held
    * chunk
    * can be queued: select's rebuild leaves one out, but a produce op queues
    * the chunks it demands, held or not. Tick drops a held one from the queue
@@ -9084,7 +9089,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // chunkHasHeldMessage's rule, over the ids tick recorded.
         const reached = held !== null && work.messageIds.some((id) => held.has(id));
         if (!reached && work.messageIds.some((id) => foldable.has(id))) return true;
-      } else if (!this.mergeBlockedByHold([...work.sourceIds], store) && mergeFolds(work.sourceIds)) {
+      } else if (!this.mergeBlockedByHold([...work.sourceIds], store, held) && mergeFolds(work.sourceIds)) {
         return true;
       }
     }
@@ -9093,17 +9098,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (executeMerge needs the model). It reaches a merge only once it has
     // taken every queued chunk, or at the cap. With a model, tick takes the
     // merges in order, the head each call: it runs a head that folds nothing
-    // (a model call, or a drop with none when it's stale) and then takes the
-    // next, and returns at a head a hold blocks. So the walk goes past a merge
-    // that folds nothing and ends at one a hold blocks; a stale merge counts
-    // until tick has dropped it, if it folds something now. A merge in flight
-    // is still the head: a hold placed since ends the walk there, since tick
-    // discards what its call returns and stops at it.
+    // (a model call, or a drop with none when it's stale) and takes the next
+    // once that call lands or drops it, and returns at a head a hold blocks.
+    // A call that fails, is refused or is withdrawn leaves the merge at the
+    // head, so work behind it waits for a later call, which the count can't
+    // foresee. So the walk goes past a merge that folds nothing and ends at
+    // one a hold blocks, reading the hold set the count read above; a stale
+    // merge counts until tick has dropped it, if it folds something now. A
+    // merge in flight is still the head: a hold placed since ends the walk
+    // there, since tick discards what its call returns and stops at it.
     const modelled = Boolean(this.config.compressionModel);
     let mergeCounts = false;
     if (this.config.hierarchical && modelled) {
       for (const merge of this.mergeQueue) {
-        if (this.mergeBlockedByHold(merge.sourceIds, store)) break;
+        if (this.mergeBlockedByHold(merge.sourceIds, store, held)) break;
         if (mergeFolds(merge.sourceIds)) {
           mergeCounts = true;
           break;
@@ -13283,9 +13291,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return blocked;
   }
 
-  /** Whether any merge source's span reaches the hold boundary. */
-  protected mergeBlockedByHold(sourceIds: string[], store: MessageStoreView): boolean {
-    const blocked = this.holdBlockedIds(store);
+  /**
+   * Whether any merge source's span reaches the hold boundary. A caller that
+   * has read holdBlockedIds for this pass already gives it as `blocked`
+   * (null when nothing is held), so a pass over many merges reads the
+   * boundary once.
+   */
+  protected mergeBlockedByHold(
+    sourceIds: string[],
+    store: MessageStoreView,
+    blocked: Set<string> | null = this.holdBlockedIds(store),
+  ): boolean {
     if (!blocked) return false;
     return sourceIds.some((id) => {
       const s = this.summaries.find((x) => x.id === id);

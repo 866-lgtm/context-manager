@@ -80,8 +80,10 @@ export interface OverBudgetDiagnostics {
  *   what the call returns. When it doesn't count, the count goes on to the
  *   queue, where a merge in flight is still the head, and it goes past a
  *   queued merge that folds nothing, which `tick` runs before it takes the
- *   next. A merge counts even when `tick` will drop it as stale without a
- *   model call: a source
+ *   next once that call lands or drops it. A call that fails, is refused or
+ *   is withdrawn leaves the merge at the head, so the count can name work
+ *   behind it that `tick` reaches only after that. A merge counts even when
+ *   `tick` will drop it as stale without a model call: a source
  *   isn't loaded or is already merged into another summary, or its sources
  *   fail the merge's topology check, in which case `tick` quarantines it.
  *   So the count can name compression for such a merge until `tick`
