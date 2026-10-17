@@ -44,7 +44,7 @@ import type {
 } from '../folding-strategy.js';
 import type { PickerInputs } from '../picker.js';
 import { SummaryTree } from '../summary-tree.js';
-import { planControlledFrontier, type ControlPlan } from '../kv-control.js';
+import { planControlledFrontier, renderableLevel, type ControlPlan } from '../kv-control.js';
 
 export interface KvStableOptions {
   /** Trust region P on per-turn perturbation, in tokens the provider would
@@ -125,11 +125,17 @@ export class KvStableStrategy implements FoldingSolver {
     // its whole covered range, so "cut through the L_k node" (design §7) fixes
     // EVERY leaf under that node at k — not just the addressed chunk. Fixing a
     // single sub-chunk while its siblings render raw is an unrenderable
-    // frontier. Clamp k to the deepest produced level for the chunk; if none
-    // exists, fall back to fixing just the chunk (the controller clamps it
-    // further). Skip leaves already forced raw (head/tail/classic pin).
+    // frontier. Clamp k to the deepest produced level for the chunk, and lower
+    // it while the chunk's own-lineage summary there doesn't list the chunk
+    // (its `parentId` can name a summary written again without its branch):
+    // that node's leaves are other chunks, so fixing them would hold leaves
+    // nothing pins and leave this one raw. If its lineage has no summary at
+    // the level (a parent more than one level up skips it), fix just the
+    // chunk there: the base keeps that level, and the chunk renders raw. Skip
+    // leaves already forced raw (head/tail/classic pin).
+    const listedBy = new Map<string, ReadonlySet<ChunkId>>();
     for (const { id, level } of fixedPins) {
-      const eff = Math.min(level, tree.maxLevel(id));
+      const eff = renderableLevel(tree, id, Math.min(level, tree.maxLevel(id)), listedBy);
       if (eff <= 0) { rawZone.add(id); continue; }
       const node = tree.ancestorAt(id, eff);
       if (!node) { fixedLevels.set(id, eff); continue; }

@@ -1578,8 +1578,10 @@ export interface ProtectedRange {
    * frontier cut passes through the L_k node — neither folded deeper nor
    * un-folded shallower. Under kv-stable, a chunk whose summaries stop below k
    * renders at the deepest it has, and one whose own-lineage summary at k
-   * doesn't list it renders where one does, or raw. Takes precedence over
-   * `maxLevel`. Omitted → not a fixed-level pin.
+   * doesn't list it renders where one does, or raw. The lowering stops at a
+   * level the chunk's lineage skips (a parent more than one level up), where
+   * the chunk renders raw. Takes precedence over `maxLevel`. Omitted → not a
+   * fixed-level pin.
    *
    * Honored by the folding strategies that read level bounds
    * (`foldingStrategy: 'kv-stable'` and `'kv-unified'`, with

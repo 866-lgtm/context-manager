@@ -24,6 +24,8 @@ import assert from 'node:assert/strict';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import { planControlledFrontier, type ControlPlanParams } from '../../src/adaptive/kv-control.js';
 import { renderLayout, kvCost, type RenderLayout } from '../../src/adaptive/render-offsets.js';
+import { Picker } from '../../src/adaptive/picker.js';
+import { KvStableStrategy } from '../../src/adaptive/strategies/kv-stable.js';
 import { buildChronicleWithChain, type MockChronicle } from './harness.js';
 import type { PickerChunk, PickerInputs } from '../../src/adaptive/picker.js';
 import type { ChunkId } from '../../src/adaptive/folding-strategy.js';
@@ -456,6 +458,57 @@ test('[kv-overlap] warns when a rendered summary doesn\'t list a leaf whose own 
   assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['recall:M', 'recall:N2']);
   assert.equal(plan.perturbation, 0);
   assert.equal(overlapWarnings, 1);
+});
+
+// The same links, through the strategy. y is pinned at L2, where its own
+// lineage is M, which doesn't list it. The pin holds y where its lineage lists
+// it, at L1 through N2, and M's own leaves stay unpinned, so with room to
+// spare x renders raw. Expanding the pin through M used to hold x, which
+// nothing pins, at L2 and leave y raw.
+test('a pin-at-level held through KvStableStrategy lowers to where its own lineage lists it', () => {
+  const chunks = [message('x', 0, 100, 'N1'), message('y', 1, 100, 'N2'), message('z', 2, 100, 'N3'), message('w', 3, 100, 'N3')];
+  const { inputs } = store(chunks, [
+    summary('N1', 1, ['x'], 20, 'M'), summary('N2', 1, ['y'], 20, 'M'), summary('N3', 1, ['z', 'w'], 20),
+    summary('M', 2, ['N1'], 15),
+  ]);
+  chunks[1]!.pinLevel = 2;
+  const { result, overlapWarnings } = quietOverlap(() =>
+    new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 100_000, targetBudget: 90_000, slack: 0.1 }));
+  assert.equal(result.finalResolutions.get('y'), 1, 'y is held at L1, where N2 lists it');
+  assert.equal(result.finalResolutions.get('x') ?? 0, 0, 'x, which nothing pins, renders raw');
+  assert.equal(overlapWarnings, 0, 'M is no longer rendered, so nothing disagrees');
+});
+
+// The same links with v beside y under N2: the pin holds N2's whole group at
+// L1, so v, which nothing pins, is held there with y, and x renders raw.
+test('a pin-at-level lowered through KvStableStrategy holds the other leaves of the summary that lists it', () => {
+  const chunks = [message('x', 0, 100, 'N1'), message('y', 1, 100, 'N2'), message('v', 2, 100, 'N2'), message('z', 3, 100, 'N3'), message('w', 4, 100, 'N3')];
+  const { inputs } = store(chunks, [
+    summary('N1', 1, ['x'], 20, 'M'), summary('N2', 1, ['y', 'v'], 20, 'M'), summary('N3', 1, ['z', 'w'], 20),
+    summary('M', 2, ['N1'], 15),
+  ]);
+  chunks[1]!.pinLevel = 2;
+  const { result, overlapWarnings } = quietOverlap(() =>
+    new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 100_000, targetBudget: 90_000, slack: 0.1 }));
+  assert.equal(result.finalResolutions.get('y'), 1, 'y is held at L1, where N2 lists it');
+  assert.equal(result.finalResolutions.get('v'), 1, 'v is held with y, at N2');
+  assert.equal(result.finalResolutions.get('x') ?? 0, 0, 'x, which nothing pins, renders raw');
+  assert.equal(overlapWarnings, 0);
+});
+
+// N2, y's own L1, was written again from v alone, so no summary of y's
+// lineage lists it. The pin lowers to raw: y renders raw, and no summary's
+// leaves are held for it, neither M's x at L2 nor N2's v at L1.
+test('a pin-at-level whose own lineage lists it at no level lowers to raw and holds no summary', () => {
+  const chunks = [message('x', 0, 100, 'N1'), message('y', 1, 100, 'N2'), message('v', 2, 100, 'N2'), message('z', 3, 100, 'N3'), message('w', 4, 100, 'N3')];
+  const { inputs } = store(chunks, [
+    summary('N1', 1, ['x'], 20, 'M'), summary('N2', 1, ['v'], 20, 'M'), summary('N3', 1, ['z', 'w'], 20),
+    summary('M', 2, ['N1'], 15),
+  ]);
+  chunks[1]!.pinLevel = 2;
+  const { result } = quietOverlap(() =>
+    new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 100_000, targetBudget: 90_000, slack: 0.1 }));
+  for (const id of ['x', 'y', 'v']) assert.equal(result.finalResolutions.get(id) ?? 0, 0, `${id} renders raw`);
 });
 
 // m0 is held at L1, where its own A renders it, and the plan folds m1 and m2

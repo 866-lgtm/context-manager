@@ -646,11 +646,6 @@ function projectToValidCut(
   let deepest = maxAvailableLevel(tree);
   for (const level of F.values()) if (level > deepest) deepest = level;
   const maxPasses = (ordered.length + 1) * (deepest + 2);
-  const lists = (node: { id: string; leafChunkIds: ChunkId[] }, leafId: ChunkId): boolean => {
-    let listed = listedBy.get(node.id);
-    if (!listed) { listed = new Set(node.leafChunkIds); listedBy.set(node.id, listed); }
-    return listed.has(leafId);
-  };
   let changed = true;
   let pass = 0;
   while (changed && pass++ < maxPasses) {
@@ -679,7 +674,7 @@ function projectToValidCut(
       // The leaf renders at this level through the node, so the node has to
       // list it: a level carried from before the tree's links changed can
       // point through a summary that no longer covers the leaf.
-      if (node && lists(node, c.id)) {
+      if (node && lists(listedBy, node, c.id)) {
         const key = `${node.id}:${lvl}`;
         const hit = unanimityMemo.get(key);
         if (hit !== undefined) {
@@ -706,12 +701,30 @@ function projectToValidCut(
 }
 
 /**
+ * Whether a summary lists a chunk among its leaves. A chunk's lineage follows
+ * `parentId`, which can name a summary that was written again without the
+ * chunk's branch, so a node on the chunk's lineage doesn't always list it.
+ * `listedBy` caches each node's leaves as a set, so a map holds for one tree:
+ * the planner keeps one per compile, and kv-stable's pin expansion one per
+ * solve, through `renderableLevel`.
+ */
+function lists(
+  listedBy: Map<string, ReadonlySet<ChunkId>>,
+  node: { id: string; leafChunkIds: readonly ChunkId[] },
+  chunkId: ChunkId,
+): boolean {
+  let listed = listedBy.get(node.id);
+  if (!listed) { listed = new Set(node.leafChunkIds); listedBy.set(node.id, listed); }
+  return listed.has(chunkId);
+}
+
+/**
  * A held level, lowered while the summary of the chunk's own lineage there
  * exists but doesn't list the chunk: the recall the chunk renders through
  * wouldn't hold it. A level with no such summary is kept, since the renderer
  * renders it raw.
  */
-function renderableLevel(
+export function renderableLevel(
   tree: SummaryTree,
   chunkId: ChunkId,
   level: number,
@@ -720,10 +733,7 @@ function renderableLevel(
   let k = level;
   while (k > 0) {
     const node = tree.ancestorAt(chunkId, k);
-    if (!node) break;
-    let listed = listedBy.get(node.id);
-    if (!listed) { listed = new Set(node.leafChunkIds); listedBy.set(node.id, listed); }
-    if (listed.has(chunkId)) break;
+    if (!node || lists(listedBy, node, chunkId)) break;
     k--;
   }
   return k;

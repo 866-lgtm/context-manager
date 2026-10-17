@@ -21,7 +21,13 @@
   lowers such a leaf, and the base lowers a locked or pinned leaf's level the
   same way, so a lock or a pin can now render below the level it holds when
   the summary there doesn't list the leaf. A held level with no summary at
-  all is kept, as before, and renders raw.
+  all is kept, as before, and renders raw. For a pin-at-level
+  (`pinAtLevel`, `ProtectedRange.level`), kv-stable now lowers the level the
+  same way before it holds the pin's summary there, so a summary it holds for
+  the pin lists the pinned chunk, and the chunk is held with that summary's
+  other leaves. It used to hold the leaves of the summary that doesn't list
+  the chunk, which nothing pins, and leave the pinned chunk unheld, so it
+  rendered raw when there was room.
 - kv-stable: on a store whose summary tree isn't nested, the solve's
   un-fold pass now moves the leaves a summary renders, decided by each
   leaf's own lineage as the projection decides. It used to leave out any
