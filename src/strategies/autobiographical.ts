@@ -6916,13 +6916,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         chunk.summaryId = coalescedSummary.id;
         return;
       }
-      // A producer whose strategy was let go of (detached, or reinitialized)
-      // wrote no L1, but it may have quarantined the chunk's request family
-      // first. The waiter takes the chunk over by compressing it afresh,
-      // through every check a new compression makes: the quarantine skip,
-      // and this coalescing, which waits on a waiter that took it over
-      // first. Nothing awaits from a compression's start to registering
-      // below, so only one waiter takes it.
+      // Past the L1 check above, a producer whose strategy was let go of
+      // (detached, or reinitialized) left no L1 for this chunk, but it may
+      // have quarantined the chunk's request family first. The waiter takes
+      // the chunk over by compressing it afresh, through this method's own
+      // checks: the quarantine skip, and this coalescing, which waits on a
+      // waiter that took it over first. The tick's hold and cap gates passed
+      // when it started this compression. Nothing awaits from a
+      // compression's start to registering below, so only one waiter takes it.
       if (result.discarded) return this.compressChunkHierarchical(chunk, ctx);
       return;
     }
@@ -7082,7 +7083,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // Work that lost its branch or strategy generation while the first
           // call was out (a detach, a branch move) makes no second one.
           if (!this.isCompressionBranchCurrent(sourceBranch)) {
-            this.logCompressionBranchDiscard(sourceBranch, curveLabel, quarantineRecord);
+            this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:before_call`, quarantineRecord);
             throw Object.assign(new Error('Compression result crossed a branch boundary'), {
               name: 'CompressionBranchDiscard',
             });

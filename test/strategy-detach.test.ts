@@ -203,6 +203,30 @@ async function logsDuring(fn: () => Promise<void>): Promise<string[]> {
   return lines;
 }
 
+/** The compression log's records written while `fn` runs, from the file
+ *  CONTEXT_MANAGER_COMPRESSION_LOG names. */
+async function compressionLogDuring(fn: () => Promise<void>): Promise<Array<Record<string, any>>> {
+  const logPath = `${TEST_STORE_PATH}-compression-log.jsonl`;
+  rmSync(logPath, { force: true });
+  const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+  process.env.CONTEXT_MANAGER_COMPRESSION_LOG = logPath;
+  try {
+    await fn();
+  } finally {
+    if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+  }
+  const records = existsSync(logPath)
+    ? readFileSync(logPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>)
+    : [];
+  rmSync(logPath, { force: true });
+  return records;
+}
+
+/** The phases of the discards a compression log records. */
+const discardPhases = (records: Array<Record<string, any>>) =>
+  records.filter((record) => record.event === 'compression:branch-result-discarded').map((record) => record.metadata?.phase);
+
 /** Record how a promise ends, so a test can assert it resolved. */
 function outcomeOf(promise: Promise<unknown>) {
   const result = { outcome: 'pending' };
@@ -478,13 +502,17 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       await waitFor(() => calls.length === 2);
       assert.ok(JSON.stringify(calls[1].request).includes('"thinking"'), "the second request carries the first summary's reasoning");
 
-      await manager.setStrategy(new PassthroughStrategy());
-      calls[1].fail(carrierRejection());
-      const ended = await settlesWithin(second);
-      await settle(50);
+      let ended = false;
+      const records = await compressionLogDuring(async () => {
+        await manager.setStrategy(new PassthroughStrategy());
+        calls[1].fail(carrierRejection());
+        ended = await settlesWithin(second);
+        await settle(50);
+      });
 
       assert.strictEqual(calls.length, 2, `the replaced strategy retried the call ${calls.length - 2} time(s)`);
       assert.ok(ended, 'the tick ended');
+      assert.deepStrictEqual(discardPhases(records), ['canonical:before_call'], 'the discard is logged as before the retry');
     } finally {
       for (const call of calls.slice(2)) call.release();
       manager.close();
@@ -814,9 +842,10 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       assert.ok(delivering, 'the producer quarantined the chunk and is delivering its alert');
       await manager.setStrategy(new PassthroughStrategy());
       openDelivery();
-      await producing.catch(() => {});
+      await settlesWithin(producing.catch(() => {}));
       await settlesWithin(waiting);
 
+      assert.strictEqual(waiterWork.compressions, 2, 'the waiter took the chunk over with a fresh compression');
       assert.strictEqual(calls.length, answered, `the waiter made ${calls.length - answered} call(s) for a quarantined chunk`);
       assert.strictEqual(waited.outcome, 'resolved', "the waiter's tick ended quietly");
       assert.deepStrictEqual(persisted(store, SUMMARIES), [], 'no summary written');
@@ -1014,17 +1043,21 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         if (label === 'canonical-no-tools' && !swapping) swapping = manager.setStrategy(new PassthroughStrategy());
         return prepare(request, label);
       };
-      const ticking = manager.tick();
-      const ended = outcomeOf(ticking);
-      await waitFor(() => calls.length === 1);
-      // A tool call takes the compression to its no-tools attempt.
-      calls[0].release([{ type: 'tool_use', id: 'tool-1', name: 'note', input: {} }], 'tool_use');
-      await settlesWithin(ticking);
-      await swapping;
+      let ended = { outcome: 'pending' };
+      const records = await compressionLogDuring(async () => {
+        const ticking = manager.tick();
+        ended = outcomeOf(ticking);
+        await waitFor(() => calls.length === 1);
+        // A tool call takes the compression to its no-tools attempt.
+        calls[0].release([{ type: 'tool_use', id: 'tool-1', name: 'note', input: {} }], 'tool_use');
+        await settlesWithin(ticking);
+        if (swapping) await settlesWithin(swapping);
+      });
 
       assert.ok(swapping, 'the second attempt began after the tool call');
       assert.strictEqual(calls.length, 1, `the replaced strategy made ${calls.length - 1} more call(s)`);
       assert.strictEqual(ended.outcome, 'resolved', 'the tick ended quietly');
+      assert.deepStrictEqual(discardPhases(records), ['canonical-no-tools:before_call'], 'the discard is logged as before the call');
       assert.deepStrictEqual(persisted(store, SUMMARIES), [], 'no summary written');
     } finally {
       for (const call of calls.slice(1)) call.release();
@@ -1167,6 +1200,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         if (letGo === 'close') manager.close();
         else await manager.setStrategy(new PassthroughStrategy());
         openInitialize();
+        assert.ok(await settlesWithin(call), 'the call settled');
         await assert.rejects(call, { message: 'initialize failed' });
         assert.strictEqual(failing.running, false, 'the work it started before it failed is stopped');
         assert.strictEqual(failing.detaches, 2, `detached by the ${letGo === 'close' ? 'close()' : 'replacement'}, and again once its initialize() rejected`);
@@ -1176,6 +1210,45 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       }
     });
   }
+
+  it('a strategy whose earlier initialize() rejects while a newer initialization of the same instance runs is not detached', async () => {
+    // Each initialize() call waits on its own gate; the first then fails,
+    // and the second starts work, as a timer would be armed.
+    class GatedInitialize extends PassthroughStrategy {
+      gates: Array<() => void> = [];
+      running = false;
+      detaches = 0;
+      async initialize(): Promise<void> {
+        const first = this.gates.length === 0;
+        await new Promise<void>((resolve) => { this.gates.push(resolve); });
+        if (first) throw new Error('first initialize failed');
+        this.running = true;
+      }
+      detach(): void { this.detaches++; this.running = false; }
+    }
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const manager = await ContextManager.open({ store, strategy: new PassthroughStrategy() });
+    try {
+      const strategy = new GatedInitialize();
+      const setting = manager.setStrategy(strategy);
+      await waitFor(() => strategy.gates.length === 1);
+      // A switchBranch() initializes the same instance again while the
+      // first initialization waits.
+      const switching = manager.switchBranch(manager.currentBranch().name);
+      await waitFor(() => strategy.gates.length === 2);
+      strategy.gates[0]();
+      assert.ok(await settlesWithin(setting), 'the first call settled');
+      await assert.rejects(setting, { message: 'first initialize failed' });
+      strategy.gates[1]();
+      assert.ok(await settlesWithin(switching), 'the second call settled');
+      await switching;
+      assert.strictEqual(strategy.detaches, 0, 'the manager holds the instance again, so its failed earlier initialization detaches nothing');
+      assert.strictEqual(strategy.running, true, 'and the newer initialization runs');
+    } finally {
+      manager.close();
+      store.close();
+    }
+  });
 
   it('an open() whose strategy fails to initialize lets go of the strategy', async () => {
     // It starts work, as a timer would be armed, and then fails.
@@ -1191,7 +1264,9 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const strategy = new FailingInitialize();
     const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
     try {
-      await assert.rejects(ContextManager.open({ store, strategy }), { message: 'initialize failed' });
+      const opening = ContextManager.open({ store, strategy });
+      assert.ok(await settlesWithin(opening), 'open() settled');
+      await assert.rejects(opening, { message: 'initialize failed' });
       assert.strictEqual(strategy.running, false, 'the work it started before it failed is stopped');
       assert.strictEqual(strategy.detaches, 1, 'detached once');
     } finally {
@@ -1200,10 +1275,6 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
   });
 
   it("a compression whose clear after its summary spans the swap ends there, and logs no discard", async () => {
-    const logPath = `${TEST_STORE_PATH}-compression-log.jsonl`;
-    rmSync(logPath, { force: true });
-    const previousLog = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = logPath;
     const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
     const { calls, membrane } = heldMembrane();
     const strategy = newStrategy();
@@ -1222,29 +1293,24 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         await clearGate;
         return clear(chunk);
       };
-      const ticking = manager.tick();
-      const ended = outcomeOf(ticking);
-      await waitFor(() => calls.length === 1);
-      calls[0].release();
-      assert.ok(await reaches(() => clearing), 'the summary is written and its clear is waiting');
-      await manager.setStrategy(new PassthroughStrategy());
-      openClear();
-      await settlesWithin(ticking);
+      let ended = { outcome: 'pending' };
+      const records = await compressionLogDuring(async () => {
+        const ticking = manager.tick();
+        ended = outcomeOf(ticking);
+        await waitFor(() => calls.length === 1);
+        calls[0].release();
+        assert.ok(await reaches(() => clearing), 'the summary is written and its clear is waiting');
+        await manager.setStrategy(new PassthroughStrategy());
+        openClear();
+        await settlesWithin(ticking);
+      });
 
       assert.strictEqual(persisted(store, SUMMARIES).length, 1, 'the summary written before the swap stays');
       assert.strictEqual(ended.outcome, 'resolved', 'the tick ended quietly');
-      const events = existsSync(logPath)
-        ? readFileSync(logPath, 'utf8').split('\n').filter(Boolean).map((line) => String(JSON.parse(line).event))
-        : [];
+      const events = records.map((record) => String(record.event));
       assert.ok(events.includes('compression:attempt'), `the compression log is written: ${JSON.stringify(events)}`);
-      assert.ok(
-        !events.includes('compression:branch-result-discarded'),
-        `a discard was logged for a summary that was written: ${JSON.stringify(events)}`,
-      );
+      assert.deepStrictEqual(discardPhases(records), [], `a discard was logged for a summary that was written: ${JSON.stringify(events)}`);
     } finally {
-      if (previousLog === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
-      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previousLog;
-      rmSync(logPath, { force: true });
       for (const call of calls) call.release();
       manager.close();
       store.close();

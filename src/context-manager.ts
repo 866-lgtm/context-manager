@@ -1446,8 +1446,9 @@ export class ContextManager {
   /**
    * Set the context management strategy and initialize it on the selected branch.
    * The strategy it replaces is detached first (ContextStrategy.detach).
-   * Also recovers a manager after failed initialization. A failure leaves work
-   * fenced until another successful initialization; it does not restore the old strategy.
+   * Also recovers a manager after failed initialization. A failure leaves the
+   * manager's operations fenced until another successful initialization, with
+   * the strategy still held; it does not restore the old strategy.
    */
   async setStrategy(strategy: ContextStrategy): Promise<void> {
     this.requireOpen('setStrategy');
@@ -1979,7 +1980,9 @@ export class ContextManager {
    * close() closes. describeRenderedForms(), which reads the strategy's
    * declared forms, and the manager's own setters, such as
    * setSystemPrompt(), still answer, and releaseCompression() still doesn't
-   * throw. A second close() does nothing.
+   * throw. close() throws the store's own error when closing a store the
+   * manager owns fails at its final sync; the store is closed all the same.
+   * A second close() does nothing.
    * If the manager owns the store (created via path config), this closes the store.
    * If the app owns the store (passed via store config), the store stays open;
    * the app is responsible for closing it when done.
