@@ -71,10 +71,13 @@ export interface OverBudgetDiagnostics {
  *   another summary, or its sources fail the merge's topology check, in
  *   which case `tick` quarantines it. So the count can name compression for
  *   such a merge until `tick` reaches it and drops it. A queued chunk counts
- *   when `tick` would adopt an L1 for it, stub it or compress it. One the
- *   compression quarantine holds, or one
- *   `tick` defers until the host declares its tools, doesn't, and the count
- *   goes on past it, as `tick` does. The count reads a chunk's tool blocks
+ *   when `tick` would adopt an L1 for it, stub it or compress it, and the
+ *   compile can fold one of its messages now: one outside the head and
+ *   recent windows that no pin keeps raw, since the compile renders the
+ *   rest raw whatever summary covers them. One the compression quarantine
+ *   holds, one `tick` defers until the host declares its tools, or one the
+ *   compile can fold none of, doesn't, and the count goes on past it, as
+ *   `tick` does. The count reads a chunk's tool blocks
  *   as stored, where `tick` strips unpaired ones first, so it can leave out
  *   a chunk `tick` would compress, but never counts one `tick` defers. It
  *   stops at a chunk that needs a model call without a compression model,
@@ -83,15 +86,16 @@ export interface OverBudgetDiagnostics {
  *   for the host's tools and go on, since its stored read can't always
  *   tell, so it can leave out the work behind such a chunk, but never
  *   counts a chunk `tick` throws at. A chunk that counts is still
- *   uncompressed, holds no held message, and has no message an L1 in memory
- *   already covers, since the adaptive picker already folds through that
- *   L1, unless the selector is the hierarchical one with chunk persistence
- *   on and `tick` would adopt an L1 that matches the chunk exactly, which
- *   ends the raw fallback the selector renders for an uncompressed chunk.
- *   It assumes the manager has a membrane to run compression. For the
- *   adaptive picker's refusals, its plan must also still have summaries to
- *   produce. Whether that work is enough to fit isn't checked, so a host
- *   can tell an agent that compression may make room, not that it will.
+ *   uncompressed, holds no held message, has a message the compile can fold
+ *   now, and has no message an L1 in memory already covers, since the
+ *   adaptive picker already folds through that L1, unless the selector is
+ *   the hierarchical one with chunk persistence on and `tick` would adopt
+ *   an L1 that matches the chunk exactly, which ends the raw fallback the
+ *   selector renders for an uncompressed chunk. It assumes the manager has
+ *   a membrane to run compression. For the adaptive picker's refusals, its
+ *   plan must also still have summaries to produce. Whether that work is
+ *   enough to fit isn't checked, so a host can tell an agent that
+ *   compression may make room, not that it will.
  * - `'newer-message'`: the newest message alone is over the budget, and a
  *   newer message that fits moves the window past it.
  * - `'smaller-recent-window'`: the raw recent window, which compression never

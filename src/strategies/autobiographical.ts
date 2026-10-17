@@ -8791,13 +8791,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * loaded or already parented, or a group its topology check refuses,
    * which it quarantines): tick drops one such entry a call, so the count
    * can name compression for it until tick reaches it. A chunk counts when
-   * it's still uncompressed, holds no held message, and has no message an
-   * L1 in memory already covers: its
-   * L1 shrinks the context on either path. An L1 only the store holds isn't
-   * in memory, so its chunk counts too: when tick starts on the chunk it
-   * adopts such an L1 that matches the chunk exactly (findExactL1 reads the
-   * store), and compresses the chunk otherwise, and either way the selector
-   * gets an L1 to fold through. A chunk with a covered message counts only on the
+   * it's still uncompressed, holds no held message, has a message the
+   * selection can fold now, and has no message an L1 in memory already
+   * covers: its L1 shrinks the context on either path. An L1 only the store
+   * holds isn't in memory, so its chunk counts too: when tick starts on the
+   * chunk it adopts such an L1 that matches the chunk exactly (findExactL1
+   * reads the store), and compresses the chunk otherwise, and either way the
+   * selector gets an L1 to fold through. A chunk with a covered message counts only on the
    * hierarchical path, when an L1 matches it exactly (in memory, or only in
    * the store, which tick's adoption reads too) and chunk persistence is
    * on: selectHierarchical renders an uncompressed chunk's messages raw beside
@@ -8824,9 +8824,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * model, or while the quarantine can't be read (where tick's own read
    * throws, quarantinedChunkSources): tick throws at such a chunk unless it
    * defers it for the host's tools first, and a host's tick loop ends at a
-   * throw. So a chunk tick adopts an L1 for or stubs counts, whatever the
-   * tools or the quarantine say, unless such a chunk is ahead of it, and so
-   * does a merge behind chunks tick only skips. Without a compression model,
+   * throw. So a chunk tick adopts an L1 for or stubs counts, if the selection
+   * can fold one of its messages, whatever the tools or the quarantine say,
+   * unless such a chunk is ahead of it, and so does a merge behind chunks
+   * tick only skips or takes without making room. Without a compression model,
    * tick throws at the first merge it would make (executeMerge needs the
    * model), so no merge counts, and the chunks it settles for good are those
    * it adopts an L1 for or stubs (its drop of a covered chunk doesn't last,
@@ -8843,7 +8844,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * can't always tell whether tick would defer the chunk: where tick would
    * defer such a chunk and go on, the count leaves out the work behind it.
    * A chunk the quarantine holds doesn't count, and the walk goes past it,
-   * as tick does. The count assumes the host keeps ticking: one that ticks a
+   * as tick does. Nor does a chunk with no message the selection can fold
+   * now, one outside the head and recent windows that no pin keeps raw
+   * (getCompressibleMessages, the chunker's own reading): both selectors
+   * render the head, the recent window and a message such a pin keeps as
+   * raw, so its L1 frees no room. Tick still takes it in turn, so the walk
+   * goes past it where tick moves on (after adopting an L1 for it, stubbing
+   * it, or compressing it with a model), and stops at it where tick throws,
+   * as at any chunk that needs a model call without a model or a readable
+   * quarantine. The count assumes the host keeps ticking: one that ticks a
    * fixed number of times between compiles reaches work only within that
    * many queued chunks, since each compile queues the skipped ones again.
    * Like tick, this assumes the manager has a membrane to run it.
@@ -8884,6 +8893,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         : isToolsLessRefusingSummarizer(this.config.compressionModel ?? '') ? () => true
           : this.requestCarriesToolBlocks(store);
     const quarantined = this.quarantinedChunkSources();
+    // A chunk with no message the selection can fold now frees no room once
+    // it has an L1: both selectors keep the head and recent windows raw, and
+    // a message a pin keeps raw. That's the chunker's own reading of what's
+    // compressible (getCompressibleMessages). Tick still takes such a chunk
+    // in turn, so the walk goes past it where tick does.
+    const foldable = new Set(this.getCompressibleMessages(store).map((m) => m.id));
+    const foldsNothing = (chunk: Chunk): boolean => !chunk.messages.some((m) => foldable.has(m.id));
     // Tick takes the queued chunks in order, one a call, and a host's tick
     // loop ends at the first call that throws.
     for (const index of this.compressionQueue) {
@@ -8891,10 +8907,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (chunk === undefined || chunk.compressed || this.chunkHasHeldMessage(chunk, held)) continue;
       const adoptable = exactL1.has(this.chunkKey(chunk));
       if (chunk.messages.some((m) => coveredByL1.has(m.id))) {
-        if (adoptionShrinks && adoptable) return true;
+        if (adoptionShrinks && adoptable && !foldsNothing(chunk)) return true;
         continue;
       }
-      if (adoptable || this.thinChunkChars(chunk) !== undefined) return true;
+      if (adoptable || this.thinChunkChars(chunk) !== undefined) {
+        if (!foldsNothing(chunk)) return true;
+        continue;
+      }
       // Any other chunk needs a model call. Tick throws at it without a
       // model, or when the quarantine can't be read, unless it defers it for
       // the host's tools first. deferredForTools can't always tell: unless
@@ -8903,7 +8922,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // model or a readable quarantine the walk stops here whatever it says:
       // going on could count work behind a chunk tick throws at.
       if (!modelled || quarantined === undefined) return false;
-      if (deferredForTools(chunk) || quarantined.has(sha256Json(chunk.messages.map((m) => m.id)))) continue;
+      if (deferredForTools(chunk) || quarantined.has(sha256Json(chunk.messages.map((m) => m.id))) || foldsNothing(chunk)) continue;
       return true;
     }
     return mergeCounts;

@@ -63,6 +63,15 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     });
   }
 
+  /** An L1 shorter than any message here, so a plan that folds anything through it gets smaller. */
+  seedShortL1(id: string, sourceIds: string[]): void {
+    this.pushSummary({
+      id, level: 1, sourceLevel: 0, sourceIds,
+      sourceRange: { first: sourceIds[0], last: sourceIds[sourceIds.length - 1] },
+      content: 'a short summary', tokens: 4, created: 0,
+    });
+  }
+
   /** Queues a merge of real summaries. */
   queueMergeOf(sourceIds: string[]): void {
     this.enqueueMerge({ level: 2, sourceIds });
@@ -91,6 +100,11 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   /** Sets the head window's size, as a host restarted with another configuration does. */
   setHeadWindowTokens(tokens: number): void {
     this.config.headWindowTokens = tokens;
+  }
+
+  /** Sets the recent window's size, as a host restarted with another configuration does. */
+  setRecentWindowTokens(tokens: number): void {
+    this.config.recentWindowTokens = tokens;
   }
 
   /** Turns hierarchical merging on or off, as a host restarted with another configuration does. */
@@ -130,16 +144,17 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
 
   /**
    * Each message's index in the store view the last refusal read, with the
-   * head window's start and end there, and where the hold region begins
-   * (the store's length with nothing held).
+   * head window's start and end there, where the recent window starts, and
+   * where the hold region begins (the store's length with nothing held).
    */
-  placement(ids: string[]): { indices: number[]; headStart: number; headEnd: number; holdStart: number } {
+  placement(ids: string[]): { indices: number[]; headStart: number; headEnd: number; recentStart: number; holdStart: number } {
     assert.ok(this.countedView, 'a refusal has counted');
     const all = this.countedView.getAll();
     return {
       indices: ids.map((id) => all.findIndex((message) => message.id === id)),
       headStart: this.getHeadWindowStartIndex(this.countedView),
       headEnd: this.getHeadWindowEnd(this.countedView),
+      recentStart: this.getRecentWindowStart(this.countedView),
       holdStart: this.holdBoundary(this.countedView),
     };
   }
@@ -2065,4 +2080,187 @@ describe('OverBudgetError.clearedBy', () => {
       });
     });
   }
+
+  // A queued chunk the compile can fold none of frees no room once it has an
+  // L1: the head and recent windows render raw, and so does a message a pin
+  // keeps raw (getCompressibleMessages). Tick still takes the chunk, so the
+  // count goes past it where tick does, and stops at it where tick throws.
+  const foldingChunks = () => new DiagnosticStrategy({
+    adaptiveResolution: true,
+    targetChunkTokens: 400,
+    headWindowTokens: 0,
+    recentWindowTokens: 0,
+    overBudgetGraceRatio: 0.25,
+    autoTickOnNewMessage: false,
+    speculativeProduction: false,
+  });
+
+  /** Twelve messages of one size, none split into shards at a 400-token chunk size: three chunks of four close. */
+  const twelveEven = (manager: ContextManager): string[] =>
+    Array.from({ length: 12 }, (_, i) => manager.addMessage('user', [{ type: 'text', text: `message ${String(i).padStart(2, '0')} ` + 'word '.repeat(120) }]));
+
+  /** Pins each chunk's messages from its first to its `last`th (its last when left out). */
+  const pinChunks = (manager: ContextManager, chunks: string[][], last?: number): void => {
+    for (const chunk of chunks) manager.pinRange(chunk[0]!, chunk[last ?? chunk.length - 1]!, { name: 'zz-pin' });
+  };
+
+  for (const pinned of [false, true]) {
+    it(`names ${pinned ? 'nothing' : 'compression'} on the adaptive path for queued chunks that need a model call${pinned ? ', every message of which a pin keeps raw, since their L1s fold nothing' : ''}`, async () => {
+      const strategy = foldingChunks();
+      strategy.produce = true;
+      await withManager(strategy, async (manager) => {
+        twelveEven(manager);
+        const queued = await settledQueue(manager, strategy);
+        assert.equal(queued.length, 3, 'three chunks of four are queued');
+        if (pinned) pinChunks(manager, queued);
+        const error = await refusal(manager);
+        assert.match(error.message, /^Adaptive picker exhausted/);
+        assert.deepEqual(strategy.queuedChunkIds(), queued, 'the chunks stay queued, pinned or not');
+        assert.deepEqual(error.clearedBy, pinned ? [] : ['compression']);
+        // The premise: their L1s, as compression writes them, make the plan smaller only where no pin keeps every message raw.
+        queued.forEach((ids, i) => strategy.seedShortL1(`L1-folding-${i}`, ids));
+        const after = await refusal(manager);
+        if (pinned) assert.equal(after.actual, error.actual, 'the L1s folded nothing');
+        else assert.ok(after.actual < error.actual, `the plan went from ${error.actual} to ${after.actual} tokens`);
+      });
+    });
+  }
+
+  it('names compression on the adaptive path for queued chunks a pin keeps only partly raw, since their other messages fold through their L1s', async () => {
+    const strategy = foldingChunks();
+    strategy.produce = true;
+    await withManager(strategy, async (manager) => {
+      twelveEven(manager);
+      const queued = await settledQueue(manager, strategy);
+      pinChunks(manager, queued, 1);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Adaptive picker exhausted/);
+      assert.deepEqual(error.clearedBy, ['compression']);
+      queued.forEach((ids, i) => strategy.seedShortL1(`L1-partly-${i}`, ids));
+      const after = await refusal(manager);
+      assert.ok(after.actual < error.actual, `the plan went from ${error.actual} to ${after.actual} tokens`);
+    });
+  });
+
+  for (const where of ['head', 'recent'] as const) {
+    for (const whole of [true, false]) {
+      it(`names ${whole ? 'nothing' : 'compression'} on the adaptive path for a queued chunk lying ${whole ? 'wholly' : 'partly'} in ${where === 'head' ? 'a grown head window' : 'a raised recent window'}${whole ? ', which renders raw whatever its L1' : ', since its other messages fold through its L1'}`, async () => {
+        const strategy = foldingChunks();
+        strategy.produce = true;
+        await withManager(strategy, async (manager) => {
+          twelveEven(manager);
+          const queued = await settledQueue(manager, strategy);
+          assert.equal(queued.length, 3, 'three chunks of four are queued');
+          const inWindow = where === 'head' ? queued[0]! : queued[2]!;
+          // Every other queued chunk gets its L1, so the one in the window is the only work left.
+          queued.forEach((ids, i) => { if (ids !== inWindow) strategy.seedL1(`L1-other-${i}`, ids); });
+          // Each message's estimate, from a head that holds them all.
+          strategy.setHeadWindowTokens(1_000_000_000);
+          const each = manager.previewContext({ maxTokens: 2_000_000_000, reserveForResponse: 20 })!.headTokens / 12;
+          strategy.setHeadWindowTokens(0);
+          // Four and a half messages hold the chunk whole; three and a half, only part of it.
+          const tokens = Math.round((whole ? 4.5 : 3.5) * each);
+          if (where === 'head') strategy.setHeadWindowTokens(tokens);
+          else strategy.setRecentWindowTokens(tokens);
+          // The plan says it's over the budget, so the picker refuses and takes the list, with the window inside the budget.
+          strategy.overstate = true;
+          const error = await manager.compile({ maxTokens: 2_000, reserveForResponse: 20 }).then(
+            () => assert.fail('compile should refuse'),
+            (e: unknown) => e,
+          );
+          strategy.overstate = false;
+          assert.ok(error instanceof OverBudgetError);
+          assert.match(error.message, /^Adaptive picker exhausted/);
+          assert.deepEqual(strategy.queuedChunkIds(), queued, 'the chunks stay queued');
+          const { indices, headEnd, recentStart } = strategy.placement(inWindow);
+          const inside = indices.filter((i) => (where === 'head' ? i < headEnd : i >= recentStart)).length;
+          assert.equal(inside, whole ? 4 : 3, `the window holds ${whole ? 'the whole chunk' : 'three of its four messages'}`);
+          assert.deepEqual(error.clearedBy, whole ? [] : ['compression']);
+          // The premise: its L1 makes the plan smaller only when part of the chunk lies outside the window.
+          const big = { maxTokens: 2_000_000_000, reserveForResponse: 20 };
+          const before = manager.previewContext(big)!.finalTokens;
+          strategy.seedShortL1('L1-in-window', inWindow);
+          const after = manager.previewContext(big)!.finalTokens;
+          if (whole) assert.equal(after, before, 'its L1 folded nothing');
+          else assert.ok(after < before, `the plan went from ${before} to ${after} tokens`);
+        });
+      });
+    }
+  }
+
+  it('without a compression model, names nothing for chunks the thin-chunk guard stubs when a pin keeps every message of them raw', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: false,
+      targetChunkTokens: 40,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+      minChunkCharsForLLM: 100_000,
+      compressionModel: undefined,
+    });
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      pinChunks(manager, queued);
+      const error = await refusal(manager);
+      assert.deepEqual(strategy.queuedChunkIds(), queued, 'the pinned chunks stay queued');
+      assert.deepEqual(error.clearedBy, []);
+    }, { membrane: true });
+  });
+
+  it('names nothing for queued chunks every message of which a pin keeps raw, whose exact L1s only the store holds, though tick adopts them without a model call', async () => {
+    const strategy = queuedChunks();
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      queued.forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
+      pinChunks(manager, queued);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assert.deepEqual(error.clearedBy, []);
+      // The premise: tick still takes them, adopting each stored L1.
+      await adoptAll(manager, strategy);
+      assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
+      assert.deepEqual([...strategy.summaryIds()].sort(), queued.map((_, i) => `L1-stored-${i}`).sort(), 'tick adopted each stored L1');
+    }, { membrane: true });
+  });
+
+  it('names nothing on the hierarchical path for queued chunks L1s match exactly when a pin keeps every message of them raw, since adoption ends no raw fallback for them', async () => {
+    const strategy = queuedChunks();
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids));
+      pinChunks(manager, queued);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assert.deepEqual(error.clearedBy, []);
+      // The premise: adopting the exact L1s leaves the render as it was, where unpinned chunks' adoption shrinks it.
+      const before = (await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 })).messages.length;
+      await adoptAll(manager, strategy);
+      const after = (await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 })).messages.length;
+      assert.deepEqual(strategy.queuedChunkIds(), [], 'the adoptions persisted, so the rebuild queued nothing');
+      assert.equal(after, before, `the render stayed at ${before} messages`);
+    }, { membrane: true });
+  });
+
+  it('without a compression model, names nothing for chunks tick adopts an L1 for, queued behind one a pin keeps wholly raw that needs a model call, since tick throws at that one first', async () => {
+    const strategy = modelCallChunks({ compressionModel: undefined });
+    const calls = { n: 0 };
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 12; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      assert.ok(queued.length >= 2, 'two chunks or more are queued');
+      pinChunks(manager, queued.slice(0, 1));
+      queued.slice(1).forEach((ids, i) => strategy.seedStoredL1(`L1-stored-${i}`, ids));
+      assert.deepEqual((await refusal(manager)).clearedBy, []);
+      assert.deepEqual(strategy.queuedChunkIds(), queued, 'the compile queued the same chunks, in the same order');
+      // The premise: tick takes the pinned chunk first, and the host's loop ends there.
+      await assert.rejects(hostTicks(manager, strategy), /compressionModel is NOT configured/);
+      assert.deepEqual(strategy.queuedChunkIds(), queued.slice(1), 'tick took the first chunk only');
+      assert.equal(calls.n, 0, 'no model call');
+    }, { membrane: countingMembrane(calls) });
+  });
 });
