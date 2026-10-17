@@ -73,6 +73,7 @@ import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
+import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
@@ -5018,6 +5019,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         setTimeout(() => this.driveSpeculativeDrain(ctx), 0);
       })
       .catch((err) => {
+        // A host's withdrawal stops the drain quietly: the host asked for it.
+        if (isCompressionWithdrawn(err)) return;
         console.error('AutobiographicalStrategy: speculative-drain error:', err);
       });
   }
@@ -5083,10 +5086,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the fact) waits; the rebuild after release re-queues it.
       if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) return;
 
+      const table = this.chunks;
       this.pendingCompression = this.compressChunkHierarchical(chunk, ctx);
 
       try {
         await this.pendingCompression;
+      } catch (error) {
+        // Withdrawn by the host: the chunk goes back to the head of the
+        // queue, for the next tick after the host lets calls through. A
+        // rebuild while the call was out made a new chunk table, where the
+        // index may name another chunk, and decided the queue afresh: it
+        // queued the chunk again if it may be compressed, and left it out if
+        // overlap blocks it, a fail-closed halt stopped compression, or a
+        // hold covers a chunk it reads from a record, so its queue stands. A
+        // held chunk it closes anew is queued, and tick drops it at its
+        // turn, as it drops a chunk put back here when a hold placed during
+        // the call came with no rebuild. A dry run's rebuild puts the table
+        // and the queue back, so after a preview the chunk still goes back.
+        // Queued again meanwhile without a rebuild, as a plan's demand does
+        // at the tail, it moves to the head, once. A withdrawal on a branch
+        // that moved during the call never reaches here: the call discards
+        // it, as it does any error, and the queue belongs to the branch the
+        // store left.
+        if (isCompressionWithdrawn(error) && this.chunks === table) {
+          const queued = this.compressionQueue.indexOf(chunkIndex);
+          if (queued !== -1) this.compressionQueue.splice(queued, 1);
+          this.compressionQueue.unshift(chunkIndex);
+        }
+        throw error;
       } finally {
         this.pendingCompression = null;
       }
@@ -5123,6 +5150,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.dequeueMerge();
         }
       } catch (error) {
+        // Withdrawn by the host: no attempt, no streak; the merge stays at the
+        // head of the queue for the next tick.
+        if (isCompressionWithdrawn(error)) throw error;
         // Terminal-disposition rejection: the LLM answered, but with a
         // refusal / truncation / tool call / empty — bounded-retry policy,
         // not a crash. Anything else (429, network, timeout) keeps the
@@ -7131,6 +7161,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const callStart = Date.now();
     let logResponse: string | undefined;
     let logError: string | undefined;
+    let logWithdrawn = false;
     let logSummaryId: string | undefined;
     const attemptTraces: CompressionAttemptTrace[] = [];
     let successfulTrace: CompressionAttemptTrace | undefined;
@@ -7184,8 +7215,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         } catch (error) {
           // Degraded mode: the transport rejected the carrier blocks
           // themselves (invalid_request about thinking — never a refusal).
-          // Retry this attempt once with text-only recall pairs, loudly.
-          if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(attemptRequest)) {
+          // Retry this attempt once with text-only recall pairs, loudly. A
+          // host's withdrawal is never a transport rejection, whatever it
+          // carries.
+          if (isCompressionWithdrawn(error) || !isCarrierTransportRejection(error) || !requestCarriesReasoning(attemptRequest)) {
             throw error;
           }
           console.error(
@@ -7419,6 +7452,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             }
             logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
           } catch (error) {
+            // A host's withdrawal is no outcome of this rung: rethrow it.
+            if (isCompressionWithdrawn(error)) throw error;
             if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
             const errorType = error && typeof error === 'object' && 'type' in error
               ? String((error as { type: unknown }).type)
@@ -7510,6 +7545,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               variant.children.map((child) => child.id),
             );
           } catch (error) {
+            // A host's withdrawal is no outcome of this rung: rethrow it.
+            if (isCompressionWithdrawn(error)) throw error;
             if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
             if (!this.isCompressionBranchCurrent(sourceBranch)) {
               this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:error`, quarantineRecord);
@@ -7631,6 +7668,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             }
             logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
           } catch (error) {
+            // A host's withdrawal is no outcome of this rung: rethrow it.
+            if (isCompressionWithdrawn(error)) throw error;
             if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
             const errorType = error && typeof error === 'object' && 'type' in error
               ? String((error as { type: unknown }).type)
@@ -7738,11 +7777,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const label = `split:${a}-${b}`;
             calls++;
             attempted.calls++;
-            this.splitCallTimes.push(Date.now());
+            const stamp = Date.now();
+            this.splitCallTimes.push(stamp);
             let res: unknown;
             try {
               res = await runAttempt(sub, label, [], [], leafHash);
             } catch (error) {
+              // A host's withdrawal is no outcome of this part: it gives the
+              // part's slot in the split window back once its call returns
+              // (until then the slot counts), so withdrawn parts don't
+              // accumulate in the window, and is rethrown. A part sends one
+              // call: its request carries no reasoning (buildSub strips the
+              // raw thinking and adds no recall pairs), so the carrier
+              // fallback never sends a second.
+              if (isCompressionWithdrawn(error)) {
+                const slot = this.splitCallTimes.lastIndexOf(stamp);
+                if (slot !== -1) this.splitCallTimes.splice(slot, 1);
+                throw error;
+              }
               attempted.errors++;
               if (error instanceof Error && error.name === 'CompressionBranchDiscard') throw error;
               abortReason = `provider-error:${error instanceof Error ? error.name : typeof error}`;
@@ -8070,12 +8122,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.checkMergeThreshold();
     } catch (error) {
       if (error instanceof Error && error.name === 'CompressionBranchDiscard') return;
+      // A host's withdrawal isn't a failure: the host asked for it, so its
+      // receipts say withdrawn rather than carrying an error, a moved
+      // branch's included. On a current branch a coalesced waiter gets it
+      // (inFlightError) and rethrows it. On a moved branch the call
+      // discards it, as it discards any error, so nothing is rethrown and a
+      // waiter resolves.
+      if (isCompressionWithdrawn(error)) logWithdrawn = true;
       if (!this.isCompressionBranchCurrent(sourceBranch)) {
-        this.logCompressionBranchDiscard(sourceBranch, 'canonical_error', quarantineRecord);
+        this.logCompressionBranchDiscard(sourceBranch, logWithdrawn ? 'canonical_withdrawn' : 'canonical_error', quarantineRecord);
         return;
       }
-      console.error('Failed to compress chunk (hierarchical):', error);
-      logError = error instanceof Error ? error.message : String(error);
+      if (!logWithdrawn) {
+        console.error('Failed to compress chunk (hierarchical):', error);
+        logError = error instanceof Error ? error.message : String(error);
+      }
       inFlightError = error;
       throw error;
     } finally {
@@ -8123,6 +8184,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           model,
           latency_ms: Date.now() - callStart,
           summary_id: logSummaryId,
+          ...(logWithdrawn ? { withdrawn: true } : {}),
         },
         response: summarizeTelemetryText(logResponse),
         error: logError,
@@ -8864,6 +8926,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const callStart = Date.now();
     let logResponse: string | undefined;
     let logError: string | undefined;
+    let logWithdrawn = false;
     let logNewSummaryId: string | undefined;
     // The request last sent: `dispatchRequest`, or after a carrier
     // rejection its copy with the reasoning stripped. When the call
@@ -8877,8 +8940,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         response = await ctx.membrane.complete(dispatchRequest, { formatter: this.nativeFormatter });
       } catch (error) {
         // Same degraded-mode fallback as the L1 ladder: transport rejected
-        // the carrier blocks → retry once text-only, loudly.
-        if (!isCarrierTransportRejection(error) || !requestCarriesReasoning(dispatchRequest)) throw error;
+        // the carrier blocks → retry once text-only, loudly. A host's
+        // withdrawal is never a transport rejection, whatever it carries.
+        if (isCompressionWithdrawn(error) || !isCarrierTransportRejection(error) || !requestCarriesReasoning(dispatchRequest)) throw error;
         console.error(
           `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
             `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -9019,10 +9083,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } catch (error) {
       // Disposition rejections already warned + receipted above — don't
       // double-log them as crashes; tick() consumes them for retry policy.
-      if (!(error instanceof MergeDispositionRejection)) {
+      if (!(error instanceof MergeDispositionRejection) && !isCompressionWithdrawn(error)) {
         console.error(`Failed to merge summaries into L${targetLevel}:`, error);
       }
-      logError = error instanceof Error ? error.message : String(error);
+      // A withdrawal's receipt says withdrawn rather than carrying an error.
+      if (isCompressionWithdrawn(error)) logWithdrawn = true;
+      else logError = error instanceof Error ? error.message : String(error);
       throw error;
     } finally {
       logCompressionCall({
@@ -9045,6 +9111,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           model: this.requireCompressionModel(),
           latency_ms: Date.now() - callStart,
           summary_id: logNewSummaryId,
+          ...(logWithdrawn ? { withdrawn: true } : {}),
         },
         response: summarizeTelemetryText(logResponse),
         error: logError,
