@@ -465,6 +465,30 @@ test('[kv-overlap] warns when a rendered summary doesn\'t list a leaf whose own 
   assert.doesNotMatch(overlapLines[0]!, /double-representation/);
 });
 
+// m disagrees both ways. Its own L1 N1 names B as its parent, but B was
+// written from N2 alone, and A lists m through N1, one of A's sources. A held
+// plan renders m through N1, p through B and q through A, so A lists a leaf of
+// another lineage and B doesn't list a leaf of its own. The warning names m
+// once, on the first line.
+test('[kv-overlap] names a leaf that disagrees both ways once, on the first line', () => {
+  const { inputs, tree } = store(
+    [message('m', 0, 100, 'N1'), message('p', 1, 100, 'N2'), message('q', 2, 100, 'N3')],
+    [
+      summary('N1', 1, ['m'], 20, 'B'), summary('N2', 1, ['p'], 20, 'B'), summary('N3', 1, ['q'], 20, 'A'),
+      summary('B', 2, ['N2'], 15), summary('A', 2, ['N1', 'N3'], 15),
+    ],
+  );
+  const previous = new Map<ChunkId, number>([['m', 1], ['p', 2], ['q', 2]]);
+  const { result: plan, overlapLines } = quietOverlap(() => planControlledFrontier(inputs, tree, {
+    ...trio, targetTokens: 30, expandAtTokens: 30, foldAtTokens: 300, previous,
+  }));
+  assert.deepEqual(Object.fromEntries(plan.resolutions), { m: 1, p: 2, q: 2 });
+  assert.equal(plan.perturbation, 0);
+  assert.equal(overlapLines.length, 1);
+  assert.match(overlapLines[0]!, /1 leaf\(s\) with conflicting lineage/);
+  assert.match(overlapLines[0]!, /sample=m$/);
+});
+
 // The same links, through the strategy. y is pinned at L2, where its own
 // lineage is M, which doesn't list it. The pin holds y where its lineage lists
 // it, at L1 through N2, and M's own leaves stay unpinned, so with room to
@@ -514,6 +538,34 @@ test('a pin-at-level whose own lineage lists it at no level lowers to raw and ho
   const { result } = quietOverlap(() =>
     new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 100_000, targetBudget: 90_000, slack: 0.1 }));
   for (const id of ['x', 'y', 'v']) assert.equal(result.finalResolutions.get(id) ?? 0, 0, `${id} renders raw`);
+});
+
+// y's own L1 N2 names T, an L3, as its parent, so y's lineage skips L2, and T,
+// written from M alone, doesn't list y. Pinned at L3, y lowers to L2, where its
+// lineage has no summary. The lowering stops there, as the base's does for a
+// held level, so y is held at L2 and renders raw, though N2 lists it. The
+// picker then reports y's level as one it can't realize, as it does at `main`
+// for a pin at such a level (#194 takes up whether the lowering should go on
+// past it), so the test catches its log lines rather than print them.
+test('a pin-at-level lowered to a level its own lineage skips is held there, and renders raw', () => {
+  const chunks = [message('x', 0, 100, 'N1'), message('y', 1, 100, 'N2'), message('z', 2, 100, 'N3'), message('w', 3, 100, 'N3')];
+  const { inputs, tree } = store(chunks, [
+    summary('N1', 1, ['x'], 20, 'M'), summary('M', 2, ['N1'], 15, 'T'), summary('T', 3, ['M'], 10),
+    summary('N2', 1, ['y'], 20, 'T'), summary('N3', 1, ['z', 'w'], 20),
+  ]);
+  chunks[1]!.pinLevel = 3;
+  const original = console.error;
+  const lines: string[] = [];
+  console.error = (...args: unknown[]) => { lines.push(String(args[0])); };
+  let result;
+  try {
+    result = new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 100_000, targetBudget: 90_000, slack: 0.1 });
+  } finally {
+    console.error = original;
+  }
+  assert.equal(result.finalResolutions.get('y'), 2, 'y is held at L2, the level its lineage skips');
+  assert.ok(unitsOf(renderLayout(inputs, tree, result.finalResolutions)).includes('raw:y'), 'y renders raw');
+  assert.equal(result.finalResolutions.get('x') ?? 0, 0, 'x, which nothing pins, renders raw');
 });
 
 // m0 is held at L1, where its own A renders it, and the plan folds m1 and m2
