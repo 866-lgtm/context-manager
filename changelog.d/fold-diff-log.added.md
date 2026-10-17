@@ -25,7 +25,12 @@
   differ in their bytes from the previous request's, the comparison that
   places the stable-prefix cache marker, which now also runs under
   kv-unified. A pin, an appended message or a message edited in place since
-  the previous request shows where it lands. Its offsets count the entries'
+  the previous request shows where it lands; after a branch switch, the
+  previous request is the other branch's. Its offsets count the entries'
   tokens only: the system prompt and tools come before them and are neither
-  compared nor counted. The strategy's first compile after the process starts
-  has nothing to compare with, and its line says so.
+  compared nor counted. Nor are the injections `compile()` adds after the
+  comparison: one placed before the last user message moves with it, so
+  where nothing earlier differs, the request first differs at the injection,
+  a message before the divergence the line reports. The strategy's first
+  compile after the process starts has nothing to compare with, and its line
+  says so.

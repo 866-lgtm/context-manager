@@ -64,7 +64,10 @@ export interface RequestDivergence {
  * compares this request's entries, its messages, with those of the last
  * request the strategy returned (after a branch switch, the other branch's);
  * the system prompt and tools come before the entries and are neither
- * compared nor counted.
+ * compared nor counted. Nor are the injections ContextManager.compile adds
+ * after the comparison: one placed before the last user message moves with
+ * it, so where nothing earlier differs, the request first differs at the
+ * injection, a message before the divergence reported.
  */
 export interface FoldDiff {
   /** Chunks whose rendered level differs between the carried frontier and the
