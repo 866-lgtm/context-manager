@@ -891,6 +891,62 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
+  it('reports a calibration retry\'s head/tail refusal in a preview, as the live compile does, not the discarded attempt\'s plan', async () => {
+    // A provisional multiplier above 1 is dropped to 1 when its compile is
+    // refused, and the select runs again (#179). At 1 the head window holds
+    // more messages, so the retry can refuse at the head/tail check, before
+    // its plan records a preview, where the first attempt's plan was over.
+    const directory = mkdtempSync(join(tmpdir(), 'cm-budget-diagnostics-'));
+    const path = join(directory, 'store');
+    const options = {
+      adaptiveResolution: true,
+      targetChunkTokens: 100_000, // no message is split, and no chunk closes
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    } as const;
+    type Internals = { store: { setStateJson(id: string, value: unknown): void } | null; calibrationStateId: string };
+    try {
+      // One message's estimate at 1, with every message in the head.
+      const measuring = new DiagnosticStrategy({ ...options, headWindowTokens: 1_000_000_000 });
+      const opened = await ContextManager.open({ path, strategy: measuring });
+      for (let i = 0; i < 8; i++) opened.addMessage('user', [{ type: 'text', text: 'word '.repeat(400) }]);
+      const each = opened.previewContext({ maxTokens: 2_000_000_000, reserveForResponse: 20 })!.headTokens / 8;
+      // A multiplier without a pricing stamp loads as provisional.
+      const internals = measuring as unknown as Internals;
+      internals.store!.setStateJson(internals.calibrationStateId, { multiplier: 1.45, at: Date.now() });
+      await opened.close();
+
+      // A head window of 2.5 messages holds one at 1.45 and two at 1, and a
+      // rejection budget of 1.75 lies between them.
+      const strategy = new DiagnosticStrategy({ ...options, headWindowTokens: Math.round(2.5 * each) });
+      strategy.produce = true;
+      const manager = await ContextManager.open({ path, strategy });
+      try {
+        strategy.startCompressing(); // compression runs, so a plan's list names it
+        const budget = { maxTokens: Math.round((1.75 * each) / 1.25) + 20, reserveForResponse: 20 };
+        const preview = manager.previewContext(budget);
+        assert.ok(preview);
+        const live = await manager.compile(budget).then(() => assert.fail('compile should refuse'), (e: unknown) => e);
+        assert.ok(live instanceof OverBudgetError);
+        assert.match(live.message, /^Head\/tail reservation exceeded budget/);
+        assert.equal(live.diagnostics.headTokens, 2 * each, 'the retry ran at 1, where the head holds two messages');
+        assert.deepEqual(live.clearedBy, []);
+        assert.equal(preview.fits, false);
+        assert.deepEqual(
+          [preview.finalTokens, preview.budgetTokens, preview.headTokens, preview.clearedBy],
+          [live.actual, live.budget, live.diagnostics.headTokens, live.clearedBy],
+          'the preview is the retry\'s refusal',
+        );
+      } finally {
+        await manager.close();
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('carries no list in a preview that fits, with compression work running', async () => {
     const strategy = new DiagnosticStrategy({
       adaptiveResolution: true,

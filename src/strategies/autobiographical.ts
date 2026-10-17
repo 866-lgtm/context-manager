@@ -5251,6 +5251,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // standing, no inference would run, so no sample could ever correct
         // it (#179, the startup wedge). Any other refusal stands.
         if (!(err instanceof OverBudgetError) || !this.dropProvisionalCalibration(err, opts?.dryRun === true)) throw err;
+        // The retry answers for the select: a preview the discarded attempt
+        // recorded mustn't stand in for a retry that refuses before recording
+        // its own (previewContext reads _lastPreview).
+        this._lastPreview = undefined;
         return this.selectAdaptive(store, budget, opts);
       }
     }
