@@ -646,7 +646,11 @@ function randomNonNested(rng: () => number): {
   const frozen = new Set<ChunkId>();
   if (rng() < 0.2) {
     const c = pick(chunks);
-    if (!rawZone.has(c.id) && !fixedLevels.has(c.id)) frozen.add(c.id);
+    if (!rawZone.has(c.id) && !fixedLevels.has(c.id)) {
+      frozen.add(c.id);
+      // A lock keeps the level it was carried at, raw or folded.
+      c.currentResolution = Math.floor(rng() * 4);
+    }
   }
   const rawTotal = chunks.reduce((total, c) => total + c.rawTokens, 0);
   const targetTokens = Math.max(1, Math.floor(rawTotal * (0.05 + rng() * 0.6)));
@@ -739,14 +743,17 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
     };
     // The level a protection sets, which every plan must keep: the raw zone
     // raw, a pinned leaf at its level (as deep as its summaries go) and a
-    // locked leaf where it was, each lowered where its summary doesn't list it.
-    const heldLevel = (c: PickerChunk): number | undefined => {
+    // locked leaf at its carried level, each lowered where its summary
+    // doesn't list it. A lock's carried level is the one the plan is given,
+    // or on a first plan from nothing the chunk's own, as the base reads it.
+    const heldLevel = (c: PickerChunk, carried: ReadonlyMap<ChunkId, number>): number | undefined => {
       if (params.rawZone.has(c.id)) return 0;
       const k = params.fixedLevels!.get(c.id);
       if (k !== undefined) return k === 0 ? 0 : renderable(c.id, Math.min(k, tree.maxLevel(c.id)));
       if (params.frozen!.has(c.id)) {
+        const level = carried.get(c.id) ?? c.currentResolution;
         const cap = params.pinCaps!.get(c.id);
-        return renderable(c.id, cap === undefined ? c.currentResolution : Math.min(c.currentResolution, cap));
+        return renderable(c.id, cap === undefined ? level : Math.min(level, cap));
       }
       return undefined;
     };
@@ -755,7 +762,7 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
         let previous: ReadonlyMap<ChunkId, number> = start.previous;
         // The first plan's perturbation counts from the carried frontier,
         // which applies those levels to where it starts.
-        let before = renderLayout(inputs, tree, new Map(inputs.chunks.map((c) => [c.id, heldLevel(c) ?? previous.get(c.id) ?? 0])));
+        let before = renderLayout(inputs, tree, new Map(inputs.chunks.map((c) => [c.id, heldLevel(c, previous) ?? previous.get(c.id) ?? 0])));
         for (let turn = 1; turn <= 4; turn++) {
           const plan = planControlledFrontier(inputs, tree, { ...params, reachTokens: start.reachTokens, previous });
           const after = renderLayout(inputs, tree, plan.resolutions);
@@ -764,7 +771,7 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
           assert.equal(plan.perturbation, kvCost(before, after), `perturbation is the change from the last plan's render, ${where}`);
           for (const c of inputs.chunks) {
             const level = plan.resolutions.get(c.id) ?? 0;
-            const held = heldLevel(c);
+            const held = heldLevel(c, previous);
             if (held !== undefined) assert.equal(level, held, `${c.id} keeps its protected level, ${where}`);
             const cap = params.pinCaps!.get(c.id);
             if (cap !== undefined && !params.fixedLevels!.has(c.id)) assert.ok(level <= cap, `${c.id} stays at or below its pin cap, ${where}`);
