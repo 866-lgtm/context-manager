@@ -233,8 +233,9 @@ is what stops it.)`;
 // its absence is accepted too. Two runs are judged wrongly: `yarn run version`
 // sets none either and bumps nothing, so it gets past this check and only the
 // release's own refusals (a version that already has a section, nothing to
-// release) stop it; and a version command launched by npx or from an npm
-// script inherits that runner's npm_command, so it is refused after its bump.
+// release) stop it; and one that sets no npm_command itself, launched by npx
+// or from an npm script, inherits that runner's ("exec", "run"), so it is
+// refused after its bump. npm version sets its own, from an npm script too.
 function checkInvocation(args, env) {
   if (args.includes("--help") || args.includes("-h")) return "help";
   if (args.length > 0) {
