@@ -66,8 +66,13 @@ export interface OverBudgetDiagnostics {
  *   the queued chunks, in `tick`'s order, while the speculative cap lets it
  *   take one; and after them, with `hierarchical` merging on and a
  *   compression model, the first queued merge, unless a compression hold
- *   blocks it. A queued chunk counts when `tick` would adopt an L1 for it,
- *   stub it or compress it. One the compression quarantine holds, or one
+ *   blocks it. That merge counts even when `tick` will drop it as stale
+ *   without a model call: a source isn't loaded or is already merged into
+ *   another summary, or its sources fail the merge's topology check, in
+ *   which case `tick` quarantines it. So the count can name compression for
+ *   such a merge until `tick` reaches it and drops it. A queued chunk counts
+ *   when `tick` would adopt an L1 for it, stub it or compress it. One the
+ *   compression quarantine holds, or one
  *   `tick` defers until the host declares its tools, doesn't, and the count
  *   goes on past it, as `tick` does. The count reads a chunk's tool blocks
  *   as stored, where `tick` strips unpaired ones first, so it can leave out
@@ -75,9 +80,9 @@ export interface OverBudgetDiagnostics {
  *   stops at a chunk that needs a model call without a compression model,
  *   or while the quarantine can't be read, where `tick` throws and a host's
  *   tick loop ends. It stops there even where `tick` would defer that chunk
- *   for the host's tools and go on, since its stored read can't tell, so
- *   it can leave out the work behind such a chunk, but never counts a
- *   chunk `tick` throws at. A chunk that counts is still
+ *   for the host's tools and go on, since its stored read can't always
+ *   tell, so it can leave out the work behind such a chunk, but never
+ *   counts a chunk `tick` throws at. A chunk that counts is still
  *   uncompressed, holds no held message, and has no message an L1 in memory
  *   already covers, since the adaptive picker already folds through that
  *   L1, unless the selector is the hierarchical one with chunk persistence

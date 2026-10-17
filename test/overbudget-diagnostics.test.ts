@@ -1874,6 +1874,7 @@ describe('OverBudgetError.clearedBy', () => {
       autoTickOnNewMessage: false,
       speculativeProduction: false,
     });
+    const calls = { n: 0 };
     await withManager(strategy, async (manager) => {
       const ids = Array.from({ length: 2 }, (_, i) =>
         manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
@@ -1883,10 +1884,43 @@ describe('OverBudgetError.clearedBy', () => {
       assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'the premise: with it on, the merge counts');
       strategy.setHierarchical(false);
       assert.equal(strategy.countsCompressionWork(), false);
-      // The premise: tick leaves the merge queued.
+      // The premise: tick leaves the merge queued and calls no model.
       await manager.tick();
       assert.equal(strategy.queuedMergeCount(), 1, 'tick ran no merge');
+      assert.equal(calls.n, 0, 'tick called no model');
+      // With it on again, the same tick asks the model for the merge.
+      strategy.setHierarchical(true);
+      await assert.rejects(manager.tick(), /no model in this test/);
+      assert.equal(calls.n, 1);
+    }, { membrane: countingMembrane(calls) });
+  });
+
+  it('names compression for a queued merge tick drops as stale without a model call, until tick has dropped it', async () => {
+    const strategy = new DiagnosticStrategy({
+      adaptiveResolution: false,
+      hierarchical: true,
+      positionedRecallPairs: true,
+      targetChunkTokens: 100_000,
+      headWindowTokens: 0,
+      recentWindowTokens: 0,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
     });
+    const calls = { n: 0 };
+    await withManager(strategy, async (manager) => {
+      const ids = Array.from({ length: 2 }, (_, i) =>
+        manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+      strategy.seedL1('L1-a', [ids[0]!]);
+      strategy.seedL1('L1-b', [ids[1]!]);
+      // One source isn't loaded, so executeMerge drops the entry.
+      strategy.queueMergeOf(['L1-a', 'L1-gone']);
+      assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      await manager.tick();
+      assert.equal(calls.n, 0, 'tick called no model');
+      assert.equal(strategy.queuedMergeCount(), 0, 'tick dropped the merge');
+      assert.deepEqual((await refusal(manager)).clearedBy, []);
+    }, { membrane: countingMembrane(calls) });
   });
 
   it('names compression for a queued chunk behind a merge a hold blocks, since tick takes chunks before any merge', async () => {
