@@ -338,7 +338,9 @@ describe('split-stitch L1 fallback', () => {
     await fx.strategy.run(fx.target, managerContext(fx.manager));
     const projection = (fx.strategy as unknown as { readCompressionQuarantineProjection(): Map<string, { outcomes: Array<{ curveLabel: string; outcome: string; errorType?: string }> }> }).readCompressionQuarantineProjection();
     const split = [...projection.values()][0]?.outcomes.find((outcome) => outcome.curveLabel === 'split-stitch');
-    assert.deepEqual([split?.outcome, split?.errorType], ['provider_error', 'provider-error:malformed_response']);
+    // The bare type, as every other rung's rejection records it.
+    assert.deepEqual([split?.outcome, split?.errorType], ['provider_error', 'malformed_response']);
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().spans[0]?.latestOutcome, 'provider_error:malformed_response', 'the span names the type once');
   });
 
   it('a rung its failures decided is recorded as the decision, so the span counts it as no answer', async () => {

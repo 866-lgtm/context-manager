@@ -931,8 +931,8 @@ describe('compression refusal recall curves', () => {
 
     await fx.strategy.run(fx.target, managerContext(fx.manager));
     assert.equal(mock.calls.length, 1, 'canonical usage over budget suppresses provider fallbacks');
-    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
-      .record as Record<string, unknown>;
+    const exhausted = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!;
+    const record = exhausted.record as Record<string, unknown>;
     assert.equal(record.canonicalProviderInputTokens, 90_000);
     assert.match(String(record.accountingSource), /provider_total_input/);
     const plan = record.plan as Array<Record<string, unknown>>;
@@ -940,6 +940,27 @@ describe('compression refusal recall curves', () => {
     assert.ok(plan.every((item) => item.disposition === 'admission_rejected'));
     assert.ok(plan.every((item) => item.accountingSource === 'canonical_provider_usage_plus_expansion'));
     assert.ok(plan.every((item) => Number(item.boundedInputTokens) > 90_000));
+    // The family's record keeps each variant the plan left unsent, with its planned size, after the canonical's refusal.
+    const outcomes = exhausted.outcomes as Array<Record<string, unknown>>;
+    assert.deepEqual(outcomes.map((outcome) => outcome.outcome), ['refusal', ...plan.map(() => 'admission_rejected')]);
+    assert.deepEqual(
+      outcomes.slice(1).map((outcome) => [outcome.admittedTokens, outcome.budgetTokens]),
+      plan.map((item) => [item.admittedTokens, item.budgetTokens]),
+    );
+    fx.manager.close();
+  });
+
+  it('a recall variant a provider rejects is recorded with its planned size, as a refused one is', async () => {
+    const rejected = Object.assign(new Error('zz invalid request'), { type: 'invalid_request', httpStatus: 400, retryable: false });
+    const mock = flexibleMembrane([{ stop: 'refusal' }, { error: rejected }]);
+    const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 1 });
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2, 'the premise: the canonical, then one recall variant');
+    const exhausted = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!;
+    const plan = (exhausted.record as { plan: Array<Record<string, unknown>> }).plan;
+    const variant = (exhausted.outcomes as Array<Record<string, unknown>>).find((outcome) => outcome.outcome === 'provider_error')!;
+    assert.equal(variant.errorType, 'invalid_request');
+    assert.deepEqual([variant.admittedTokens, variant.budgetTokens], [plan[0]!.admittedTokens, plan[0]!.budgetTokens]);
     fx.manager.close();
   });
 

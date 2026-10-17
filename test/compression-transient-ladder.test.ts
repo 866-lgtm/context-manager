@@ -1,6 +1,6 @@
 import { after, describe, it, mock as testMock } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import type { ContentBlock, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
 
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
@@ -850,6 +850,19 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
     fx.manager.close();
   });
 
+  it("and so does source-only-final's answer that strips to empty (cm138-r11 I4)", async () => {
+    const mock = scripted([REFUSAL as never, THINKING as never]);
+    const fx = await build(mock.membrane, { sourceOnlyFallback: true });
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2, 'no plain-prose retry follows source-only-final');
+    assert.ok(isCanonical(mock.calls[0]!) && !isCanonical(mock.calls[1]!), 'the premise: the canonical, then source-only-final');
+    const status = fx.strategy.getCompressionQuarantineStatus();
+    assert.equal(status.count, 1, 'the family exhausted');
+    assert.equal(status.spans[0]!.answeredAttempts, 2, "the canonical's refusal and source-only-final's empty answer");
+    assert.equal(status.spans[0]!.latestOutcome, 'unusable_empty');
+    fx.manager.close();
+  });
+
   it('the same for an empty tools-less answer', async () => {
     const mock = scripted([TOOL_USE as never, TOOL_USE as never, THINKING as never, { throw: failure('network') }, OK('prose memory')]);
     const fx = await build(mock.membrane);
@@ -892,6 +905,24 @@ describe('every rung keeps its own identity across a resume (#47653)', () => {
     assert.ok(!carriesThinking(mock.calls[2]!));
     assert.ok(fx.strategy.summariesView().some((s) => s.content === 'stripped memory'));
     fx.manager.close();
+  });
+
+  it("a carrier rejection counts in the exhausted family's record whichever exit ends it (cm138-r11 I2)", async () => {
+    const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
+    // The refusal ladder's exit: the carrier request is rejected, and its stripped retry is refused.
+    const refused = scripted([{ throw: rejected }, REFUSAL as never]);
+    const a = await withCarriers(refused.membrane);
+    await a.strategy.run(a.target(), managerContext(a.manager));
+    assert.ok(carriesThinking(refused.calls[0]!) && !carriesThinking(refused.calls[1]!) && refused.calls.length === 2, 'the premise: the carrier request, then its stripped retry');
+    assert.equal(a.strategy.getCompressionQuarantineStatus().spans[0]!.answeredAttempts, 2, "the carrier rejection and the stripped retry's refusal");
+    a.manager.close();
+    // The empty answer's exit: the stripped retry answers with nothing usable, and so does the plain-prose retry.
+    const empty = scripted([{ throw: rejected }, THINKING as never, THINKING as never]);
+    const b = await withCarriers(empty.membrane);
+    await b.strategy.run(b.target(), managerContext(b.manager));
+    assert.equal(empty.calls.length, 3, 'the premise: the carrier request, its stripped retry and the plain-prose retry');
+    assert.equal(b.strategy.getCompressionQuarantineStatus().spans[0]!.answeredAttempts, 3, 'the carrier rejection counts here too');
+    b.manager.close();
   });
 
   it("the stripped request's failures are its own: with work landing between them, the eighth ends it, the carrier request paid once (#48315)", async () => {
@@ -2025,6 +2056,119 @@ describe("a split-window wait skips its chunk for the wait and lets the tick go 
     assert.ok(notBefore! >= before + waitMs && notBefore! <= Date.now() + waitMs, 'the chunk is skipped for that wait');
     await fx.strategy.tick(managerContext(fx.manager));
     assert.ok(!attempted.slice(2).includes(attempted[0]!), 'and skipped again before it ends');
+    fx.manager.close();
+  });
+});
+
+describe("another instance's split-window wait holds nothing here (cm138-r11 I1)", () => {
+  it('rethrown through a joined call, it leaves the chunk unheld at the head and the lane unpaused, and the next tick attempts the chunk', async () => {
+    const mock = scripted([OK('the next chunk'), OK('its own attempt')]);
+    const fx = await queued(mock.membrane);
+    assert.ok(fx.strategy.compressionQueueView().length >= 2, 'two chunks pending');
+    const other = await queued(scripted([OK('unused')]).membrane);
+    const window = other.strategy as unknown as { splitCallTimes: number[]; splitWindowWait(needed: number, limit: number, windowMs: number): Error };
+    window.splitCallTimes = [Date.now() - 1_000];
+    // The wait the other instance's split rung met, as a call joined to its attempt rethrows it.
+    const foreign = window.splitWindowWait(1, 1, 60_000);
+    const lane = fx.strategy as unknown as {
+      compressChunkHierarchical(chunk: Chunk, ctx: StrategyContext, onSkip?: () => void): Promise<void>;
+      compressionNotBefore: Map<string, number>;
+    };
+    const original = lane.compressChunkHierarchical.bind(fx.strategy);
+    const attempted: number[] = [];
+    lane.compressChunkHierarchical = async (chunk, ctx, onSkip) => {
+      attempted.push(chunk.index);
+      if (attempted.length === 1) throw foreign;
+      return original(chunk, ctx, onSkip);
+    };
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(attempted.length, 2, 'the chunk behind it ran in the same tick');
+    assert.equal(lane.compressionNotBefore.size, 0, 'no hold for a window not its own');
+    assert.equal(fx.strategy.pause(), null, 'and no pause');
+    assert.equal(fx.strategy.compressionQueueView()[0], attempted[0], 'the chunk is back at the head');
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(attempted[2], attempted[0], 'the next tick attempts it');
+    other.manager.close();
+    fx.manager.close();
+  });
+});
+
+describe('a family dropped while its ladder ran is not quarantined by its exhaustion (cm138-r11 I10)', () => {
+  const THINKING = { content: [text('<thinking>all of it went here</thinking>')], stopReason: 'end_turn', usage: { inputTokens: 80, outputTokens: 20 } };
+  /** scripted's answers, with the family's progress dropped as the call at `dropAt` arrives, as a clear, a mint or a sweep drops it. */
+  function dropping(steps: Step[], dropAt: number, strategy: () => ProbeStrategy) {
+    const inner = scripted(steps);
+    const complete = (inner.membrane as { complete(request: NormalizedRequest): Promise<unknown> }).complete;
+    return {
+      calls: inner.calls,
+      membrane: {
+        complete: async (request: NormalizedRequest) => {
+          if (inner.calls.length === dropAt) {
+            (strategy() as unknown as { forgetCompressionFamilyProgress(matches: () => boolean): void }).forgetCompressionFamilyProgress(() => true);
+          }
+          return complete(request);
+        },
+      } as never,
+    };
+  }
+
+  it("at the refusal ladder's exit: no record, the dropped progress stays dropped, and the next attempt pays afresh", async () => {
+    let fx!: Awaited<ReturnType<typeof build>>;
+    // The canonical's refusal is written; the family is dropped as source-only-final's call arrives.
+    const mock = dropping([REFUSAL as never, REFUSAL as never, OK('a fresh memory')], 1, () => fx.strategy);
+    fx = await build(mock.membrane, { sourceOnlyFallback: true });
+    const log = `${freshPath()}-calls.jsonl`;
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+    try {
+      await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+    }
+    assert.equal(mock.calls.length, 2, 'the premise: the canonical, then source-only-final');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'nothing is quarantined');
+    const events = readFileSync(log, 'utf8').trim().split('\n').map((line) => (JSON.parse(line) as { event: string }).event);
+    assert.ok(events.includes('compression:family-dropped') && !events.includes('compression:curve-exhausted'), 'the log says the family was dropped, not exhausted');
+    assert.deepEqual(progressSlot(fx.manager), [], 'and nothing writes the progress back');
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 3, 'the next attempt pays for the canonical again');
+    assert.ok(fx.strategy.summariesView().some((s) => s.content === 'a fresh memory'));
+    fx.manager.close();
+  });
+
+  it("at the empty answer's exit too", async () => {
+    let fx!: Awaited<ReturnType<typeof build>>;
+    // The canonical's empty answer is written; the family is dropped as the plain-prose retry's call arrives.
+    const mock = dropping([THINKING as never, THINKING as never, OK('a fresh memory')], 1, () => fx.strategy);
+    fx = await build(mock.membrane);
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 2, 'the premise: the canonical, then the plain-prose retry');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'nothing is quarantined');
+    assert.deepEqual(progressSlot(fx.manager), [], 'and nothing writes the progress back');
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.equal(mock.calls.length, 3, 'the next attempt pays for the canonical again');
+    assert.ok(fx.strategy.summariesView().some((s) => s.content === 'a fresh memory'));
+    fx.manager.close();
+  });
+});
+
+describe('a chunk a plan demands goes ahead of the chunks that failed (cm138-r11 I7)', () => {
+  it('enqueueL1ForRange queues it ahead of a failed chunk', async () => {
+    const fx = await queued(scripted([OK('unused')]).membrane);
+    const lane = fx.strategy as unknown as {
+      compressionQueue: number[];
+      compressionFailureOrder: Map<string, number>;
+      chunks: Chunk[];
+      chunkKey(chunk: Chunk): string;
+      enqueueL1ForRange(firstMsgId: string, lastMsgId: string): void;
+    };
+    const [failed, demanded] = lane.compressionQueue.slice(0, 2).map((index) => lane.chunks[index]!);
+    assert.ok(failed && demanded, 'two chunks pending');
+    lane.compressionQueue = [failed.index];
+    lane.compressionFailureOrder.set(lane.chunkKey(failed), 1);
+    lane.enqueueL1ForRange(demanded.messages[0]!.id, demanded.messages.at(-1)!.id);
+    assert.deepEqual(lane.compressionQueue, [demanded.index, failed.index]);
     fx.manager.close();
   });
 });

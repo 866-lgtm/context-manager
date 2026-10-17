@@ -870,11 +870,15 @@ class MergeHoldDiscard extends Error {
  * compressionSplitMaxCallsPer10Min calls in ten minutes, per strategy
  * instance) to have room for a whole attempt. A local throttle is no answer
  * and no failure: nothing is recorded or counted, the lane isn't paused, and
- * the chunk waits `waitMs` while other work runs.
+ * the chunk waits `waitMs` while other work runs. `window` names the
+ * instance whose window it is: only that instance's tick holds the chunk for
+ * the wait. An instance that joined the call rethrows the wait and holds
+ * nothing: its next attempt is its own, and its split rung meets its own
+ * window.
  */
 class CompressionSplitWindowWait extends Error {
   override name = 'CompressionSplitWindowWait';
-  constructor(readonly waitMs: number, used: number, limit: number) {
+  constructor(readonly waitMs: number, used: number, limit: number, readonly window: symbol) {
     super(`split-stitch waits for its call window: ${used} of ${limit} calls in the last 10 minutes`);
   }
 }
@@ -1617,10 +1621,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * The lane's order of failures in this process: each chunk (by source
    * identity) and each queued merge (by mergeFailureKey) that failed and is
-   * still pending maps to the sequence number of its latest failure. Work
-   * that failed goes behind work that hasn't, least recently failed first
-   * (orderCompressionQueue, and a merge's place in tick). In memory only: a
-   * restart tries the queue in its own order again.
+   * still pending maps to the sequence number of its latest failure. A chunk
+   * tick skipped for its quarantine takes an order too, as a failure does.
+   * Work that failed or was skipped goes behind work that hasn't, least
+   * recently first (orderCompressionQueue, and a merge's place in tick). In
+   * memory only: a restart tries the queue in its own order again.
    */
   private compressionFailureOrder = new Map<string, number>();
   private mergeFailureOrder = new Map<string, number>();
@@ -2983,6 +2988,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   /** Sliding-window timestamps of split-stitch sub-calls (compressionSplitMaxCallsPer10Min). */
   protected splitCallTimes: number[] = [];
+  /** This instance's split call window, as its waits name it (CompressionSplitWindowWait). */
+  private readonly splitWindow = Symbol('split call window');
   /** Accounting of the most recent split-stitch attempt (receipts/tests). */
   /** Aggregate details of the most recent stitched response (receipts/tests). */
   protected lastSplitDetails: NormalizedResponse['details'] | undefined;
@@ -4255,18 +4262,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
   }
 
+  /**
+   * Quarantine a family whose ladder ended with no summary, with its record
+   * (`outcomes`). `familyOpen` is asked under the ledger's lock, the lock an
+   * operator's clear drops a family's progress under: a family dropped while
+   * its ladder ran (minted, cleared or swept) is not brought back, and true
+   * is returned with nothing written. A family already quarantined under this
+   * key is left as it is.
+   */
   private async exhaustCompressionRequestFamily(
     source: CompressionOperationBranch,
     record: CompressionRefusalQuarantineRecord,
     outcomes: CompressionRefusalOutcomeRecord[],
-  ): Promise<void> {
-    if (!this.store) return;
+    familyOpen: () => boolean,
+  ): Promise<boolean> {
+    if (!this.store) return false;
+    let dropped = false;
     await withCompressionStateLock(
       this.store,
       source.name,
       this.compressionRefusalQuarantineLedgerStateId,
       () => {
       if (!this.isCompressionBranchCurrent(source)) return;
+      if (!familyOpen()) {
+        dropped = true;
+        return;
+      }
       const current = this.readCompressionQuarantineProjection();
       if (current.has(record.key)) return;
       const exhausted = this.appendCompressionQuarantineEvent({
@@ -4286,6 +4307,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.isCompressionBranchCurrent(source)) {
       await this.deliverPendingCompressionQuarantineAlerts(source);
     }
+    return dropped;
+  }
+
+  /** A ladder ended with no summary on a family dropped while it ran: no record, and the chunk stays raw. */
+  private logCompressionFamilyDropped(chunk: Chunk, record: CompressionRefusalQuarantineRecord): void {
+    console.warn(
+      `[autobiographical] the chunk from ${chunk.messages[0]?.id ?? '?'} stays raw and unquarantined: ` +
+        'its family was dropped while its ladder ran (minted, cleared or swept)',
+    );
+    logCompressionCall({
+      event: 'compression:family-dropped',
+      operation: 'compress_l1',
+      metadata: { quarantine_key: record.key, family_key: record.familyKey },
+    });
   }
 
   private readCompressionFamilyProgress(): Map<string, CompressionFamilyProgress> {
@@ -4431,8 +4466,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * one joined (a coalesced wait). It paces this lane by the provider's
    * stated wait, so this instance doesn't send the same request inside it,
    * and keeps the failure count and the backoff as they were: no call of
-   * this instance's failed. With no stated wait it installs nothing. The
-   * join passes no deferral here, since a deferral made no call.
+   * this instance's failed. With no stated wait, a failure installs nothing.
+   * It isn't for a deferral, which the admission's hold above would still
+   * install: the join, its only caller, passes none, since a deferral made
+   * no call.
    */
   private pauseCompressionLane(
     source: CompressionOperationBranch,
@@ -4592,9 +4629,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * The compression queue in the order the lane takes it: chunks that haven't
-   * failed in this process first, in queue order, then those that have, least
-   * recently failed first. Every rebuild applies it too, so a rebuild, which
-   * queues chunks in index order, never puts a failed chunk back at the head.
+   * failed or been skipped for their quarantine in this process first, in
+   * queue order, then those that have, least recently first. Every rebuild
+   * applies it too, so a rebuild, which queues chunks in index order, never
+   * puts a failed or skipped chunk back at the head.
    * A failure order or a run whose chunk is no longer pending is dropped,
    * and so is one whose merge is no longer queued.
    */
@@ -4686,7 +4724,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const excess = this.splitCallTimes.length + needed - limit;
     if (excess <= 0) return null;
     const freeAt = this.splitCallTimes[Math.min(excess, this.splitCallTimes.length) - 1]! + windowMs;
-    return new CompressionSplitWindowWait(Math.max(0, freeAt - now), this.splitCallTimes.length, limit);
+    return new CompressionSplitWindowWait(Math.max(0, freeAt - now), this.splitCallTimes.length, limit, this.splitWindow);
   }
 
   /** Normalized `compressionToolProseFallback`, or undefined when off/invalid. */
@@ -5442,7 +5480,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Ensure that chunks whose message range overlaps [firstMsgId..lastMsgId]
    * are queued for L1 compression. No-op if the matching chunk is already
-   * compressed or already in the queue.
+   * compressed or already in the queue. A chunk it adds goes ahead of the
+   * chunks that failed or were skipped for their quarantine
+   * (orderCompressionQueue).
    */
   protected enqueueL1ForRange(
     firstMsgId: MessageId,
@@ -5484,6 +5524,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const holdback = this.config.l1HoldbackChunks ?? 1;
     const holdbackCutoff = this.chunks.length - holdback;
+    let pushed = false;
     for (const chunk of candidates) {
       if (chunk.compressed) continue;
       const lastId = chunk.messages[chunk.messages.length - 1]?.id;
@@ -5506,7 +5547,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       if (this.compressionQueue.includes(chunk.index)) continue;
       this.compressionQueue.push(chunk.index);
+      pushed = true;
     }
+    // Demanded work goes behind nothing that has failed or been skipped, as
+    // every other place that adds to the queue keeps it.
+    if (pushed) this.orderCompressionQueue();
   }
 
   /**
@@ -5826,7 +5871,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // stands. A chunk compressed meanwhile is never put back.
         const kind = compressionFailureKind(error);
         if (this.isCompressionBranchCurrent(sourceBranch) && kind !== 'rejection') {
-          if (error instanceof CompressionSplitWindowWait) {
+          // Only this instance's own window holds the chunk: a wait that
+          // another instance's split rung met, rethrown to this one through a
+          // joined call, says nothing about this instance's window.
+          if (error instanceof CompressionSplitWindowWait && error.window === this.splitWindow) {
             this.compressionNotBefore.set(key, Date.now() + error.waitMs);
           }
           this.requeuePendingChunk(
@@ -7897,18 +7945,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         knownOutcomes.set(`${known.curveLabel}\u0000${known.requestHash}`, known);
       }
       const progressOutcomes: CompressionRefusalOutcomeRecord[] = [...(progress?.outcomes ?? [])];
+      /**
+       * The family's exhausted record, which every exit that exhausts it
+       * writes: each outcome the family noted, in the order noted (an earlier
+       * ladder's answers and carrier rejections among them), and this
+       * ladder's admission rejections, which no call answered and progress
+       * doesn't keep, where the ladder made them.
+       */
+      const familyRecord: CompressionRefusalOutcomeRecord[] = [...progressOutcomes];
       let progressCanonicalInputTokens = progress?.canonicalProviderInputTokens;
       // Whether this family's progress has been in the slot during this
       // ladder: found there when it began, or written by it since.
       let progressSeen = progress !== undefined;
+      // A family whose progress was in the slot during this ladder, and is
+      // gone from it now, was dropped meanwhile (minted, exhausted, cleared
+      // or swept, here or by another strategy on this store): this ladder
+      // must not bring it back, by a progress write or by an exhaustion,
+      // whether it began with progress or wrote the first.
+      const familyOpen = (): boolean => !progressSeen || this.readCompressionFamilyProgress().has(quarantineRecord.familyKey);
       const persistProgress = (): void => {
-        // A family whose progress was in the slot during this ladder, and is
-        // gone from it now, was dropped meanwhile (minted, exhausted, cleared
-        // or swept, here or by another strategy on this store): this ladder's
-        // snapshot must not bring it back, whether it began with progress or
-        // wrote the first. The check and the write are synchronous, with no
-        // await between them.
-        if (progressSeen && !this.readCompressionFamilyProgress().has(quarantineRecord.familyKey)) return;
+        // The check and the write are synchronous, with no await between them.
+        if (!familyOpen()) return;
         this.recordCompressionFamilyProgress(
           sourceBranch, quarantineRecord, progressOutcomes, progressCanonicalInputTokens,
           chunk.messages.map((message) => message.id),
@@ -7921,6 +7978,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (knownOutcomes.has(key)) return;
         knownOutcomes.set(key, outcome);
         progressOutcomes.push(outcome);
+        familyRecord.push(outcome);
         // An answer ends that rung's run of failures.
         for (const stripped of [false, true]) this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, outcome.curveLabel, stripped));
         persistProgress();
@@ -7976,6 +8034,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         curveLabel: string,
         requestHash: string,
         call: () => Promise<unknown>,
+        // Fields a rejection or a decision is noted with besides its own, such
+        // as a recall variant's planned size.
+        annotation: Pick<CompressionRefusalOutcomeRecord, 'admittedTokens' | 'budgetTokens'> = {},
       ): Promise<LadderStep> => {
         const known = knownOutcomes.get(`${curveLabel}\u0000${requestHash}`);
         if (known) {
@@ -7998,7 +8059,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           const kind = compressionFailureKind(error);
           if (kind === 'abort') throw error;
-          const outcome: CompressionRefusalOutcomeRecord = kind === 'rejection'
+          const decided: CompressionRefusalOutcomeRecord = kind === 'rejection'
             ? {
                 curveLabel,
                 requestHash,
@@ -8011,6 +8072,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 requestHash,
                 (error !== null && typeof error === 'object' ? dispatchedRequestHash.get(error) : undefined) ?? requestHash,
               );
+          const outcome: CompressionRefusalOutcomeRecord = { ...decided, ...annotation };
           noteOutcome(outcome);
           return { kind: 'decided', outcome, reused: false };
         }
@@ -8179,17 +8241,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           canonicalProviderInputTokens,
           sourceOnlyFallbackRequestHash,
         );
-        // The ledger keeps what each request of the canonical stage got: the
-        // canonical request's answer, its no-tools and tools-less retries',
-        // and a rejection or a decision by failures, as noteOutcome recorded
-        // them, so the quarantine status counts every answer a provider gave.
-        const canonicalStage = progressOutcomes.filter((outcome) => CANONICAL_STAGE_LABELS.has(outcome.curveLabel));
-        const outcomes: CompressionRefusalOutcomeRecord[] = canonicalStage.length > 0 ? [...canonicalStage] : [canonicalRejection ?? {
-          curveLabel: 'canonical',
-          requestHash: canonicalRequestHash,
-          outcome: canonicalOutcome,
-          ...(canonicalStopReason !== undefined ? { stopReason: canonicalStopReason } : {}),
-        }];
         const canonicalTrace = attemptTraces.find((trace) => trace.curveLabel === 'canonical');
         if (canonicalTrace) canonicalTrace.outcome = canonicalOutcome;
         successfulTrace = undefined;
@@ -8200,7 +8251,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               ? 'compression:canonical-refused'
               : 'compression:canonical-incomplete',
           operation: 'compress_l1',
-          metadata: canonicalTrace ?? outcomes[0],
+          metadata: canonicalTrace ?? familyRecord.find((outcome) => CANONICAL_STAGE_LABELS.has(outcome.curveLabel)),
         });
         let fallbackResponse: NormalizedResponse | undefined;
 
@@ -8217,10 +8268,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const result = await ladderStep(curveLabel, requestHash, () => runAttempt(
             hoistedRequest, curveLabel, recallIds, recallLevels, coverageHash,
           ));
-          if (result.kind === 'decided') {
-            outcomes.push(result.outcome);
-            return;
-          }
+          if (result.kind === 'decided') return;
           const trace = attemptTraces[attemptTraces.length - 1]!;
           const assessment = this.assessFallbackCompressionResponse(result.response);
           if (assessment.outcome === 'valid') {
@@ -8235,7 +8283,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
               ...(assessment.outcome === 'provider_error' ? { errorType: assessment.errorType } : {}),
             };
-            outcomes.push(outcome);
             noteOutcome(outcome);
           }
           logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
@@ -8300,7 +8347,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               budgetTokens: contextBudget,
             };
             attemptTraces.push(trace);
-            outcomes.push({
+            // No call answers it, so progress doesn't keep it; the family's
+            // record does, where the ladder made it.
+            familyRecord.push({
               curveLabel,
               requestHash: variant.requestHash,
               outcome: 'admission_rejected',
@@ -8320,9 +8369,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             variant.leafCoverageHash,
             variant.parent.id,
             variant.children.map((child) => child.id),
-          ));
+          ), { admittedTokens, budgetTokens: contextBudget });
           if (result.kind === 'decided') {
-            outcomes.push({ ...result.outcome, admittedTokens, budgetTokens: contextBudget });
             if (!result.reused) {
               const trace: CompressionAttemptTrace = {
                 curveLabel,
@@ -8368,7 +8416,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               admittedTokens,
               budgetTokens: contextBudget,
             };
-            outcomes.push(outcome);
             noteOutcome(outcome);
             continue;
           }
@@ -8386,7 +8433,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               admittedTokens,
               budgetTokens: contextBudget,
             };
-            outcomes.push(outcome);
             noteOutcome(outcome);
             continue;
           }
@@ -8412,7 +8458,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             sha256Json(chunk.messages.map((message) => message.id)),
           ));
           if (result.kind === 'decided') {
-            outcomes.push(result.outcome);
             sourceOnlyOutcome = result.outcome.outcome;
           } else {
             const trace = attemptTraces[attemptTraces.length - 1]!;
@@ -8430,7 +8475,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 ...(assessment.stopReason !== undefined ? { stopReason: assessment.stopReason } : {}),
                 ...(assessment.outcome === 'provider_error' ? { errorType: assessment.errorType } : {}),
               };
-              outcomes.push(outcome);
               noteOutcome(outcome);
             }
             logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
@@ -8479,7 +8523,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             operation: 'compress_l1',
             metadata: { quarantine_key: quarantineRecord.key, curveLabel: 'split-stitch', requestHash: splitLeafHash, outcome: knownSplit.outcome },
           });
-          outcomes.push(knownSplit);
         } else if (!fallbackResponse && !canonicalRejection && this.config.compressionSplitFallback === true && sourceOnlyFallbackRequest) {
           const leafHash = splitLeafHash;
           const textOf = (m: { content: ContentBlock[] }): string =>
@@ -8520,8 +8563,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           let modelReportedLeaves = 0;
           const splitStart = Date.now();
           let abortReason: string | undefined;
-          /** The rung's outcome when its failures decided it, recorded as interrupt() gives it. */
-          let splitDecision: CompressionRefusalOutcomeRecord | undefined;
           const MAX_SPLIT_CALLS = this.config.compressionSplitMaxCallsPerChunk ?? 40;
           const WINDOW_MS = 10 * 60_000;
           const MAX_WINDOW_CALLS = this.config.compressionSplitMaxCallsPer10Min ?? 80;
@@ -8643,8 +8684,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // whole rung runs again on a later tick, its per-attempt caps
             // applying again. When the failures decide the request
             // (COMPRESSION_PERSISTENT_FAILURES), the rung ends here instead.
-            splitDecision = interrupt(error, 'split-stitch', leafHash);
-            abortReason = `provider-error:${splitDecision.errorType ?? 'persistent'}`;
+            const decision = interrupt(error, 'split-stitch', leafHash);
+            abortReason = `provider-error:${decision.errorType ?? 'persistent'}`;
           }
           this.lastSplitAttempted = { ...attempted, complete };
           if (complete && lastGood && parts.some((p) => p.kind === 'fold')) {
@@ -8698,10 +8739,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             logCompressionCall({ event: 'compression:split-stitch', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, composite_hash: compositeHash, content_hash: contentHash, parts: partsMeta, placeholders, calls, attempted } });
           } else {
             const reason = abortReason ?? 'refused';
-            // A decision keeps its own errorType (persistent-<class>), as every
-            // other rung's does, so the quarantine status reads it as one.
-            const splitOutcome: CompressionRefusalOutcomeRecord = splitDecision ?? { curveLabel: 'split-stitch', requestHash: leafHash, outcome: reason.startsWith('provider-error') ? 'provider_error' : 'refusal', ...(abortReason ? { errorType: abortReason } : {}) };
-            outcomes.push(splitOutcome);
+            // A provider error, a piece's rejection or the rung's decision,
+            // records its bare type, as every other rung's does (a decision's
+            // is persistent-<class>, so the quarantine status reads it as
+            // one); a cap's trip records the cap.
+            const rejectedAs = reason.startsWith('provider-error:') ? reason.slice('provider-error:'.length) : undefined;
+            const splitOutcome: CompressionRefusalOutcomeRecord = {
+              curveLabel: 'split-stitch',
+              requestHash: leafHash,
+              outcome: rejectedAs !== undefined ? 'provider_error' : 'refusal',
+              ...(abortReason ? { errorType: rejectedAs ?? abortReason } : {}),
+            };
             noteOutcome(splitOutcome);
             console.error(`[autobiographical] split-stitch abandoned for chunk ${chunk.index}: ${reason} after ${calls} call(s), ${parts.length} piece(s) discarded (receipts only)`);
             logCompressionCall({ event: 'compression:split-stitch-abandoned', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, reason, calls, attempted, piecesDiscarded: parts.length } });
@@ -8712,8 +8760,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this.logCompressionBranchDiscard(sourceBranch, 'before_exhaustion', quarantineRecord);
             return;
           }
-          await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, outcomes);
+          const dropped = await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, familyRecord, familyOpen);
           if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+          if (dropped) {
+            this.logCompressionFamilyDropped(chunk, quarantineRecord);
+            return;
+          }
           // The quarantine ledger now holds this family's outcome.
           this.forgetCompressionFamilyProgress((entry) => entry.familyKey === quarantineRecord.familyKey);
           logCompressionCall({
@@ -8726,7 +8778,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               canonical_request_hash: canonicalRequestHash,
               fallback_limit: quarantineRecord.fallbackLimit,
               plan: quarantineRecord.plan,
-              outcomes,
+              outcomes: familyRecord,
             },
           });
           return;
@@ -8845,9 +8897,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 proseOutcome ?? { curveLabel: 'canonical-plain-prose', outcome: 'unusable_empty', requestHash: proseRequestHash },
               ];
           for (const outcome of ended) noteOutcome(outcome);
-          await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, [...progressOutcomes]);
+          const dropped = await this.exhaustCompressionRequestFamily(sourceBranch, quarantineRecord, familyRecord, familyOpen);
           if (this.isCompressionBranchCurrent(sourceBranch)) {
-            this.forgetCompressionFamilyProgress((entry) => entry.familyKey === quarantineRecord.familyKey);
+            if (dropped) this.logCompressionFamilyDropped(chunk, quarantineRecord);
+            else this.forgetCompressionFamilyProgress((entry) => entry.familyKey === quarantineRecord.familyKey);
           }
         }
         return;
