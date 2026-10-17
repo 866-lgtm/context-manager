@@ -303,6 +303,10 @@ describe('AutobiographicalStrategy — persistence', () => {
       assert.throws(() => strategy.pushRaw(rawSummary('L1-7', 1, 'm1', { first: 'm1', last: 'm1' })), /L1-7 at L1.*its sourceIds is "m1",/);
       assert.throws(() => strategy.pushRaw(rawSummary('L2-6', 2, ['L1-a', null], { first: 'm1', last: 'm2' })), /L2-6 at L2.*its sourceIds is \["L1-a",null\],/);
       assert.throws(() => strategy.pushRaw(rawSummary('L2-8', 2, ['L1-a', ''], { first: 'm1', last: 'm2' })), /L2-8 at L2.*its sourceIds is \["L1-a",""\],/);
+      // A sparse list, whose empty slot `every` would skip and the store can't write.
+      const sparse = new Array<string>(2);
+      sparse[1] = 'm1';
+      assert.throws(() => strategy.pushRaw(rawSummary('L1-11', 1, sparse, { first: 'm1', last: 'm1' })), /L1-11 at L1.*its sourceIds is \[null,"m1"\],/);
       assert.throws(
         () => strategy.pushRaw(rawSummary('L2-1', 2, ['L1-a', 'L1-b'], { first: 'm1' })),
         /refusing to persist summary L2-1 at L2, a bug in the code that built it: its sourceRange is \{"first":"m1"\}, where readers need two message ids/,

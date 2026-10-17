@@ -747,9 +747,18 @@ function sha256Json(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
 }
 
-/** Sources as readers iterate them: a non-empty list of ids. */
+/**
+ * Sources as readers iterate them: a non-empty list of ids. Every index is
+ * read, since `every` skips an empty slot of a sparse array, which the store
+ * can't write.
+ */
 function isIdList(ids: unknown): ids is string[] {
-  return Array.isArray(ids) && ids.length > 0 && ids.every((id) => typeof id === 'string' && id.length > 0);
+  if (!Array.isArray(ids) || ids.length === 0) return false;
+  for (let i = 0; i < ids.length; i++) {
+    const id: unknown = ids[i];
+    if (typeof id !== 'string' || id.length === 0) return false;
+  }
+  return true;
 }
 
 /** A range as readers dereference it: its first and last message ids. */
