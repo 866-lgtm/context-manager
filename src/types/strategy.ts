@@ -1,6 +1,7 @@
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
+import type { FoldDiff } from '../adaptive/fold-diff.js';
 import type {
   ContextEntry,
   TokenBudget,
@@ -661,6 +662,11 @@ export interface RenderStats {
     /** Under `foldingStrategy: 'kv-unified'` only: the forest build, solve
      *  and latent-demand ranking inside `compileMs`, in whole ms (`solveMs=`). */
     solveMs?: number;
+    /** Which chunks moved between which levels, and where this request's
+     *  entries first differ from those of the last request the strategy
+     *  returned, past which no cached prefix reaches. Present only when a
+     *  compile that changed at least one saved level committed. */
+    foldDiff?: FoldDiff;
   };
 }
 
@@ -1298,7 +1304,8 @@ export interface AutobiographicalConfig {
   /**
    * Per-tool retention limit: keep at most the last N `tool_result` blocks
    * for each tool name. Older results get their content replaced with a
-   * brief marker referencing the tool name and how many newer results exist.
+   * brief marker naming the tool and the limit; a limit of 0 replaces every
+   * result of the tool.
    *
    * Two shapes accepted:
    *  - `number`: applies as a global default across all tools.

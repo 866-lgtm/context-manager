@@ -55,6 +55,7 @@ import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { KvUnifiedStrategy, type KvUnifiedReuse } from '../adaptive/strategies/kv-unified.js';
 import { SummaryTree } from '../adaptive/summary-tree.js';
 import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
+import { describeFoldDiff, formatFoldDiff, type FoldDiff, type RequestDivergence } from '../adaptive/fold-diff.js';
 import {
   KvUnifiedReceiptChain,
   type SerializedReceiptChain,
@@ -5132,7 +5133,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (opts?.dryRun !== true) {
       this.rebuildChunks(store);
       if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
-      return this.selectPath(store, budget, opts);
+      // The cache-marker baseline is the last request this strategy returned.
+      // A select refused after it placed its markers (assertMiddleCoverage,
+      // kv-unified's marker reconcile) returns none, so its keys go back, and
+      // the next compile's stable prefix and fold diff are measured against
+      // the request before it.
+      const prevCacheKeys = this._prevCacheKeys;
+      try {
+        return this.selectPath(store, budget, opts);
+      } catch (err) {
+        this._prevCacheKeys = prevCacheKeys;
+        throw err;
+      }
     }
     // A dry run commits nothing, and that includes what a select leaves for
     // the next one and for observers: the cache-marker baseline the next
@@ -5409,8 +5421,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // and are NOT reflected in the snapshot. Trims only remove entries (total
   // over-counts by at most the trimmed tail); the pairing validator can also
   // ADD stub tool_result entries (total then under-counts by those stubs).
-  // Both deltas are a handful of tokens — the stats describe the selection, not
-  // the byte-exact wire payload. Do not treat `total` as an exact wire count.
+  // Neither delta is counted (a stub is about 36 tokens): the stats describe
+  // the selection, not the byte-exact wire payload. Do not treat `total` as
+  // an exact wire count.
   // ===========================================================================
   private _rs: RenderStats | null = null;
   private _lastRenderStats: RenderStats | null = null;
@@ -5728,6 +5741,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._emittedSummaryIds = new Set();
     this._plannedTokens = null;
     this._plannedMeta = null;
+    this._lastFoldDiff = null;
     this._rs = {
       head: { messages: 0, tokens: 0 },
       tail: { messages: 0, tokens: 0 },
@@ -5761,6 +5775,55 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** `performance.now()` at the top of the current `select()`; rsEnd() stamps
    *  the compile's own elapsed time on the plan-vs-actual line from it. */
   private _selectStartedAt = 0;
+
+  /** Fold diff of THIS compile, for `planVsActual`: reset with the other
+   *  figures of the pass (`rsBegin`, dry runs included) and set only when a
+   *  compile that changed at least one saved level commits. It describes the
+   *  compile it is attached to, so a quiet compile has none. */
+  private _lastFoldDiff: FoldDiff | null = null;
+
+  /**
+   * `[fold-diff]` for a compile that has just committed saved-level changes:
+   * which chunks moved between which levels, and where its request first
+   * differs from the last one returned, in its entries' tokens
+   * (`firstChanged`, the entry index `placeCacheMarkers` measured; null with
+   * no earlier compile). Logged
+   * once and returned for `planVsActual`. Observability never fails a
+   * compile: a throw is reported, and the compile goes on without it.
+   */
+  private logFoldDiff(
+    inputs: PickerInputs,
+    middleChunkCount: number,
+    levelAt: (sequence: number, id: ChunkId) => number,
+    entries: ContextEntry[],
+    firstChanged: number | null,
+  ): FoldDiff | null {
+    try {
+      // The middle chunks are the prefix of the inputs' chunks. Each carries
+      // the level it was planned from, and `levelAt` answers the level this
+      // compile gave it without materializing the solver's frontier map.
+      const middle = inputs.chunks.slice(0, middleChunkCount);
+      const carried = new Map<ChunkId, number>(middle.map((c) => [c.id, c.currentResolution]));
+      const next = new Map<ChunkId, number>(middle.map((c) => [c.id, levelAt(c.sequence, c.id)]));
+      let divergence: RequestDivergence | null = null;
+      if (firstChanged !== null) {
+        let offset = 0;
+        let suffixTokens = 0;
+        entries.forEach((entry, index) => {
+          const tokens = this.estimateTokens(entry.content);
+          if (index < firstChanged) offset += tokens;
+          else suffixTokens += tokens;
+        });
+        divergence = { offset, suffixTokens };
+      }
+      const diff = describeFoldDiff(inputs, new SummaryTree(inputs), carried, next, divergence);
+      console.error(formatFoldDiff(diff));
+      return diff;
+    } catch (err) {
+      console.warn('[fold-diff] unavailable for this compile:', err);
+      return null;
+    }
+  }
 
   protected rsSummary(level: number, tokens: number, id?: string): void {
     if (id) this._emittedSummaryIds.add(id);
@@ -5820,6 +5883,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(m?.solver !== undefined ? { solver: m.solver } : {}),
         compileMs,
         ...(solveMs !== undefined ? { solveMs } : {}),
+        ...(this._lastFoldDiff ? { foldDiff: this._lastFoldDiff } : {}),
       };
       // Loud only when the emitter OVERRUNS the plan — that is the direction
       // that costs the tail. Under-spend is harmless slack.
@@ -9704,7 +9768,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // single head marker the cache hit is ~2%; well-placed breakpoints take the
     // real strategy to ~50% (docs/kv-stable-context-control.md — marker
     // placement is the dominant KV lever).
-    this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
+    const firstChanged = this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
     // A dry run made no draft of its own (see the draft's creation), so the
     // draft here is the last real compile's, which a dry layout must not
     // re-mark.
@@ -9724,6 +9788,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (const [id, level] of pendingResolutionChanges) this.resolutions.set(id, level);
       this.persistResolutions();
       selectionCause = 'budget-fit';
+      // The fold is now real: say once what it moved and where this request
+      // first differs from the last one returned. A plan refused before here
+      // logs nothing, so a retry doesn't log the same moves twice, and a
+      // compile that changes no saved level logs nothing either, however many
+      // locked chunks its solver moved (PR #157 review).
+      this._lastFoldDiff = this.logFoldDiff(pickerInputs, middleChunkCount, levelAt, merged, firstChanged);
     }
     if (!dryRun) this.pendingSelectionCause = selectionCause;
     // Same commit point for the receipt left behind by kv-unified: a real
@@ -10214,9 +10284,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Previous compile's per-entry cache identities (participant + content
-   * bytes), used to find the measured stable-prefix boundary. In-memory only:
-   * after a restart the first compile falls back to seam placement.
+   * Per-entry cache identities (participant + content bytes) of the last
+   * request this strategy returned, used to find the measured stable-prefix
+   * boundary, which the fold diff also reports. A select that throws puts the
+   * previous ones back (select). In-memory only: after a restart the first
+   * compile falls back to seam placement.
    */
   protected _prevCacheKeys?: string[];
 
@@ -10267,16 +10339,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * degradation (Rhys, 2026-07-26: "A maximum of 4 blocks with
    * cache_control may be provided. Found 5.").
    *
-   * Idempotent; clears any pre-existing markers first.
+   * Returns the index of this compile's first entry whose bytes differ from
+   * the previous compile's entry at the same position, or that has none there
+   * (the first appended one): the measurement behind the stable-prefix mark,
+   * which the fold diff reports. It is the entry count only when these
+   * entries are the previous compile's or a prefix of them, and null with no
+   * earlier compile to compare or no entries.
+   *
+   * Clears any pre-existing markers first. It records these entries' keys for
+   * the next compile to compare with, so a second call on the same entries
+   * returns their count.
    */
   protected placeCacheMarkers(
     entries: ContextEntry[],
     headMessageIds: ReadonlySet<MessageId>,
     tailMessageIds: ReadonlySet<MessageId>,
-  ): void {
+  ): number | null {
     for (const e of entries) if (e.cacheMarker) e.cacheMarker = false;
     const n = entries.length;
-    if (n === 0) return;
+    if (n === 0) return null;
+
+    // Measured stable prefix: first index where this compile's entry bytes
+    // diverge from the previous compile's. Measured for every strategy, since
+    // the fold diff reports it; kv-unified places its markers without it.
+    const keys = entries.map(
+      (e) => `${e.participant}\0${JSON.stringify(e.content)}`,
+    );
+    let firstDiff = n;
+    const prev = this._prevCacheKeys;
+    if (prev) {
+      let i = 0;
+      while (i < n && i < prev.length && keys[i] === prev[i]) i++;
+      firstDiff = i;
+    }
+    this._prevCacheKeys = keys;
+    const firstChanged = prev ? firstDiff : null;
 
     let lastHead = -1;
     let firstTail = n;
@@ -10344,25 +10441,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         );
       }
       for (const idx of marks) entries[idx]!.cacheMarker = true;
-      return;
+      return firstChanged;
     }
 
-    // Measured stable prefix: first index where this compile's entry bytes
-    // diverge from the previous compile's. No previous compile → seam
+    // The measured stable prefix's last entry. No previous compile → seam
     // placement, the old bounded cold-start behavior. Later pure appends mark
     // the previous endpoint itself so reuse never depends on Anthropic finding
     // it within the new end marker's 20-block backward-search window.
-    const keys = entries.map(
-      (e) => `${e.participant}\0${JSON.stringify(e.content)}`,
-    );
-    let firstDiff = n;
-    const prev = this._prevCacheKeys;
-    if (prev) {
-      let i = 0;
-      while (i < n && i < prev.length && keys[i] === prev[i]) i++;
-      firstDiff = i;
-    }
-    this._prevCacheKeys = keys;
     const stableEnd = prev ? firstDiff - 1 : historyEnd;
 
     const marks = new Set<number>();
@@ -10383,6 +10468,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     for (const idx of marks) if (idx >= 0 && idx < n) entries[idx].cacheMarker = true;
+    return firstChanged;
   }
 
   /** Convert emitted message markers back to atomic solver-layout boundaries.
@@ -12092,8 +12178,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return 0;
   }
 
-  /** Text substituted for an image block once it leaves the live-image window. */
-  private static readonly IMAGE_PLACEHOLDER = '[image dropped from live context]';
+  /** Text substituted for an image block the context doesn't carry. It
+   *  names no particular limit and no recency, since several rules write it:
+   *  the count, byte and depth limits (the byte rule is greedy, so a large
+   *  newest image can be replaced while smaller older ones stay), the
+   *  hysteresis watermark, which strips below them, and the compression
+   *  request's own image byte cap. Windowed passthrough uses the same text. */
+  private static readonly IMAGE_PLACEHOLDER = '[image not shown: this context keeps only some images]';
 
   /** Post-pass over compiled entries: replace image blocks with a text
    *  placeholder once they fall outside the live-image window — either deeper
@@ -12893,9 +12984,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
-  /** Placeholder body for a stub tool_result inserted by enforceToolPairing. */
+  /** Placeholder body for a stub tool_result inserted by enforceToolPairing:
+   *  the call's result isn't in the rendered context next to it (see the
+   *  cases listed there, and its tail pass, for a last entry that holds both
+   *  a call and a result), so the text names no cause. A read-only call can be
+   *  made again, and returns what the tool reads now; one with effects
+   *  shouldn't be repeated blind. */
   private static readonly STUB_TOOL_RESULT_TEXT =
-    '[tool result unavailable — omitted during context compression]';
+    '[this call\'s result isn\'t shown in this context. If you need its output and the tool only reads, call it again; you\'ll get what it returns now.]';
 
   // Track generated objects, not their text: genuine tool output can quote
   // the same marker. Weak keys avoid retaining previous rendered contexts.
@@ -13087,10 +13183,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *     `toolUseInputMaxTokens`.
    *  2. For each tool name, keep only the last N `tool_result` blocks
    *     per `toolResultMaxLastN`; older ones get their `content` replaced
-   *     with a brief marker referencing the tool name and how many newer
-   *     results exist below.
+   *     with a brief marker naming the tool and the limit. A limit of 0
+   *     replaces every result of the tool.
    *
-   * Both passes are no-ops when the corresponding config is unset/0.
+   * The first pass does nothing when `toolUseInputMaxTokens` is unset or 0,
+   * and the second when `toolResultMaxLastN` is unset, or for a tool whose
+   * limit is unset or negative.
    * Pruning runs AFTER selection and orphan-trimming, so it doesn't
    * affect chunk formation or the recall/pin layout.
    */
@@ -13177,10 +13275,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const { entry, blockIndex } = occs[i];
           const orig = entry.content[blockIndex];
           if (orig.type !== 'tool_result') continue;
-          const fresherCount = occs.length - i - 1;
           replaceBlock(entry, blockIndex, {
             ...orig,
-            content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
+            // The whole result is replaced, not cut short. Name the limit
+            // rather than count what follows: later results may be replaced
+            // too, and with a limit of 0 every one is.
+            content: limit === 0
+              ? `[result of tool '${toolName}' left out: this context shows none of its results]`
+              : `[result of tool '${toolName}' left out: this context shows only the tool's last ${limit === 1 ? 'result' : `${limit} results`}]`,
           });
         }
       }
@@ -13655,7 +13757,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // Budget exhausted — include with minimal content to preserve pairing
             result.push({
               ...block,
-              content: '[content omitted — context budget exceeded]',
+              content: '[content omitted: this message reached its token limit before this result]',
             });
           } else if (text.length > remaining) {
             result.push({
