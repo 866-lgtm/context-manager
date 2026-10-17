@@ -2577,6 +2577,33 @@ describe('OverBudgetError.clearedBy', () => {
     }, { membrane: model.membrane });
   });
 
+  it('names compression while tick runs a folding merge, though the walk stops at a queued chunk that needs a model call while the compression quarantine can\'t be read, since the merge in flight lands whatever the walk reads', async () => {
+    const strategy = modelCallChunks({ hierarchical: true, positionedRecallPairs: true });
+    const model = waitingMembrane();
+    await withManager(strategy, async (manager) => {
+      for (let i = 0; i < 24; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
+      const queued = await settledQueue(manager, strategy);
+      // Two L1s over adjacent messages of the last queued chunk, and their merge; the first chunk holds neither.
+      assert.ok(queued.length >= 3 && queued.at(-1)!.length >= 2, 'three chunks or more are queued, the last of two messages or more');
+      strategy.seedL1('L1-a', [queued.at(-1)![0]!]);
+      strategy.seedL1('L1-b', [queued.at(-1)![1]!]);
+      strategy.queueMergeOf(['L1-a', 'L1-b']);
+      // At the cap tick runs merges only, so it takes the merge with chunks queued; below the cap again,
+      // the count walks those chunks, as it does when chunks queue while a merge is out.
+      strategy.atCap = true;
+      const ticking = manager.tick().then(() => undefined, (error: unknown) => error);
+      await Promise.race([model.called, ticking]);
+      assert.equal(model.calls.n, 1, 'premise: tick asked the model for the merge, and waits');
+      assert.equal(strategy.chunkInFlight(), undefined, 'premise: the work in flight is the merge');
+      strategy.atCap = false;
+      strategy.breakQuarantineRead();
+      assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      assert.deepEqual(strategy.queuedChunkIds()[0], queued[0], 'premise: the walk reaches the first queued chunk first, which needs a model call');
+      model.release();
+      await ticking;
+    }, { membrane: model.membrane });
+  });
+
   it('names nothing while tick compresses a chunk that a hold placed since reaches, since its landing discards the L1', async () => {
     const strategy = modelCallChunks();
     const model = waitingMembrane();
