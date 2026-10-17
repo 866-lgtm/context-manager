@@ -853,7 +853,8 @@ locked chunks. Salience never overrides a pin.
 *(rev 5.1 amendment — boundary-cut tolerance, `de3d293`.)* A hard protection
 protects its **leaf**, no longer its whole group: a protected leaf inside a
 foldable group is *excluded from the fold* rather than vetoing it, and renders
-raw beside the group's recall (the renderer's "ownership wins" semantics).
+at the level it's held at (raw for the flat zone, head, tail and a classic
+pin) beside the group's recall (the renderer's "ownership wins" semantics).
 Without this, a head/tail boundary cutting two messages into a 742-leaf L3
 group made the entire group permanently unfoldable and OverBudget-wedged the
 agent with its own L3 sitting unused. Details and the related unanimity
@@ -960,9 +961,10 @@ stores; all are load-bearing and none appeared in the original rev 5.0 text.
 **Boundary-cut tolerance** (`de3d293`). A hard-protected leaf (−1 sentinel:
 raw zone / pins / locked) inside a foldable group is *excluded from the fold*
 rather than vetoing it, and is exempt from group unanimity in the validity
-projection. The renderer already draws protected messages raw beside their
-chunk's recall ("ownership wins"), so a boundary cutting through a group must
-not make the group permanently unfoldable. Trigger: calibration drift moved
+projection. The renderer already draws a protected message at the level it's
+held at (raw for the raw zone and a classic pin) beside its group's recall
+("ownership wins"), so a boundary cutting through a group must not make the
+group permanently unfoldable. Trigger: calibration drift moved
 the token-derived head boundary two messages into an L3's first chunk — the
 2-leaf overlap vetoed the whole 742-leaf group in every phase, and the agent
 OverBudget-wedged with its own L3 unused. Consequence for §3.8: group

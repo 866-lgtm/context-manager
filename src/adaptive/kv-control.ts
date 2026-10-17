@@ -367,7 +367,7 @@ function relevanceCut(
         // bound; the soft shape cap blocks only in phase A.
         if (!groupEligible(ancestor.id, ancestor.leafChunkIds, level, ignoreShapeCaps)) continue;
         for (const leafId of ancestor.leafChunkIds) {
-          if ((caps.get(leafId) ?? 0) < 0) continue; // protected: stays raw beside the recall
+          if ((caps.get(leafId) ?? 0) < 0) continue; // protected: keeps its held level beside the recall
           // Overlap tolerance: only mark leaves whose own lineage renders as
           // part of THIS node at this level. Disagreeing leaves keep their
           // level (see the note above `priority`).
@@ -425,8 +425,9 @@ function relevanceCut(
         if (attempted.has(attemptKey)) continue;
         let eligible = true;
         for (const leafId of node.leafChunkIds) {
-          // Protected members sit at raw beside the recall (boundary-cut
-          // tolerance) — they neither veto nor participate in the un-fold.
+          // Protected members sit at the level they're held at beside the
+          // recall (boundary-cut tolerance): they neither veto nor take part
+          // in the un-fold.
           // Nor does a member whose own lineage at this level is another
           // node, or none: this node doesn't render it (§13.6 overlap).
           if (rawZone.has(leafId) || immovable.has(leafId)) continue;
@@ -1054,11 +1055,12 @@ function planUnreported(
     if (v !== 0) { carriedNonEmpty = true; break; }
   }
   diagHist('carried(pre-projection)', carried, tree);
-  // Hard-protected set for boundary-cut tolerance: raw zone + immovable
-  // leaves render raw beside their group's recall and are exempt from
-  // group-unanimity everywhere. A leaf whose lineage disagrees with a group
-  // (overlap tolerance) needs no entry: the projection leaves it out of that
-  // group's unanimity by its lineage, exactly as for the ideal cut.
+  // Hard-protected set for boundary-cut tolerance: raw-zone and immovable
+  // leaves render at their held level beside their group's recall (raw for the
+  // raw zone) and are exempt from group-unanimity everywhere. A leaf whose
+  // lineage disagrees with a group (overlap tolerance) needs no entry: the
+  // projection leaves it out of that group's unanimity by its lineage, exactly
+  // as for the ideal cut.
   const boundaryExempt = new Set<ChunkId>();
   for (const c of ordered) {
     if (p.rawZone.has(c.id) || immovable.has(c.id)) boundaryExempt.add(c.id);

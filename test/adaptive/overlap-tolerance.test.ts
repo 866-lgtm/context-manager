@@ -13,9 +13,9 @@
  * layer sat unused ("deepest fold level=L3" with L4s present).
  *
  * New behavior: disagreeing leaves are skipped by folds and exempted from
- * unanimity (they render raw beside the recall — the renderer's existing
- * ownership-wins semantics), and the solve iterates fold→project until the
- * render fits under W.
+ * unanimity (they render through their own lineage, or raw, beside the recall:
+ * the renderer's existing ownership-wins semantics), and the solve iterates
+ * fold→project until the render fits under W.
  */
 
 import { test } from 'node:test';
