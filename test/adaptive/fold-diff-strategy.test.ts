@@ -50,6 +50,9 @@ type Plan = 'fold' | 'raw' | 'carried' | ((c: PickerChunk, inputs: PickerInputs)
 class PlannedStrategy extends AutobiographicalStrategy {
   plan: Plan = 'fold';
   lie = false;
+  /** The moves the planned picker reported on its last run: the solver's own
+   *  count, whatever `planVsActual.moves` counts. */
+  pickedMoves = 0;
   placed: Array<Array<{ participant: string; content: ContentBlock[]; sourceMessageId?: MessageId }>> = [];
   /** Refuse the next compile after it has placed its cache markers, where the
    *  coverage check refuses. */
@@ -97,6 +100,7 @@ class PlannedStrategy extends AutobiographicalStrategy {
         }
         let moves = 0;
         for (const c of inputs.chunks) if ((finalResolutions.get(c.id) ?? 0) !== c.currentResolution) moves++;
+        this.pickedMoves = moves;
         const finalTokens = this.lie ? 1 : accountFrontier(inputs, finalResolutions).tokens;
         return {
           finalResolutions,
@@ -315,7 +319,7 @@ describe('AutobiographicalStrategy — [fold-diff] wiring', () => {
     // level, though the solver reports it as a move.
     strategy.plan = (c) => (c.id === locked ? 0 : c.currentResolution);
     await manager.compile(BIG);
-    assert.equal(stats(manager)?.planVsActual?.moves, 1, 'fixture: the solver moved the locked chunk');
+    assert.equal(strategy.pickedMoves, 1, 'fixture: the solver moved the locked chunk');
     assert.deepEqual(foldLines(), []);
     assert.equal(stats(manager)?.planVsActual?.foldDiff, undefined);
     manager.close();
