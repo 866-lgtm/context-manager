@@ -70,7 +70,7 @@ export interface WindowedPassthroughOptions {
 /** Text substituted for an image block once it leaves the live-image window
  *  (identical to the autobiographical strategy's placeholder, so a merged
  *  timeline reads the same in both agents' windows). */
-const IMAGE_PLACEHOLDER = '[image dropped from live context]';
+const IMAGE_PLACEHOLDER = '[image not shown: this context keeps only some images]';
 /** Mirrors `AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES` (protected there). */
 const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
 
@@ -116,6 +116,8 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
 export class WindowedPassthroughStrategy implements ContextStrategy {
   readonly name = 'windowed-passthrough';
   readonly maxMessageTokens?: number;
+  /** Renders the window raw; history before the anchor is not rendered. */
+  readonly renderedForms = ['raw', 'omitted'] as const;
 
   private readonly reAnchorFraction: number;
   private readonly anchorStateIdOverride?: string;
@@ -130,6 +132,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   private loadedBranch: StoreBranchGeneration | null = null;
   /** Content identity of the previous committed compile's entries. */
   private prevCacheKeys: string[] | null = null;
+  /** Set when a committed select moved the anchor (see takeSelectionCause). */
+  private pendingCause: string | undefined;
 
   constructor(options: WindowedPassthroughOptions = {}) {
     const fraction = options.reAnchorFraction ?? 0.5;
@@ -295,6 +299,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         if (newAnchor !== this.anchor) {
           this.anchor = newAnchor;
           this.persistAnchor();
+          this.pendingCause = 'window';
         }
       }
     }
@@ -337,6 +342,13 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     this.applyImageStripping(entries, messages, store);
     if (!opts?.dryRun) this.placeCacheMarkers(entries);
     return entries;
+  }
+
+  /** 'window' when the last committed select moved the window's start. */
+  takeSelectionCause(): string | undefined {
+    const cause = this.pendingCause;
+    this.pendingCause = undefined;
+    return cause;
   }
 
   // --------------------------------------------------------------------------
@@ -493,7 +505,7 @@ function truncateContent(content: ContentBlock[], maxTokens: number): ContentBlo
       if (typeof block.content === 'string') {
         const text = block.content;
         if (remaining <= 0) {
-          result.push({ ...block, content: '[content omitted — context budget exceeded]' });
+          result.push({ ...block, content: '[content omitted: this message reached its token limit before this result]' });
         } else if (text.length > remaining) {
           result.push({
             ...block,

@@ -81,9 +81,6 @@ describe('imageStripHysteresisRatio', () => {
   });
 
   describe('a dry select leaves the watermark as it found it', () => {
-    // Node 20.0.0's runner doesn't apply the outer beforeEach to tests in a
-    // nested describe, so these clear the store themselves.
-    beforeEach(cleanup);
     // compile() and previewContext() reach the watermark through the adaptive
     // picker's post-strip estimates.
     const adaptive = (extra: Record<string, unknown> = {}) => strategy({

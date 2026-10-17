@@ -16,6 +16,7 @@ import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import type { ContentBlock } from '@animalabs/membrane';
 import {
+  AutobiographicalStrategy,
   ContextManager,
   PassthroughStrategy,
   WindowedPassthroughStrategy,
@@ -368,6 +369,44 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     assert.ok(t.length < 500, `cut to the cap (400 chars) plus marker, got ${t.length}`);
     await manager.close();
   });
+
+  it('a tool result past the message\'s cap keeps its pairing and says the cap ran out', async () => {
+    const path = freshPath();
+    const manager = await ContextManager.open({
+      path,
+      strategy: new WindowedPassthroughStrategy({ maxMessageTokens: 100 }),
+    });
+    manager.addMessage('a', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+    manager.addMessage('u', [
+      { type: 'text', text: 'x'.repeat(2000) },
+      { type: 'tool_result', toolUseId: 't1', content: 'the file' },
+    ]);
+    const compiled = await manager.compile(budget);
+    const blocks = compiled.messages.flatMap((m) => m.content);
+    const result = blocks.find((b) => b.type === 'tool_result') as { toolUseId?: string; content: unknown } | undefined;
+    assert.equal(result?.toolUseId, 't1', 'the result still answers its call');
+    assert.ok(blocks.some((b) => b.type === 'tool_use' && (b as { id: string }).id === 't1'), 'and the call is still there');
+    assert.equal(result?.content, '[content omitted: this message reached its token limit before this result]');
+    await manager.close();
+  });
+
+  it('autobiographical\'s message cap writes the same marker on a tool result past it', async () => {
+    const path = freshPath();
+    const manager = await ContextManager.open({
+      path,
+      strategy: new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 100_000, maxMessageTokens: 100 }),
+    });
+    manager.addMessage('a', [{ type: 'tool_use', id: 't1', name: 'read', input: {} }]);
+    manager.addMessage('u', [
+      { type: 'text', text: 'x'.repeat(2000) },
+      { type: 'tool_result', toolUseId: 't1', content: 'the file' },
+    ]);
+    const compiled = await manager.compile(budget);
+    const result = compiled.messages.flatMap((m) => m.content).find((b) => b.type === 'tool_result') as { toolUseId?: string; content: unknown } | undefined;
+    assert.equal(result?.toolUseId, 't1');
+    assert.equal(result?.content, '[content omitted: this message reached its token limit before this result]');
+    await manager.close();
+  });
 });
 
 describe('WindowedPassthroughStrategy: live-image policy', () => {
@@ -389,8 +428,8 @@ describe('WindowedPassthroughStrategy: live-image policy', () => {
       m.content.map((b) => (b.type === 'image' ? 'image' : (b as { text: string }).text)),
     );
     assert.deepEqual(shape, [
-      ['i1', '[image dropped from live context]'],
-      ['i2', '[image dropped from live context]'],
+      ['i1', "[image not shown: this context keeps only some images]"],
+      ['i2', "[image not shown: this context keeps only some images]"],
       ['i3', 'image'],
     ]);
     await manager.close();

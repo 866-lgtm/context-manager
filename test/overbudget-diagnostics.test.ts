@@ -1300,6 +1300,49 @@ describe('OverBudgetError.clearedBy', () => {
     }, { membrane: countingMembrane(calls) });
   });
 
+  const pinnedCycleAt = {
+    'head window': 'in the head window, which tick\'s head then carries raw',
+    'reset head': 'before a reset head start, which tick\'s request then carries raw though it lies before the head',
+  } as const;
+  for (const place of Object.keys(pinnedCycleAt) as (keyof typeof pinnedCycleAt)[]) {
+    it(`names nothing before the host declares its tools once a pin opens the L1 that covers a tool cycle ${pinnedCycleAt[place]}`, async () => {
+      const strategy = new DiagnosticStrategy({
+        adaptiveResolution: false,
+        targetChunkTokens: 40,
+        headWindowTokens: 60,
+        recentWindowTokens: 0,
+        overBudgetGraceRatio: 0.25,
+        autoTickOnNewMessage: false,
+        speculativeProduction: false,
+        minChunkCharsForLLM: 0,
+      });
+      const calls = { n: 0 };
+      await withManager(strategy, async (manager) => {
+        // The conversation opens with a tool cycle, which an L1 covers.
+        const cycle = [
+          manager.addMessage('assistant', [{ type: 'tool_use', id: 'zz-pinned', name: 'zz_tool', input: { q: 'zz' } } as ContentBlock]),
+          manager.addMessage('user', [{ type: 'tool_result', toolUseId: 'zz-pinned', content: 'zz result' } as ContentBlock]),
+        ];
+        const texts: string[] = [];
+        for (let i = 0; i < 12; i++) texts.push(manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+        if (place === 'reset head') strategy.resetHeadWindow(texts[6]!);
+        strategy.seedL1('L1-cycle', cycle);
+        assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'the premise: covered, the cycle holds no chunk back');
+        // A pin on the call opens the L1 for every chunk after it, so tick's request carries the cycle raw.
+        manager.pinRange(cycle[0]!, cycle[0]!, { name: 'zz-pin' });
+        const error = await refusal(manager);
+        assert.ok(strategy.queuedChunkIds().length > 0, 'text chunks are queued');
+        assert.deepEqual(error.clearedBy, [], 'nothing tick will do clears it');
+        // The premise: tick defers every queued chunk, with no model call.
+        for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+        assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
+        assert.equal(calls.n, 0, 'tick asked no model');
+        manager.setToolDefinitions([{ name: 'zz_tool', description: 'zz', inputSchema: { type: 'object' } }]);
+        assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'with the tools declared, they count');
+      }, { membrane: countingMembrane(calls) });
+    });
+  }
+
   for (const fable of [false, true]) {
     it(`names nothing for chunks tick defers until the host declares its tools (${fable ? 'a Fable summarizer, text alone' : 'chunks holding tool blocks'}), and compression once it has`, async () => {
       const strategy = new DiagnosticStrategy({
