@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   ExactKvUnifiedPolicySolver,
   KvUnifiedPolicyError,
+  MAX_AGE_BAND_STEPS,
   bandedAge,
   continuityLeafBase,
   fidelityLeafBase,
@@ -1654,6 +1655,8 @@ test('banded ages move a weight only when the age crosses a band edge', () => {
   assert.throws(() => normalizePolicy({ ageBandSteps: -1 }), KvUnifiedPolicyError);
   assert.throws(() => normalizePolicy({ ageBandSteps: Number.NaN }), KvUnifiedPolicyError);
   assert.throws(() => normalizePolicy({ ageBandSteps: 0.5 }), KvUnifiedPolicyError, 'a band count is an integer');
+  assert.equal(normalizePolicy({ ageBandSteps: MAX_AGE_BAND_STEPS }).ageBandSteps, MAX_AGE_BAND_STEPS);
+  assert.throws(() => normalizePolicy({ ageBandSteps: MAX_AGE_BAND_STEPS + 1 }), KvUnifiedPolicyError, 'a band count is bounded');
 });
 
 test('banded continuity holds stability, reads it at doublings, and saturates recency', () => {

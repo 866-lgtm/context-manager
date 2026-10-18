@@ -812,7 +812,7 @@ export interface KvUnifiedConfig {
      * sequences, continuity recency in tokens, stability in turns): an age
      * is priced at the lower edge of its band, so a leaf's weight changes
      * only when it crosses a band edge instead of on every append. 4 unless
-     * set (a band is a factor of 2^(1/4) ≈ 1.19 wide); 0 prices exact ages,
+     * set (a band is a factor of 2^(1/4) ≈ 1.19 wide; at most 64); 0 prices exact ages,
      * which is what the solver itself does when the key is absent. Two
      * continuity readings differ from the plain band rule whenever banding
      * is on, whatever the count: recency is at its floor from eight

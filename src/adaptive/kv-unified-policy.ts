@@ -88,6 +88,11 @@ export const DEFAULT_KV_UNIFIED_WELFARE_POLICY: KvUnifiedWelfarePolicy = {
 /** The lower edge of the geometric band `age` falls in, with `steps` bands
  * per doubling: 2^(floor(log2(age) · steps) / steps). Ages below 1 and a
  * `steps` of 0 are returned as given. */
+/** The finest banding the policy accepts: 64 bands per doubling is a
+ * step of 1.1%, below any weight's sensitivity, and keeps the edge table
+ * (one entry per band, scanned per leaf) small. */
+export const MAX_AGE_BAND_STEPS = 64;
+
 export function bandedAge(age: number, steps: number): number {
   if (!(steps > 0) || !(age >= 1) || !Number.isFinite(age)) return age;
   // The octave the age falls in, then its band within the octave from the
@@ -486,8 +491,8 @@ export function normalizePolicy(
   if (policy.budgetLowRatio > policy.budgetHighRatio) {
     throw new KvUnifiedPolicyError('budgetLowRatio must not exceed budgetHighRatio');
   }
-  if (!Number.isInteger(policy.ageBandSteps) || policy.ageBandSteps < 0) {
-    throw new KvUnifiedPolicyError('ageBandSteps must be a non-negative integer');
+  if (!Number.isInteger(policy.ageBandSteps) || policy.ageBandSteps < 0 || policy.ageBandSteps > MAX_AGE_BAND_STEPS) {
+    throw new KvUnifiedPolicyError(`ageBandSteps must be an integer from 0 to ${MAX_AGE_BAND_STEPS}`);
   }
   return policy;
 }
