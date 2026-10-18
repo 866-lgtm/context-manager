@@ -860,16 +860,8 @@ function reachableLevel(saved: number, l1Id: SummaryId | undefined, summariesByI
  */
 const compressionStateLocks = new WeakMap<JsStore, Map<string, Promise<void>>>();
 const compressionInFlight = new WeakMap<JsStore, Map<string, Promise<CompressionInFlightResult>>>();
-// 3: the provider total counts cache writes and reads for every provider
-// (#182). A version-2 record still counts toward the shape cap where the
-// corrected count would have planned its ladder the same
-// (countsUnderCurrentAccounting). Any other version-2 record, and every
-// record from before version 2, doesn't, so its chunk gets a fresh attempt.
-const COMPRESSION_BUDGET_ACCOUNTING_VERSION = 3;
+const COMPRESSION_BUDGET_ACCOUNTING_VERSION = 2;
 const COMPRESSION_BUDGET_ACCOUNTING_SOURCE =
-  'provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v3';
-/** Version 2's label, for the family key a version-2 record holds (previousAccountingFamilyKey). */
-const COMPRESSION_BUDGET_ACCOUNTING_SOURCE_V2 =
   'provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v2';
 const COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS = 256;
 const COMPRESSION_QUARANTINE_MAX_ACTIVE = 1_024;
@@ -3275,12 +3267,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // provider, and a full cache hit is a zero input count beside a positive
     // cache read. The usage comes from the host's instance (ctx.membrane),
     // which this package's range doesn't bind: a host on an older membrane
-    // passes Gemini's counts raw, with the cached span inside the input
-    // count, so the sum counts that span twice and admission is stricter. A
-    // usage whose convention membrane can't establish keeps the counts its
-    // provider gives: in 0.6.0 that's openai-compatible's and
-    // openai-completions', which never report cache reads, and an OpenRouter
-    // response with no cache field, so the sum is its input count.
+    // passes Gemini's counts raw, and before 0.5.81 OpenAI's too, with the
+    // cached span inside the input count, so the sum counts that span twice
+    // and admission is stricter. A usage whose convention membrane can't
+    // establish keeps the counts its provider gives: in 0.6.0 that's
+    // openai-compatible's and openai-completions', which never report cache
+    // reads, and an OpenRouter response with no cache field, so the sum is
+    // its input count.
     const input = read('inputTokens');
     // Usage without an input count, or with a zero total, is no observation
     // of the prompt: the complete normalized request bound stands instead.
@@ -4272,11 +4265,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // family stay byte-identical to what they were before the rung existed.
       ...(toolProseFallback ? { toolProseFallback } : {}),
     };
-    const familyKey = this.compressionFamilyKey(
-      { model, chunkSourceHash, frontierHash, canonicalRequestHash, normalizedConfig },
-      variants,
-      COMPRESSION_BUDGET_ACCOUNTING_SOURCE,
-    );
+    const familyKey = sha256Json({
+      model,
+      chunkSourceHash,
+      frontierHash,
+      canonicalRequestHash,
+      accountingSource: COMPRESSION_BUDGET_ACCOUNTING_SOURCE,
+      normalizedConfig,
+      variants: variants.map((variant) => ({
+        parentId: variant.parent.id,
+        childIds: variant.children.map((child) => child.id),
+        requestHash: variant.requestHash,
+      })),
+    });
     const key = sha256Json({
       familyKey,
       model,
@@ -4305,95 +4306,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       plan,
       created: Date.now(),
     };
-  }
-
-  /**
-   * A request family's key: the request, its frontier and every variant, under
-   * an accounting label. It hashes the record's parts as record creation
-   * builds them, so the same request built again gives the same key. A record
-   * read back from the store has its objects' keys in another order, so its
-   * key can't be computed again from that copy.
-   */
-  private compressionFamilyKey(
-    parts: Pick<
-      CompressionRefusalQuarantineRecord,
-      'model' | 'chunkSourceHash' | 'frontierHash' | 'canonicalRequestHash' | 'normalizedConfig'
-    >,
-    variants: RecallCurveVariant[],
-    accountingSource: string,
-  ): string {
-    return sha256Json({
-      model: parts.model,
-      chunkSourceHash: parts.chunkSourceHash,
-      frontierHash: parts.frontierHash,
-      canonicalRequestHash: parts.canonicalRequestHash,
-      accountingSource,
-      normalizedConfig: parts.normalizedConfig,
-      variants: variants.map((variant) => ({
-        parentId: variant.parent.id,
-        childIds: variant.children.map((child) => child.id),
-        requestHash: variant.requestHash,
-      })),
-    });
-  }
-
-  /**
-   * The family key a record of the same request had under accounting version
-   * 2: the same request, frontier, variants and configuration, with version
-   * 2's label and number. A version-2 record that still counts holds this
-   * family, as it did before the upgrade, where the release that wrote it
-   * built the same request as this one does.
-   */
-  private previousAccountingFamilyKey(
-    record: CompressionRefusalQuarantineRecord,
-    variants: RecallCurveVariant[],
-  ): string {
-    return this.compressionFamilyKey(
-      { ...record, normalizedConfig: { ...record.normalizedConfig, accountingVersion: 2 } },
-      variants,
-      COMPRESSION_BUDGET_ACCOUNTING_SOURCE_V2,
-    );
-  }
-
-  /**
-   * Whether a quarantine record counts toward its chunk's shape cap and holds
-   * its family. Every record of the current accounting version does. A
-   * version-2 record does when its plan rejected every recall-curve variant
-   * on the provider's count of the canonical request, as an empty plan does,
-   * and it ran no tool-prose hoist. Version 3 changed only how that count is
-   * read, besides the label every family key hashes, which is why
-   * previousAccountingFamilyKey rebuilds version 2's key. Where version 2
-   * had a count, version 3's is the same or larger, since it adds cache
-   * writes and reads, so a variant rejected on version 2's count is rejected
-   * on version 3's, and the ladder comes out as version 2 would plan it now.
-   * Any other record's chunk gets a fresh attempt:
-   * - a variant admitted on the count may be rejected on the larger one,
-   *   which frees its attempt for a variant that fits;
-   * - a variant priced on the complete request bound, because version 2 read
-   *   no count, may be priced on one now: outside Anthropic and Bedrock,
-   *   version 2 read a count of no uncached input, such as a full cache hit,
-   *   as none;
-   * - a hoist that was sent may be rejected now, and one that was rejected
-   *   may have been priced on the complete bound or, for the source-only
-   *   hoist, on source-only-final's count, which the record doesn't keep.
-   * A record names its model but not its provider, and one model can run
-   * through more than one adapter, so this can't spare a record because its
-   * provider's count was already right. Every release at version 2 stored a
-   * plan with each record and the outcomes with each exhausted event; a
-   * record without either can't show its ladder, so it doesn't count.
-   */
-  private countsUnderCurrentAccounting(active: ActiveCompressionQuarantine): boolean {
-    const version = active.record.normalizedConfig?.accountingVersion;
-    if (version === COMPRESSION_BUDGET_ACCOUNTING_VERSION) return true;
-    if (version !== 2) return false;
-    const { plan } = active.record;
-    const { outcomes } = active;
-    return Array.isArray(plan) && Array.isArray(outcomes) &&
-      plan.every((entry) =>
-        entry.accountingSource === 'canonical_provider_usage_plus_expansion' &&
-        entry.disposition === 'admission_rejected') &&
-      !outcomes.some((outcome) =>
-        outcome.curveLabel === 'tool-prose-hoist' || outcome.curveLabel === 'source-only-tool-prose-hoist');
   }
 
   protected setMergedInto(entry: SummaryEntry, mergedIntoId: string): void {
@@ -7196,7 +7108,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // already match by chunkSourceHash).
     const sameHash = [...durableQuarantine.values()].filter(
       (active) => active.record.chunkSourceHash === quarantineRecord.chunkSourceHash &&
-        this.countsUnderCurrentAccounting(active),
+        active.record.normalizedConfig?.accountingVersion === COMPRESSION_BUDGET_ACCOUNTING_VERSION,
     );
     // The shape cap is per request regime, not merely per source chunk. Enabling
     // the final source-only rung is a genuine request-family change and must
@@ -7212,12 +7124,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       sha256Json(active.record.normalizedConfig?.toolProseFallback ?? null) ===
         sha256Json(quarantineRecord.normalizedConfig.toolProseFallback ?? null),
     );
-    // A version-2 record that still counts holds its family under the key
-    // version 2 gave it.
-    const previousFamilyKey = this.previousAccountingFamilyKey(quarantineRecord, variants);
     const durableActive = durableQuarantine.get(quarantineRecord.key)
-      ?? sameRegime.find((active) =>
-        active.record.familyKey === quarantineRecord.familyKey || active.record.familyKey === previousFamilyKey)
+      ?? sameRegime.find((active) => active.record.familyKey === quarantineRecord.familyKey)
       ?? (sameRegime.length >= AutobiographicalStrategy.CHUNK_QUARANTINE_SHAPE_CAP ? sameRegime[0] : undefined);
     if (durableActive) {
       this.compressionRefusalQuarantine = durableQuarantine;
@@ -9708,7 +9616,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const sources = new Set<string>();
     for (const active of projection.values()) {
-      if (this.countsUnderCurrentAccounting(active)) {
+      if (active.record.normalizedConfig?.accountingVersion === COMPRESSION_BUDGET_ACCOUNTING_VERSION) {
         sources.add(active.record.chunkSourceHash);
       }
     }

@@ -104,7 +104,7 @@ usage exists, it uses a conservative UTF-8-byte bound over every input-bearing
 field of the complete normalized variant (head, recall, raw middle, chunk,
 tools, instruction, system/provider fields), a per-message formatter-envelope
 allowance, and the output reserve. After canonical refusal reports complete
-provider input usage, admission uses `provider total input + positive
+provider input usage, v2 admission uses `provider total input + positive
 serialized expansion delta + output reserve`; the complete-request bound
 remains the fail-closed path when usage is absent, has no input count, or
 totals zero. Through membrane the input count is always a number: the
