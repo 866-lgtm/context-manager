@@ -16,7 +16,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import type { JsStore } from '@animalabs/chronicle';
 import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
-import { capContent } from './message-cap.js';
+import { capContent, cappedPriceExtra } from './message-cap.js';
 
 /**
  * Options for {@link WindowedPassthroughStrategy}.
@@ -261,16 +261,18 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     }
 
     // Per-message shaping BEFORE pricing, so the window is sized on what
-    // will actually be sent. A message the cap cuts is priced as the
-    // autobiographical strategy prices one, at min(estimate, cap + 50). That
-    // price isn't a bound on what renders: the cut's suffix, a string
-    // result's omission notice and the omission marker can take a capped
-    // message past it. A message the truncator leaves whole renders whole and
-    // is priced at its full estimate, even past the cap, where the
-    // autobiographical strategy prices every message at min(estimate, cap +
-    // 50). The two estimates differ: the store's counts every block, thinking
-    // included, and the truncator's counts text and string results alone,
-    // rounding each block up, so either can pass the cap with nothing cut.
+    // will actually be sent. A message the cap cuts is priced as it renders,
+    // as the autobiographical strategy prices one: its estimate, plus what
+    // the cut adds to it as the store estimates the content sent
+    // (cappedPriceExtra). The cut changes text and string results alone, and
+    // the store prices the text the cap keeps at its own rates, so the
+    // difference holds the kept text, the suffix, the omission notices and
+    // the marker, and the message's other blocks keep their price. A message
+    // the truncator leaves whole renders whole and is priced at its
+    // estimate, even past the cap. The two estimates differ: the store's
+    // counts every block, thinking included, and the truncator's counts text
+    // and string results alone, rounding each block up, so either can pass
+    // the cap with nothing cut.
     const cap = this.maxMessageTokens ?? 0;
     const shaped = new Map<number, ContentBlock[]>();
     const priced = (i: number): number => {
@@ -280,7 +282,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       const content = truncateContent(msg.content, cap);
       if (content === msg.content) return estimate;
       shaped.set(i, content);
-      return Math.min(estimate, cap + 50);
+      return estimate + cappedPriceExtra(store, msg, content);
     };
 
     let total = 0;

@@ -6,6 +6,7 @@
  */
 import type { ContentBlock } from '@animalabs/membrane';
 import { isEmptyTextBlock, releaseVanishedRawForms } from '../raw-forms.js';
+import type { MessageStoreView, StoredMessage } from '../types/index.js';
 
 /** A text block that holds nothing, the one rule the cap and the raw-form
  *  release share (raw-forms.ts). */
@@ -180,4 +181,22 @@ export function capContent(
     return releaseVanishedRawForms(content, [capMarker()]);
   }
   return releaseVanishedRawForms(content, result);
+}
+
+/**
+ * What sending `capped`, which `capContent` made of `message`'s content, adds
+ * to the message's price: the store's estimate of `capped`, less its estimate
+ * of the message as stored, and 0 where the cap left the content whole. Both
+ * strategies price a capped message at its uncapped price plus this, so the
+ * cut is priced as it renders (#223). The cap keeps four characters a token,
+ * and the store prices the text it keeps at its own rates. It cuts text
+ * blocks and string tool results alone and passes every other block through
+ * in place, so the difference holds the kept and cut text, the suffix, the
+ * omission notices and the marker, and an image or a tool call keeps
+ * whatever price the site's uncapped price gives it. A block the cut makes
+ * give up its raw form estimates as it did, so it adds nothing.
+ */
+export function cappedPriceExtra(store: MessageStoreView, message: StoredMessage, capped: ContentBlock[]): number {
+  if (capped === message.content) return 0;
+  return store.estimateTokens({ content: capped } as StoredMessage) - store.estimateTokens(message);
 }

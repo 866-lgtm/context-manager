@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AutobiographicalStrategy, ContextManager, OverBudgetError } from '../src/index.js';
-import type { SummaryEntry, SummaryLevel } from '../src/types/index.js';
+import type { StoredMessage, SummaryEntry, SummaryLevel } from '../src/types/index.js';
 import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
 import type { FoldingBudget } from '../src/adaptive/folding-strategy.js';
 import type { ContentBlock, Membrane } from '@animalabs/membrane';
@@ -788,7 +788,14 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
-  it('prices the newest turn as the cap prices it, and names a smaller window when the head and that turn just fit', async () => {
+  /** What a compile with room sends, as the store estimates it. */
+  async function sentTotal(manager: ContextManager): Promise<number> {
+    const store = (manager as unknown as { messageStore: { estimateTokens(message: StoredMessage): number } }).messageStore;
+    const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+    return compiled.messages.reduce((sum, m) => sum + store.estimateTokens({ content: m.content } as StoredMessage), 0);
+  }
+
+  it('prices the newest turn as it renders under the cap, and names a smaller window when the head and that turn fit', async () => {
     const strategy = new AutobiographicalStrategy({
       adaptiveResolution: true,
       headWindowTokens: 0,
@@ -799,14 +806,45 @@ describe('OverBudgetError.clearedBy', () => {
       speculativeProduction: false,
     });
     await withManager(strategy, async (manager) => {
-      // Each message is over the cap, so each costs exactly 50 + 50 tokens:
-      // the newest alone is the whole 100-token budget, and six are over it.
+      // Each message is over the cap, so each costs what its first 200
+      // characters and the cut's suffix estimate at: the newest alone fits
+      // the 100-token budget, and six are over it.
       for (let i = 0; i < 6; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]);
+      const sent = await sentTotal(manager);
+      // The six messages are the same length, so each sends a sixth of it.
+      assert.ok(sent / 6 <= 100, `premise: the newest turn alone fits: ${sent / 6}`);
       const error = await refusal(manager);
       assert.match(error.message, /^Head\/tail reservation exceeded budget/);
       assert.equal(error.budget, 100);
-      assert.equal(error.diagnostics.tailTokens, 600);
+      assert.equal(error.diagnostics.tailTokens, sent);
       assert.deepEqual(error.clearedBy, ['smaller-recent-window']);
+    });
+  });
+
+  it('names no smaller window when the newest turn renders past the budget, though the cap alone would have priced it within', async () => {
+    const strategy = new AutobiographicalStrategy({
+      adaptiveResolution: true,
+      headWindowTokens: 0,
+      recentWindowTokens: 100_000,
+      maxMessageTokens: 50,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    await withManager(strategy, async (manager) => {
+      // The newest message is over the cap and carries an image, which the cap
+      // keeps whole: it renders past the budget, where the cap plus 50 was 100.
+      for (let i = 0; i < 5; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]);
+      manager.addMessage('user', [
+        { type: 'text', text: 'message 5 ' + 'word '.repeat(200) },
+        { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AAAA' } } as ContentBlock,
+      ]);
+      const sent = await sentTotal(manager);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+      assert.equal(error.diagnostics.tailTokens, sent);
+      // The newest turn's image alone is the store's 1,600 tokens.
+      assert.deepEqual(error.clearedBy, [], 'a smaller recent window still holds the newest turn');
     });
   });
 
