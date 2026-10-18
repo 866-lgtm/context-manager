@@ -130,10 +130,11 @@ describe('blockAsStored', () => {
     assert.deepStrictEqual(back, { type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' } });
   });
 
-  it('leaves out of its read a reference of an unknown original type, naming the type, and reads one with no media type as before', async () => {
+  it('leaves out of its read a reference of an unknown original type, and one of audio with no media type, naming each, and reads an image\'s with none as before', async () => {
     storeLegacyReference((hash) => [
       { type: 'blob_ref', ref: { hash, mediaType: 'image/png', originalType: 'hologram' } },
       { type: 'blob_ref', ref: { hash, originalType: 'image' } },
+      { type: 'blob_ref', ref: { hash, originalType: 'audio' } },
     ], 'image/png');
     const lines: string[] = [];
     const original = console.error;
@@ -141,15 +142,22 @@ describe('blockAsStored', () => {
     let manager: ContextManager | undefined;
     try {
       manager = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
-      // The first reference is left out, where every read of it threw, and the second, of an image
-      // whose reference has no media type, reads relabelled from its bytes, as before.
-      assert.deepEqual(manager.getAllMessages()[0]!.content, [{ type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' } }]);
+      // The first reference is left out, where every read of it threw. The second, of an image whose
+      // reference has no media type, reads relabelled from its bytes, as before. The third, of audio
+      // with no media type, which nothing else names, is left out, where it read back without one.
+      const read = manager.getAllMessages()[0]!.content;
+      assert.deepEqual(read, [{ type: 'image', source: { type: 'base64', data: b64(PNG), mediaType: 'image/png' } }]);
+      // What the read gives, a write takes: a host copying the message as read can store it.
+      manager.addMessage('user', read);
       await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
     } finally {
       console.error = original;
       manager?.close();
     }
-    assert.ok(lines.some((line) => line.includes('(content[0].ref.originalType is "hologram", not image, document, audio or video)')), lines.join('\n'));
+    assert.ok(
+      lines.some((line) => line.includes('(content[0].ref.originalType is "hologram", not image, document, audio or video; content[2].ref.mediaType is undefined, not a string)')),
+      lines.join('\n'),
+    );
   });
 
   it('throws for a block the store refuses, and for a blob_ref, rather than return a form the store would not give back', async () => {
