@@ -19,6 +19,7 @@ import type {
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
 import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from './body-runs.js';
+import { contentForWrite, wellFormedContent } from './well-formed-content.js';
 
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
 
@@ -222,6 +223,8 @@ export interface TokenEstimatorOptions {
  */
 export class MessageStore {
   private blobManager: BlobManager;
+  /** Messages whose malformed content a read has already logged (wellFormedContent). */
+  private malformedLogged = new Set<string>();
   private listeners: Set<MessageStoreListener> = new Set();
   private idToIndex: Map<MessageId, number> = new Map();
   private tokenEstimator: (text: string) => number;
@@ -411,14 +414,15 @@ export class MessageStore {
    * adaptive-resolution metadata (bodyGroupId for shards, initial
    * resolution state, etc.) at ingestion time.
    */
-  static readonly _appendExtraKeys = ['bodyGroupId', 'shardIndex', 'currentResolution', 'lockedByAgent'] as const;
+  static readonly _appendExtraKeys = ['bodyGroupId', 'shardIndex', 'shardCount', 'currentResolution', 'lockedByAgent'] as const;
 
   /**
    * Append a new message to the store.
    *
    * `extra` is an optional bag of adaptive-resolution metadata
-   * (bodyGroupId / shardIndex / currentResolution / lockedByAgent) that
-   * callers may set at ingestion. Field semantics match StoredMessage.
+   * (bodyGroupId / shardIndex / shardCount / currentResolution /
+   * lockedByAgent) that callers may set at ingestion. Field semantics match
+   * StoredMessage.
    */
   append(
     participant: string,
@@ -428,10 +432,12 @@ export class MessageStore {
     extra?: {
       bodyGroupId?: string;
       shardIndex?: number;
+      shardCount?: number;
       currentResolution?: number;
       lockedByAgent?: boolean;
     }
   ): StoredMessage {
+    content = contentForWrite(content, 'Message refused');
     // Extract blobs from content
     const storedContent = this.blobManager.extractBlobs(content);
 
@@ -541,6 +547,7 @@ export class MessageStore {
    * message, remove the whole bodyGroup and re-append.
    */
   edit(messageId: MessageId, newContent: ContentBlock[]): void {
+    newContent = contentForWrite(newContent, `Edit of ${messageId} refused`);
     const index = this.lookupIndex(messageId);
     if (index === undefined) {
       throw new Error(`Message not found: ${messageId}`);
@@ -558,7 +565,11 @@ export class MessageStore {
       );
     }
 
-    const oldContent = this.blobManager.resolveBlobs(oldMessage.content);
+    // The old content as a read gives it, so an edit can replace a message
+    // whose stored content doesn't match ContentBlock.
+    const oldContent = this.blobManager.resolveBlobs(
+      wellFormedContent(oldMessage.content, `message ${messageId}`, this.malformedLogged),
+    );
     const storedContent = this.blobManager.extractBlobs(newContent);
 
     // Update the stored message
@@ -910,6 +921,21 @@ export class MessageStore {
   private _messageTokens = new WeakMap<StoredMessage, {
     blocks: readonly ContentBlock[]; calibration: number; tokens: number;
   }>();
+
+  /**
+   * Base token estimate of some content: the sum of each block's raw
+   * estimate, before the calibration multiplier and its per-block rounding
+   * (which `estimateTokens` applies, so dividing its result by the
+   * calibration does not recover this). Identical content estimates the same
+   * at any calibration.
+   */
+  estimateBaseTokens(content: readonly ContentBlock[]): number {
+    let tokens = 0;
+    for (const block of content) {
+      tokens += this.estimateBlockTokensRaw(block);
+    }
+    return tokens;
+  }
 
   /**
    * Closed-loop calibration multiplier applied to every estimate (default 1).
@@ -1814,6 +1840,9 @@ export class MessageStore {
     _index: number,
     resolveBlobs: boolean = true,
   ): StoredMessage {
+    // What doesn't match ContentBlock is left out before anything reads it,
+    // blob resolution included (well-formed-content.ts).
+    const content = wellFormedContent(internal.content, `message ${id}`, this.malformedLogged);
     const stored: StoredMessage = {
       id,
       // chronicle record sequence captured when the message was appended
@@ -1833,8 +1862,8 @@ export class MessageStore {
       // through un-inflated (StoredContentBlock ⊂ wire-safe superset of
       // ContentBlock for viewer purposes).
       content: resolveBlobs
-        ? this.blobManager.resolveBlobs(internal.content)
-        : (internal.content as unknown as ContentBlock[]),
+        ? this.blobManager.resolveBlobs(content)
+        : (content as unknown as ContentBlock[]),
       metadata: internal.metadata,
       timestamp: new Date(internal.timestamp),
       causedBy: internal.causedBy,
@@ -1842,6 +1871,7 @@ export class MessageStore {
     // Carry adaptive-resolution fields through unchanged.
     if (internal.bodyGroupId !== undefined) stored.bodyGroupId = internal.bodyGroupId;
     if (internal.shardIndex !== undefined) stored.shardIndex = internal.shardIndex;
+    if (internal.shardCount !== undefined) stored.shardCount = internal.shardCount;
     if (internal.currentResolution !== undefined) stored.currentResolution = internal.currentResolution;
     if (internal.lockedByAgent !== undefined) stored.lockedByAgent = internal.lockedByAgent;
     return stored;

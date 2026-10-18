@@ -12,6 +12,190 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.15.0 — 2026-10-16
+
+### Added
+
+- `compile()` returns `provenance` beside the messages. It holds a `compileId`, the
+  namespace and branch the compile read (`{id, name, created}`), and one entry per
+  compiled message naming what it carries: raw stored bodies (each marked
+  `complete`, or listing what is `missing`: content or shards), the
+  summaries it renders, a context injection, or other derived content. It also
+  holds an immutable rendered layout for strategies that report one. Every
+  compile builds it, whether or not the host accepts rounds, at a cost that
+  grows with the history the compile reads. The sources
+  of a split message repeat on every part. A raw body is judged as stored: its
+  id is shard 0's (the id `addMessage` returned), and a shard the view filter
+  hid from the strategy counts as missing. A composite that merged a body's
+  shards is complete when it carries their text in order and their media
+  unaltered, and a tool result that pairing repair moved next to its tool_use
+  still counts as carried there. A body is one ingestion: the same text
+  ingested twice is two bodies, though a group id (a hash of the content)
+  names both. `rawBodies` maps each raw body's head to its stored messages as
+  the compile read them (head first, then every shard of that ingestion,
+  including any the view filter hid), auxiliary-store messages included.
+- Strategies can report their rendered layout. A strategy declares `renderedForms`
+  and names the summaries behind derived entries in `ContextEntry.summaries`, with
+  `describeRenderedSummaries(ids)` giving each summary's level, covered messages and
+  method. `takeSelectionCause()` can explain the last committed selection.
+  Passthrough, windowed passthrough and autobiographical (with its subclasses)
+  report layouts, and autobiographical marks a summary whose rendered text a cap
+  cut as `partial`.
+- Fold receipts: `acceptRound({ provenance, usage, presentation })` accepts a
+  compile whose provider round succeeded. It compares the layout with the last
+  layout accepted on the compile's own branch in its namespace, by any manager
+  of that namespace on the store, even when another branch has since been
+  selected, over messages present in both. When any message changed form
+  (raw, partial raw, summary, a different summary, omitted), it appends a
+  receipt naming each changed run's boundaries, forms, summaries and estimated
+  tokens. It writes a baseline when the branch has no record, or when its
+  newest record can't be read (another format, or a chain that doesn't
+  rebuild), which is reported once. Arrivals are not folds.
+  - Each acceptance, an unchanged layout included, commits the branch's new
+    layout and its receipt as one Chronicle typed record, alongside a
+    once-minted store-id record. Typed records are enumerable from any branch
+    and survive branch deletion, though each takes the next sequence of the
+    branch selected when it is written. The store syncs before the record is
+    appended, so the state it names is durable first, and again after, so an
+    acceptance is durable before `acceptRound` returns or announces it, or a
+    query lists it. Each sync fsyncs the log and the store's metadata, even
+    with nothing pending, so every accepted round pays two. A compile is
+    accepted once: a retry writes nothing and returns what its first
+    acceptance returned (its receipt, or null), whether that acceptance
+    reported success or an uncertain failure, ran in another manager on the
+    store, or ran before a reopen. The one exception is Chronicle's own: if
+    the store's last record rots, open drops it, so a retry writes the
+    acceptance again, and the lost record's id goes to the next record. A compile is accepted on
+    the manager that compiled it: one of another namespace is refused with
+    an error.
+  - A layout persists as its members (message sequences, gap-coded, about
+    1.3 bytes each) and its units (forms with counts), so a message missing
+    from either view is never counted inside a range. An acceptance writes a
+    delta on the branch's previous record, holding the members that changed
+    and the units from the first that changed to the last, or a snapshot of
+    the whole layout once the records since the last snapshot would outweigh
+    it, each counted whole, receipt included. So snapshots are amortized
+    against the deltas between them, and on average the bytes stored per
+    acceptance stay bounded while the deltas do, as when messages arrive
+    and a fold changes one stretch of the view. Changes far apart re-send the
+    units between them, so a change at each end of a long view re-sends all
+    of it. Each snapshot holds the whole view's members, and rebuilding a
+    layout reads at most about two snapshots' worth.
+  - A use reads the records it needs rather than every record. An
+    acceptance reads its branch's newest record and the chain that rebuilds
+    its layout. A branch is found by reading back from the store's newest
+    record, and every branch met on the way is noted, so the records present
+    when the store opened are read at most once, by whichever lookups need
+    them; a branch with no record yet, or a deleted branch looked up by
+    name, may take that whole read. A compile carries where the journal
+    stood (`provenance.journalMark`, a record known durable), so finding an
+    earlier acceptance of the same compile reads only the records after it.
+    Each record names its branch's previous receipt, so a branch's receipts
+    are walked back reading only receipts. Every manager on one store
+    object shares what has been read; the first use after the store opens
+    lists the records' ids and, when there are any, syncs once, making every
+    record present durable.
+  - Layouts persist base token estimates, taken before the store's
+    calibration, so identical content costs the same in every compile. A
+    receipt's estimated token counts apply the calibration its compile
+    captured to both sides, and count each summary once per side, in the
+    first changed run that names it.
+  - `presentation` (`verbatim`, `altered` or `unknown`) records how the
+    confirming round carried the compile, as its producer reported.
+  - Usage is the confirming round's own, with unreported fields `unknown`.
+  - Query with `listFoldReceipts({ afterId, since, limit, branch })`:
+    newest first, or with `afterId` (a receipt id) oldest first from just
+    after it, so a reader pages forward from the last receipt it got, with
+    `more` saying whether there is more, and `afterId: '0'` pages a branch's
+    whole record from its start; `since` is an ISO 8601 date, or a date
+    and time with its offset (a bare number, or a time without an offset,
+    is refused rather than guessed at). `branch` is a name, or a branch as
+    receipts name it (`{ id, created }`), which reaches a deleted branch
+    even when a live one has taken its name. A query returns its manager's
+    namespace's receipts. A history that can't be read whole says so in
+    `note`. Label receipts with `setReceiptSource`.
+  - Subscribe with `onFoldReceipt`. A listener hears each receipt its
+    manager's `acceptRound` returns, and, at that manager's next acceptance
+    on a branch, the branch's newest receipt if the manager hasn't announced
+    it: one whose write reported a failure, one another manager wrote, or one
+    from before a reopen. So it can hear a receipt again, and needn't hear
+    every receipt: key on the receipt's id and `compileId` (a receipt lost to
+    Chronicle's rot exception can have its id go to a later receipt), and
+    read `listFoldReceipts` for the whole record.
+  - `getStoreId`, `currentBranchRef` and `describeRenderedForms` support hosts
+    that export or explain them.
+
+- A sharded `addMessage` records `shardCount`, its group's size, on every
+  shard, and writes the shards in index order, so the id it returns is shard
+  0's. Compile provenance counts a group that declared its size as complete
+  only when every declared shard is stored and carried. A write that fails
+  partway removes the shards it wrote from the store, so a retry writes one
+  body. A group left short anyway (a crash mid-write, or a failed write whose
+  shards couldn't be removed) is missing `shards`, before or after a reopen,
+  even though its members can't be edited. For a group written before sizes
+  were declared, `complete` keeps a weaker meaning: every member stored for it
+  was carried. That does not prove the group was ever written whole. A
+  chunking decision whose indices aren't exactly 0..n-1 is refused before
+  anything is written.
+
+### Changed
+
+- The kv-unified hysteresis certificate is on by default for a strategy built
+  from a recipe: a `kvUnified` block without `hysteresisCertificate` now takes
+  the certified exit, and `hysteresisCertificate: false` restores the full
+  solver on every compile. The certificate only skips the full solve when it
+  proves the carried layout is what the `adoptEpsilon` rule selects, and
+  declines to the full solver on a turn it cannot prove (changed ownership,
+  pins or locks, cache churn, a forced budget transition, or a cap), so
+  eligibility, adoption and fallback are unchanged; a certified result proves
+  the hysteresis policy, not identity with the bucketed solver's pick. The
+  solver-level `ParetoSolveOptions` flag keeps its absent-means-off reading.
+
+- A listener added with `onMessage` that throws no longer fails the write
+  that emitted its event: the error is logged, the write stands, and the
+  other listeners are still told. Before, the write threw after it had
+  landed, so a caller that retried wrote it twice, and a sharded
+  `addMessage` stopped partway through its body. The log line names the
+  message the listener missed. Each `onMessage` call now registers its own
+  listener and returns its own unsubscribe, so a function registered twice
+  hears each event twice; before, the second registration was ignored, and
+  either unsubscribe removed both.
+
+- context-manager builds and typechecks with TypeScript 7 (`^7.0.2`, a devDependency). Built from the same source, the published `.js` is byte-identical to TypeScript 5.9's output; a few `.d.ts` files differ only in the quote style of string-literal types, and source maps differ in their `mappings`. A build now needs TypeScript 7's native compiler for the platform: one of its optional `@typescript/typescript-<os>-<cpu>` packages, which npm installs where TypeScript publishes one. So neither a checkout nor a git dependency's `prepare` builds on a platform with none, and a checkout installed without optional dependencies (`npm ci --omit=optional`) fails in its `prepare` build. A git dependency still builds under an outer `--omit=optional`, since npm installs its dependencies with optional ones included before its `prepare` runs. A build also needs Node 20.10 or later on the 20 line, since Node 20.0 to 20.9 refuses 7's launcher (`ERR_UNKNOWN_FILE_EXTENSION`). Installing the published package is unaffected.
+
+### Fixed
+
+- Compression prompts replace serialized `data:<mime>;base64,…` URLs whose payload has at least 4096 characters with a marker naming the media type and the payload's length. Imported tool output can carry a whole image as text, which the image-byte cap can't see and which is priced as prose: a 1 MiB image is about 1.4 million base64 characters. Text blocks, tool results (string or block array) and a tool call's input (its strings, or the text of arguments that didn't parse) are covered. MIME parameters before `;base64`, JSON escapes (escaped slashes however many times the text was serialized, `\u` escapes in the type and in parameter values, and escapes inside the payload such as wrapped lines) and any letter case are matched. Bare base64 isn't, nor is a data URL with a parameter value holding a quote, a backslash other than a `\u` escape, or (unquoted) a colon. Chronicle content is never changed.
+- Every compression request is prepared the same way before its admission, hash and dispatch: canonical and source-only L1 requests, recall-curve fallbacks, split parts, the tool-prose rewrite and the no-tools retries, merges and transition summaries. A request gets its own message wrappers and copies of what preparation changes, so preparing one never edits a stored message or another request, and preparing a prepared request changes nothing. Recall-curve fallbacks are built from the unprepared answers and prepared on their own, so a parent answer carrying a data URL keeps its fallback, and the children's answers are prepared too.
+- A block that preparation edits gives up its replay form (`rawXml`, `rawItem`), and so do the blocks in its message that share one with it and a reasoning item paired with it, so the old payload can't be replayed in place of the marker. Other blocks keep their identities and replay forms.
+- The compression image cap counts every inline image block a prompt can carry: a base64 source, a `data:` URL source, and a `data` field beside `mimeType`, as MCP image blocks in tool results and generated images have. Generated images are now capped too. The live window's image strip is unchanged.
+- What preparation replaced in a request is logged when the request is sent, naming it: one line counts the data URLs replaced, and the image cap's line states its inline image budget and what it kept, in MiB.
+
+- The canonical L1 compression prompt shows a message a pin keeps raw as raw, as the live view does, where the pins fit its budgets (next item); it used to recall the summary covering it. A frontier summary that covers such a message is descended rather than recalled: its children take its place, so only the branch holding the pin opens, sibling branches stay recall pairs, and the raw a pin adds is its own L1 chunk. An opened chunk renders raw wherever it lies before the chunk being compressed, including before the head window. The head window always comes first; after it, recall pairs and raw messages go in source order, so the summarizer doesn't read old turns as coming after later memories. Empty-content frontier summaries above L1 are descended the same way, and an empty L1 that holds no pin stays covered, as before. Only opened chunks lose coverage: a merged L1 that its parent doesn't list stays covered, as before, unless a pin opens it. Only pins before the chunk being compressed count, so a summary after it is recalled as before. Merge recall, L3+ merge inputs and transition summaries do not consult pins, and the source-only L1 shows no history for them to change.
+- An L1 prompt shows pinned history raw only when it fits. The raw that pins add is spent from `compressionRecallBudgetTokens` first, and recall pairs get the rest, oldest dropped first as before. The request with it must also fit `compressionContextBudgetTokens`, priced as the message store prices the messages it would send, with the system prompt, tools and output reserve. When either fails, that compression lays history out as it would without pins: it recalls the summaries the pins override, and pinned history before the head window that no summary covers is left out, as before. A warning and a `compression:pinned-raw-over-budget` log event name the pins, the sizes and the limit. Waiting instead would stall every later L1, since the pinned history precedes each of them. The live view still shows the pins raw, and a canonical request without pins is still always attempted. A compression's warnings, this one and those for head ownership and the recall cap, are logged once it goes ahead, after the deferral for missing tool definitions, the quarantine skip and in-flight coalescing.
+- A pin resolves once, for compression, chunking and every selector (the strategy's `resolvedPinBounds`). Level bounds are read only under `foldingStrategy: 'kv-stable'` and `'kv-unified'` with `adaptiveResolution`, with kv-stable's precedence: where pins overlap at a message, a bound takes a classic pin's place, `level` takes `maxLevel`'s, and the lowest of each kind wins; a level or cap of 0 is raw. Under every other selector a pinned message is raw, as `pinAtLevel` documents, so the flat-profile and oldest-first folders no longer fold a message pinned with a level. Picker chunks carry one reading: a raw pin, a level or cap of 0 included, is `pinned`, so kv-unified no longer asks for an L1 of a chunk pinned at level 0, and `pinLevel` and `pinMaxLevel` are set only above 0. kv-unified's constraint source for such a chunk is now `raw-pin` (it was `classic-pin`). Under kv-unified, a `level` and a `maxLevel` that overlap no longer conflict: the `level` applies, as under kv-stable. Under kv-stable and kv-unified, a message pinned at a level or cap above 0 before it was compressed is now compressed, since only a summary can supply its level; before, the chunker skipped every pinned message, so no summary ever covered it. Under kv-unified, a pinned level on a message between the head window and the recent window that no summary supplies yet is a constraint conflict, and every compile fails until one does, as before. A message pinned that way before this change, whose neighbours have since been compressed and merged, gets an L1 of its own that nothing merges, so kv-stable renders it at L1, while kv-unified's compiles keep failing, as before.
+
+- A store holding a summary whose `sourceIds` is null no longer throws on every compile under adaptive resolution. Opening a store now repairs summaries whose text, sources or range readers can't use: empty text, sources that aren't a list of ids (null, a string, an empty list, or a list holding something other than ids), or a range that isn't two ids. An L1 with unreadable sources takes them from the compressed chunk record that names it, as that record now names them, or else from another copy of itself, and its range is always its sources' ends; a summary above L1 takes sources and range together from another copy. Copies of one id keep the text of a non-empty copy, preferring one whose pointer names a summary above it that lists it. A summary's parent is the first pointer on any of its copies, `parentId` before `mergedInto`, that names a kept summary listing it among its sources; without one, it is the kept summary one level up that lists it, when exactly one does. `mergedInto` is set to that parent, and so is a `parentId` naming anything else. A summary that can't be recovered is dropped, and so is every summary above it that names a summary no longer in the store, including one an earlier version dropped: on upgrade, a store where an earlier version dropped an empty summary loses the summaries above it from its active summaries once, and their surviving sources merge again. A summary that names one at its own level or above is dropped too, since no merge writes one, and two such summaries can cover each other's messages. A parent pointer that names no such parent is cleared, and a null one counts as none. Chunk records whose L1 is gone are reopened, and queued merges naming a missing summary are removed. The repair is persisted, so a second open changes nothing, also when the store is opened with `auditOnly`; its log line names the summaries dropped, for each reason, those rebuilt, those given a parent and those whose parent pointers it cleared. When the live lookup finds an L1 that another instance wrote after this one loaded, this instance reloads the store's summaries, repaired as an open repairs them, so it holds the L1 with the summaries above it. The open's topology audit doesn't run on that reload, as it didn't when the lookup adopted the L1 alone. Adopting the L1 alone left its parent pointer naming a summary this instance didn't hold, which kv-unified's canonical forest refused on every compile (#176). A message whose saved fold level names a summary that is gone is planned from the deepest summary still over it at or below that level, so the solvers fold it to its surviving L1 instead of rendering it raw. The next compile that commits saves the level it presented, except for a locked message, which keeps its saved level. Where the budget can't hold the summaries still over such messages, a compile is refused as over budget, as for any store whose summaries outgrow its budget. Under kv-unified, a range pinned at a level that only a dropped summary supplied is refused as infeasible instead, whatever the budget; releasing the pin, or pinning the range at a level its surviving summaries supply, lets it compile.
+
+## 0.14.1 — 2026-10-15
+
+### Fixed
+
+- A calibration record without a pricing stamp is no longer counted as epoch 1 and re-stamped on load (#179). 0.11.0 to 0.13.0 wrote such records, and so did every release before 0.11.0, whose pricing `CALIBRATION_EPOCH_REPRICES` doesn't model; nothing in the record tells them apart. Five production stores upgraded from pre-0.11 runtimes to 0.14.0 kept the multiplier they had learned under the flat signed-thinking price, four at the 1.8 ceiling and one at 1.45. One refused every compile with `OverBudgetError`, and the others ran folded, the worst to about 45% of the window it could hold. An unstamped multiplier is now **provisional**:
+  - It is discarded at load, as before, when the store holds content the epochs since 1 repriced, and now also when it sits at a clamp edge (1.8 or 0.6): a residual pinned there corrected per-class rates that were off by more than the clamp allows, and says nothing about this release's. Otherwise it is kept, with one `console.warn`, and the record is left as it is: the stamp is written by the first sample, not the load.
+  - A provisional multiplier above 1 that puts a compile over budget is dropped to 1 and the select runs again, so the first compile resolves instead of wedging, unless it is over budget at 1 as well. The drop is logged, persisted as `calibration.reset`, and shown in render stats. A provisional multiplier at or below 1 is never raised.
+  - The first sample the sanity band accepts replaces a provisional multiplier outright (and writes the stamp); the learner's EMA steps only from there. The 1 any discard restarts from is provisional too, so one applied sample sets it rather than about ten, each repricing every message; it is persisted as provisional, so a restart before that sample keeps it a guess.
+  - `RenderStats.calibration.provisional` is `true` meanwhile. `CalibrationReset.fromEpoch` is `null` for a record without a stamp (it is now typed `number | null`). A dry select or preview decides and falls back as a real compile would, at the picker's refusal too (which a dry run otherwise only reports as `fits: false`), so a budget preview says what the real compile will do; it writes no record and emits no calibration log.
+  - **Operators:** this covers a record that is still unstamped. A store that already opened on 0.14.0 and ran a committing compile had its multiplier re-stamped as epoch 2, which is honoured as learned, as before; such a store keeps the folded window or the wedge and still needs the one-time reset in 0.14.0's notes.
+
+- A dry compile that is the first compile after a message is removed no
+  longer leaves later compiles reading message positions from before the
+  removal. Those stale positions could make every later compile, dry or
+  committing, throw `UncoveredDropError`, as they did with the middle one of
+  three messages removed, until something rebuilt the order, such as setting
+  the strategy again. The dry run had put the strategy's store order back
+  without the listing it was built from. A regression in 0.14.0.
+
 ## 0.14.0 — 2026-10-13
 
 ### Added

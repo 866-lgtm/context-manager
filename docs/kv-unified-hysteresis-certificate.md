@@ -1,13 +1,19 @@
-# Hysteresis certificate prototype
+# Hysteresis certificate
 
 The certificate alone is insufficient for normal-operation latency. General
 solver work and measurements, with this certificate disabled, are documented
 in [General kv-unified solver performance](kv-unified-general-solver-performance.md).
 
-This opt-in prototype avoids Pareto label propagation when the existing
-`adoptEpsilon` rule provably selects the unchanged accepted presentation.
-Enable it with `hysteresisCertificate: true` in `ParetoSolveOptions` or
-`KvUnifiedOptions`. It is not enabled in any resident recipe or pinned runtime.
+The certificate avoids Pareto label propagation when the existing
+`adoptEpsilon` rule provably selects the unchanged accepted presentation. A
+strategy built from a recipe has it on unless the recipe's `kvUnified` block
+says `hysteresisCertificate: false`, which runs the full solver on every
+compile. At the solver level (`ParetoSolveOptions`) the flag is still opt-in:
+an absent flag means off. A turn the certificate cannot prove (a changed
+ownership chain, pins or locks, cache churn, a forced budget transition, or
+one of the caps below) declines to the full solver and pays the proof's cost
+on top; a proven turn skips the full solve. It was opt-in and off by default
+until 0.15.
 
 ## Bound and selection proof
 

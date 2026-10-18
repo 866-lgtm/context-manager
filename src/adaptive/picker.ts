@@ -53,6 +53,87 @@ export interface OverBudgetDiagnostics {
 }
 
 /**
+ * What clears an over-budget refusal at run time besides a larger budget,
+ * which clears any of them: waiting, or a hot setting. Cold configuration,
+ * such as the head window's size, isn't named, and neither is a head-window
+ * reset (`resetHeadWindow`), which clears a head that's over but starts a new
+ * topic, nor newer messages that would shrink a head holding images, since
+ * the image strip takes the oldest images first but may not take enough.
+ * The strategy that refuses sets it, since it knows which part of the
+ * context is over and what can shrink that part:
+ * - `'compression'`: compression work that would shrink this context is
+ *   running or queued, as `tick` would take it: a compression in flight;
+ *   the queued chunks, in `tick`'s order, while the speculative cap lets it
+ *   take one, the cap read as it stands when the count is asked (an L1
+ *   `tick` makes on the way can bring the drain to the cap before it reaches
+ *   a chunk that counts, and a merge that folds nothing can relieve the cap
+ *   when it lands); and after them, with `hierarchical` merging on and a
+ *   compression model, the queued merges, in `tick`'s order up to one a
+ *   compression hold blocks, where `tick` stops. Each counts only when the
+ *   compile can fold now one of the messages its summary would cover: one
+ *   outside the head and recent windows that no pin keeps raw, since the
+ *   compile renders the rest raw whatever summary covers them. A chunk's
+ *   messages are its own, a merge's are the leaves of its sources in
+ *   memory, and the work in flight's are those of the chunk or merge `tick`
+ *   is working on. The work in flight counts only while no compression hold
+ *   placed since reaches it, since its landing checks the hold and discards
+ *   what the call returns, and, for a chunk, until its summary has landed,
+ *   which can come before the call ends. When it doesn't count, the count
+ *   goes on to the queue, where a merge in flight is still the head, and it
+ *   goes past a queued merge that folds nothing, which `tick` runs before it
+ *   takes the next once that call lands or drops it. A call that fails, is
+ *   refused or is withdrawn leaves the merge at the head, so the count can
+ *   name work behind it that `tick` reaches only after that. A merge counts
+ *   even when `tick` will drop it as stale without a model call: a source
+ *   isn't loaded or is already merged into another summary, or its sources
+ *   fail the merge's topology check, in which case `tick` quarantines it.
+ *   So the count can name compression for such a merge until `tick`
+ *   reaches it and drops it, while a source in memory covers a message the
+ *   compile can fold; one with no source in memory names nothing. A queued
+ *   chunk counts when `tick` would adopt an L1 for it, stub it or compress
+ *   it. One that needs a model call while the compression quarantine holds
+ *   it, one `tick` defers until the host declares its tools, or one the
+ *   compile can fold none of, doesn't, and the count goes on past it where
+ *   `tick` does. The count reads a chunk's tool blocks
+ *   as stored, where `tick` strips unpaired ones first, so it can leave out
+ *   a chunk `tick` would compress, but never counts one `tick` defers. It
+ *   stops at a chunk that needs a model call without a compression model,
+ *   or while the quarantine can't be read, where `tick` throws and a host's
+ *   tick loop ends. It stops there even where `tick` would defer that chunk
+ *   for the host's tools and go on, since its stored read can't always
+ *   tell, so it can leave out the work behind such a chunk, but never
+ *   counts a chunk `tick` throws at. A chunk that counts is still
+ *   uncompressed, holds no held message, has a message the compile can fold
+ *   now, and has no message an L1 in memory already covers, since the
+ *   adaptive picker already folds through that L1, unless the selector is
+ *   the hierarchical one with chunk persistence on and `tick` would adopt
+ *   an L1 that matches the chunk exactly, which ends the raw fallback the
+ *   selector renders for an uncompressed chunk. It assumes the manager has
+ *   a membrane to run compression. For the adaptive picker's refusals, its
+ *   plan must also still have summaries to produce. Whether that work is
+ *   enough to fit isn't checked, so a host can tell an agent that
+ *   compression may make room, not that it will.
+ * - `'newer-message'`: the newest message alone is over the budget, and a
+ *   newer message that fits moves the window past it.
+ * - `'smaller-recent-window'`: the raw recent window, which compression never
+ *   touches, is what's over the budget, and the head fits beside the newest
+ *   turn as the compile must keep it raw, or beside everything from a
+ *   compression hold if one starts earlier. That's the newest message (for
+ *   one split into shards, its newest shard, since the earlier shards can
+ *   fold), unless the newest message's body holds a tool_result, on its first
+ *   shard: then it's that whole body and the whole call before it, which the
+ *   result must follow raw. A smaller
+ *   `recentWindowTokens` (the hot `tailTokens`) moves the rest out of the raw
+ *   window into the middle, which folds once its chunks have closed and
+ *   compression has summarized them.
+ *
+ * Each list describes the refusal that was hit. Clearing it can bring the
+ * next one: a smaller recent window can leave the picker waiting for
+ * compression.
+ */
+export type OverBudgetClearedBy = 'compression' | 'newer-message' | 'smaller-recent-window';
+
+/**
  * Error raised when the picker has folded everything it can and the
  * resulting context still exceeds the hard token budget.
  *
@@ -74,11 +155,18 @@ export class OverBudgetError extends Error {
   readonly actual: number;
   /** Diagnostic snapshot of the picker's final state. */
   readonly diagnostics: OverBudgetDiagnostics;
+  /**
+   * What clears this refusal at run time besides a larger budget (see
+   * {@link OverBudgetClearedBy}). Empty when nothing else is known to clear it.
+   */
+  readonly clearedBy: readonly OverBudgetClearedBy[];
 
   constructor(opts: {
     budget: number;
     actual: number;
     diagnostics: OverBudgetError['diagnostics'];
+    /** What clears the refusal besides a larger budget; empty when left out. */
+    clearedBy?: readonly OverBudgetClearedBy[];
     /** Which stage refused — defaults to the plan-stage wording. Emission
      *  sites pass their own so a planner/emitter drift refusal doesn't
      *  masquerade as picker exhaustion (it cost a debugging session once). */
@@ -122,6 +210,7 @@ export class OverBudgetError extends Error {
     this.budget = opts.budget;
     this.actual = opts.actual;
     this.diagnostics = opts.diagnostics;
+    this.clearedBy = Object.freeze([...(opts.clearedBy ?? [])]);
   }
 }
 
@@ -186,27 +275,41 @@ export interface PickerChunk {
   sequence: number;
   rawTokens: number;
   /**
-   * The level this chunk carries in from the last committed solve. The greedy
-   * solvers and kv-stable render a pinned chunk raw whatever it carries (the
-   * greedy solvers seed it at 0); kv-unified composes a pin with the chunk's
-   * other constraints, a lock among them.
+   * The level this chunk starts the solve at (0 = raw). The autobiographical
+   * strategy passes the level it carries in from the last committed solve, or,
+   * when the summaries over it no longer reach that level, the deepest level
+   * below it that they reach. The greedy solvers and kv-stable render a pinned
+   * chunk raw whatever it carries (the greedy solvers seed it at 0); kv-unified
+   * composes a pin with the chunk's other constraints, a lock among them.
    */
   currentResolution: number;
   lockedByAgent: boolean;
   bodyGroupId?: string;
+  /**
+   * A pin keeps this chunk raw: never folded. That's a classic pin, a level
+   * or cap of 0, and under a folding strategy that doesn't read level
+   * bounds, every pin. A chunk carries at most one of `pinned`, `pinLevel`
+   * and `pinMaxLevel`, as its pins resolve (the autobiographical strategy's
+   * `resolvedPinBounds`).
+   */
   pinned: boolean;
   /**
-   * V2 dynamic pin — fix this chunk at EXACTLY this fold level (0 = raw). Set
-   * from a `ProtectedRange.level`. Such a chunk is NOT `pinned` (the controller
-   * must be able to move it to its level), but the KV-stable controller holds it
-   * there and never folds/un-folds it. Ignored by non-kv-stable solvers.
+   * V2 dynamic pin — fix this chunk at EXACTLY this fold level, above 0 (a
+   * level of 0 arrives as `pinned`). Set from a `ProtectedRange.level`, only
+   * under the folding strategies that read it (kv-stable, kv-unified, with
+   * adaptive resolution). Such
+   * a chunk is NOT `pinned` (the controller must be able to move it to its
+   * level), but the controller holds it there and never folds/un-folds it.
    */
   pinLevel?: number;
   /**
-   * V2 dynamic pin — this chunk may fold no deeper than this level (hard cap).
-   * Set from a `ProtectedRange.maxLevel`. Honored only by the KV-stable
-   * controller, throughout the solve — there is no emergency path (design
-   * §13). Ignored elsewhere.
+   * V2 dynamic pin — this chunk may fold no deeper than this level (hard cap),
+   * above 0 (a cap of 0 arrives as `pinned`). Set from a
+   * `ProtectedRange.maxLevel`, only under the folding strategies that read it
+   * (kv-stable, kv-unified, with adaptive resolution), and only when no
+   * `level` applies.
+   * The KV-stable controller honors it throughout the solve — there is no
+   * emergency path (design §13).
    */
   pinMaxLevel?: number;
   /**
@@ -265,7 +368,8 @@ export interface PickerResult {
    *  full folding exceeds the hard wall (a dead-band hold is NOT exhausted).
    *  Falls back to the greedy formula when a solver doesn't set it. */
   exhausted: boolean;
-  /** Number of chunks whose resolution changed vs the carried state. */
+  /** Number of chunks whose resolution changed from the `currentResolution`
+   *  they started at. */
   moves: number;
   /** Solver-frontier entries that reference no live chunk (summaries whose
    *  sources were removed by store surgery). Dropped from application;
