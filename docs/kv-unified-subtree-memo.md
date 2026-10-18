@@ -180,6 +180,7 @@ variant; 150 steps, solve time of the trajectory-driving solve.
 | packed DAG, exact ages | 41 | 37 | 52 | 122 |
 | packed DAG, 4 bands | 48 | 44 | 62 | 133 |
 | subtree, 4 bands | 38 | 34 | 50 | 95 |
+| subtree, 4 bands, after review | 35 | 30 | 47 | 97 |
 | subtree, 4 bands, certificate on | 30 | | | 112 |
 
 The resident's solve was already small (94k labels, the Oct 1 campaign), so the engine
