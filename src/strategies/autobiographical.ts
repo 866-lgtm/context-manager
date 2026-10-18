@@ -12388,8 +12388,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.postProcessToolEntries(entries);
     // Strip stale images (this path places no cache markers). Its emission
     // priced every message at the store's full estimate, apart from a message
-    // maxMessageTokens caps, priced at most at the cap plus 50, which leaves
-    // out its images. So it priced no image as the placeholder, and the strip
+    // maxMessageTokens caps, priced at most at the cap plus 50, where the
+    // price leaves out its images. So it priced no image as the placeholder, and the strip
     // counts only the images it sends (see applyImageStripping's
     // asEstimated). The render stats keep each message at the price emission
     // gave it, a stripped image included.
@@ -13190,7 +13190,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  at post-strip prices, and `selectHierarchical` at the store's full
    *  estimate, so that its `RenderStats.total` counts a stripped image at
    *  full price. Both tallied a message `maxMessageTokens` caps at most at
-   *  the cap plus 50, which leaves out its images.
+   *  the cap plus 50, where the price leaves out its images.
    *
    *  `asEstimated`: the caller prices messages by `postStripEstimates`, which
    *  counts the images of every stored message, so the strip counts, ahead of
@@ -13198,15 +13198,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  and the two keep and strip the same images. `selectAdaptive` asks: every
    *  budgeting site in it prices a message by those estimates, apart from a
    *  message `maxMessageTokens` caps, priced at most at the cap plus 50,
-   *  which leaves out its images, and the middle region's text-only entry of
-   *  a sharded body, priced by its text. `selectHierarchical` doesn't: its
-   *  emission prices head, middle and tail at the store's full estimate,
-   *  apart from a message `maxMessageTokens` caps, priced at most at the cap
-   *  plus 50 as in `selectAdaptive`. So it priced no image as the
-   *  placeholder, and counting images it doesn't send would only cost it
-   *  live ones. (Its recent window's start and the image watermark count
-   *  every stored image, as the estimates do.) A caller that prices by the
-   *  estimates asks too. */
+   *  where the price leaves out its images, and the middle region's
+   *  text-only entry of a sharded body, priced by its text.
+   *  `selectHierarchical` doesn't: its emission prices head, middle and tail
+   *  at the store's full estimate, apart from a message `maxMessageTokens`
+   *  caps, priced at most at the cap plus 50 as in `selectAdaptive`. So it
+   *  priced no image as the placeholder, and counting images it doesn't send
+   *  would only cost it live ones. (Its recent window's start and the image
+   *  watermark count every stored image, as the estimates do.) A caller that
+   *  prices by the estimates asks too. */
   protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView, opts: { asEstimated?: boolean } = {}): void {
     const maxLive = this.config.maxLiveImages ?? 0;             // 0 = unlimited count
     const depthTokens = this.config.imageStripDepthTokens ?? 0; // 0 = no depth strip
