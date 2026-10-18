@@ -6090,7 +6090,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _plannedTokens: number | null = null;
   private _plannedMeta: { budgetMet: boolean; exhausted: boolean; moves: number; solver: string } | null = null;
   /** `performance.now()` at the top of the current `select()`; rsEnd() stamps
-   *  the compile's own elapsed time on the plan-vs-actual line from it. */
+   *  the base `select()`'s elapsed time on the plan-vs-actual line from it. */
   private _selectStartedAt = 0;
   /** Length of the strategy's view of the branch at the top of `select()`,
    *  whichever chunker runs; rsEnd() logs it as `messages=`. */

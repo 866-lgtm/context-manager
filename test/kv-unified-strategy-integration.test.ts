@@ -1,8 +1,8 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, rmSync } from 'node:fs';
-import { ContextManager, AutobiographicalStrategy, KnowledgeStrategy, OverBudgetError } from '../src/index.js';
-import type { ContextEntry } from '../src/types/index.js';
+import { ContextManager, AutobiographicalStrategy, KnowledgeStrategy, OverBudgetError, PassthroughStrategy } from '../src/index.js';
+import type { ContextEntry, StoredMessage } from '../src/types/index.js';
 import type { KvUnifiedReceiptChain } from '../src/adaptive/kv-unified-receipts.js';
 
 const STORE = './test-kv-unified-integration-store';
@@ -651,7 +651,7 @@ test('a usage report inside the calibration dead band keeps the kv-unified fores
   manager.close();
 });
 
-test('every adaptive compile that commits a plan stamps its own elapsed time on plan-vs-actual, with the kv-unified solve inside it', async () => {
+test('one live kv-unified compile stamps its own elapsed time on plan-vs-actual, with the solve inside it', async () => {
   const manager = await ContextManager.open({ path: STORE, strategy: strategy() });
   const added = ['time me', 'timing you', 'and again'];
   for (const [i, text] of added.entries()) manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text }]);
@@ -835,4 +835,43 @@ test('compileMs spans the select from its start, chunk rebuild included, and no 
   assert.ok(compileMs! >= 30, `compileMs=${compileMs} leaves out the chunk rebuild`);
   assert.ok(compileMs! <= Math.ceil(elapsed), `compileMs=${compileMs} is longer than the compile call, ${elapsed.toFixed(1)} ms`);
   manager.close();
+});
+
+test('a preview marks its plan-vs-actual line and its own stats dryRun, and a dry pass leaves the live stats as the live compile left them', async () => {
+  let preview: ReturnType<ContextManager['previewContext']> = null;
+  const lines = await planVsActualLines(async () => {
+    const manager = await ContextManager.open({ path: STORE, strategy: strategy() });
+    for (const [i, text] of ['one', 'two', 'three'].entries()) manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text }]);
+    const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+    await manager.compile(budget);
+    await manager.compile(budget, undefined, { dryRun: true });
+    preview = manager.previewContext(budget, undefined, { render: true });
+    assert.equal(manager.getRenderStats()!.planVsActual!.dryRun, undefined, 'getRenderStats still describes the live compile');
+    manager.close();
+  });
+  assert.equal(preview!.stats?.planVsActual?.dryRun, true, "the preview's own stats are marked");
+  assert.equal(lines.length, 3, `one line for each compile: ${JSON.stringify(lines)}`);
+  assert.match(lines[2]!, new RegExp(PVA_OPENING + String.raw` solver=kv-unified messages=3 compileMs=\d+ solveMs=\d+ dryRun=true` + PVA_OVERRUN),
+    "the preview's line");
+});
+
+test('messages= counts the strategy view: auxiliary slots merged in, after the view filter', async () => {
+  const shown = (message: StoredMessage) => !message.content.some((block) => block.type === 'text' && block.text.includes('hidden'));
+  const main = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+  const reader = await ContextManager.open({
+    store: main.getStore(),
+    namespace: 'plan-vs-actual/reader',
+    isolate: true,
+    strategy: strategy(),
+    auxiliaryMessageViews: [{}],
+    viewFilter: shown,
+  });
+  for (const text of ['main one', 'main two', 'main hidden']) main.addMessage('user', [{ type: 'text', text }]);
+  for (const text of ['reader one', 'reader hidden']) reader.addMessage('user', [{ type: 'text', text }]);
+  await reader.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  // Five stored across the two slots, two of them hidden. Unfiltered the view
+  // would hold five, and without the merge two, or one once filtered.
+  assert.equal(reader.getRenderStats()!.planVsActual!.messages, 3);
+  reader.close();
+  main.close();
 });

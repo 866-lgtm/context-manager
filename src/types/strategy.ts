@@ -686,8 +686,10 @@ export interface RenderStats {
      *  `[plan-vs-actual]` line, in whole ms: chunk rebuild, planning (the fold
      *  solver) and emission. It excludes a subclass's own `select()` override
      *  and the `ContextManager` work around the call; a host that wants the
-     *  whole compile times `compile()` itself. After a provisional-calibration
-     *  retry it includes the refused first attempt. Logged as `compileMs=`. */
+     *  whole compile times `compile()` itself. It includes a
+     *  `productionBudgetTokens` shadow pick, whose solve `solveMs` leaves out,
+     *  and after a provisional-calibration retry the refused first attempt.
+     *  Logged as `compileMs=`. */
     compileMs?: number;
     /** Under `foldingStrategy: 'kv-unified'` only: the forest build, solve and
      *  latent-demand ranking of the compile's final pick inside `compileMs`,
@@ -695,6 +697,9 @@ export interface RenderStats {
     solveMs?: number;
     /** Set on a dry run or preview (`dryRun: true`, `previewContext`), which
      *  skips work a live compile does; logged as `dryRun=true`. Absent on a
+     *  live compile. A caller reads a dry pass's stats only from
+     *  `previewContext(..., { render: true })`'s `stats`: `compile()` returns
+     *  no stats, and a dry pass leaves `getRenderStats()` describing the last
      *  live compile. */
     dryRun?: true;
     /** Which chunks moved between which levels, and where this request's
