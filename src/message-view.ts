@@ -74,6 +74,17 @@ export function filterMessageStoreView(
   };
 }
 
+/** Merged listings keyed by the chain of source listings they were merged
+ * from (primary first, then each auxiliary, compared by identity). Every
+ * link is a WeakMap, so a combination lives only while all of its source
+ * arrays do: a store that keeps appending while another stays put leaves
+ * no trail of obsolete merges behind the unchanged listing. */
+interface MergedListingNode {
+  merged?: StoredMessage[];
+  next: WeakMap<readonly StoredMessage[], MergedListingNode>;
+}
+const mergedListings: MergedListingNode = { next: new WeakMap() };
+
 /**
  * Merge one primary view with any number of auxiliary views into a single
  * timeline ordered by `sequence`.
@@ -93,14 +104,6 @@ export function filterMessageStoreView(
  * Auxiliary views are read-only by construction — MessageStoreView carries
  * no write surface.
  */
-/** Merged listings per primary listing, each entry keyed by the auxiliary
- * listings it was merged from (compared by identity). A primary listing
- * meets few auxiliary combinations before an append replaces it. */
-const mergedListings = new WeakMap<
-  readonly StoredMessage[],
-  Array<{ sources: readonly (readonly StoredMessage[])[]; merged: StoredMessage[] }>
->();
-
 export function mergeMessageStoreViews(
   primary: MessageStoreView,
   auxiliary: MessageStoreView[],
@@ -110,19 +113,19 @@ export function mergeMessageStoreViews(
   const all = () => {
     const source = primary.getAll();
     const sources = auxiliary.map((v) => v.getAll());
-    let entries = mergedListings.get(source);
-    if (!entries) {
-      entries = [];
-      mergedListings.set(source, entries);
-    }
-    for (const entry of entries) {
-      if (entry.sources.length === sources.length && entry.sources.every((listing, i) => listing === sources[i])) {
-        return entry.merged;
+    let node = mergedListings;
+    for (const listing of [source, ...sources]) {
+      let next = node.next.get(listing);
+      if (!next) {
+        next = { next: new WeakMap() };
+        node.next.set(listing, next);
       }
+      node = next;
     }
+    if (node.merged) return node.merged;
     const merged = source.concat(...sources);
     merged.sort((a, b) => a.sequence - b.sequence);
-    entries.push({ sources, merged });
+    node.merged = merged;
     return merged;
   };
   return {

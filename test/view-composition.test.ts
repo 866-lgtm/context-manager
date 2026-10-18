@@ -118,17 +118,23 @@ describe('mergeMessageStoreViews', () => {
     assert.equal(mergeMessageStoreViews(primary, [aux]).getTail(5), first);
 
     // An append replaces the source array: the merge is rebuilt once and shared again.
+    const oldAuxListing = auxListing;
+    const oldAux = stable(() => oldAuxListing);
     auxListing = [...auxListing, { id: 'x2', sequence: 3 } as StoredMessage];
     const second = mergeMessageStoreViews(primary, [aux]).getAll();
     assert.notEqual(second, first);
     assert.deepEqual(second.map((m) => m.id), ['p1', 'x1', 'x2', 'p2']);
     assert.equal(mergeMessageStoreViews(primary, [aux]).getAll(), second);
 
-    // The old combination is still served if a view still holds the old source.
+    // A view still holding the old auxiliary array is served the old merge.
+    assert.equal(mergeMessageStoreViews(primary, [oldAux]).getAll(), first);
+
+    // The primary moving on rebuilds against the current sources.
     primaryListing = [...primaryListing];
     const third = mergeMessageStoreViews(primary, [aux]).getAll();
     assert.notEqual(third, second);
     assert.deepEqual(third.map((m) => m.id), ['p1', 'x1', 'x2', 'p2']);
+    assert.equal(mergeMessageStoreViews(primary, [aux]).getAll(), third);
   });
 });
 
