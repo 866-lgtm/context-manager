@@ -3277,12 +3277,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const input = read('inputTokens');
     // Usage without an input count, or with a zero total, is no observation
     // of the prompt: the complete normalized request bound stands instead.
-    // membrane's Anthropic and Bedrock adapters pass the provider's input
-    // count through, so a missing one arrives as missing, as from a caller
-    // outside membrane. Its other adapters report an omitted count as zero,
-    // so a zero beside cache counts reads as a full cache hit: a response
-    // can't tell a provider's omitted count from one, and membrane flags an
-    // omitted count only in a streamed round's report (unreportedUsage).
+    // Through complete(), which compression calls, membrane's Anthropic and
+    // Bedrock adapters pass the provider's input count through, so a missing
+    // one arrives as missing, as from a caller outside membrane. Its other
+    // adapters report an omitted count as zero, so a zero beside cache counts
+    // reads as a full cache hit: a response can't tell a provider's omitted
+    // count from one, and membrane flags an omitted count only in a streamed
+    // round's report (unreportedUsage).
     if (input === undefined) return undefined;
     const total = input + (read('cacheCreationTokens') ?? 0) + (read('cacheReadTokens') ?? 0);
     return total > 0 ? total : undefined;
