@@ -457,7 +457,11 @@ Given:
             budgetMet, exhausted, moves, deadFrontierIds, unrealizable }.
 
 [selectAdaptive — strategy side, after picker.run]
-5. Commit finalResolutions to strategy state; persist if changed.
+5. Stage each unlocked middle chunk's level where it differs from the level
+   it has saved. A dry run stages them too, to count them. Commit and
+   persist the staged changes only once every later stage has succeeded,
+   and never in a dry run, so neither a refused compile nor a dry run saves
+   a level.
 6. If produced.length > 0: handleProducedOps to route into compression
    queue / merge queue (§3.8).
 7. If finalTokens > rejectionBudget — the hard budget × (1 +
@@ -468,9 +472,13 @@ Given:
    shards via the rendering algorithm in §3.6.1.
 ```
 
-`moves` is the number of chunks whose resolution changed vs the carried
-state (it replaced the op walk's `iterations` in `PlanVsActual` and the
-preview surfaces when the walk was retired — see §3.5 history note).
+`moves` is the number of chunks whose resolution changed from the level
+they started the solve at. It replaced the op walk's `iterations` in
+`PlanVsActual` and the preview surfaces when the walk was retired (see §3.5
+history note). Those surfaces now report instead the changes step 5 stages,
+which are the saved levels a compile commits. They leave out locked chunks,
+which keep their saved level even while a pin renders them at another
+(#195).
 
 Token counting: each chunk's `rawTokens` is computed at picker-input
 construction time (delegated to `MessageStoreView.estimateTokens`); each
@@ -751,7 +759,13 @@ and re-introducing one via the objective notation would repeat it.
   not obtained by minimizing this function.
 - `perturbation(F, F_prev)` — exact, not modeled: rendered tokens from the
   earliest position where `F`'s layout diverges from `F_prev`'s to the end
-  (`kvCost` in `render-offsets.ts`) — precisely what the provider will re-read.
+  (`kvCost` in `render-offsets.ts`) — precisely what the provider will re-read
+  for the plan's own choices. `F_prev` here is the carried frontier: the
+  persisted one with this compile's protections applied first (the raw zone
+  raw, pins at their level and locks at theirs, each lowered where its
+  own-lineage summary doesn't list it, and a tightened pin-max-level, a
+  lock's included) and projected to a valid cut (§13.6). A change every plan must make is in it already, so no plan's
+  perturbation counts it.
 - `P` (`reachTokens`, re-priced) — a **trust region on per-turn divergence**,
   not a spatial eligibility gate. It bounds how much perturbation an ordinary
   turn may take; it never determines *which* chunks may move.
@@ -847,7 +861,8 @@ locked chunks. Salience never overrides a pin.
 *(rev 5.1 amendment — boundary-cut tolerance, `de3d293`.)* A hard protection
 protects its **leaf**, no longer its whole group: a protected leaf inside a
 foldable group is *excluded from the fold* rather than vetoing it, and renders
-raw beside the group's recall (the renderer's "ownership wins" semantics).
+at the level it's held at (raw for the flat zone, head, tail and a classic
+pin) beside the group's recall (the renderer's "ownership wins" semantics).
 Without this, a head/tail boundary cutting two messages into a 742-leaf L3
 group made the entire group permanently unfoldable and OverBudget-wedged the
 agent with its own L3 sitting unused. Details and the related unanimity
@@ -954,9 +969,10 @@ stores; all are load-bearing and none appeared in the original rev 5.0 text.
 **Boundary-cut tolerance** (`de3d293`). A hard-protected leaf (−1 sentinel:
 raw zone / pins / locked) inside a foldable group is *excluded from the fold*
 rather than vetoing it, and is exempt from group unanimity in the validity
-projection. The renderer already draws protected messages raw beside their
-chunk's recall ("ownership wins"), so a boundary cutting through a group must
-not make the group permanently unfoldable. Trigger: calibration drift moved
+projection. The renderer already draws a protected message at the level it's
+held at (raw for the raw zone and a classic pin) beside its group's recall
+("ownership wins"), so a boundary cutting through a group must not make the
+group permanently unfoldable. Trigger: calibration drift moved
 the token-derived head boundary two messages into an L3's first chunk — the
 2-leaf overlap vetoed the whole 742-leaf group in every phase, and the agent
 OverBudget-wedged with its own L3 unused. Consequence for §3.8: group
@@ -970,12 +986,59 @@ monotone-lowers the whole group around it — observed: one disagreeing leaf
 un-folded a 200-leaf group, 615 leaves cascaded (+24k tokens), and the solve
 returned an over-W frontier while a produced L4/L5 layer sat unused (opus4).
 Now leaves whose lineage disagrees are skipped by folds and exempted from
-unanimity: they render raw beside the covering recall. **This is a degraded
-mode, not a feature** — every exempted leaf means messages are semantically
+unanimity: they keep their own level, raw or through their own lineage,
+beside the covering recall. **This is a degraded mode, not a feature** —
+every exempted leaf means messages are semantically
 *double-represented* in the window (rendered raw or via their own chain while
 a covering recall also renders). The solve proceeding is the mitigation; the
 topology is the disease. `[kv-overlap]` warns on **every** affected compile
-until the store gets nesting repair.
+until the store gets nesting repair. It reads the frontier the plan emits: a
+rendered summary that lists a leaf whose own lineage at that level is
+another summary, or none, or that a leaf's own lineage runs through but
+that doesn't list it (a summary written again without one of its sources).
+So a plan that keeps carried folds reports them as one that makes them
+does. Each direction has a line of its own, the second saying only that
+listing and lineage disagree. The planner only finds these leaves, as the
+plan's `overlap`, and the compile logs them for its own plan, beside
+`[kv-escalation]`. So the shadow production pick, which a compile that isn't
+a dry run makes when `productionBudgetTokens` is set below its budget, plans
+the same way and doesn't warn: no compile renders its plan. A leaf that a
+lock or a pin holds beside a
+summary of its own lineage that lists it renders in both recalls without a
+warning: a protection put it there, not the topology. A fold's eligibility
+and its moves, phase C's un-folds and the validity projection all decide
+which leaves a node renders by that same lineage rule, per node, so no pass
+depends on which folds ran in this compile.
+
+The validity projection decides the exemption by lineage: a leaf that a group
+lists, but whose own lineage at the group's level is another summary or none,
+never vetoes the group. Nor does a leaf folded above the group's level: it
+renders through a coarser summary of its own lineage, and that summary's
+unanimity decides whether it stays there. Where it stays and the group
+renders, the leaf is in both recalls. On a nested tree that can't last for a
+leaf no protection holds, since the coarser summary owns the group's leaves
+and those below its level veto it, unless every one of them is
+hard-protected, since those never veto. A held leaf stays where the base
+put it: a pin-at-level holds a whole node's leaves at one level, but a lock
+holds one chunk, so a lock above its group stays there with the group's
+recall beside it, boundary-cut tolerance extended to a lock. On a non-nested
+tree an unheld leaf can stay too, overlap like the rest of this section's.
+Only a listed leaf of the group's own lineage rendered in more detail than
+the group vetoes it, and a hard-protected leaf (raw zone, pinned or locked)
+never does. A leaf also stays at its level only where its own lineage there
+lists it: a level carried from before the tree's links changed can point
+through a summary that no longer covers the leaf. The projection lowers such
+a leaf, and the base clamps a locked or pinned leaf's level the same way,
+since the projection holds those. Every projection applies
+the rule alike, the ideal cut's, the carried frontier's and each
+suffix-adoption candidate's, so a frontier the planner emitted projects to
+itself on unchanged inputs. Before this rule,
+only the ideal cut's projection exempted these leaves, through the solve's
+own exempt set, and the carried frontier's and suffix candidates'
+projections didn't. The next compile's carried frontier then un-folded the
+group around them, so on unchanged inputs the window re-laid while the plan
+reported a perturbation of 0, or reported a fold and a perturbation for a
+frontier it hadn't changed.
 
 **Fold→project fixpoint** (`b99fcc3`). The validity projection can only lower
 levels; on a non-nested tree its repairs *add* tokens after the phases stopped
@@ -1009,8 +1072,12 @@ unit identity (siblings share one recall unit). Phase C therefore records
 may hold members below the fold level, and a hardcoded from/to drifts the
 ledger off the render — after which every later accept decision runs on
 corrupt arithmetic (observed: phase C walked an L3 fold all the way back to
-carried while its ledger believed it sat on target). Anyone editing the
-phases is editing against this invariant.
+carried while its ledger believed it sat on target). Each un-fold phase C
+tries prices each leaf it moves where the projection will put it, so the
+accept weighs it there: one level down, or deeper while the summary of the
+leaf's own lineage there is missing, doesn't list it, or is vetoed by a leaf
+below it, down to raw. A revert moves each leaf back from that level. Anyone
+editing the phases is editing against these invariants.
 
 **Memoization contracts** (`1c4c436`, `7f2d5e1`). Three memos are
 correctness-relevant, not just performance: group *eligibility* is memoized

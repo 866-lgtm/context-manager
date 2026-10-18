@@ -21,8 +21,8 @@
  */
 
 import type { ChunkId, SummaryId } from './folding-strategy.js';
-import type { PickerInputs } from './picker.js';
-import type { SummaryTree } from './summary-tree.js';
+import type { PickerChunk, PickerInputs } from './picker.js';
+import type { SummaryNode, SummaryTree } from './summary-tree.js';
 
 /** Resolution map: chunkId → display level (0 = raw). */
 export type Frontier = ReadonlyMap<ChunkId, number>;
@@ -43,6 +43,21 @@ export interface RenderedUnit {
 export interface RenderLayout {
   units: RenderedUnit[];
   totalTokens: number;
+}
+
+/**
+ * The summary `c` renders through under `frontier`, or null when it renders
+ * raw: pinned, at level 0, or with no ancestor at its level (the renderer
+ * makes the same call; `computeTokens` falls back the same way). The one rule
+ * for the form a chunk takes, which `renderLayout` and the fold diff share.
+ */
+export function renderedAncestor(
+  c: PickerChunk,
+  tree: SummaryTree,
+  frontier: Frontier,
+): SummaryNode | null {
+  const level = c.pinned ? 0 : frontier.get(c.id) ?? 0;
+  return level > 0 ? tree.ancestorAt(c.id, level) : null;
 }
 
 /**
@@ -67,15 +82,8 @@ export function renderLayout(
   const renderedSummaries = new Set<SummaryId>();
   for (const c of ordered) {
     if (inputs.headChunkIds.has(c.id) || inputs.tailChunkIds.has(c.id)) continue;
-    const effective = c.pinned ? 0 : frontier.get(c.id) ?? 0;
-    if (effective === 0) {
-      push('raw', c.id, c.rawTokens);
-      continue;
-    }
-    const ancestor = tree.ancestorAt(c.id, effective);
+    const ancestor = renderedAncestor(c, tree, frontier);
     if (!ancestor) {
-      // Resolution set but summary missing — render raw (renderer makes the
-      // same call). Matches computeTokens' fallback.
       push('raw', c.id, c.rawTokens);
       continue;
     }

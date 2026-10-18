@@ -1,11 +1,13 @@
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
+import type { FoldDiff } from '../adaptive/fold-diff.js';
 import type {
   ContextEntry,
   TokenBudget,
   PendingWork,
 } from './context.js';
+import type { OverBudgetClearedBy } from '../adaptive/picker.js';
 
 /**
  * Read-only view of the message store for strategies.
@@ -208,6 +210,39 @@ export interface ContextStrategy {
     participant: string,
     content: ContentBlock[]
   ): IngressChunkResult | null;
+
+  /**
+   * Declares that select() reports its rendered layout completely, and which
+   * forms history can take under this strategy. Reporting completely means:
+   * every message it renders raw is a `copy` entry naming its source ids, and
+   * every entry that represents history through summaries names them in
+   * `ContextEntry.summaries`; a message of the view represented by neither
+   * is reported as omitted. A strategy that does not declare this gets no
+   * rendered layout, so no fold receipts are written for it.
+   */
+  readonly renderedForms?: ReadonlyArray<'raw' | 'summary' | 'omitted'>;
+
+  /**
+   * For layout reporting: which messages each named summary covers, at what
+   * level, and by what method it was written ('unknown' when the strategy
+   * does not record authorship). Required when select() names summaries.
+   */
+  describeRenderedSummaries?(ids: readonly string[]): ReadonlyMap<string, RenderedSummaryInfo>;
+
+  /**
+   * Why the last select() changed what it renders, when the strategy knows
+   * (for example 'budget-fit' or 'window'). Reading clears it.
+   */
+  takeSelectionCause?(): string | undefined;
+}
+
+/** What a rendered summary covers, for layout reporting. */
+export interface RenderedSummaryInfo {
+  level: number;
+  /** The stored message ids the summary covers. */
+  leaves: readonly MessageId[];
+  /** 'authored' | 'summarizer' | 'harness' | 'unknown'. */
+  method: string;
 }
 
 /**
@@ -237,7 +272,9 @@ export interface SelectOptions {
    * `previewContext` is where infeasibility is reported. The head-and-tail
    * check before the plan check, and any later stage that can't fit, still
    * throw as for a real compile, leaving nothing behind; `previewContext`
-   * reports an over-budget throw and passes any other throw through.
+   * reports an over-budget throw, as the plan's own preview when the plan was
+   * already over the budget (the live compile refuses it at the plan check),
+   * and passes any other throw through.
    *
    * A compression hold ends at its deadline, whoever looks: the manager
    * releases an expired hold at any compile or hold query, a dry compile
@@ -271,6 +308,16 @@ export interface PreviewResult {
   fits: boolean;
   /** True when the picker could not fold any further. */
   exhausted: boolean;
+  /**
+   * When the layout doesn't fit: what clears that refusal besides a larger
+   * budget, in the terms of the live compile's `OverBudgetError.clearedBy`.
+   * For a plan over the budget it's the plan's list, as the live compile's
+   * refusal at the plan check takes it. A dry run doesn't queue its plan's own
+   * work, so it names compression only for work queued when it takes the
+   * list, the chunks its own rebuild closed included; the live list can add
+   * compression for what the plan's own ops queue.
+   */
+  clearedBy?: readonly OverBudgetClearedBy[];
   /** Verbatim head / tail cost, and the foldable middle. */
   headTokens: number;
   tailTokens: number;
@@ -281,7 +328,11 @@ export interface PreviewResult {
   deepestLevel: number;
   /** Fold level per chunk the layout would settle on. */
   resolutions: Record<string, number>;
-  /** Chunks whose resolution this layout would change vs the carried state. */
+  /** Chunks whose saved fold level this layout changes, which are the levels
+   *  a compile that commits this layout saves. They're counted whether or not
+   *  the layout fits. A locked chunk keeps its saved level, so it isn't
+   *  counted. The picker's own `moves` compares each chunk with the level it
+   *  was planned from instead. */
   moves: number;
   /** Summaries the layout needs that do not exist yet — real LLM work. */
   producedCount: number;
@@ -384,9 +435,15 @@ export function isResettableStrategy(s: ContextStrategy): s is ResettableStrateg
 }
 
 /**
- * Strategy that supports protected ranges (pins + documents).
- * Pinned ranges are excluded from compression and render raw at their
- * original chronological position. Implemented by AutobiographicalStrategy.
+ * Strategy that supports protected ranges (pins + documents). A pin's bound
+ * is its `level`, or without one its `maxLevel`. A range pinned raw, with no
+ * bound or a bound of 0, is excluded from compression and renders raw at its
+ * original chronological position. Where the selector reads level bounds
+ * (`foldingStrategy: 'kv-stable'` and `'kv-unified'`, with
+ * `adaptiveResolution`), a bound above 0 leaves the range compressible, and
+ * where pins overlap at a message, the bound `ProtectedRange` names holds
+ * it, so a raw pin there might not keep it raw. Implemented by
+ * AutobiographicalStrategy.
  */
 export interface PinnableStrategy extends ContextStrategy {
   pinRange(firstMessageId: string, lastMessageId: string, opts?: PinLevelOptions): string;
@@ -610,11 +667,20 @@ export interface RenderStats {
     delta: number;
     budgetMet: boolean;
     exhausted: boolean;
+    /** Chunks whose saved fold level this compile changed, or for a dry run
+     *  would change. A locked chunk keeps its saved level, so it isn't
+     *  counted. The picker's own `moves` compares each chunk with the level it
+     *  was planned from instead. */
     moves: number;
     /** Name of the fold solver that planned this compile (e.g. 'kv-stable',
      *  'flat-profile'). Surfaces the policy actually in force — a config
      *  clobber that silently downgrades the solver is invisible without it. */
     solver?: string;
+    /** Which chunks moved between which levels, and where this request's
+     *  entries first differ from those of the last request the strategy
+     *  returned, past which no cached prefix reaches. Present only when a
+     *  compile that changed at least one saved level committed. */
+    foldDiff?: FoldDiff;
   };
 }
 
@@ -681,7 +747,9 @@ export interface KvUnifiedConfig {
    * Certified hysteresis exit (see `docs/kv-unified-hysteresis-certificate.md`):
    * when the accepted presentation provably remains the policy's selection,
    * skip label propagation. Proves the exact hysteresis policy; it does not
-   * guarantee identity with every bucketed approximate solve. Off unless set.
+   * guarantee identity with every bucketed approximate solve. On unless set
+   * to `false`; the solver itself treats an absent flag as off, the strategy
+   * built from a recipe fills in `true`.
    */
   hysteresisCertificate?: boolean;
 }
@@ -998,10 +1066,20 @@ export interface AutobiographicalConfig {
   topologyPolicy?: 'reject' | 'report';
   /**
    * Open for inspection only: `initialize` still loads and audits the store,
-   * but never chunks the uncovered frontier, enqueues merges, or rewrites the
-   * persisted merge queue. Audit and repair tooling opens stores this way; a
-   * plain open under a config that is not the resident's own would otherwise
-   * mint chunk records with the wrong head window and chunk size.
+   * but never chunks the uncovered frontier, enqueues merges, or drops queued
+   * merges that the current grouping grammar refuses. Audit and repair tooling
+   * opens stores this way; a plain open under a config that is not the
+   * resident's own would otherwise mint chunk records with the wrong head
+   * window and chunk size. Loading repairs what readers can't use on every
+   * open, this one included, and persists the repair: it keeps one of a
+   * summary's duplicate copies, rebuilds sources and ranges it can recover,
+   * drops summaries that are empty, whose sources or range it can't recover,
+   * that list a summary at their own level or above, or that list one they
+   * aren't the parent of, and the summaries above them, resolves each
+   * summary's parent pointers, and
+   * reopens or removes the chunk records and queued merges that name a
+   * summary it doesn't keep. It also stores the summary-id counter when the
+   * stored one trails the ids the store holds.
    */
   auditOnly?: boolean;
   /** Legacy first-choice target-only merge request. Default false. */
@@ -1127,7 +1205,11 @@ export interface AutobiographicalConfig {
    * argument moved into a call to `intoTool` — a note-taking tool the agent
    * really has — placed as its own round just before the original call, a short
    * stub left behind. If the source-only final rung is enabled and also refuses,
-   * it gets the same rewrite once. Nothing the agent wrote is dropped.
+   * it gets the same rewrite once. Nothing the agent wrote is dropped. Each
+   * rewrite is admitted against `compressionContextBudgetTokens` as a
+   * recall-curve variant is, measured against the request it rewrites; one
+   * over the budget is recorded as rejected and not sent. Each moved argument
+   * adds two messages, which the admission bound prices before their bytes.
    *
    * The rung is SKIPPED unless `intoTool` is among the tools the host declared:
    * the summarizer is the agent, and it must never be shown itself using a tool
@@ -1179,20 +1261,29 @@ export interface AutobiographicalConfig {
    * Total model context budget used to admit refusal-curve compression
    * requests, including the request input and the configured output reserve.
    * The canonical request remains unchanged and is always attempted first;
-   * only fallback variants are gated. Before authoritative canonical usage
-   * exists, admission uses a conservative complete normalized-request bound.
-   * After canonical refusal reports complete provider input usage, admission
-   * uses provider-total input plus a positive serialized expansion delta, then
-   * adds the output reserve. Zero, partial, or unknown usage contracts retain
-   * the conservative bound. Default: 200000.
+   * the recall-curve variants and the tool-prose hoists
+   * (`compressionToolProseFallback`) are gated. Before authoritative canonical
+   * usage exists, admission uses a conservative complete normalized-request
+   * bound. After a refusal reports complete provider input usage, a request
+   * is admitted on the provider-total input of the request it rewrites (the
+   * canonical, or the source-only fallback for that rung's hoist), plus a
+   * positive serialized expansion delta, then the output reserve. Zero,
+   * partial, or unknown usage contracts, and a count of the carrier-stripped
+   * copy a transport rejection made the request go as, retain the
+   * conservative bound of the request itself. Default: 200000.
    *
    * It also decides whether an L1 prompt shows pinned history raw: with the
    * raw that pins add, the canonical request must fit it, priced as the
    * message store prices the messages it would send (after splitting,
    * collapsing and dropping unpaired tool blocks, before the image cap,
-   * which only replaces images), with the system prompt, tools and output
-   * reserve. Otherwise that compression lays
-   * history out as it would without pins (see
+   * which only replaces images), with serialized media priced as the markers
+   * that replace them and thinking as the request carries it (the raw
+   * messages' stripped, a recall answer's signed reasoning kept), with the
+   * system prompt, tools and output reserve, and with the longer of the lines
+   * the no-tools and plain-prose retries add to its instruction, so either
+   * retry fits too. The tool-prose hoists aren't priced in this decision,
+   * since each is admitted on its own, as above. Otherwise that compression
+   * lays history out as it would without pins (see
    * `compressionRecallBudgetTokens`). A canonical request without pins is
    * still always attempted.
    */
@@ -1241,7 +1332,8 @@ export interface AutobiographicalConfig {
   /**
    * Per-tool retention limit: keep at most the last N `tool_result` blocks
    * for each tool name. Older results get their content replaced with a
-   * brief marker referencing the tool name and how many newer results exist.
+   * brief marker naming the tool and the limit; a limit of 0 replaces every
+   * result of the tool.
    *
    * Two shapes accepted:
    *  - `number`: applies as a global default across all tools.
@@ -1468,8 +1560,9 @@ export interface SummaryEntry {
   parentId?: string;
   /**
    * The slice this summarizes is inherited/witnessed record, not the agent's
-   * lived experience (witnessedBeforeSequence pin). Stamped at L1 mint;
-   * merges of all-witnessed sources keep the witnessed voice AND the flag —
+   * lived experience (witnessedBeforeSequence pin). Stamped at L1 mint, and
+   * on a quiet-stretch stub as on an L1 of its chunk; merges of all-witnessed
+   * sources keep the witnessed voice AND the flag —
    * without propagation the consolidation instruction re-first-persons
    * others' lives one level up (observed 2026-07-27: an L3 opening "I
    * remember the full arc of my relationship with Tavy" — another
@@ -1552,13 +1645,17 @@ export function getSummaryParentId(s: SummaryEntry): string | undefined {
 }
 
 /**
- * A range of messages protected from compression. Pins keep a span of raw
- * messages visible at their original position in the rendered context.
+ * A range of messages a pin protects. A pin's bound is its `level`, or
+ * without one its `maxLevel`. A raw pin, with no bound or a bound of 0, keeps
+ * the span raw at its original position in the rendered context and out of
+ * compression. Where the selector reads level bounds, a bound above 0 sets
+ * how far the span folds instead, and where pins overlap at a message, one
+ * bound holds it (see `level`), so a raw pin there might not keep it raw.
  *
  * - `kind: 'pin'` — generic protected range (any first/last span).
  * - `kind: 'document'` — typically a single message containing a body of
- *   information the agent wants to retain in full; semantically identical
- *   to a single-message pin, distinguished by metadata for tooling.
+ *   information the agent wants to keep; semantically identical to a
+ *   single-message pin, distinguished by metadata for tooling.
  */
 export interface ProtectedRange {
   /** Stable id assigned at pin time. */
@@ -1574,9 +1671,13 @@ export interface ProtectedRange {
   created: number;
   /**
    * Pin-AT-level-k (V2 dynamic pins, `docs/best-fit-frontier-resolution.md` §7).
-   * Fix the covered chunks to render at EXACTLY this fold level (0 = raw): the
+   * Fix the covered chunks to render at this fold level (0 = raw): the
    * frontier cut passes through the L_k node — neither folded deeper nor
-   * un-folded shallower. Takes precedence over `maxLevel`. Omitted → not a
+   * un-folded shallower. Under kv-stable, a chunk whose summaries stop below k
+   * renders at the deepest it has, and one whose own-lineage summary at k
+   * doesn't list it renders where one does, or raw. The lowering stops at a
+   * level the chunk's lineage skips (a parent more than one level up), where
+   * the chunk renders raw. Takes precedence over `maxLevel`. Omitted → not a
    * fixed-level pin.
    *
    * Honored by the folding strategies that read level bounds
@@ -1609,7 +1710,9 @@ export interface ProtectedRange {
 /** Optional fold-depth bounds for a V2 dynamic pin (see `ProtectedRange`). */
 export interface PinLevelOptions {
   name?: string;
-  /** Pin AT exactly this level (0 = raw). Fixes the cut through the L_k node. */
+  /** Pin at this level (0 = raw): fixes the cut through the L_k node, with
+   *  kv-stable's exceptions for a chunk its summaries don't reach there
+   *  (`ProtectedRange.level`). */
   level?: number;
   /** Fold no deeper than this level (hard cap; `0` ≡ classic pin-raw). */
   maxLevel?: number;

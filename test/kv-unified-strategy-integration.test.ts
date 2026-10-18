@@ -11,13 +11,7 @@ afterEach(() => {
   if (existsSync(STORE)) rmSync(STORE, { recursive: true, force: true });
 });
 
-function strategy(overrides: Record<string, unknown> = {}): AutobiographicalStrategy {
-  return new AutobiographicalStrategy({
-    adaptiveResolution: true,
-    foldingStrategy: 'kv-unified',
-    headWindowTokens: 0,
-    recentWindowTokens: 100,
-    kvUnified: {
+const KV_UNIFIED = {
       policy: {
         alpha: 0.7,
         budgetLowRatio: 0.5,
@@ -42,7 +36,16 @@ function strategy(overrides: Record<string, unknown> = {}): AutobiographicalStra
       adoptEpsilon: 0,
       treeifyNonContiguousSummaries: false,
       preserveGapBearingSummaries: false,
-    },
+};
+
+function strategy(overrides: Record<string, unknown> = {}): AutobiographicalStrategy {
+  return new AutobiographicalStrategy({
+    adaptiveResolution: true,
+    foldingStrategy: 'kv-unified',
+    headWindowTokens: 0,
+    recentWindowTokens: 100,
+    // A copy per strategy: a test below deletes a key from its own block.
+    kvUnified: { ...KV_UNIFIED, policy: { ...KV_UNIFIED.policy } },
     ...overrides,
   });
 }
@@ -186,6 +189,31 @@ test('kv-unified places token-weighted 33/66/100 history markers plus tail', () 
       (entry as { cacheMarker?: boolean }).cacheMarker ? [index] : []),
     [1, 2, 8, 11],
   );
+});
+
+test('kv-unified measures where its entries first differ from the previous compile’s, as other strategies do, and marks them as before', () => {
+  const selected = strategy() as unknown as {
+    placeCacheMarkers: (
+      entries: ContextEntry[],
+      head: ReadonlySet<string>,
+      tail: ReadonlySet<string>,
+    ) => number | null;
+  };
+  const entries = (edited?: number) => Array.from({ length: 12 }, (_, index) => ({
+    index,
+    sourceMessageId: `m${index}`,
+    sourceRelation: 'copy' as const,
+    participant: 'user',
+    content: [{ type: 'text' as const, text: (index === edited ? 'y' : 'x').repeat(index === 2 ? 400 : 40) }],
+  })) as ContextEntry[];
+  const place = (es: ContextEntry[]) => selected.placeCacheMarkers(es, new Set(['m0']), new Set(['m9', 'm10', 'm11']));
+  const marks = (es: ContextEntry[]) => es.flatMap((entry, index) => (entry.cacheMarker ? [index] : []));
+  const first = entries();
+  assert.equal(place(first), null, 'no earlier compile');
+  const second = entries(6); // the same length, other bytes
+  assert.equal(place(second), 6);
+  assert.deepEqual(marks(second), marks(first));
+  assert.deepEqual(marks(first), [1, 2, 8, 11]);
 });
 
 test('kv-unified reconciles folded, composite, and tail markers to atomic layout units', () => {
@@ -621,4 +649,49 @@ test('a usage report inside the calibration dead band keeps the kv-unified fores
   assert.equal(applied, true);
   assert.equal(derived(), false, 'an applied multiplier change is a full build');
   manager.close();
+});
+
+test('the hysteresis certificate is on unless the recipe says false', async () => {
+  // A kvUnified block without the key certifies the carried layout on an
+  // append; the same block with `hysteresisCertificate: false` runs the full
+  // solver, which leaves no certificate on the result.
+  const certified = async (kvUnified: Record<string, unknown>) => {
+    const selected = strategy({ kvUnified });
+    const internals = selected as unknown as {
+      _lastKvUnified: { lastResult: { certificate?: unknown } | null; lastTimings: { certificateMs: number } | null } | null;
+    };
+    const manager = await ContextManager.open({ path: STORE, strategy: selected });
+    const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+    const prefix = { kvUnifiedImmutablePrefixHash: 'immutable-v1' };
+    for (let i = 0; i < 12; i++) manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text: `turn ${i} ` + 'word '.repeat(30) }]);
+    await manager.compile(budget, undefined, prefix);
+    assert.equal(internals._lastKvUnified?.lastResult?.certificate, undefined, 'a blank-slate solve is never certified');
+    // The carried layout is the last ACCEPTED presentation, so accept this one.
+    selected.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+    const markerCount = (selected as unknown as { kvUnifiedPendingMarkerUnitIndices: number[] }).kvUnifiedPendingMarkerUnitIndices.length;
+    selected.reportKvUnifiedAccepted({
+      submissionId: 's1',
+      acceptedAt: 1,
+      wireReceipt: {
+        requestHash: 'wire1',
+        markers: Array.from({ length: markerCount }, (_, ordinal) => ({ ordinal, prefixHash: `prefix-${ordinal}`, estimatedOffset: ordinal + 1 })),
+      },
+    });
+    manager.addMessage('user', [{ type: 'text', text: 'turn 12 ' + 'word '.repeat(30) }]);
+    await manager.compile(budget, undefined, prefix);
+    const result = {
+      certificate: internals._lastKvUnified?.lastResult?.certificate !== undefined,
+      certificateMs: internals._lastKvUnified?.lastTimings?.certificateMs ?? 0,
+    };
+    manager.close();
+    rmSync(STORE, { recursive: true, force: true });
+    return result;
+  };
+  // Epsilon 0 can never be proven: the bound subtracts a roundoff allowance.
+  const byDefault = await certified({ ...KV_UNIFIED, adoptEpsilon: 50 });
+  assert.equal(byDefault.certificate, true, 'no key: the append is certified');
+  assert.ok(byDefault.certificateMs > 0, 'no key: the certificate ran');
+  const off = await certified({ ...KV_UNIFIED, adoptEpsilon: 50, hysteresisCertificate: false });
+  assert.equal(off.certificate, false, 'false: the full solver decides');
+  assert.equal(off.certificateMs, 0, 'false: the certificate never ran');
 });
