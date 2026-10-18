@@ -766,6 +766,20 @@ describe('compile provenance', () => {
     cm.close();
   });
 
+  it("counts a beforeUser injection placed at the end of messages with no user message in the layout's tokens", async () => {
+    const { cm } = await open();
+    cm.addMessage('assistant', [{ type: 'text', text: 'a0 thinking aloud' }]);
+    const note: ContentBlock[] = [{ type: 'text', text: '[body] online, battery 62%' }];
+    const bare = (await cm.compile(BUDGET)).provenance!.layout!;
+    const result = await cm.compile(BUDGET, [{ namespace: 'body', position: 'beforeUser', content: note }]);
+    assert.deepEqual(result.messages.map((m) => m.participant), ['assistant', 'system_context:body']);
+    const store = (cm as unknown as { messageStore: { estimateBaseTokens(content: ContentBlock[]): number } }).messageStore;
+    const noteTokens = store.estimateBaseTokens(note);
+    assert.ok(noteTokens > 0);
+    assert.equal(result.provenance!.layout!.totalTokens, bare.totalTokens + noteTokens);
+    cm.close();
+  });
+
   it('estimates layout tokens before calibration, so identical content costs the same at any calibration', async () => {
     const { cm } = await open();
     // Five blocks of two base tokens each: a calibrated estimate rounds each
