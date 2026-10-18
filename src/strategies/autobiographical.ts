@@ -784,6 +784,21 @@ function sha256Json(value: unknown): string {
 }
 
 /**
+ * JSON with each object's keys in one order whatever order they were set in
+ * (sorted, though integer-like keys come first, ascending, as in any object),
+ * and each array's items in their own order, so two values that differ only
+ * in the order their keys were set give the same text. An object the store
+ * keeps comes back with its keys sorted, while one built here keeps the order
+ * it was built in.
+ */
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_key, inner: unknown) => {
+    if (inner === null || typeof inner !== 'object' || Array.isArray(inner)) return inner;
+    return Object.fromEntries(Object.keys(inner).sort().map((key) => [key, (inner as Record<string, unknown>)[key]]));
+  });
+}
+
+/**
  * Sources as readers iterate them: a non-empty list of ids. Every index is
  * read, since `every` skips an empty slot of a sparse array, which the store
  * can't write.
@@ -7116,9 +7131,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       active.record.normalizedConfig?.sourceOnlyFallbackRequestHash ===
         quarantineRecord.normalizedConfig.sourceOnlyFallbackRequestHash &&
       // Same rule for the tool-prose rung: enabling or re-pointing it is a
-      // request-family change (sha of undefined-vs-options differs).
-      sha256Json(active.record.normalizedConfig?.toolProseFallback ?? null) ===
-        sha256Json(quarantineRecord.normalizedConfig.toolProseFallback ?? null),
+      // request-family change (no options and some options differ). The
+      // options are compared as canonicalJson gives them, since a record read
+      // back from the store has their keys in another order than
+      // toolProseHoistOptions builds them in.
+      canonicalJson(active.record.normalizedConfig?.toolProseFallback ?? null) ===
+        canonicalJson(quarantineRecord.normalizedConfig.toolProseFallback ?? null),
     );
     const durableActive = durableQuarantine.get(quarantineRecord.key)
       ?? sameRegime.find((active) => active.record.familyKey === quarantineRecord.familyKey)

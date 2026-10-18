@@ -1391,6 +1391,123 @@ describe('compression refusal recall curves', () => {
     manager.close();
   });
 
+  for (const rung of [false, true]) {
+    it(rung
+      ? 'a quarantined chunk run again makes no call with the tool-prose rung on, though the store gives back the rung\'s options with their keys in another order'
+      : 'a quarantined chunk run again makes no call with the tool-prose rung off (the control)', async () => {
+      // Every call is refused with a provider count, which the stored record's key carries and the gate's doesn't,
+      // so only the record's family, in the current request regime, can hold the chunk.
+      const mock = flexibleMembrane([{ stop: 'refusal', inputTokens: 100 }]);
+      const fx = await fixture(mock.membrane, {
+        compressionRefusalCurveFallbacks: 0,
+        ...(rung
+          ? { compressionToolProseFallback: { intoTool: 'journal', field: 'content', minChars: 100, fromTools: ['skip_reply'] } }
+          : {}),
+      });
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+      assert.ok(mock.calls.length >= 1, 'premise: the first run called the model');
+      const exhausted = quarantineEvents(fx.manager).filter((event) => event.kind === 'exhausted');
+      assert.equal(exhausted.length, 1, 'premise: the first run quarantined the chunk');
+      assert.equal(
+        (exhausted[0]!.record as { canonicalProviderInputTokens?: number }).canonicalProviderInputTokens, 100,
+        "premise: the stored record's key carries the provider's count",
+      );
+      if (rung) {
+        const stored = (exhausted[0]!.record as { normalizedConfig: { toolProseFallback: object } }).normalizedConfig.toolProseFallback;
+        const built = (fx.strategy as unknown as { toolProseHoistOptions(): object }).toolProseHoistOptions();
+        assert.deepEqual(stored, built, 'premise: the stored options are the ones the strategy builds');
+        assert.notDeepEqual(Object.keys(stored), Object.keys(built), 'premise: the store gives back their keys in another order');
+      }
+      const logPath = `${freshPath()}-trace.jsonl`;
+      paths.push(logPath);
+      const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      process.env.CONTEXT_MANAGER_COMPRESSION_LOG = logPath;
+      try {
+        for (const run of ['second', 'third']) {
+          fx.target.compressed = false;
+          const before = mock.calls.length;
+          await fx.strategy.run(fx.target, managerContext(fx.manager));
+          assert.equal(mock.calls.length - before, 0, `the ${run} run makes no call`);
+        }
+      } finally {
+        if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+        else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      }
+      const events = existsSync(logPath)
+        ? readFileSync(logPath, 'utf8').trim().split('\n').map((line) => (JSON.parse(line) as { event?: string }).event)
+        : [];
+      assert.deepEqual(
+        events.filter((event) => event === 'compression:quarantine-skipped'),
+        ['compression:quarantine-skipped', 'compression:quarantine-skipped'],
+        'the quarantine gate skipped each of those runs',
+      );
+      fx.manager.close();
+    });
+  }
+
+  it("the tool-prose rung's options make one request regime: its shape cap holds the chunk, and options that differ start another", async () => {
+    type RungOptions = { intoTool: string; field?: string; result?: string; minChars?: number; fromTools: string[] };
+    const base: RungOptions = { intoTool: 'journal', field: 'content', minChars: 100, fromTools: ['skip_reply'] };
+    const rung = (changes: Partial<RungOptions> = {}) => ({ compressionToolProseFallback: { ...base, ...changes } });
+    const path = freshPath();
+    // The first shape, quarantined at the default context budget.
+    const firstMock = flexibleMembrane([{ stop: 'refusal', inputTokens: 100 }]);
+    const first = await fixture(firstMock.membrane, { compressionRefusalCurveFallbacks: 0, ...rung() }, path);
+    const targetIds = first.target.messages.map((message) => message.id);
+    await first.strategy.run(first.target, managerContext(first.manager));
+    assert.ok(firstMock.calls.length >= 1, 'premise: the first shape is attempted');
+    first.manager.close();
+    let exhausted = 0;
+    // Each context budget is another request shape of the same chunk.
+    const callsFor = async (options: ConstructorParameters<typeof ProbeStrategy>[0]): Promise<number> => {
+      const mock = flexibleMembrane([{ stop: 'refusal', inputTokens: 100 }]);
+      const strategy = new ProbeStrategy({
+        compressionModel: MODEL,
+        targetChunkTokens: 100,
+        recentWindowTokens: 0,
+        headWindowTokens: 0,
+        minChunkCharsForLLM: 0,
+        mergeThreshold: 99,
+        compressionRefusalCurveFallbacks: 0,
+        ...options,
+      });
+      const manager = await ContextManager.open({ path, strategy, membrane: mock.membrane });
+      const ctx = managerContext(manager);
+      const chunk: Chunk = {
+        index: 999,
+        startIndex: 10,
+        endIndex: 12,
+        messages: targetIds.map((id) => ctx.messageStore.get(id)!).filter(Boolean),
+        tokens: 100,
+        compressed: false,
+      };
+      await strategy.run(chunk, ctx);
+      exhausted = quarantineEvents(manager).filter((event) => event.kind === 'exhausted').length;
+      manager.close();
+      return mock.calls.length;
+    };
+    for (const budget of [101_000, 102_000]) {
+      assert.ok(await callsFor({ ...rung(), compressionContextBudgetTokens: budget }) >= 1, `premise: the shape at ${budget} is attempted`);
+    }
+    assert.equal(exhausted, 3, 'premise: each of the three shapes is quarantined');
+    assert.equal(
+      await callsFor({ ...rung(), compressionContextBudgetTokens: 103_000 }), 0,
+      'a fourth shape with the same options is held by the cap of three',
+    );
+    // Options that differ in any one value, or the rung off, are another regime, which the three records don't fill.
+    const others: Array<[string, ConstructorParameters<typeof ProbeStrategy>[0]]> = [
+      ['the rung off', {}],
+      ['another intoTool', rung({ intoTool: 'notes' })],
+      ['another field', rung({ field: 'text' })],
+      ['another result', rung({ result: 'zz noted' })],
+      ['another minChars', rung({ minChars: 50 })],
+      ['another fromTools', rung({ fromTools: ['skip_reply', 'zz_think'] })],
+    ];
+    for (const [name, options] of others) {
+      assert.ok(await callsFor({ ...options, compressionContextBudgetTokens: 103_000 }) >= 1, `with ${name}, the chunk is attempted afresh`);
+    }
+  });
+
   it('restart with fallback limit 1→3 invalidates the exhausted plan key', async () => {
     const path = freshPath();
     const firstMock = scriptedMembrane(['refusal']);
