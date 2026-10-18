@@ -6,7 +6,7 @@ import type {
   ChunkId,
 } from '../folding-strategy.js';
 import type { PickerInputs } from '../picker.js';
-import { CanonicalSummaryForest } from '../kv-unified.js';
+import { CanonicalSummaryForest, SparseLabelCeilingError } from '../kv-unified.js';
 import type { SummaryEntry } from '../../types/strategy.js';
 import {
   ParetoKvUnifiedPolicySolver,
@@ -190,9 +190,23 @@ export class KvUnifiedStrategy implements FoldingSolver {
     const epsilon = Number.isFinite(this.options.adoptEpsilon) && (this.options.adoptEpsilon ?? 0) > 0
       ? this.options.adoptEpsilon!
       : 0;
-    if (config.mode === 'joint') {
-      return this.rankJointLatentDemand(inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier);
-    }
+    const args = [inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier] as const;
+    return config.mode === 'joint' ? this.rankJointLatentDemand(...args) : this.rankIndividualLatentDemand(...args);
+  }
+
+  /** One what-if solve per candidate (two with the expected cost), each
+   * gated and ordered on its own gain against the base. */
+  private rankIndividualLatentDemand(
+    inputs: PickerInputs,
+    whatIf: WhatIfReuse,
+    solver: ParetoKvUnifiedPolicySolver,
+    baseline: Extract<ParetoPolicySolveResult, { feasible: true }>,
+    budget: FoldingBudget,
+    candidates: readonly LatentCandidate[],
+    epsilon: number,
+    policy: KvUnifiedWelfarePolicy,
+    multiplier: number,
+  ): ProduceRequest[] {
     // Pass 1: one conservative (p80 recall-cost) what-if solve per candidate.
     const solved = candidates.flatMap((candidate) => {
       const conservative = solveWithLatentCandidate(
@@ -365,9 +379,34 @@ export class KvUnifiedStrategy implements FoldingSolver {
       this.demandSolves++;
       return solveWithLatentCandidates(inputs, whatIf, conservative, options, budget.totalBudget);
     };
-    let joint = solveJoint(this.options);
-    if (!joint.feasible) return [];
+    try {
+      return this.rankJointPool(inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier, solveJoint);
+    } catch (error) {
+      // The joint forest holds every candidate at once and can need more
+      // labels than the live solve or any single what-if; the demand is
+      // optional, so the compile goes on with the candidates one at a time
+      // rather than failing on its account.
+      if (!(error instanceof SparseLabelCeilingError)) throw error;
+      return this.rankIndividualLatentDemand(inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier);
+    }
+  }
+
+  private rankJointPool(
+    inputs: PickerInputs,
+    whatIf: WhatIfReuse,
+    solver: ParetoKvUnifiedPolicySolver,
+    baseline: Extract<ParetoPolicySolveResult, { feasible: true }>,
+    budget: FoldingBudget,
+    candidates: readonly LatentCandidate[],
+    epsilon: number,
+    policy: KvUnifiedWelfarePolicy,
+    multiplier: number,
+    solveJoint: (options: KvUnifiedOptions) => ParetoPolicySolveResult,
+  ): ProduceRequest[] {
     type Feasible = Extract<ParetoPolicySolveResult, { feasible: true }>;
+    const initial = solveJoint(this.options);
+    if (!initial.feasible) return [];
+    let joint: Feasible = initial;
     const best = (result: Feasible, cacheFloor: number, continuityFloor: number): number => {
       if (result.bestScoreUnder) return result.bestScoreUnder(cacheFloor, continuityFloor);
       let score = Infinity;
@@ -377,9 +416,10 @@ export class KvUnifiedStrategy implements FoldingSolver {
       }
       return score;
     };
+    const frame = (base: Feasible, pool: Feasible): [number, number] =>
+      [Math.min(base.cacheFloor, pool.cacheFloor), Math.min(base.continuityFloor, pool.continuityFloor)];
     const gainOf = (base: Feasible, pool: Feasible): number => {
-      const cacheFloor = Math.min(base.cacheFloor, pool.cacheFloor);
-      const continuityFloor = Math.min(base.continuityFloor, pool.continuityFloor);
+      const [cacheFloor, continuityFloor] = frame(base, pool);
       return best(base, cacheFloor, continuityFloor) - best(pool, cacheFloor, continuityFloor);
     };
     let base = baseline;
@@ -388,12 +428,16 @@ export class KvUnifiedStrategy implements FoldingSolver {
     // When that interval spans the gate, solve again without the certificate
     // and keep the better pool (the certified pool is a real layout, so its
     // gain is a floor; the uncertified solve prunes and can come back worse).
-    const slack = joint.certificate?.maxImprovement ?? 0;
-    if (joint.certificate && gain <= epsilon && gain + slack > epsilon) {
-      const full = solveJoint({ ...this.options, hysteresisCertificate: false });
-      if (full.feasible && gainOf(base, full) >= gain) joint = full;
-      gain = gainOf(base, joint);
-    }
+    // The gate moves when the base is replaced below, so this is asked again.
+    const settle = (): void => {
+      const slack = joint.certificate?.maxImprovement ?? 0;
+      if (joint.certificate && gain <= epsilon && gain + slack > epsilon) {
+        const full = solveJoint({ ...this.options, hysteresisCertificate: false });
+        if (full.feasible && gainOf(base, full) >= gain) joint = full;
+        gain = gainOf(base, joint);
+      }
+    };
+    settle();
     // A certified base exposes only the carried layout and its extensions,
     // scored up to epsilon above the best cut; a passing gain is decided
     // against the unrestricted base instead.
@@ -403,13 +447,24 @@ export class KvUnifiedStrategy implements FoldingSolver {
       if (unrestricted.feasible) {
         base = unrestricted;
         gain = gainOf(base, joint);
+        settle();
       }
     }
-    // A candidate is the only summary at its level over its leaves in the
-    // what-if forest, so the selected cut uses it exactly when it renders
-    // some leaf of its sources at that level (a pinned or locked leaf under
-    // it is a hole the cut renders through the children).
-    const frontier = joint.selected.frontier;
+    // The merges demanded are the ones the cut that supplies the gain uses:
+    // the pool's best cut in the shared frame, not the hysteresis selection,
+    // which may be the carried layout kept within epsilon of it. A candidate
+    // is the only summary at its level over its leaves in the what-if
+    // forest, so a cut uses it exactly when it renders some leaf of its
+    // sources at that level (a pinned or locked leaf under it is a hole the
+    // cut renders through the children).
+    const [cacheFloor, continuityFloor] = frame(base, joint);
+    const frontier = (joint.bestUnder
+      ? joint.bestUnder(cacheFloor, continuityFloor)
+      : joint.candidates.reduce((winner, c) => {
+          const value = policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss, cacheFloor, continuityFloor, policy, multiplier);
+          return value < winner.score ? { score: value, candidate: c } : winner;
+        }, { score: Infinity, candidate: joint.selected }).candidate
+    ).frontier;
     const used = new Set(candidates.filter((candidate) => candidate.sourceIds.some((sourceId) =>
       whatIf.base.summary(sourceId)?.leafIds.some((leafId) => frontier.get(leafId) === candidate.level))));
     const approximate = Boolean(

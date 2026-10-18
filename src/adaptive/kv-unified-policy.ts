@@ -185,6 +185,9 @@ export type ExactPolicySolveResult =
        * the given floors instead of the pool's own. Scores from different
        * solves are comparable only through a shared frame like this. */
       readonly bestScoreUnder?: (cacheFloor: number, continuityFloor: number) => number;
+      /** The candidate that reaches `bestScoreUnder` (ties broken as the
+       * selection breaks them). Its fields are in the pool's own frame. */
+      readonly bestUnder?: (cacheFloor: number, continuityFloor: number) => ExactPolicyCandidate;
     };
 
 export interface UnscoredCandidate {
@@ -619,9 +622,11 @@ export function comparePolicyCandidates(a: ExactPolicyCandidate, b: ExactPolicyC
 export function withBestScoreUnder<T extends object>(
   result: T,
   bestScoreUnder: (cacheFloor: number, continuityFloor: number) => number,
-): T & { readonly bestScoreUnder: typeof bestScoreUnder } {
+  bestUnder?: (cacheFloor: number, continuityFloor: number) => ExactPolicyCandidate,
+): T & { readonly bestScoreUnder: typeof bestScoreUnder; readonly bestUnder?: typeof bestUnder } {
   Object.defineProperty(result, 'bestScoreUnder', { value: bestScoreUnder, enumerable: false, writable: false, configurable: true });
-  return result as T & { readonly bestScoreUnder: typeof bestScoreUnder };
+  if (bestUnder) Object.defineProperty(result, 'bestUnder', { value: bestUnder, enumerable: false, writable: false, configurable: true });
+  return result as T & { readonly bestScoreUnder: typeof bestScoreUnder; readonly bestUnder?: typeof bestUnder };
 }
 
 export function policyScore(fidelity: number, budget: number, cache: number, continuity: number,

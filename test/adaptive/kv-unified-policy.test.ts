@@ -1858,3 +1858,41 @@ test('joint latent demand gates a certified base solve the way the individual ra
     assert.equal(joint.strategy.lastTimings?.demandSolves, certificate ? 2 : 1);
   }
 });
+
+test('joint latent demand falls back to the individual ranking when the joint forest exceeds the label ceiling', () => {
+  // Six L1s of varied size and cost under a ceiling of 40 labels: each
+  // what-if fits on its own and the joint forest, which holds every
+  // candidate at once, does not. The demand is optional, so the compile
+  // goes on with the candidates one at a time instead of failing.
+  const fixture = (): PickerInputs => {
+    const chronicle = new MockChronicle({ recallPairTokens: 60, mergeThreshold: 2 });
+    const raw = [90, 130, 70, 160, 110, 140];
+    const recall = [40, 75, 55, 90, 65, 80];
+    for (let index = 0; index < 6; index++) {
+      const id = `latent-${index}`;
+      chronicle.addChunk({ id, rawTokens: raw[index] });
+      chronicle.chunks[index].salience = 0.4 + 0.1 * index;
+      const l1 = chronicle.produceL1([id]);
+      chronicle.recallPairTokens.set(l1.id, recall[index]);
+    }
+    return {
+      chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+    };
+  };
+  const build = (mode: 'individual' | 'joint', labelCeiling: number) => {
+    const strategy = new KvUnifiedStrategy({
+      policy: { alpha: 0.7, budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0, budgetOverLambda: 100_000, cacheLambda: 0, continuityLambda: 0 },
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode },
+    });
+    const result = strategy.solve(fixture(), { totalBudget: 500, targetBudget: 450, slack: 0.1 });
+    return { strategy, result };
+  };
+  const individual = build('individual', 40);
+  const joint = build('joint', 40);
+  assert.ok(individual.result.produced.length > 0);
+  assert.deepEqual(joint.result.produced, individual.result.produced, 'the fallback is the individual ranking');
+  assert.equal(joint.strategy.lastTimings?.demandSolves, individual.strategy.lastTimings!.demandSolves + 1, 'the joint attempt, then the individual solves');
+  assert.equal(build('joint', 10_000).strategy.lastTimings?.demandSolves, 1, 'with room, the set is measured once');
+});

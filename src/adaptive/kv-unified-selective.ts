@@ -126,27 +126,37 @@ export function scoreBoundedCandidates(source: readonly BoundedPolicyCandidate[]
   const selected = carried && carried.score <= best.score + epsilon ? carried : best;
   // Same interval pruning as the winner search, but against caller-supplied
   // floors. Only candidates whose lower bound can still win are refined.
-  const bestScoreUnder = (kf: number, cf: number): number => {
+  const bestUnder = (kf: number, cf: number): ExactPolicyCandidate => {
     const exactScore = (c: UnscoredCandidate) =>
       policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss, kf, cf, policy, multiplier);
+    let best = -1;
+    let bestScore = Infinity;
+    const consider = (i: number): void => {
+      const value = exactScore(refine(i));
+      if (value < bestScore || (value === bestScore && best >= 0 && comparePolicyCandidates(score(i), score(best), leafIds) < 0)) {
+        best = i; bestScore = value;
+      }
+    };
     if (fullyEvaluate) {
-      let best = Infinity;
-      for (let i = 0; i < source.length; i++) best = Math.min(best, exactScore(refine(i)));
-      return best;
+      for (let i = 0; i < source.length; i++) consider(i);
+    } else {
+      const low = new Float64Array(source.length);
+      let upperBound = Infinity;
+      for (let i = 0; i < source.length; i++) {
+        const c = source[i];
+        low[i] = policyScore(c.fidelity.lower, c.budgetPenalty, c.cacheChurn, c.continuity.lower, kf, cf, policy, multiplier);
+        upperBound = Math.min(upperBound, policyScore(c.fidelity.upper, c.budgetPenalty, c.cacheChurn, c.continuity.upper, kf, cf, policy, multiplier));
+      }
+      for (let i = 0; i < source.length; i++) if (low[i] <= upperBound) consider(i);
     }
-    const low = new Float64Array(source.length);
-    let upperBound = Infinity;
-    for (let i = 0; i < source.length; i++) {
-      const c = source[i];
-      low[i] = policyScore(c.fidelity.lower, c.budgetPenalty, c.cacheChurn, c.continuity.lower, kf, cf, policy, multiplier);
-      upperBound = Math.min(upperBound, policyScore(c.fidelity.upper, c.budgetPenalty, c.cacheChurn, c.continuity.upper, kf, cf, policy, multiplier));
-    }
-    let best = Infinity;
-    for (let i = 0; i < source.length; i++) {
-      if (low[i] > upperBound) continue;
-      best = Math.min(best, exactScore(refine(i)));
-    }
-    return best;
+    if (best < 0) throw new Error('kv-unified score intervals failed to retain a winner');
+    // The candidate scored in the caller's frame; its own fields keep the
+    // pool's floors, as every candidate of this pool does.
+    return score(best);
+  };
+  const bestScoreUnder = (kf: number, cf: number): number => {
+    const c = bestUnder(kf, cf);
+    return policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss, kf, cf, policy, multiplier);
   };
   return withBestScoreUnder({
     feasible: true, selected, cacheFloor, continuityFloor, cacheRelevant, enumeration: stats,
@@ -154,5 +164,5 @@ export function scoreBoundedCandidates(source: readonly BoundedPolicyCandidate[]
       return candidates ??= source.map((_candidate, index) => score(index))
         .sort((a, b) => comparePolicyCandidates(a, b, leafIds));
     },
-  }, bestScoreUnder);
+  }, bestScoreUnder, bestUnder);
 }
