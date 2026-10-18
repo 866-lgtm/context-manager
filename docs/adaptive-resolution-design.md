@@ -265,10 +265,11 @@ selectNextFold(state, budget):
   // Pick the most-populous level. Tiebreak: lower level (so we fold
   // older fragmented detail before consolidating coarser regions).
   k = argmax(visibleCounts)
-  // Within that level, pick the oldest group eligible to raise.
+  // Within that level, pick the oldest group eligible to raise: the oldest
+  // chunk's next summary up, past a level where it has none.
   groupRoot = oldestRaisableGroupAtLevel(state, k)
   if !groupRoot:
-    // Try to produce the next level.
+    // No summary above lists it: try to produce the next level.
     return { kind: 'produce', level: k+1, range: oldestGroupRange(state, k) }
   return { kind: 'raise', groupRoot: groupRoot }
 ```
@@ -287,11 +288,13 @@ raiseGroup(groupRoot):
   for chunk in chunksUnder(groupRoot):
     if chunk.lockedByAgent:
       continue   // skip locked chunks; group fold becomes partial
+    if ancestorAt(chunk, groupRoot.level) != groupRoot:
+      continue   // a leaf it lists through another lineage keeps its level
     chunk.currentResolution = max(chunk.currentResolution, groupRoot.level)
     chunk.resolutionChangedAt = now()
 ```
 
-`chunksUnder(groupRoot)` walks the summary tree down from `groupRoot` to all leaf chunks under it. The `max` matters: a chunk already at a higher resolution isn't lowered when an intermediate group containing it is folded later.
+`chunksUnder(groupRoot)` walks the summary tree down from `groupRoot` to all leaf chunks under it. A leaf whose own summary at that level (`SummaryTree.ancestorAt`) is another one, or none, keeps its level, as kv-control's group fold decides. The `max` matters: a chunk already at a higher resolution isn't lowered when an intermediate group containing it is folded later.
 
 **Locked chunks block group-fold partially.** If chunk C is `lockedByAgent: true` and the picker raises C's level-k ancestor group, every chunk in the group *except* C flips to level k. C stays at its current resolution. The rendered output then has a hole inside what was a contiguous group — strategy must handle this in its eligibility check (only consider a group raisable if at least one chunk inside is unlocked, ideally most).
 
@@ -300,9 +303,16 @@ raiseGroup(groupRoot):
 > foldable group is excluded from the fold rather than vetoing it — boundary-cut
 > tolerance, §13.6. Group atomicity means "every participating leaf".
 
-**Producing missing summaries.** If `raiseGroup(groupRoot)` requires
-L_{k+1} and no L_{k+1} exists yet, the strategy emits a `produce` op
-instead of a `raise`. The picker collects produce ops in
+**Producing missing summaries.** If no summary above the chunk lists it,
+the strategy emits a `produce` op for L_{k+1} instead of a `raise`. A level
+the chunk's lineage skips, or one whose summary doesn't list it, is passed
+over to the next summary up that lists it rather than produced: below it the
+lineage already links upward, and the handler below makes an L1 only for a
+chunk without one, and merges only summaries that link to none, two or more
+at a time. For the same reason, a produce op for a chunk whose summary links
+upward to one that doesn't list it makes nothing, and the next compile asks
+again. A store the strategy opens has no such link, since its load repair
+replaces or clears it. The picker collects produce ops in
 `PickerResult.produced` and stops (one produce op per `run()` call). The
 caller — `AutobiographicalStrategy.selectAdaptive` — routes each op via
 `handleProducedOps`:
@@ -995,7 +1005,7 @@ topology is the disease. `[kv-overlap]` warns on **every** affected compile
 until the store gets nesting repair. It reads the frontier the plan emits: a
 rendered summary that lists a leaf whose own summary at that level
 (`SummaryTree.ancestorAt`) is another one, or that has none there. So a plan
-that keeps carried folds reports them as one that makes them does. The
+reports the leaves of a fold it carries as it reports those of one it makes. The
 planner only finds these leaves, as the
 plan's `overlap`, and the compile logs them for its own plan, beside
 `[kv-escalation]`. So the shadow production pick, which a compile that isn't

@@ -470,6 +470,18 @@ for (const [name, make] of greedySolvers) {
     });
   }
 
+  // On #194's store with y first, N2 names M, which doesn't list it, and no
+  // summary above lists y. So once y is at L1 the step asks for an L2 over
+  // N2's range, as it does at the top of any lineage. The strategy's
+  // production can't make it, since N2 already has a parent; a store the
+  // strategy opens doesn't carry such a link.
+  test(`picker (${name}): where no summary above lists the chunk, a step asks for the next level`, () => {
+    const result = new Picker(make()).run(unlistedParent('y first'), BUDGET(60, 0));
+    assert.deepEqual(result.produced, [{ level: 2, range: { firstChunkId: 'y0', lastChunkId: 'y1' } }]);
+    assert.equal(result.finalResolutions.get('y0'), 1);
+    assert.equal(result.finalResolutions.get('y1'), 1);
+  });
+
   // A level carried from before M was written again: y at L2, where its
   // lineage reaches M, which doesn't list it. A greedy step only raises, so y
   // starts at L1, where N2 lists it, rather than stay at a level it can't
@@ -496,18 +508,52 @@ for (const [name, make] of greedySolvers) {
     assert.deepEqual(unrealizable, []);
   });
 
+  // x's L1 L1-0 names R, an L2 written from L1-1 alone, while T, the L3 above
+  // R, lists L1-0 through its other source Q. x has no summary at L2, and a
+  // merge can't make one for it, since L1-0 already has a parent. So a step
+  // raises x through T, the next summary up that lists it, with w.
+  test(`picker (${name}): past a summary that doesn't list the chunk, a step raises it through the next one up that does`, () => {
+    const inputs = greedyStore([['x', 'L1-0'], ['w', 'L1-1']], [
+      ['L1-0', 1, ['x'], 30, 'R'], ['L1-1', 1, ['w'], 30, 'R'], ['R', 2, ['L1-1'], 20, 'T'],
+      ['Q', 2, ['L1-0'], 20], ['T', 3, ['R', 'Q'], 10],
+    ]);
+    const { result, unrealizable } = runQuietly(make(), inputs, BUDGET(25, 0));
+    assert.equal(result.finalResolutions.get('x'), 3);
+    assert.equal(result.finalResolutions.get('w'), 3);
+    assert.deepEqual(result.produced, []);
+    assert.equal(result.finalTokens, 20);
+    assert.deepEqual(unrealizable, []);
+  });
+
+  // x's L1 N names T, an L3 that lists N directly, so x's lineage skips L2,
+  // and a merge can't make an L2 for x, since N already has a parent. A step
+  // raises x through T, the next summary up, with w.
+  test(`picker (${name}): a step raises a chunk past a level its lineage skips to the next summary up`, () => {
+    const inputs = greedyStore([['x', 'N'], ['w', 'N2']], [
+      ['N', 1, ['x'], 30, 'T'], ['N2', 1, ['w'], 30, 'M'], ['M', 2, ['N2'], 20, 'T'], ['T', 3, ['N', 'M'], 10],
+    ]);
+    const { result, unrealizable } = runQuietly(make(), inputs, BUDGET(25, 0));
+    assert.equal(result.finalResolutions.get('x'), 3);
+    assert.equal(result.finalResolutions.get('w'), 3);
+    assert.deepEqual(result.produced, []);
+    assert.equal(result.finalTokens, 20);
+    assert.deepEqual(unrealizable, []);
+  });
+
   // N1 lists x0, x1 and y0, while y0's own L1 is N2, which has no parent, and
   // M, N1's parent, is an L2. Raising N1 and then M for x moves x0 and x1; y0,
   // whose summary at those levels is N2 and then none, keeps its level. It
   // used to be raised with them, to L2, where it has no summary, and the
-  // picker reported a level it can't realize.
+  // picker reported a level it can't realize. flat-profile then raises y0
+  // through N2; oldest-first, which only ever chooses for the oldest chunk,
+  // leaves it raw.
   test(`picker (${name}): raising a summary leaves a leaf it lists through another lineage at its level`, () => {
     const inputs = greedyStore([['x0', 'N1'], ['x1', 'N1'], ['y0', 'N2']], [
       ['N1', 1, ['x0', 'x1', 'y0'], 30, 'M'], ['N2', 1, ['y0'], 30], ['M', 2, ['N1'], 20],
     ]);
     const { result, unrealizable } = runQuietly(make(), inputs, BUDGET(60, 0));
     assert.equal(result.finalResolutions.get('x0'), 2, 'M was raised for x');
-    assert.ok((result.finalResolutions.get('y0') ?? 0) <= 1, 'y0 renders raw or through N2');
+    assert.equal(result.finalResolutions.get('y0'), name === 'flat-profile' ? 1 : 0);
     assert.deepEqual(unrealizable, []);
   });
 }

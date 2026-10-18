@@ -16,4 +16,9 @@
   summary tree isn't nested this changes their plans, and oldest-first, which
   chooses a summary only for the oldest chunk, can meet its target less often.
   A chunk carried at a level whose summary doesn't list it now starts at the
-  next level down where it has one (#194).
+  next level down where it has one. And a step raises a chunk past a level
+  where it has no summary, one its lineage skips or one whose summary doesn't
+  list it, through the next summary up that lists it. Past a level its
+  lineage skips, it used to ask for a summary at that level, which the
+  strategy can't produce for a chunk whose lineage already links past it, and
+  stop there, short of its target, on every compile (#194).

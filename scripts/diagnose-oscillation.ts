@@ -212,7 +212,12 @@ async function main() {
     // lineage of the node itself
     let cur = tree.summary(rootId);
     const chain: string[] = [];
-    while (cur) { chain.push(`${cur.id}(L${cur.level})`); cur = cur.parentId ? tree.summary(cur.parentId) : null; }
+    const chained = new Set<string>();
+    while (cur && !chained.has(cur.id)) {
+      chained.add(cur.id);
+      chain.push(`${cur.id}(L${cur.level})`);
+      cur = cur.parentId ? tree.summary(cur.parentId) : null;
+    }
     console.log(`  node parent chain: ${chain.join(' → ')}`);
   }
   console.log('\nDONE');

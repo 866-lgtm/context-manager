@@ -250,10 +250,10 @@ export class SummaryTree {
   /**
    * The highest level at or below `level` at which the chunk has a summary
    * (`ancestorAt`), or 0 when there's none. A level held for the chunk, such
-   * as a pin's or a lock's, renders there: above the top of the chunk's
-   * lineage, at a level the lineage skips (a parent more than one level up),
-   * or at one whose summary doesn't list the chunk, the chunk has no summary,
-   * and the next level down where it has one comes nearest.
+   * as a pin's or a lock's, renders at the level this returns: above the top
+   * of the chunk's lineage, at a level the lineage skips (a parent more than
+   * one level up), or at one whose summary doesn't list the chunk, the chunk
+   * has no summary, and the next level down where it has one comes nearest.
    */
   renderableLevel(chunkId: ChunkId, level: number): number {
     let k = Math.min(level, this.maxLevel(chunkId));

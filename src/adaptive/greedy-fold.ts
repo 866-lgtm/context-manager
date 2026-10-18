@@ -13,7 +13,9 @@
  * A chunk's summary at a level is the one `SummaryTree.ancestorAt` gives, so
  * it lists the chunk. Raising a summary moves the leaves whose summary at its
  * level it is, the chunk that chose it among them; a leaf the summary lists
- * whose own lineage has another summary there, or none, keeps its level.
+ * whose own lineage has another summary there, or none, keeps its level. A
+ * step raises a chunk through its next summary up
+ * (`GreedyState.nextAncestor`), past a level where it has none.
  *
  * Extracted from the former picker-side `MutableFoldingState` when the op
  * walk was retired (see folding-strategy.ts header).
@@ -50,6 +52,17 @@ export interface GreedyState {
   foldableMiddle(): readonly GreedyChunkView[];
   /** Rendered-token estimate at the current resolutions. */
   tokenCount(): number;
+  /** The chunk's summary at the lowest level above its current one where it
+   *  has one, or null when no summary above lists it. A level its lineage
+   *  skips, or one whose summary doesn't list it, is passed over, since the
+   *  strategy can't produce a summary there: below that level the lineage
+   *  already links upward, and its production (`handleProducedOps`) makes an
+   *  L1 only for a chunk without one, and merges only summaries that link to
+   *  none, two or more at a time. With null, a step asks for the next level,
+   *  which that production makes only on those terms. A method of the state
+   *  rather than of each view, since the engine makes every view again after
+   *  each raise. */
+  nextAncestor(chunk: GreedyChunkView): SummaryNode | null;
 }
 
 /**
@@ -139,6 +152,18 @@ class GreedyEngine implements GreedyState {
     }
     this.foldableCache = out;
     return out;
+  }
+
+  nextAncestor(chunk: GreedyChunkView): SummaryNode | null {
+    const from = (this.resolutions.get(chunk.id) ?? 0) + 1;
+    const next = this.tree.ancestorAt(chunk.id, from);
+    if (next) return next;
+    const top = this.tree.maxLevel(chunk.id);
+    for (let k = from + 1; k <= top; k++) {
+      const node = this.tree.ancestorAt(chunk.id, k);
+      if (node) return node;
+    }
+    return null;
   }
 
   tokenCount(): number {

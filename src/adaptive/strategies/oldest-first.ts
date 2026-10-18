@@ -33,11 +33,12 @@ function oldestFirstStep(state: GreedyState, budget: FoldingBudget): GreedyOp | 
   const middle = state.foldableMiddle();
   if (middle.length === 0) return null;
 
-  // Find the oldest raisable chunk.
+  // Raise the oldest chunk through its next summary up. With none above it,
+  // ask for one at the next level.
   const oldest = middle[0];
-  const targetLevel = oldest.currentResolution + 1;
-  const parent = oldest.ancestorAt(targetLevel);
+  const parent = state.nextAncestor(oldest);
   if (!parent) {
+    const targetLevel = oldest.currentResolution + 1;
     const lkAncestor = oldest.currentResolution === 0 ? null : oldest.ancestorAt(oldest.currentResolution);
     const range = lkAncestor
       ? {
