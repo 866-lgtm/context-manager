@@ -690,8 +690,8 @@ export interface RenderStats {
      *  retry it includes the refused first attempt. Logged as `compileMs=`. */
     compileMs?: number;
     /** Under `foldingStrategy: 'kv-unified'` only: the forest build, solve and
-     *  latent-demand ranking of the final live pick inside `compileMs`, in
-     *  whole ms (`solveMs=`). */
+     *  latent-demand ranking of the compile's final pick inside `compileMs`,
+     *  in whole ms (`solveMs=`). */
     solveMs?: number;
     /** Set on a dry run or preview (`dryRun: true`, `previewContext`), which
      *  skips work a live compile does; logged as `dryRun=true`. Absent on a

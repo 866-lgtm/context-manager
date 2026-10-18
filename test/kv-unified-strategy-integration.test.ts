@@ -768,3 +768,71 @@ test('messages= counts the strategy view under a strategy with its own chunker',
   assert.equal(manager.getRenderStats()!.planVsActual!.messages, 3);
   manager.close();
 });
+
+/** The [plan-vs-actual] lines logged while `fn` runs, read through a stand-in
+ *  console: the line goes to console.error, or to console.warn with an overrun
+ *  note when the emitter overruns the plan. Lines opening with a tag in
+ *  `quiet` are dropped; everything else goes to the real console. */
+async function planVsActualLines(fn: () => Promise<void>, quiet: string[] = []): Promise<string[]> {
+  const lines: string[] = [];
+  const { error, warn } = console;
+  const capture = (pass: (...args: unknown[]) => void) => (...args: unknown[]) => {
+    const first = args[0];
+    if (typeof first === 'string' && first.startsWith('[plan-vs-actual]')) lines.push(first);
+    else if (!(typeof first === 'string' && quiet.some((tag) => first.startsWith(tag)))) pass(...args);
+  };
+  console.error = capture(error);
+  console.warn = capture(warn);
+  try {
+    await fn();
+  } finally {
+    console.error = error;
+    console.warn = warn;
+  }
+  return lines;
+}
+
+/** The fields every [plan-vs-actual] line opens with, through `moves=`. */
+const PVA_OPENING =
+  String.raw`^\[plan-vs-actual\] planned=\d+ actual=\d+ delta=[+-]\d+ \([+-]\d+\.\d%\) budgetMet=(true|false) exhausted=(true|false)` +
+  String.raw` moves=\d+`;
+/** The note that ends the line when the emitter overruns the plan. */
+const PVA_OVERRUN = String.raw`( \u2014 emitter overran the plan; .*)?$`;
+
+test('a kv-stable compile after a preview that solved with kv-unified logs no solveMs', async () => {
+  // buildPicker's kv-stable branch leaves _lastKvUnified as the preview's pick
+  // set it, so only the plan's solver keeps those timings off the live line.
+  const lines = await planVsActualLines(async () => {
+    const manager = await ContextManager.open({ path: STORE, strategy: strategy({ foldingStrategy: 'kv-stable' }) });
+    for (const [i, text] of ['one', 'two', 'three'].entries()) manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text }]);
+    const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+    assert.ok(manager.previewContext(budget, { foldingStrategy: 'kv-unified' }), 'premise: the preview ran');
+    await manager.compile(budget);
+    manager.close();
+  }, ['[picker-config-drift]']);
+  assert.equal(lines.length, 2, `one line for each compile: ${JSON.stringify(lines)}`);
+  assert.match(lines[0]!, new RegExp(PVA_OPENING + String.raw` solver=kv-unified messages=3 compileMs=\d+ solveMs=\d+ dryRun=true` + PVA_OVERRUN),
+    'premise: the preview solved with kv-unified');
+  assert.match(lines[1]!, new RegExp(PVA_OPENING + String.raw` solver=kv-stable messages=3 compileMs=\d+` + PVA_OVERRUN), 'the live kv-stable compile');
+});
+
+test('compileMs spans the select from its start, chunk rebuild included, and no more than the compile call', async () => {
+  const selected = strategy();
+  // A chunk rebuild that takes at least 30 ms: select() runs it before it plans.
+  const internals = selected as unknown as { rebuildChunks: (store: unknown) => void };
+  const rebuild = internals.rebuildChunks.bind(selected);
+  internals.rebuildChunks = (store) => {
+    const until = performance.now() + 30;
+    while (performance.now() < until) { /* the rebuild's own time */ }
+    rebuild(store);
+  };
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  manager.addMessage('user', [{ type: 'text', text: 'slow to chunk' }]);
+  const started = performance.now();
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  const elapsed = performance.now() - started;
+  const { compileMs } = manager.getRenderStats()!.planVsActual!;
+  assert.ok(compileMs! >= 30, `compileMs=${compileMs} leaves out the chunk rebuild`);
+  assert.ok(compileMs! <= Math.ceil(elapsed), `compileMs=${compileMs} is longer than the compile call, ${elapsed.toFixed(1)} ms`);
+  manager.close();
+});

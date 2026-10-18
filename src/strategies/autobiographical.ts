@@ -6174,8 +6174,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // projected after folding; `actual` is what the emitter committed. They
     // should agree — a persistent gap means the plan is written in units the
     // emitter doesn't spend in, and the difference is silently absorbed by
-    // whatever renders last (the recent window). Logged on every compile so
-    // the drift is observable before it becomes an eviction.
+    // whatever renders last (the recent window). Logged on every adaptive
+    // compile that returns, so the drift is observable before it becomes an
+    // eviction.
     if (this._plannedTokens !== null) {
       const actual = r.total.tokens;
       const planned = this._plannedTokens;
@@ -10176,9 +10177,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // A failing shadow pick must never break the live compile.
         console.warn('autobio: shadow production pick failed:', err);
       } finally {
-        // The shadow pick is not a compile — keep §13.4 observability (and
-        // the live solve's timings on [plan-vs-actual]) pointed at the
-        // strategy instance behind the live pick.
+        // The shadow pick is not a compile. Put back the strategy instances
+        // behind the live pick: _lastKvStable for §13.4 observability, and
+        // _lastKvUnified for the live solve's timings on [plan-vs-actual].
         this._lastKvStable = liveKvStable;
         this._lastKvUnified = liveKvUnified;
       }
