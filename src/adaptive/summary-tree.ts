@@ -81,6 +81,10 @@ export class SummaryTree {
   /** Each summary's leaves as a set, built the first time a chunk's lineage
    *  reaches it (`ancestorAt`, `maxLevel`). */
   private readonly leafSets = new Map<SummaryId, ReadonlySet<ChunkId>>();
+  /** Each chunk's answers from `ancestorAt`, by level, kept as they're
+   *  asked. The tree doesn't change once built, and a greedy solve asks the
+   *  same ones on every step. */
+  private readonly ancestorMemo = new Map<ChunkId, (SummaryNode | null)[]>();
 
   constructor(inputs: PickerInputs, previous?: SummaryTree, rebuild?: readonly SummaryEntry[]) {
     this.summaries = inputs.summaries;
@@ -228,11 +232,19 @@ export class SummaryTree {
    */
   ancestorAt(chunkId: ChunkId, level: number): SummaryNode | null {
     if (level <= 0) return null;
+    let known = this.ancestorMemo.get(chunkId);
+    const cached = known?.[level];
+    if (cached !== undefined) return cached;
     const leaf = this.leaves.get(chunkId);
-    if (!leaf || !leaf.l1Id) return null;
-    let cur = this.nodes.get(leaf.l1Id);
-    while (cur && cur.level < level) cur = this.parentOf(cur);
-    return cur && cur.level === level && this.leafSet(cur).has(chunkId) ? cur : null;
+    let found: SummaryNode | null = null;
+    if (leaf?.l1Id) {
+      let cur = this.nodes.get(leaf.l1Id);
+      while (cur && cur.level < level) cur = this.parentOf(cur);
+      if (cur && cur.level === level && this.leafSet(cur).has(chunkId)) found = cur;
+    }
+    if (!known) this.ancestorMemo.set(chunkId, (known = []));
+    known[level] = found;
+    return found;
   }
 
   /** The highest level at which the chunk has a summary (`ancestorAt`), or 0
