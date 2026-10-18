@@ -140,7 +140,8 @@ export interface ContextStrategy {
 
   /** Maximum tokens per individual message. Used by the framework to truncate
    *  tool results in-flight (yielding stream) and at storage time.
-   *  0 or undefined = no limit. */
+   *  A value that isn't a positive number, such as 0, undefined, a negative
+   *  or NaN, means no limit. */
   readonly maxMessageTokens?: number;
 
   /**
@@ -929,7 +930,8 @@ export interface AutobiographicalConfig {
    */
   compressionMaxTokens?: number;
   /** Maximum tokens per individual message in compiled output. Messages exceeding
-   *  this limit have their text/tool_result content truncated. 0 = no limit. */
+   *  this limit have their text/tool_result content truncated. A value that
+   *  isn't a positive number, such as 0 or NaN, means no limit. */
   maxMessageTokens: number;
 
   /**

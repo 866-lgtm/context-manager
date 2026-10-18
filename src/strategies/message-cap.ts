@@ -187,8 +187,9 @@ export function capContent(
 }
 
 /**
- * What sending `capped`, which `capContent` made of `message`'s content, adds
- * to the message's price: the store's estimate of `capped`, less its estimate
+ * What sending `capped`, which the cap made of `message`'s content (with
+ * `capContent`, or a strategy's override of its cut), adds to the message's
+ * price: the store's estimate of `capped`, less its estimate
  * of the message as stored, and 0 where the cap left the content whole. Both
  * strategies price a capped message at its uncapped price plus this, so the
  * cut is priced as it renders (#223). The cap keeps four characters a token,
@@ -202,7 +203,9 @@ export function capContent(
  */
 export function cappedPriceExtra(store: MessageStoreView, message: StoredMessage, capped: ContentBlock[]): number {
   // Content the cap left whole is the message's own array, whose two
-  // estimates would sum the same blocks: a shortcut that changes no result.
+  // estimates would sum the same blocks, so this returns 0 without taking
+  // either: with no cap set, every raw message comes through here at every
+  // site that prices it.
   if (capped === message.content) return 0;
   return store.estimateTokens({ content: capped } as StoredMessage) - store.estimateTokens(message);
 }

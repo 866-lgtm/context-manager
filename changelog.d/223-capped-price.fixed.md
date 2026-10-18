@@ -10,20 +10,32 @@
   15 tokens, where it was priced at 51. In the autobiographical strategy, a
   message the cap leaves whole is priced as it is with no cap, where it was
   priced at no more than the cap plus 50. In the adaptive selection's middle,
-  a body sharded at ingress is priced whole where the plan keeps it raw, as
-  it renders there, where a cap smaller than a shard had the plan count it
-  cut, so emission could overrun the plan and refuse. A compile's render
+  a body sharded at ingress is priced uncut where the plan keeps it raw,
+  since the middle sends its text uncut, where a cap smaller than a shard had
+  the plan count it cut, so emission could overrun the plan by what the cut
+  left out and refuse. A compile's render
   stats count each message at its new price. A `maxMessageTokens` that isn't
   a positive number, such as NaN, is no cap in the windowed strategy too,
   which cut away a message's text and left the cap's notices in its place.
   - Where `maxMessageTokens` is set, a compile fits fewer raw messages in its
-    budget where capped messages carry images, tool calls or thinking, and at
-    large caps such as connectome-host's 10,000. The autobiographical
-    strategy folds or evicts sooner, and can refuse with `OverBudgetError`
-    where it sent a window over its budget. The windowed strategy re-anchors
-    sooner, and refuses a newest message that renders past the budget, where
-    it sent it. At small caps, a compile fits more capped messages of text
-    alone.
+    budget wherever a capped message sends more than the cap plus 50: every
+    message the cap cuts does at caps such as connectome-host's 10,000, and
+    at any cap a message's images, tool calls or thinking can take it past.
+    The autobiographical strategy then folds or evicts sooner, and can refuse
+    with `OverBudgetError` where it sent a window over its budget. The
+    windowed strategy re-anchors sooner, and refuses a newest message that
+    renders past the budget, where it sent it. At small caps, a capped
+    message that keeps little beside its cut text is priced lower, so a
+    compile fits more of them.
+  - The estimator's calibration starts pricing epoch 3. A multiplier learned
+    where capped messages were under-priced made up for that price, so kept,
+    it would run high, and a compile it put over the hard budget would stay
+    refused. So the first compile discards the multiplier in a store holding
+    a message whose estimate the cut's test puts past the cap, or one the old
+    price could have limited, with an `[estimator-calibration]` warning and
+    `calibration.reset` in the render stats, and the first provider sample
+    sets it again. A store with no cap, or nothing near it, keeps its
+    multiplier.
   - The hierarchical selection, which runs when `adaptiveResolution` is off
     (the default), prices raw messages before the image strip. So a capped
     message whose image the strip replaces is now priced with that image
@@ -31,4 +43,5 @@
     no more than the cap plus 50. Such a window can be refused where its
     rendered size fits the budget.
   - A window this moves misses the prompt cache on its first request after the
-    upgrade.
+    upgrade, and, in a store whose calibration restarts, can miss it again
+    once the first provider sample sets the multiplier.

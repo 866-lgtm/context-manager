@@ -9,7 +9,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
-import { CAP_OMISSION_TEXT, capContent, cappedWhole, isEmptyTextBlock } from '../src/strategies/message-cap.js';
+import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isEmptyTextBlock } from '../src/strategies/message-cap.js';
+import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
 
 /** Text and string tool results at four characters a token, as windowed passthrough counts. */
 function textEstimate(content: ContentBlock[]): number {
@@ -147,12 +148,15 @@ describe('capContent', () => {
     assert.equal(out[1], part, 'the kept part keeps its item, since the item still ships whole through it');
   });
 
-  it("returns the content itself for a cap that isn't a positive number, which means no cap", () => {
+  it("returns the content itself for a cap that isn't a positive number, which means no cap, without estimating it", () => {
+    // With no cap set, every raw message goes through here at every site
+    // that prices it, so the estimate isn't taken.
     const content = [text('x'.repeat(2000)), text('dropped')];
-    assert.equal(capContent(content, 0, textEstimate), content);
-    assert.equal(capContent(content, -1, textEstimate), content);
-    assert.equal(capContent(content, Number.NaN, textEstimate), content);
-    assert.equal(capContent(content, undefined as unknown as number, textEstimate), content);
+    const unasked = (): number => { throw new Error('estimated content under no cap'); };
+    assert.equal(capContent(content, 0, unasked), content);
+    assert.equal(capContent(content, -1, unasked), content);
+    assert.equal(capContent(content, Number.NaN, unasked), content);
+    assert.equal(capContent(content, undefined as unknown as number, unasked), content);
   });
 
   it("reads a text block without string text as holding nothing, so, given an estimate that doesn't read its text, it passes before the cap", () => {
@@ -168,6 +172,35 @@ describe('capContent', () => {
     const cut = textOf(out[0])!;
     assert.ok(cut.startsWith('aaa\n\n[truncated'), cut);
     assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(cut), 'no lone high surrogate');
+  });
+});
+
+describe('cappedPriceExtra', () => {
+  /** A store whose estimate counts its calls: a block's text length, plus 1 a block. */
+  function countingStore(): { store: MessageStoreView; calls: () => number } {
+    let calls = 0;
+    const store = {
+      estimateTokens: (message: StoredMessage) => {
+        calls++;
+        return message.content.reduce((sum, block) => sum + 1 + (textOf(block) ?? '').length, 0);
+      },
+    } as unknown as MessageStoreView;
+    return { store, calls: () => calls };
+  }
+
+  it("is 0 for the message's own content, without estimating anything", () => {
+    const { store, calls } = countingStore();
+    const message = { content: [text('x'.repeat(40))] } as StoredMessage;
+    assert.equal(cappedPriceExtra(store, message, message.content), 0);
+    assert.equal(calls(), 0, 'no estimate taken for content the cap left whole');
+  });
+
+  it('is the estimate of what is sent less that of the message, for content the cap made', () => {
+    const { store, calls } = countingStore();
+    const message = { content: [text('x'.repeat(40))] } as StoredMessage;
+    const capped = [text('x'.repeat(4)), text('[cut]')];
+    assert.equal(cappedPriceExtra(store, message, capped), (5 + 6) - 41);
+    assert.equal(calls(), 2);
   });
 });
 

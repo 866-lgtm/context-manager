@@ -53,8 +53,9 @@ export interface WindowedPassthroughOptions {
    * tool-result clamp mirrors it. Side-process agents should mirror their
    * principal's value so the two see the same truncation policy. Images are
    * not subject to this cap; they are governed by the live-image policy
-   * below. Unset = no truncation, in which case a single message larger
-   * than the usable budget is refused (see {@link OverBudgetError}).
+   * below. Unset, or any value that isn't a positive number, = no
+   * truncation, in which case a single message larger than the usable
+   * budget is refused (see {@link OverBudgetError}).
    */
   maxMessageTokens?: number;
   /**
@@ -272,7 +273,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     // estimate, even past the cap. The two estimates differ: the store's
     // counts every block, thinking included, and the truncator's counts text
     // and string results alone, rounding each block up, so either can pass
-    // the cap with nothing cut.
+    // the cap with nothing cut. The image strip's depth (applyImageStripping)
+    // is still measured by the store's estimate of each stored message,
+    // before the cap, as the autobiographical strategy measures its own.
     const cap = this.maxMessageTokens ?? 0;
     const shaped = new Map<number, ContentBlock[]>();
     const priced = (i: number): number => {

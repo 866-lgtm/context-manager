@@ -20,7 +20,7 @@
  * 50 too. Between them they pin each place a raw message is priced but one:
  * the head window, the middle (positioned and combined recall pairs, a plan
  * whose level has no summary, and a body's raw shards, which the adaptive
- * middle renders whole and the head and recent windows cut), the recent
+ * middle sends uncut and the head and recent windows cut), the recent
  * window's reservation and eviction walk, the picker's pinned head and tail
  * chunks, kv-unified's tail units, and the windowed strategy's window. The
  * one, the refusal floor of the head and tail reservation, is pinned by
@@ -289,7 +289,35 @@ describe("the picker's pinned head and tail chunks carry the prices the head and
   });
 });
 
-describe("a body's raw shards render whole in the adaptive middle and cut in the head and recent windows, each priced as it renders", () => {
+describe("an override of truncateContent is the cut a raw message is priced and sent by", () => {
+  // The strategy's cut is its protected truncateContent, which a raw message
+  // and a summary both go through, so an override changes what a raw message
+  // sends, and its price follows.
+  class MarkedCut extends AutobiographicalStrategy {
+    protected override truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
+      const long = content.some((block) => block.type === 'text' && block.text.length > maxTokens * 4);
+      return maxTokens > 0 && long ? [{ type: 'text', text: 'cut by the override' }] : content;
+    }
+  }
+  for (const [mode, config] of SELECTIONS) {
+    it(`autobiographical, ${mode}: a capped message sends the override's cut, and the render stats count it`, async () => {
+      const strategy = new MarkedCut({ maxMessageTokens: 100, overBudgetGraceRatio: 0, ...config });
+      const { manager, rendered, attempt, close } = await open(strategy, [['u', [{ type: 'text', text: 'r'.repeat(2000) }]]]);
+      try {
+        const compiled = await manager.compile(BIG);
+        const texts = compiled.messages.flatMap((m) => m.content.map((block) => (block as { text?: string }).text));
+        assert.ok(texts.includes('cut by the override'), `the override's cut is sent: ${JSON.stringify(texts).slice(0, 200)}`);
+        const sent = rendered(compiled);
+        assertStatsMatch(manager, sent, config.adaptiveResolution === true);
+        assert.equal(await attempt(sent), sent, `a budget of ${sent} sends all of it`);
+      } finally {
+        await close();
+      }
+    });
+  }
+});
+
+describe("a body's raw shards go out uncut in the adaptive middle and cut in the head and recent windows, each priced as it's sent", () => {
   // Ingress splits a long text into shards of about targetChunkTokens at four
   // characters a token, 12,000 characters by default. In the middle, the
   // shard path joins a body's raw shards into one entry without the cap, so a
@@ -309,27 +337,29 @@ describe("a body's raw shards render whole in the adaptive middle and cut in the
     compiled.messages.map(textOf).join('').split('[truncated').length - 1;
   type Sent = { messages: Array<{ content: ContentBlock[] }> };
   type Stats = { head: { messages: number }; tail: { messages: number } };
-  // The third field is how far over the request the render stats may run. A
-  // text block's estimate is its characters over a rate the store picks from
-  // its first 2,000 characters, rounded up. This body's shards all share one
-  // rate, and the strategy priced each shard's block on its own, so in the
-  // head and recent windows, whose shards it joins into one block, the stats
-  // come to between 0 and 6 tokens over the request. (Shards of different
-  // densities would make the joined block's rate its first shard's.) The
-  // middle's shard path prices the joined block itself.
-  const windows: Array<[string, Record<string, unknown>, number, (compiled: Sent, stats: Stats) => void]> = [
-    ['in the middle, whole', { headWindowTokens: 0, recentWindowTokens: 2000 }, 0, (compiled) =>
-      assert.equal(textOf(compiled.messages[0]).length, 80_000, 'premise: the body renders whole in the middle, its shards joined')],
-    ['in the recent window, cut', { headWindowTokens: 0 }, 6, (compiled, stats) => {
+  // The third field is how far over the request the render stats may run,
+  // and the fourth how far over the emitter's count the plan may. A text
+  // block's estimate is its characters over a rate the store picks from its
+  // first 2,000 characters, rounded up. This body's shards all share one
+  // rate, and the strategy priced each shard's block on its own, so where a
+  // count sums the shards and the request joins them into one block, the
+  // count comes to between 0 and 6 tokens over: the stats in the head and
+  // recent windows, and the plan in the middle, whose shard path prices the
+  // joined block itself for the stats. (Shards of different densities would
+  // put the joined block at its first shard's rate, as on `main`.)
+  const windows: Array<[string, Record<string, unknown>, number, number, (compiled: Sent, stats: Stats) => void]> = [
+    ['in the middle, uncut', { headWindowTokens: 0, recentWindowTokens: 2000 }, 0, 6, (compiled) =>
+      assert.equal(textOf(compiled.messages[0]).length, 80_000, 'premise: the middle sends the body uncut, its shards joined')],
+    ['in the recent window, cut', { headWindowTokens: 0 }, 6, 0, (compiled, stats) => {
       assert.ok(stats.tail.messages >= 7, `premise: the tail holds the seven shards: ${stats.tail.messages} messages`);
       assert.equal(cutShards(compiled), 7, 'premise: the recent window sends each shard cut');
     }],
-    ['in the head window, cut', { headWindowTokens: 40_000 }, 6, (compiled, stats) => {
+    ['in the head window, cut', { headWindowTokens: 40_000 }, 6, 0, (compiled, stats) => {
       assert.ok(stats.head.messages >= 7, `premise: the head holds the seven shards: ${stats.head.messages} messages`);
       assert.equal(cutShards(compiled), 7, 'premise: the head sends each shard cut');
     }],
   ];
-  for (const [where, config, rounding, premise] of windows) {
+  for (const [where, config, rounding, planRounding, premise] of windows) {
     it(`autobiographical, adaptive selection, a cap of 1,000 tokens under shards of 12,000 characters: ${where}`, async () => {
       const strategy = autobiographical(1000, { adaptiveResolution: true, ...config });
       const { manager, rendered, attempt, close } = await open(strategy, body);
@@ -340,11 +370,14 @@ describe("a body's raw shards render whole in the adaptive middle and cut in the
         const sent = rendered(compiled);
         const price = stats.total.tokens;
         assert.ok(price - sent >= 0 && price - sent <= rounding, `render stats ${price}, sent ${sent}`);
-        assert.equal(stats.planVsActual!.planned, stats.planVsActual!.actual,
-          `planned ${stats.planVsActual!.planned}, emitted ${stats.planVsActual!.actual}`);
-        assert.equal(await attempt(price), sent, `a budget of ${price} sends all of it`);
-        const under = await attempt(price - 1);
-        if (under !== 'refused') assert.ok(under < sent, `a budget of ${price - 1} sent ${under}`);
+        const { planned, actual } = stats.planVsActual!;
+        assert.ok(planned - actual >= 0 && planned - actual <= planRounding, `planned ${planned}, emitted ${actual}`);
+        // A compile must fit both its plan and what it emits, so the budget
+        // that sends all of it is the larger of the two.
+        const counted = Math.max(price, planned);
+        assert.equal(await attempt(counted), sent, `a budget of ${counted} sends all of it`);
+        const under = await attempt(counted - 1);
+        if (under !== 'refused') assert.ok(under < sent, `a budget of ${counted - 1} sent ${under}`);
       } finally {
         await close();
       }
