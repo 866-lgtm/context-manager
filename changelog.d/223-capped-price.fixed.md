@@ -22,5 +22,11 @@
     sooner, and refuses a newest message that renders past the budget, where
     it sent it. At small caps, a compile fits more capped messages of text
     alone.
+  - The hierarchical selection, which runs when `adaptiveResolution` is off
+    (the default), prices raw messages before the image strip. So a capped
+    message whose image the strip replaces is now priced with that image
+    whole, as an uncapped message there already is, where it was priced at
+    no more than the cap plus 50. Such a window can be refused where its
+    rendered size fits the budget.
   - A window this moves misses the prompt cache on its first request after the
     upgrade.

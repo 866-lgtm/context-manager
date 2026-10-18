@@ -1,10 +1,14 @@
 /**
- * A message `maxMessageTokens` caps is priced as it renders (#223): what the
- * strategy counts for it in its plan, its budget checks and its render
- * stats is what the store estimates for the content it sends. The cap cuts
- * text and string tool results only, at four characters a token, so a
- * capped message's images, tool calls and thinking go out whole, and its
- * kept text is priced at the store's own rate.
+ * The cut of a message `maxMessageTokens` caps is priced as it renders
+ * (#223): what the strategy counts for the message in its plan, its budget
+ * checks and its render stats is its path's price for it uncapped, plus the
+ * store's estimate of what the cut changed. The cap cuts text and string tool
+ * results only, at four characters a token, so a capped message's images,
+ * tool calls and thinking go out whole, and its kept text is priced at the
+ * store's own rate. Where no image is stripped, that sum is the store's
+ * estimate of what's sent. The hierarchical selection prices an image the
+ * strip replaces at full weight, uncapped messages included, so the strip's
+ * case is tested in the adaptive selection, whose base is post-strip.
  *
  * The rule it replaced charged a capped message no more than the cap plus
  * 50: too little for an image, a tool call or thinking the cap keeps whole,
@@ -19,7 +23,7 @@
  * windowed strategy's window. The one, the refusal floor of the head and tail
  * reservation, is pinned by overbudget-diagnostics' floor tests. The windows'
  * sizes aren't prices: they're measured before the cap, in the stored history
- * compression summarizes.
+ * compression summarizes. A cap given as undefined is no cap.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -192,6 +196,36 @@ describe('a capped message is priced as it renders', () => {
       });
     }
   }
+});
+
+describe('a cap given as undefined is no cap', () => {
+  // A caller's explicit `maxMessageTokens: undefined` stays in the
+  // autobiographical config, as the constructor resolves it.
+  const text = 'r'.repeat(2000);
+  const sentText = (compiled: { messages: Array<{ content: ContentBlock[] }> }): string =>
+    compiled.messages.flatMap((m) => m.content).map((block) => (block as { text?: string }).text ?? '').join('');
+  for (const [mode, config] of SELECTIONS) {
+    it(`autobiographical, ${mode}: the message is sent whole, and the render stats count what's sent`, async () => {
+      const strategy = new AutobiographicalStrategy({ maxMessageTokens: undefined, ...config });
+      const { manager, rendered, close } = await open(strategy, [['u', [{ type: 'text', text }]]]);
+      try {
+        const compiled = await manager.compile(BIG);
+        assert.equal(sentText(compiled), text, `sent ${sentText(compiled).length} characters of ${text.length}`);
+        assertStatsMatch(manager, rendered(compiled), config.adaptiveResolution === true);
+      } finally {
+        await close();
+      }
+    });
+  }
+  it('windowed passthrough: the message is sent whole', async () => {
+    const { manager, close } = await open(new WindowedPassthroughStrategy({ maxMessageTokens: undefined }), [['u', [{ type: 'text', text }]]]);
+    try {
+      const compiled = await manager.compile(BIG);
+      assert.equal(sentText(compiled), text, `sent ${sentText(compiled).length} characters of ${text.length}`);
+    } finally {
+      await close();
+    }
+  });
 });
 
 describe('a capped message in the head window is priced as it renders', () => {

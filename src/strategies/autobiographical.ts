@@ -14896,7 +14896,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     msg: StoredMessage,
     msgCap: number,
   ): { content: ContentBlock[]; extra: number } {
-    if (msgCap <= 0) return { content: msg.content, extra: 0 };
+    // A cap that isn't a positive number is no cap: a caller's explicit
+    // `maxMessageTokens: undefined` stays in the config, and capContent would
+    // cut at NaN characters.
+    if (!(msgCap > 0)) return { content: msg.content, extra: 0 };
     // capContent estimates the content it's given, which is msg.content.
     const content = capContent(msg.content, msgCap, () => this.estimateTextOnlyTokens(msg));
     return { content, extra: cappedPriceExtra(store, msg, content) };
