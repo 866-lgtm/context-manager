@@ -10,7 +10,7 @@
 
 import { readFileSync } from 'node:fs';
 import { SummaryTree } from '../src/adaptive/summary-tree.js';
-import { planControlledFrontier } from '../src/adaptive/kv-control.js';
+import { planControlledFrontier, reportOverlap } from '../src/adaptive/kv-control.js';
 import type { PickerInputs, PickerChunk } from '../src/adaptive/picker.js';
 import type { ChunkId } from '../src/adaptive/folding-strategy.js';
 
@@ -85,6 +85,7 @@ async function main() {
     pinCaps,
     now,
   });
+  reportOverlap(plan.overlap);
 
   console.log(`plan: tokens=${plan.tokens} folded=${plan.folded} expanded=${plan.expanded} escalated=${plan.escalated} pert=${plan.perturbation} override=${plan.override ?? '-'} blocked=${plan.blocked ?? '-'}`);
 

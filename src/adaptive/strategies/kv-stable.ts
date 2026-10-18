@@ -80,9 +80,9 @@ export class KvStableStrategy implements FoldingSolver {
     return this._lastTarget;
   }
 
-  /** The full control plan behind the target (perturbation, override) — for
-   *  observability at the call site (`[kv-escalation]` logging). Null before
-   *  the first `solve`. */
+  /** The full control plan behind the target (perturbation, override,
+   *  overlap) — for observability at the call site (`[kv-escalation]` and
+   *  `[kv-overlap]` logging). Null before the first `solve`. */
   lastPlan(): ControlPlan | null {
     return this._lastPlan;
   }
