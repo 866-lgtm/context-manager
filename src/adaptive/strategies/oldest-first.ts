@@ -5,7 +5,9 @@
  * of level distribution. This is the "memory fades chronologically" policy
  * — the simplest possible monotonic policy and the one originally proposed
  * in rev 1 of the design doc. Like flat-profile, it never lowers a chunk
- * within a solve, and a pinned chunk is seeded raw (greedy-fold.ts).
+ * within a solve, a pinned chunk is seeded raw, and a chunk carried at a level
+ * where it has no summary starts at the next level down where it has one
+ * (greedy-fold.ts).
  *
  * Kept for comparison against FlatProfileStrategy and as a fallback during
  * early rollout.

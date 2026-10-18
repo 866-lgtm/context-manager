@@ -8,8 +8,9 @@
  *
  * Monotonic within a solve (never lowers). Memory-fading by construction: a
  * given chunk's resolution only ever increases within a solve, and the carried
- * resolutions seed the next one, except that a pinned chunk is seeded raw
- * (greedy-fold.ts).
+ * resolutions seed the next one, except that a pinned chunk is seeded raw and
+ * a chunk carried at a level where it has no summary starts at the next level
+ * down where it has one (greedy-fold.ts).
  *
  * See `docs/adaptive-resolution-design.md` §3.7.
  */
