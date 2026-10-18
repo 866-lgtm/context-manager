@@ -7,6 +7,7 @@ import type {
   TokenBudget,
   PendingWork,
 } from './context.js';
+import type { OverBudgetClearedBy } from '../adaptive/picker.js';
 
 /**
  * Read-only view of the message store for strategies.
@@ -271,7 +272,9 @@ export interface SelectOptions {
    * `previewContext` is where infeasibility is reported. The head-and-tail
    * check before the plan check, and any later stage that can't fit, still
    * throw as for a real compile, leaving nothing behind; `previewContext`
-   * reports an over-budget throw and passes any other throw through.
+   * reports an over-budget throw, as the plan's own preview when the plan was
+   * already over the budget (the live compile refuses it at the plan check),
+   * and passes any other throw through.
    *
    * A compression hold ends at its deadline, whoever looks: the manager
    * releases an expired hold at any compile or hold query, a dry compile
@@ -305,6 +308,16 @@ export interface PreviewResult {
   fits: boolean;
   /** True when the picker could not fold any further. */
   exhausted: boolean;
+  /**
+   * When the layout doesn't fit: what clears that refusal besides a larger
+   * budget, in the terms of the live compile's `OverBudgetError.clearedBy`.
+   * For a plan over the budget it's the plan's list, as the live compile's
+   * refusal at the plan check takes it. A dry run doesn't queue its plan's own
+   * work, so it names compression only for work queued when it takes the
+   * list, the chunks its own rebuild closed included; the live list can add
+   * compression for what the plan's own ops queue.
+   */
+  clearedBy?: readonly OverBudgetClearedBy[];
   /** Verbatim head / tail cost, and the foldable middle. */
   headTokens: number;
   tailTokens: number;
