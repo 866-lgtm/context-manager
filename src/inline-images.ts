@@ -59,6 +59,24 @@ export function hasImage(content: readonly ContentBlock[]): boolean {
 }
 
 /**
+ * The tokens a message's estimate gives back when the strip replaces this
+ * image with the placeholder: the image's price as MessageStore prices it (a
+ * generated image at 1,600 whatever it carries, an image at its stamp or
+ * 1,600), at round(raw × calibration) as `estimateTokens` prices a block,
+ * less `placeholderPrice`, the placeholder text as the store prices it,
+ * calibrated (ask the store for it once per pass). That's exact for a
+ * top-level image. For one nested in a `tool_result`, which the store prices
+ * as the rounded sum of its blocks, it can be a token off. It's negative for
+ * an image priced below the placeholder, such as one stamped with a small
+ * `tokenEstimate`: the strip then makes its message cost more.
+ */
+export function strippedImageSaving(image: ContentBlock, placeholderPrice: number, calibration: number): number {
+  const factor = Number.isFinite(calibration) && calibration > 0 ? calibration : 1;
+  const price = image.type === 'generated_image' ? 1600 : (image as { tokenEstimate?: number }).tokenEstimate ?? 1600;
+  return Math.round(price * factor) - placeholderPrice;
+}
+
+/**
  * Replace images with a text placeholder, in the order `imagesIn` gives
  * them: `strip` is asked about each image once, and an image it answers
  * true for is replaced. Every raw form an edited block carried is

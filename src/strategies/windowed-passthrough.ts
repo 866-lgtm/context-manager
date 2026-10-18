@@ -17,7 +17,7 @@ import type { JsStore } from '@animalabs/chronicle';
 import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
 import { releaseEditedRawForms } from '../raw-forms.js';
-import { hasImage, inlineImageBytes, replaceImages } from '../inline-images.js';
+import { hasImage, imagesIn, inlineImageBytes, replaceImages, strippedImageSaving } from '../inline-images.js';
 
 /**
  * Options for {@link WindowedPassthroughStrategy}.
@@ -256,14 +256,18 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       start++;
     }
 
-    // Per-message shaping BEFORE pricing, so the window is sized on what
-    // will actually be sent. Truncation follows the autobiographical
-    // strategy: a capped message is priced at the cap plus its marker.
+    // Per-message shaping BEFORE pricing: the live-image policy's verdicts,
+    // decided once from the newest message down to the anchor
+    // (liveImagePolicy), so the window is priced without the images the
+    // strip takes out, and truncation, which follows the autobiographical
+    // strategy: a capped message is priced at the cap plus its marker, which
+    // leaves out the images truncation keeps.
+    const policy = this.liveImagePolicy(messages, store, start);
     const cap = this.maxMessageTokens ?? 0;
     const shaped = new Map<number, ContentBlock[]>();
     const priced = (i: number): number => {
       const msg = messages[i];
-      const estimate = store.estimateTokens(msg);
+      const estimate = Math.max(0, store.estimateTokens(msg) - (policy.saved[i] ?? 0));
       if (cap <= 0) return estimate;
       const content = truncateContent(msg.content, cap);
       if (content === msg.content) return estimate;
@@ -341,7 +345,14 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       });
     }
 
-    this.applyImageStripping(entries, messages, store);
+    for (const entry of entries) {
+      const strips = policy.strips[entry.index];
+      if (!strips) continue;
+      // Truncation passes every block that holds an image through, so the
+      // entry's images are its message's, in the order the verdicts follow.
+      let k = 0;
+      entry.content = replaceImages(entry.content, () => strips[k++]!, IMAGE_PLACEHOLDER);
+    }
     if (!opts?.dryRun) this.placeCacheMarkers(entries);
     return entries;
   }
@@ -357,15 +368,37 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   // Live-image policy (mirrors AutobiographicalStrategy.applyImageStripping)
   // --------------------------------------------------------------------------
 
-  private applyImageStripping(
-    entries: ContextEntry[],
+  /**
+   * The policy's verdict on every image of the messages from `from` to the
+   * newest (`strips`, true where the placeholder replaces it, in the order
+   * `imagesIn` and `replaceImages` visit a message's images), and the tokens
+   * each message's estimate gives back for the images it loses (`saved`).
+   * `select` prices the window by `saved` and applies `strips` to what it
+   * emits, so the verdicts it prices are the ones the strip applies.
+   *
+   * That holds wherever the window starts, and the re-anchor walk reads them
+   * as they are: the window is every message from the anchor on, and each
+   * verdict is decided from that message and newer ones only, its depth from
+   * the newest message over the whole view and its count and bytes
+   * newest-first. So a message's verdicts, and its price after them, are the
+   * same whichever message the window starts at. A rule that looked at older
+   * messages, or at where the window starts, would break that, and the
+   * window would again be priced with images the strip takes out.
+   */
+  private liveImagePolicy(
     messages: StoredMessage[],
     store: MessageStoreView,
-  ): void {
+    from: number,
+  ): { strips: (boolean[] | undefined)[]; saved: number[] } {
+    const strips: (boolean[] | undefined)[] = [];
+    const saved: number[] = [];
     const maxLive = this.maxLiveImages;
     const depthTokens = this.imageStripDepthTokens;
     const maxLiveBytes = this.maxLiveImageBytes;
-    if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return;
+    if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return { strips, saved };
+    const calibration = store.getTokenCalibration?.() ?? 1;
+    // The placeholder as the store prices it, calibrated, by its own text estimator.
+    const placeholderPrice = store.estimateTokens({ content: [{ type: 'text', text: IMAGE_PLACEHOLDER }] } as unknown as StoredMessage);
 
     // Depth boundary: walk newest→oldest over the whole view (the policy is
     // "distance from the newest message", not "distance from the anchor").
@@ -380,24 +413,32 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
 
     let keptImages = 0;
     let keptImageBytes = 0;
-    // Entries are in timeline order; the policy counts newest-first.
-    for (let e = entries.length - 1; e >= 0; e--) {
-      const entry = entries[e];
-      // Every image the entry carries, nested in a tool_result included,
-      // counted and stripped as the autobiographical strategy does (see
-      // inline-images.ts), raw forms of an edited block released.
-      if (!hasImage(entry.content)) continue;
-      const tooDeep = depthTokens > 0 && entry.index < stripStart;
-      entry.content = replaceImages(entry.content, (image) => {
+    // Newest-first. Every image a message carries, nested in a tool_result
+    // included, is counted as the autobiographical strategy counts it (see
+    // inline-images.ts).
+    for (let i = messages.length - 1; i >= from; i--) {
+      const content = messages[i]!.content;
+      if (!hasImage(content)) continue;
+      const tooDeep = depthTokens > 0 && i < stripStart;
+      const verdicts: boolean[] = [];
+      let tokens = 0;
+      for (const image of imagesIn(content)) {
         const bytes = inlineImageBytes(image);
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + bytes > maxLiveBytes;
-        if (tooDeep || overCount || overBytes) return true;
-        keptImages++;
-        keptImageBytes += bytes;
-        return false;
-      }, IMAGE_PLACEHOLDER);
+        const strip = tooDeep || overCount || overBytes;
+        if (strip) {
+          tokens += strippedImageSaving(image, placeholderPrice, calibration);
+        } else {
+          keptImages++;
+          keptImageBytes += bytes;
+        }
+        verdicts.push(strip);
+      }
+      strips[i] = verdicts;
+      saved[i] = tokens;
     }
+    return { strips, saved };
   }
 
   // --------------------------------------------------------------------------

@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, AutobiographicalStrategy, WindowedPassthroughStrategy, MessageStore, ContextLog } from '../src/index.js';
-import type { StoredMessage } from '../src/index.js';
+import type { ContextEntry, MessageStoreView, StoredMessage } from '../src/index.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'live-image-accounting-'));
 let n = 0;
@@ -69,13 +69,17 @@ function stateOf(messages: { content: ContentBlock[] }[], label: string): 'image
 /**
  * A store view over plain messages, priced as the store prices them: an image
  * at its estimate or 1600, a generated image at 1600, text at a token per four
- * characters, a tool result at what it nests.
+ * characters unless `textTokens` says otherwise, a tool result at what it
+ * nests.
  */
-function viewOf(messages: Array<{ id: string; sequence: number; content: ContentBlock[] }>) {
+function viewOf(
+  messages: Array<{ id: string; sequence: number; content: ContentBlock[] }>,
+  textTokens: (text: string) => number = (text) => Math.ceil(text.length / 4),
+) {
   const raw = (b: ContentBlock): number => {
     if (b.type === 'image') return (b as { tokenEstimate?: number }).tokenEstimate ?? 1600;
     if ((b as { type: string }).type === 'generated_image') return 1600;
-    if (b.type === 'text') return Math.ceil(b.text.length / 4);
+    if (b.type === 'text') return textTokens(b.text);
     const nested = (b as { content?: unknown }).content;
     return b.type === 'tool_result' && Array.isArray(nested) ? (nested as ContentBlock[]).reduce((s, x) => s + raw(x), 0) : 0;
   };
@@ -344,6 +348,250 @@ describe('live image accounting', () => {
     const pse = (strategy as unknown as StripInternals).postStripEstimates(store);
     assert.equal(pse[1], 1600, 'the newest is live at 1600');
     assert.equal(pse[0], 14, 'the older costs its placeholder: all 1600 come off, not the 400 it carries');
+  });
+
+  it('windowed passthrough prices a message after its image policy, so an image the policy strips no longer refuses it', async () => {
+    const largeBase64 = (): ContentBlock =>
+      ({ type: 'image', source: { type: 'base64', data: 'A'.repeat(5000), mediaType: 'image/png' } }) as ContentBlock;
+    for (const [kind, image] of [['base64', largeBase64], ['generated', () => generatedImage(5000)]] as const) {
+      const cm = await ContextManager.open({
+        path: fresh(),
+        strategy: new WindowedPassthroughStrategy({ maxLiveImages: 0, imageStripDepthTokens: 0, maxLiveImageBytes: 1000 }),
+      });
+      cm.addMessage('Claude', [image(), { type: 'text', text: `wp-bytes-${kind}` }]);
+      // About 1,600 tokens with its image, and far under the budget once the
+      // bytes cap replaces it with the placeholder.
+      const { messages } = await cm.compile({ maxTokens: 1000, reserveForResponse: 0 });
+      assert.equal(stateOf(messages, `wp-bytes-${kind}`), 'stripped', `the ${kind} image goes, and its message is sent`);
+      cm.close();
+    }
+  });
+
+  it('windowed passthrough keeps its anchor while the window fits once its images are stripped', async () => {
+    const cm = await ContextManager.open({
+      path: fresh(),
+      strategy: new WindowedPassthroughStrategy({ maxLiveImages: 1, imageStripDepthTokens: 0 }),
+    });
+    const labels = ['wp-fit-1', 'wp-fit-2', 'wp-fit-3', 'wp-fit-4', 'wp-fit-5'];
+    for (const label of labels) cm.addMessage('Claude', [base64Image(), { type: 'text', text: label }]);
+    // About 8,000 tokens with every image; with four of them stripped, well
+    // under the 3,000 budget.
+    const { messages } = await cm.compile({ maxTokens: 3000, reserveForResponse: 0 });
+    assert.equal(stateOf(messages, 'wp-fit-5'), 'image', 'the newest image is kept');
+    for (const label of labels.slice(0, 4)) {
+      assert.equal(stateOf(messages, label), 'stripped', `${label} is sent, with its image stripped`);
+    }
+    cm.close();
+  });
+
+  /** An autobiographical strategy whose head window is message 0 and whose recent window starts at message 2, with its two image passes in reach. */
+  class FoldedWindow extends AutobiographicalStrategy {
+    protected override getHeadWindowStartIndex(): number { return 0; }
+    protected override getHeadWindowEnd(): number { return 1; }
+    protected override getRecentWindowStart(): number { return 2; }
+    estimates(store: unknown): number[] { return this.postStripEstimates(store as never); }
+    /** The strip as `selectAdaptive` asks for it, or, with `asEstimated` false, as `selectHierarchical` does. */
+    strip(entries: ContextEntry[], store: unknown, asEstimated = true): void {
+      this.applyImageStripping(entries, store as never, { asEstimated });
+    }
+  }
+
+  for (const nested of [false, true]) {
+    it(`the strip counts the ${nested ? 'nested' : 'top-level'} image of a message a fold left out, as the estimate does`, () => {
+      const middle: ContentBlock[] = nested
+        ? [{ type: 'tool_result', toolUseId: 'm', content: [base64Image(), { type: 'text', text: 'middle' }] } as unknown as ContentBlock]
+        : [base64Image(), { type: 'text', text: 'middle' }];
+      const messages = [
+        { id: 'head', sequence: 0, participant: 'User', content: [base64Image(), { type: 'text', text: 'head' }] as ContentBlock[] },
+        { id: 'middle', sequence: 1, participant: 'User', content: middle },
+        { id: 'tail', sequence: 2, participant: 'Claude', content: [base64Image(), { type: 'text', text: 'tail' }] as ContentBlock[] },
+      ];
+      const store = viewOf(messages);
+      const strategy = new FoldedWindow({ maxLiveImages: 2, imageStripDepthTokens: 0 } as never);
+      const estimates = strategy.estimates(store);
+      // The fold leaves the middle message out: a summary derived from it
+      // stands for it, without its image.
+      const entries: ContextEntry[] = [
+        { index: 0, sourceMessageId: 'head', sourceRelation: 'copy', participant: 'User', content: messages[0]!.content },
+        { index: 1, sourceMessageIds: ['middle'], sourceRelation: 'derived', participant: 'User', content: [{ type: 'text', text: 'what came between' }] },
+        { index: 2, sourceMessageId: 'tail', sourceRelation: 'copy', participant: 'Claude', content: messages[2]!.content },
+      ];
+      strategy.strip(entries, store);
+      assert.equal(estimates[0], 15, "the estimate gives the middle's image the second live slot and prices the head's at the placeholder");
+      assert.equal(stateOf(entries, 'head'), 'stripped', 'and the strip does the same');
+      assert.equal(stateOf(entries, 'tail'), 'image');
+    });
+  }
+
+  it("the strip counts a merged body's images once, at its first shard, where the chunker puts them, as the estimate does", () => {
+    // chunkIngressMessage puts a body's images on its first shard, and
+    // mergeAdjacentBodyGroupRaw keeps them ahead of the merged text.
+    const messages = [
+      { id: 'a', sequence: 0, participant: 'User', content: [{ type: 'text', text: 'a' }, base64Image(), base64Image()] as ContentBlock[] },
+      { id: 'b', sequence: 1, participant: 'User', content: [{ type: 'text', text: 'b' }] as ContentBlock[] },
+      { id: 'c', sequence: 2, participant: 'Claude', content: [base64Image(), { type: 'text', text: 'c' }] as ContentBlock[] },
+    ];
+    const store = viewOf(messages);
+    const strategy = new FoldedWindow({ maxLiveImages: 2, imageStripDepthTokens: 0 } as never);
+    const estimates = strategy.estimates(store);
+    const entries: ContextEntry[] = [
+      {
+        index: 0, sourceMessageId: 'a', sourceMessageIds: ['a', 'b'], sourceRelation: 'copy', participant: 'User',
+        content: [base64Image(), base64Image(), { type: 'text', text: 'ab' }],
+      },
+      { index: 1, sourceMessageId: 'c', sourceRelation: 'copy', participant: 'Claude', content: messages[2]!.content },
+    ];
+    strategy.strip(entries, store);
+    assert.equal(estimates[0], 1600 + 14 + 1, "two live slots: the estimate prices c's image and a's first live, and a's second at the placeholder");
+    assert.equal(stateOf(entries, 'c'), 'image', 'and the strip keeps the same images');
+    assert.deepEqual(entries[0]!.content.map((b) => b.type), ['image', 'text', 'text']);
+  });
+
+  it("the real chunker and merge put a body's images on its first shard, ahead of its text, where the strip and the estimate count them alike", () => {
+    class Chunking extends FoldedWindow {
+      merge(entries: ContextEntry[], store: unknown, messages: unknown): ContextEntry[] {
+        return this.mergeAdjacentBodyGroupRaw(entries, store as never, messages as never);
+      }
+    }
+    const strategy = new Chunking({ adaptiveResolution: true, targetChunkTokens: 20, maxLiveImages: 2, imageStripDepthTokens: 0 } as never);
+    const decision = strategy.chunkIngressMessage('User', [{ type: 'text', text: 'word '.repeat(200) }, base64Image(), base64Image()]);
+    assert.ok(decision && decision.shards.length > 1, 'the body is sharded');
+    const shards = decision.shards.map((s, k) => ({
+      id: `s${k}`, sequence: k, participant: 'User', content: s.content, bodyGroupId: decision.bodyGroupId, shardIndex: s.shardIndex,
+    }));
+    const tail = { id: 'tail', sequence: shards.length, participant: 'Claude', content: [base64Image(), { type: 'text', text: 'tail' }] as ContentBlock[] };
+    const messages = [...shards, tail];
+    const store = viewOf(messages);
+    const estimates = strategy.estimates(store);
+    const entries: ContextEntry[] = messages.map((m, index) => ({ index, sourceMessageId: m.id, sourceRelation: 'copy', participant: m.participant, content: m.content }));
+    const merged = strategy.merge(entries, store, messages);
+    const body = merged.find((e) => (e.sourceMessageIds?.length ?? 0) > 1);
+    assert.ok(body, 'the shards merge into one entry');
+    assert.deepEqual(body.content.map((b) => b.type).slice(0, 2), ['image', 'image'], "the first shard's images, ahead of the text");
+    strategy.strip(merged, store);
+    const firstShardText = (shards[0]!.content[0] as { text: string }).text;
+    assert.equal(estimates[0], Math.ceil(firstShardText.length / 4) + 1600 + 14,
+      "two live slots: the estimate prices the tail's image and the body's first live, at the first shard, and its second at the placeholder");
+    assert.deepEqual(body.content.map((b) => b.type).slice(0, 2), ['image', 'text'], 'and the strip keeps the same one');
+    assert.equal(stateOf(merged, 'tail'), 'image');
+  });
+
+  it("the strip counts the images on a body's first shard where the middle region's composite sends the body's text only, as the estimate does", () => {
+    const messages = [
+      { id: 'head', sequence: 0, participant: 'User', content: [base64Image(), { type: 'text', text: 'head' }] as ContentBlock[] },
+      { id: 's0', sequence: 1, participant: 'User', content: [{ type: 'text', text: 'shard zero ' }, base64Image()] as ContentBlock[] },
+      { id: 's1', sequence: 2, participant: 'User', content: [{ type: 'text', text: 'shard one' }] as ContentBlock[] },
+      { id: 'tail', sequence: 3, participant: 'Claude', content: [base64Image(), { type: 'text', text: 'tail' }] as ContentBlock[] },
+    ];
+    const store = viewOf(messages);
+    const strategy = new FoldedWindow({ maxLiveImages: 2, imageStripDepthTokens: 0 } as never);
+    const estimates = strategy.estimates(store);
+    // The middle region renders a raw run of a body's shards as one entry of
+    // their text (selectAdaptive): it names both shards and sends no image.
+    const entries: ContextEntry[] = [
+      { index: 0, sourceMessageId: 'head', sourceRelation: 'copy', participant: 'User', content: messages[0]!.content },
+      { index: 1, sourceMessageIds: ['s0', 's1'], sourceRelation: 'copy', participant: 'User', content: [{ type: 'text', text: 'shard zero shard one' }] },
+      { index: 2, sourceMessageId: 'tail', sourceRelation: 'copy', participant: 'Claude', content: messages[3]!.content },
+    ];
+    strategy.strip(entries, store);
+    assert.equal(estimates[0], 15, "the estimate gives the first shard's image the second live slot and prices the head's at the placeholder");
+    assert.equal(stateOf(entries, 'head'), 'stripped', 'and the strip does the same');
+    assert.equal(stateOf(entries, 'tail'), 'image');
+  });
+
+  it("the strip counts only the images it sends where its caller prices them at full, as the hierarchical selection does", () => {
+    const messages = [
+      { id: 'head', sequence: 0, participant: 'User', content: [base64Image(), { type: 'text', text: 'head' }] as ContentBlock[] },
+      { id: 'middle', sequence: 1, participant: 'User', content: [base64Image(), { type: 'text', text: 'middle' }] as ContentBlock[] },
+      { id: 'tail', sequence: 2, participant: 'Claude', content: [base64Image(), { type: 'text', text: 'tail' }] as ContentBlock[] },
+    ];
+    const store = viewOf(messages);
+    const strategy = new FoldedWindow({ maxLiveImages: 2, imageStripDepthTokens: 0 } as never);
+    const entries: ContextEntry[] = [
+      { index: 0, sourceMessageId: 'head', sourceRelation: 'copy', participant: 'User', content: messages[0]!.content },
+      { index: 1, sourceMessageIds: ['middle'], sourceRelation: 'derived', participant: 'User', content: [{ type: 'text', text: 'what came between' }] },
+      { index: 2, sourceMessageId: 'tail', sourceRelation: 'copy', participant: 'Claude', content: messages[2]!.content },
+    ];
+    strategy.strip(entries, store, false);
+    assert.equal(stateOf(entries, 'head'), 'image', "the folded message's image takes no slot, so both images sent stay live");
+    assert.equal(stateOf(entries, 'tail'), 'image');
+  });
+
+  it('only the adaptive selection, which prices by the post-strip estimates, asks the strip to count as they do', async () => {
+    class Recording extends AutobiographicalStrategy {
+      asked: boolean[] = [];
+      protected override applyImageStripping(entries: ContextEntry[], store: MessageStoreView, opts?: { asEstimated?: boolean }): void {
+        this.asked.push(opts?.asEstimated ?? false);
+        super.applyImageStripping(entries, store, opts);
+      }
+    }
+    for (const adaptiveResolution of [true, false]) {
+      const strategy = new Recording({ adaptiveResolution, headWindowTokens: 0, recentWindowTokens: 1_000_000, maxLiveImages: 1, imageStripDepthTokens: 0 });
+      const cm = await ContextManager.open({ path: fresh(), strategy });
+      cm.addMessage('User', [base64Image(), { type: 'text', text: 'one' }]);
+      cm.addMessage('Claude', [{ type: 'text', text: 'two' }]);
+      await cm.compile(BUDGET);
+      assert.ok(strategy.asked.length > 0, 'the strip ran');
+      assert.ok(strategy.asked.every((a) => a === adaptiveResolution),
+        `${adaptiveResolution ? 'selectAdaptive asks' : 'selectHierarchical does not ask'}: ${JSON.stringify(strategy.asked)}`);
+      cm.close();
+    }
+  });
+
+  it("takes a stripped image's placeholder off the post-strip estimate at the store's price for its text", () => {
+    const strategy = new AutobiographicalStrategy({ maxLiveImages: 1 } as never);
+    // A store whose estimator prices text at a token per two characters.
+    const textTokens = (text: string) => Math.ceil(text.length / 2);
+    const store = viewOf([
+      { id: 'old', sequence: 0, content: [base64Image(), { type: 'text', text: 'old' }] },
+      { id: 'new', sequence: 1, content: [base64Image(), { type: 'text', text: 'new' }] },
+    ], textTokens);
+    const pse = (strategy as unknown as StripInternals).postStripEstimates(store);
+    assert.equal(pse[1], 1600 + 2, 'the newest is live');
+    assert.equal(pse[0], textTokens('[image not shown: this context keeps only some images]') + 2,
+      "the older costs its placeholder at the store's price for that text, 27 here, and its own text");
+  });
+
+  it("takes a stripped image priced below the placeholder off the post-strip estimate as the placeholder's extra cost", () => {
+    const strategy = new AutobiographicalStrategy({ maxLiveImages: 1 } as never);
+    const cheap = (): ContentBlock => ({ ...base64Image(), tokenEstimate: 5 }) as ContentBlock;
+    const store = viewOf([
+      { id: 'old', sequence: 0, content: [cheap(), { type: 'text', text: 'old' }] },
+      { id: 'new', sequence: 1, content: [cheap(), { type: 'text', text: 'new' }] },
+    ]);
+    const pse = (strategy as unknown as StripInternals).postStripEstimates(store);
+    assert.equal(pse[1], 5 + 1, 'the newest is live, at its stamp');
+    assert.equal(pse[0], 14 + 1, 'the older costs the placeholder, 14 here, more than the 5 its image cost');
+  });
+
+  it("windowed passthrough prices a stripped image's placeholder at the store's price for its text", async () => {
+    const js = JsStore.openOrCreate({ path: fresh() });
+    let price: (content: ContentBlock[]) => number;
+    try {
+      const estimate = ESTIMATORS[0]!.open(js);
+      price = (content) => estimate(content);
+      // Priced now, on a fresh store at calibration 1, as the windowed store below prices them.
+      const first = price([base64Image(), { type: 'text', text: 'wp-ph-1' }]);
+      const second = price([base64Image(), { type: 'text', text: 'wp-ph-2' }]);
+      const placeholder = price([{ type: 'text', text: '[image not shown: this context keeps only some images]' }]);
+      // One live slot: the older image goes, and the window costs exactly this.
+      const total = first - (1600 - placeholder) + second;
+      for (const [maxTokens, older] of [[total, 'stripped'], [total - 1, 'missing']] as const) {
+        const cm = await ContextManager.open({
+          path: fresh(),
+          strategy: new WindowedPassthroughStrategy({ maxLiveImages: 1, imageStripDepthTokens: 0 }),
+        });
+        cm.addMessage('Claude', [base64Image(), { type: 'text', text: 'wp-ph-1' }]);
+        cm.addMessage('Claude', [base64Image(), { type: 'text', text: 'wp-ph-2' }]);
+        const { messages } = await cm.compile({ maxTokens, reserveForResponse: 0 });
+        assert.equal(stateOf(messages, 'wp-ph-2'), 'image');
+        assert.equal(stateOf(messages, 'wp-ph-1'), older,
+          older === 'stripped' ? `at ${maxTokens}, the window as sent fits` : `at ${maxTokens}, one under it, the window moves past the older message`);
+        cm.close();
+      }
+    } finally {
+      js.close();
+    }
   });
 
   it("marks a generated image as an image in formatChunkForCompression's transcript", () => {

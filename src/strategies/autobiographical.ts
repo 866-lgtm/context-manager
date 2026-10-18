@@ -74,7 +74,7 @@ import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
-import { hasImage, imagesIn, inlineImageBytes, isImageBlock, replaceImages } from '../inline-images.js';
+import { hasImage, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
@@ -9509,8 +9509,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.refreshStoreOrder(messages);
     if (_diag) { console.error(`[cm-cache] selectAdaptive: calibration+getAll ${Date.now() - _t}ms`); _t = Date.now(); }
     const msgCap = this.config.maxMessageTokens;
-    // Post-strip estimates (see postStripEstimates): every budgeting site in
-    // this method prices a message the way the stripped render will cost it.
+    // Post-strip estimates (see postStripEstimates): the budgeting sites in
+    // this method price a message the way the stripped render will cost it,
+    // apart from the exceptions applyImageStripping's asEstimated names.
     const pse = this.postStripEstimates(store);
     if (_diag) { console.error(`[cm-cache] selectAdaptive: pse ${Date.now() - _t}ms`); _t = Date.now(); }
 
@@ -10328,9 +10329,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       recentStart: effectiveRecentStart,
     });
     this.postProcessToolEntries(merged);
-    // Strip stale images BEFORE placing markers and committing stats, so both
-    // describe the post-strip context the agent actually receives.
-    this.applyImageStripping(merged, store);
+    // Strip stale images BEFORE placing markers, so they describe the
+    // post-strip context the agent actually receives. This selection budgets
+    // by postStripEstimates, so the strip counts as they do (see
+    // applyImageStripping's asEstimated, which names where it doesn't).
+    this.applyImageStripping(merged, store, { asEstimated: true });
 
     // The newest stored message is the triggering turn for this compile. A
     // structural repair may rewrite tool blocks, but it must never erase that
@@ -11209,8 +11212,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // Head and tail emission keep store order, so the run's shards are
       // already in rising shard order (body-runs.ts).
-      // Build merged text content. Non-text blocks (rare in shards) are
-      // preserved on the first shard's entry only.
+      // Build merged text content. Every shard's non-text blocks are kept,
+      // ahead of the text: chunkIngressMessage puts a body's on its first
+      // shard, so they are that shard's.
       const mergedTextParts: string[] = [];
       const nonTextBlocks: ContentBlock[] = [];
       for (const r of run) {
@@ -12212,8 +12216,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.assertFullCoverage(entries, messages, { headStart, headEnd, recentStart: effectiveRecentStart });
     this.assertMiddleCoverage();
     this.postProcessToolEntries(entries);
-    // Strip stale images before committing stats so RenderStats.total reflects
-    // the post-strip context (this path places no cache markers).
+    // Strip stale images (this path places no cache markers). Its emission
+    // priced every message at the store's full estimate, apart from a message
+    // maxMessageTokens caps, priced at most at the cap plus 50, which leaves
+    // out its images. So it priced no image as the placeholder, and the strip
+    // counts only the images it sends (see applyImageStripping's
+    // asEstimated). The render stats keep each message at the price emission
+    // gave it, a stripped image included.
     this.applyImageStripping(entries, store);
     this.rsEnd();
     return entries;
@@ -13001,14 +13010,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  already text, so they're naturally unaffected. The adjacent
    *  "[image attachment: <name>]" text added at ingest preserves the filename,
    *  so the placeholder itself stays terse. Reduces tokens, so it never pushes
-   *  a compiled context back over budget.
+   *  a compiled context back over budget, apart from an image priced below
+   *  the placeholder (see `strippedImageSaving`).
    *
    *  Runs INSIDE each select path, *before* `rsEnd()` and `placeCacheMarkers`,
-   *  so the committed render stats (and the cache breakpoints) describe the
-   *  post-strip context. As it strips, it decrements the matching raw bucket of
-   *  the in-progress render stats by the reclaimed tokens, keeping
-   *  `RenderStats.total` equal to the real rendered size. */
-  protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView): void {
+   *  so the cache breakpoints describe the post-strip context. It leaves the
+   *  render stats' buckets as each selection tallied them: `selectAdaptive`
+   *  at post-strip prices, and `selectHierarchical` at the store's full
+   *  estimate, so that its `RenderStats.total` counts a stripped image at
+   *  full price. Both tallied a message `maxMessageTokens` caps at most at
+   *  the cap plus 50, which leaves out its images.
+   *
+   *  `asEstimated`: the caller prices messages by `postStripEstimates`, which
+   *  counts the images of every stored message, so the strip counts, ahead of
+   *  each image it sends, the images of the newer messages no entry sends,
+   *  and the two keep and strip the same images. `selectAdaptive` asks: every
+   *  budgeting site in it prices a message by those estimates, apart from a
+   *  message `maxMessageTokens` caps, priced at most at the cap plus 50,
+   *  which leaves out its images, and the middle region's text-only entry of
+   *  a sharded body, priced by its text. `selectHierarchical` doesn't: its
+   *  emission prices head, middle and tail at the store's full estimate,
+   *  apart from a message `maxMessageTokens` caps, priced at most at the cap
+   *  plus 50 as in `selectAdaptive`. So it priced no image as the
+   *  placeholder, and counting images it doesn't send would only cost it
+   *  live ones. (Its recent window's start and the image watermark count
+   *  every stored image, as the estimates do.) A caller that prices by the
+   *  estimates asks too. */
+  protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView, opts: { asEstimated?: boolean } = {}): void {
     const maxLive = this.config.maxLiveImages ?? 0;             // 0 = unlimited count
     const depthTokens = this.config.imageStripDepthTokens ?? 0; // 0 = no depth strip
     const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
@@ -13029,10 +13057,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (pos >= recentStart) return 'tail';
       return 'middleRaw';
     };
-    const placeholderTokens = Math.ceil(AutobiographicalStrategy.IMAGE_PLACEHOLDER.length / 4);
-
     // Image-bearing entries, newest-first by source position. Entries with no
-    // resolvable source position sort last (pos -1) and never count as "live".
+    // resolvable source position sort last (pos -1), and are stripped wherever
+    // a depth limit is set. A merged body's images all sit at its first
+    // shard's position, in block order: chunkIngressMessage puts every
+    // non-text block of a body on its first shard, and mergeAdjacentBodyGroupRaw
+    // keeps them ahead of the text, so they are that shard's images, counted
+    // where postStripEstimates counts that message. (A chunker that spread
+    // images over shards would need a position per image.)
     const ordered = entries
       .map((entry, idx) => ({
         idx,
@@ -13041,33 +13073,60 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       .filter(({ idx }) => this.hasImageBlock(entries[idx].content))
       .sort((a, b) => b.pos - a.pos);
 
+    // Asked to strip as the estimates count (asEstimated): the stored messages
+    // whose images some entry sends, each image-bearing entry's position. In
+    // this package an entry that sends an image is a raw copy of the message
+    // at its position and sends every image that message has (truncation
+    // keeps every image, and a merged body's are its first shard's, as
+    // above); an entry that sends none, such as a summary or the middle
+    // region's text of a body, sends none of its sources'. postStripEstimates
+    // counts the images of every stored message, so the strip counts those
+    // of every other one too, such as a message a fold replaced with its
+    // summary, or a body's first shard where the middle region sends the
+    // body's text only: their images take their live slots here as they did
+    // in the estimate. The two passes then keep and strip alike, and the
+    // window sends no image its estimate priced at the placeholder, at the
+    // cost of an older raw image the window could have carried losing its
+    // slot to one it doesn't send.
+    const carried = new Set(ordered.map(({ pos }) => pos));
+
     let keptImages = 0;
     let keptImageBytes = 0;
-    for (const { idx, pos } of ordered) {
-      const entry = entries[idx];
+    /** Whether the policy keeps this image, counting it live if so. */
+    const keeps = (image: ContentBlock, pos: number): boolean => {
       const tooDeep = depthTokens > 0 && (pos < 0 || pos < stripStart);
       const belowMark = pos >= 0 && this.belowImageWatermark(messages[pos]!.sequence);
+      const blockBytes = inlineImageBytes(image);
+      const overCount = maxLive > 0 && keptImages >= maxLive;
+      const overBytes = maxLiveBytes > 0 && keptImageBytes + blockBytes > maxLiveBytes;
+      if (belowMark || tooDeep || overCount || overBytes) return false;
+      keptImages++;
+      keptImageBytes += blockBytes;
+      return true;
+    };
+    // The newest stored position not yet passed: before each entry, the
+    // images of the messages newer than it that no entry sends are counted,
+    // at their own positions, newest-first, as the estimate counts them.
+    let next = messages.length - 1;
+    for (const { idx, pos } of ordered) {
+      for (; opts.asEstimated && pos >= 0 && next > pos; next--) {
+        if (carried.has(next)) continue;
+        for (const image of imagesIn(messages[next]!.content)) keeps(image, next);
+      }
+      const entry = entries[idx];
       const bucket = bucketAt(pos);
       // Every image the entry carries, nested in a tool_result included, in
       // the order postStripEstimates and the watermark count them. A block
       // is copied only when an image in it goes, and the raw forms an edited
       // block carried are released, so a replay can't bring the image back.
       entry.content = replaceImages(entry.content, (image) => {
-        const blockBytes = inlineImageBytes(image);
-        const overCount = maxLive > 0 && keptImages >= maxLive;
-        const overBytes = maxLiveBytes > 0 && keptImageBytes + blockBytes > maxLiveBytes;
-        if (belowMark || tooDeep || overCount || overBytes) {
-          // Stats-neutral (2026-07-12): every budgeting site now tallies at
-          // POST-STRIP prices (see postStripEstimates), so the bucket never
-          // charged this image at full weight — reclaiming here would
-          // double-decrement. The strip pass only swaps the block.
-          void bucket;
-          void placeholderTokens;
-          return true;
-        }
-        keptImages++;
-        keptImageBytes += blockBytes;
-        return false;
+        if (keeps(image, pos)) return false;
+        // Stats-neutral: the bucket stays as its path tallied it (see the
+        // doc above). selectAdaptive tallies at post-strip prices, so
+        // reclaiming here would double-decrement there. The strip pass only
+        // swaps the block.
+        void bucket;
+        return true;
       }, AutobiographicalStrategy.IMAGE_PLACEHOLDER);
     }
   }
@@ -13171,7 +13230,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Post-strip token estimate per message index (2026-07-12 tail-starvation
-   * fix). Mirrors `applyImageStripping`: an image beyond the `maxLiveImages`
+   * fix). Mirrors `applyImageStripping` as `selectAdaptive` asks for it
+   * (`asEstimated`): an image beyond the `maxLiveImages`
    * newest (counted newest-first) or deeper than `imageStripDepthTokens` of
    * the store's (calibrated) estimate from the live end renders as a placeholder — so every place
    * that BUDGETS messages (recent-window walk-back, head/tail sums, middle
@@ -13204,16 +13264,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const out = new Array<number>(messages.length);
     const stripActive = stripDepth > 0 || maxLive > 0 || maxLiveBytes > 0;
     if (stripActive) this.maybeAdvanceImageWatermark(store);
-    const placeholderTokens = Math.ceil(AutobiographicalStrategy.IMAGE_PLACEHOLDER.length / 4);
+    // The placeholder as the store prices it, calibrated, by its own text
+    // estimator: the price of the block that replaces a stripped image.
+    const placeholderPrice = store.estimateTokens(
+      { content: [{ type: 'text', text: AutobiographicalStrategy.IMAGE_PLACEHOLDER }] } as unknown as StoredMessage,
+    );
     // `store.estimateTokens` prices every block at round(raw × calibration);
-    // the stripped image's share must come off at that SAME price. Subtracting
-    // the uncalibrated 1600 drove image-only messages NEGATIVE whenever the
-    // calibration multiplier sat below ~0.995 (0.93 → 1488 − 1591 = −103),
-    // which kv-unified's canonical-forest check then rejects on every compile
-    // ("chunk N has invalid raw cost -111") — a hard-down that cannot heal,
-    // since calibration only moves after a successful call.
+    // the stripped image's share must come off at that SAME price
+    // (strippedImageSaving). Subtracting the uncalibrated 1600 drove
+    // image-only messages NEGATIVE whenever the calibration multiplier sat
+    // below ~0.995 (0.93 → 1488 − 1591 = −103), which kv-unified's
+    // canonical-forest check then rejects on every compile ("chunk N has
+    // invalid raw cost -111") — a hard-down that cannot heal, since
+    // calibration only moves after a successful call.
     const calibration = store.getTokenCalibration?.() ?? 1;
-    const calibrated = (tokens: number) => Math.round(tokens * (Number.isFinite(calibration) && calibration > 0 ? calibration : 1));
     let liveImagesSeen = 0;
     let liveImageBytes = 0;
     // Depth from the newest message, this one included, in the store's
@@ -13233,10 +13297,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const beyondBytes = maxLiveBytes > 0 && liveImageBytes + bytes > maxLiveBytes;
           const belowMark = this.belowImageWatermark(messages[i].sequence);
           if (belowMark || beyondDepth || beyondCount || beyondBytes) {
-            // As MessageStore prices it: a generated image at 1,600 whatever it
-            // carries, an image at its stamp or 1,600.
-            const imgEst = b.type === 'generated_image' ? 1600 : (b as { tokenEstimate?: number }).tokenEstimate ?? 1600;
-            est -= Math.max(0, calibrated(imgEst) - calibrated(placeholderTokens));
+            est -= strippedImageSaving(b, placeholderPrice, calibration);
           } else {
             liveImagesSeen++;
             liveImageBytes += bytes;
