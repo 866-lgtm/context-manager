@@ -1631,9 +1631,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * call whose synchronous start finds the branch gone can clear it with the
    * mirrors first (requireLoadedBranch does unless an initializer is still
    * current), and pendingCompression is then set with nothing recorded
-   * beside it until tick's finally.
+   * beside it until tick's finally. A chunk's record is marked `skipped`
+   * when its call skips it for the quarantine, making no model call; the
+   * call still yields a macrotask before tick's finally.
    */
-  protected pendingCompressionWork: { chunk: Chunk } | { sourceIds: readonly string[] } | null = null;
+  protected pendingCompressionWork: { chunk: Chunk; skipped?: true } | { sourceIds: readonly string[] } | null = null;
   protected compressionQueue: number[] = [];
   /** Once per source chunk on the loaded branch, across queue rebuilds:
    *  cleared with the other branch mirrors, so another branch warns afresh. */
@@ -4109,10 +4111,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * provider answered: the canonical, for the variants after a refusal or
    * an incomplete answer and for the canonical's hoist after a refusal, and
    * source-only-final, for its own hoist after a refusal. Its count is the
-   * one the family's ladder took, in this process or, kept in the family's
-   * progress, before a restart. Where the base has no count, or the
-   * provider counted only its carrier-stripped copy, the rewrite is admitted
-   * on its own complete bound. Source-only-final and the split parts
+   * one this ladder took, or one the family's progress kept from an earlier
+   * ladder: another strategy's on the same store, or one before a restart.
+   * Where the base has no count, or the provider counted only its
+   * carrier-stripped copy, the rewrite is admitted on its own complete
+   * bound. Source-only-final and the split parts
    * aren't admitted: they send the canonical's chunk, whole
    * (source-only-final sends the canonical's own messages from the chunk
    * on) or in parts, without the recall pairs, and the provider has taken
@@ -6432,9 +6435,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) return;
 
       let quarantineSkipped = false;
-      this.pendingCompressionWork = { chunk };
+      const work: { chunk: Chunk; skipped?: true } = { chunk };
+      this.pendingCompressionWork = work;
       const compression = this.compressChunkHierarchical(chunk, ctx, () => {
         quarantineSkipped = true;
+        // No model call follows, so the work in flight stops counting
+        // (compressionWorkQueued) through the hop below.
+        work.skipped = true;
       }).then(async () => {
         // Quarantine checks build compression contexts too. As in the
         // speculative drain, a macrotask hop keeps those builds from starving
@@ -11254,7 +11261,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * selectHierarchical expands them, and for the work in flight: the
    * messages of the chunk tick took, or the leaves of the merge it runs
    * (pendingCompressionWork). Work in flight that folds nothing doesn't
-   * count, nor does work a compression hold placed since reaches (for a
+   * count, nor does a chunk its call skipped for the quarantine, which makes
+   * no model call, nor work a compression hold placed since reaches (for a
    * chunk, one of its messages held, chunkHasHeldMessage's rule; for a merge,
    * mergeBlockedByHold), since its landing checks the hold and discards what
    * the call returns. Nor does a chunk whose result has landed before the
@@ -11302,20 +11310,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (const leaf of leaves) if (foldable.has(leaf)) return true;
       return false;
     };
-    // The quarantine's projection, read once for the work in flight and the
-    // walk; undefined when it can't be read.
-    let quarantineRead = false;
-    let quarantinedSources: Set<string> | undefined;
-    const readQuarantined = (): Set<string> | undefined => {
-      if (!quarantineRead) {
-        quarantinedSources = this.quarantinedChunkSources();
-        quarantineRead = true;
-      }
-      return quarantinedSources;
-    };
-    // Work in flight counts when it folds something now and no compression
-    // hold placed since reaches it, since its landing checks the hold and
-    // discards what the call returns: a chunk's L1, tick then taking the next
+    // Work in flight counts when it folds something now, its call hasn't
+    // skipped it for the quarantine, and no compression hold placed since
+    // reaches it, since its landing checks the hold and discards what the
+    // call returns: a chunk's L1, tick then taking the next
     // chunk, or a merge's L2, the merge staying at the head, where tick then
     // stops. Otherwise the count goes on to the queue, where a merge in
     // flight is still the head. A pendingCompression with nothing recorded
@@ -11328,13 +11326,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (work === null) return true;
       if ('chunk' in work) {
         // Its result has landed once the chunk is compressed; until then,
-        // chunkHasHeldMessage's rule over its messages. A chunk the
-        // quarantine holds is skipped without a model call, as the walk below
-        // reads it, so it doesn't count while its call yields after the skip.
+        // chunkHasHeldMessage's rule over its messages. A chunk its call
+        // skipped for the quarantine makes no model call, so it doesn't count
+        // while the call yields after the skip.
         const ids = work.chunk.messages.map((m) => m.id);
         const reached = held !== null && ids.some((id) => held.has(id));
-        if (!work.chunk.compressed && !reached && ids.some((id) => foldable.has(id))
-          && !readQuarantined()?.has(sha256Json(ids))) return true;
+        if (!work.skipped && !work.chunk.compressed && !reached && ids.some((id) => foldable.has(id))) return true;
       } else if (!this.mergeBlockedByHold([...work.sourceIds], store, held) && mergeFolds(work.sourceIds)) {
         return true;
       }
@@ -11385,7 +11382,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       (this.hostContext?.tools?.length ?? 0) > 0 ? () => false
         : isToolsLessRefusingSummarizer(this.config.compressionModel ?? '') ? () => true
           : this.requestCarriesToolBlocks(store);
-    const quarantined = readQuarantined();
+    const quarantined = this.quarantinedChunkSources();
     // A chunk that folds nothing frees no room once it has an L1. Tick still
     // takes such a chunk in turn, so the walk goes past it where tick does.
     // Tick takes the queued chunks in order, one a call, and a host's tick

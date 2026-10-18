@@ -65,6 +65,12 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     return work !== null && 'chunk' in work ? work.chunk.messages.map((m) => m.id) : undefined;
   }
 
+  /** Whether the call for the chunk in flight has skipped it for the quarantine, or undefined when no chunk is in flight. */
+  chunkInFlightSkipped(): boolean | undefined {
+    const work = this.pendingCompressionWork;
+    return work !== null && 'chunk' in work ? work.skipped === true : undefined;
+  }
+
   /** Whether the chunk tick is compressing has landed its result (its compressed flag), or undefined when no chunk is in flight. */
   chunkInFlightCompressed(): boolean | undefined {
     const work = this.pendingCompressionWork;
@@ -168,6 +174,15 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   protected compressionWorkQueued(...args: Parameters<AutobiographicalStrategy['compressionWorkQueued']>): boolean {
     this.countedView = args[0];
     return super.compressionWorkQueued(...args);
+  }
+
+  /** Run the moment a call skips its chunk for the quarantine, before the call yields and tick's finally runs. */
+  onQuarantineSkipProbe: (() => void) | undefined;
+
+  protected override compressChunkHierarchical(...args: Parameters<AutobiographicalStrategy['compressChunkHierarchical']>): Promise<void> {
+    const [chunk, ctx, onSkip] = args;
+    const probe = this.onQuarantineSkipProbe;
+    return super.compressChunkHierarchical(chunk, ctx, probe ? () => { onSkip?.(); probe(); } : onSkip);
   }
 
   /** Whether a hierarchical refusal's count would name compression now, over the store view the last refusal read. */
@@ -1163,15 +1178,24 @@ describe('OverBudgetError.clearedBy', () => {
     const { strategy, membrane, drive } = quarantining();
     await withManager(strategy, async (manager) => {
       const queued = await drive(manager);
-      const ticking = manager.tick();
-      // Tick's call skips the chunk without a model call, then yields a macrotask before its finally:
-      // a timer set now fires while the skipped chunk is still the work in flight.
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      assert.deepEqual(strategy.chunkInFlight(), queued[0], 'premise: the skipped chunk is the work in flight');
-      assert.deepEqual((await refusal(manager)).clearedBy, [], 'a chunk the quarantine skips frees no room');
-      assert.deepEqual(strategy.chunkInFlight(), queued[0], 'premise: still in flight when the count was taken');
-      await ticking;
+      // The count while tick's call yields after skipping the chunk, before tick's finally clears the
+      // work in flight: a timer set at the skip fires ahead of the hop, which tick schedules only once
+      // the call returns.
+      const seen: Array<{ inFlight: readonly string[] | undefined; skipped: boolean | undefined; counts: boolean }> = [];
+      strategy.onQuarantineSkipProbe = () => {
+        setTimeout(() => {
+          seen.push({ inFlight: strategy.chunkInFlight(), skipped: strategy.chunkInFlightSkipped(), counts: strategy.countsCompressionWork() });
+        }, 0);
+      };
+      await manager.tick();
+      strategy.onQuarantineSkipProbe = undefined;
+      assert.ok(seen.length >= 1, 'premise: tick took a chunk, which the quarantine skipped');
+      assert.deepEqual(seen[0]!.inFlight, queued[0], 'premise: the first chunk queued');
+      for (const [i, at] of seen.entries()) {
+        assert.deepEqual({ skipped: at.skipped, counts: at.counts }, { skipped: true, counts: false }, `skip ${i}: a chunk its call skipped frees no room while the call yields`);
+      }
       assert.equal(strategy.chunkInFlight(), undefined, 'premise: the call has ended');
+      assert.equal(strategy.countsCompressionWork(), false, 'premise: with nothing in flight, the quarantined chunks queued count nothing');
     }, { membrane });
   });
 
