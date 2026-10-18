@@ -99,12 +99,12 @@ candidate is gone. An entry is valid while its *structure* (the summary's
 level, recall cost, owned leaves and children, composed with every
 descendant's, since a parent's sets are built from its children's), its
 *solve key* (policy terms that enter propagation, the grid, the wall,
-cache relevance) and the *span hash* match; a reused set whose computation
+cache relevance, whether a presentation exists) and the *span hash* match; a reused set whose computation
 needed more labels than the solve's ceiling allows is refused the way a
 fresh computation would be. The span hash is two 32-bit
 lanes of a position-mixed hash over everything a delta reads from a leaf
 (fidelity and continuity bases, accepted level and whether it still matches,
-allowed levels, zone, raw tokens), kept as xor prefix arrays so a span's
+the allowed-level list, zone, raw tokens), kept as xor prefix arrays so a span's
 hash is O(1); the per-solve preparation that fills them is one O(N) pass
 with a small constant (~0.4 µs per leaf).
 

@@ -315,3 +315,91 @@ test('an accepted leaf that is a protected hole keeps its summary from counting 
   assert.deepEqual(subtree.selected.frontier, reference.selected.frontier);
   assert.deepEqual(metrics(subtree.candidates), metrics(reference.candidates));
 });
+
+test('without a grid the engine prunes by dominance across values, as the packed engine does', () => {
+  // 24 leaves in 12 L1 pairs and no buckets: every distinct continuity or
+  // fidelity value kept its own survivor once, and the search exceeded a
+  // ceiling of 1,000 labels where the DAG engines peak at a dozen.
+  const chronicle = new MockChronicle({ recallPairTokens: 40 });
+  for (let i = 0; i < 24; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 100 });
+  for (let i = 0; i < 24; i += 2) chronicle.produceL1([`c${i}`, `c${i + 1}`]);
+  const inputs = inputsOf(chronicle);
+  for (let i = 0; i < inputs.chunks.length; i++) inputs.chunks[i].salience = 0.3 + (i % 7) / 10;
+  const forest = new CanonicalSummaryForest(inputs);
+  const options: ParetoSolveOptions = {
+    maxTokens: 1500, labelCeiling: 1000,
+    policy: { continuityLambda: 50, cacheLambda: 100, continuityScale: 100, cacheScale: 100 },
+  };
+  const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
+  const reference = solver.solve({ ...options, storage: 'objects' });
+  const subtree = solver.solve({ ...options, engine: 'subtree' });
+  assert.ok(reference.feasible && subtree.feasible);
+  assert.deepEqual(subtree.selected.frontier, reference.selected.frontier);
+  assert.deepEqual(metrics(subtree.candidates), metrics(reference.candidates));
+  assert.ok(subtree.propagation!.maxLabelsPerState <= 4 * reference.propagation!.maxLabelsPerState,
+    `peak ${subtree.propagation!.maxLabelsPerState} vs ${reference.propagation!.maxLabelsPerState}`);
+});
+
+test('a presentation appearing elsewhere invalidates the sets of a subtree it does not cover', () => {
+  // Whether a presentation exists decides what new material is: with none,
+  // nothing is an extension; with one that covers other leaves, this
+  // subtree's leaves all are. The per-leaf hash is the same in both cases.
+  const chronicle = buildChronicleWithChain({ chunkCount: 4, tokensPerChunk: 100, mergeThreshold: 2, recallPairTokens: 40 });
+  const inputs = inputsOf(chronicle);
+  const forest = new CanonicalSummaryForest(inputs);
+  const layout = renderLayout(inputs, new SummaryTree(inputs), new Map(inputs.chunks.map((chunk) => [chunk.id, 0])));
+  const base: ParetoSolveOptions = {
+    maxTokens: 400, labelCeiling: 100_000, engine: 'subtree',
+    cache: { immutablePrefixHash: 'p', layout, markers: [{ unitIndex: layout.units.length, offset: layout.totalTokens }] },
+    currentImmutablePrefixHash: 'p',
+    policy: { continuityLambda: 50, cacheLambda: 100, continuityScale: 100, cacheScale: 100 },
+  };
+  const reuse: KvUnifiedReuse = {};
+  const blank = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...base, reuse });
+  assert.ok(blank.feasible);
+  const last = inputs.chunks[inputs.chunks.length - 1];
+  const presentation = { currentSeq: 2, leaves: new Map([[last.id, { level: 0, repHash: `raw:${last.id}`, lastChangedSeq: 1 }]]) };
+  const warm = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...base, presentation, reuse });
+  const cold = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...base, presentation, reuse: {} });
+  const reference = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...base, presentation, engine: 'dag', storage: 'objects' });
+  assert.ok(warm.feasible && cold.feasible && reference.feasible);
+  assert.equal(warm.selected.score, reference.selected.score);
+  assert.deepEqual(warm.selected.frontier, reference.selected.frontier);
+  assert.deepEqual(metrics(warm.candidates), metrics(cold.candidates));
+});
+
+test('a level the bit mask cannot hold still invalidates the memo when its constraint changes', () => {
+  // A chain up to an L31: the allowed-level mask holds levels 0 to 30, so
+  // a constraint that removes only level 31 from one leaf left the
+  // per-leaf hash as it was and the warm solve kept selecting the L31.
+  const chronicle = new MockChronicle({ recallPairTokens: 40 });
+  chronicle.addChunk({ id: 'c0', rawTokens: 100 });
+  chronicle.addChunk({ id: 'c1', rawTokens: 100 });
+  let upper = chronicle.produceL1(['c0', 'c1']);
+  chronicle.recallPairTokens.set(upper.id, 150);
+  for (let level = 2; level <= 31; level++) {
+    upper = chronicle.produceUpper(level, [upper.id]);
+    chronicle.recallPairTokens.set(upper.id, level === 31 ? 20 : level === 30 ? 90 : 150);
+  }
+  // Under a wall of 100 only the L30 (90 tokens) and the L31 (20) fit, and
+  // a hinge at 50 with a steep over-budget penalty makes the L31 the cut.
+  const options: ParetoSolveOptions = {
+    maxTokens: 100, labelCeiling: 100_000, engine: 'subtree',
+    policy: { alpha: 0, budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0, budgetOverLambda: 100_000, cacheLambda: 0, continuityLambda: 0 },
+  };
+  const reuse: KvUnifiedReuse = {};
+  const first = inputsOf(chronicle);
+  const free = new ParetoKvUnifiedPolicySolver(first, new CanonicalSummaryForest(first)).solve({ ...options, reuse });
+  assert.ok(free.feasible);
+  assert.equal(free.selected.frontier.get('c0'), 31, 'the cut uses the L31');
+  // A maximum level of 30 on one leaf removes only the level the mask
+  // cannot hold; a stale set would still offer the L31 cut.
+  chronicle.chunks[0].pinMaxLevel = 30;
+  const second = inputsOf(chronicle);
+  const warm = new ParetoKvUnifiedPolicySolver(second, new CanonicalSummaryForest(second)).solve({ ...options, reuse });
+  const cold = new ParetoKvUnifiedPolicySolver(second, new CanonicalSummaryForest(second)).solve({ ...options, reuse: {} });
+  assert.ok(warm.feasible && cold.feasible);
+  assert.equal(cold.selected.frontier.get('c0'), 30, 'the constraint holds');
+  assert.deepEqual(warm.selected.frontier, cold.selected.frontier, 'the warm solve sees the constraint');
+  assert.deepEqual(metrics(warm.candidates), metrics(cold.candidates));
+});

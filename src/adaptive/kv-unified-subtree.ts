@@ -250,7 +250,6 @@ export class SubtreeMemoSolver {
       ? presentedLeavesByIndex(presentation.leaves, forest, options) as readonly (PresentedLeaf | undefined)[]
       : null;
     const currentSeq = presentation?.currentSeq ?? 0;
-    const allowed = forest.allowedLevelMasks();
     let age = 0;
     const view = new DataView(new ArrayBuffer(8));
     const bits = (value: number): [number, number] => {
@@ -281,11 +280,15 @@ export class SubtreeMemoSolver {
       const [f0, f1] = bits(this.fidelityBase[i]);
       const [c0, c1] = bits(this.continuityBase[i]);
       const [r0, r1] = bits(leaf.rawTokens);
+      // The allowed levels as a list hash, not a bit mask: a mask holds 31
+      // levels and the forest accepts any.
+      let allowed = leaf.allowedLevels.length;
+      for (const level of leaf.allowedLevels) allowed = mix(allowed, level + 1);
       let a = mix(f0 ^ Math.imul(i + 1, 0x9e3779b1), f1 ^ r0);
       a = mix(a, c0 ^ Math.imul(this.previousLevel[i] + 2, 0x85ebca6b));
-      a = mix(a, c1 ^ (allowed[i] << 2 | this.previousMatches[i] << 1 | this.external[i]));
+      a = mix(a, c1 ^ allowed ^ (this.previousMatches[i] << 1 | this.external[i]));
       let b = mix(c1 ^ Math.imul(i + 1, 0xc2b2ae35), f0 ^ r1);
-      b = mix(b, f1 ^ Math.imul(allowed[i], 0x27d4eb2f) ^ (this.previousLevel[i] + 2));
+      b = mix(b, f1 ^ Math.imul(allowed, 0x27d4eb2f) ^ (this.previousLevel[i] + 2));
       b = mix(b, c0 ^ (this.previousMatches[i] << 1 | this.external[i]) ^ leaf.availableLevels.length);
       this.hashA[i + 1] = this.hashA[i] ^ a;
       this.hashB[i + 1] = this.hashB[i] ^ b;
@@ -347,6 +350,9 @@ export class SubtreeMemoSolver {
       p.alpha, p.cacheReadPrice, p.cacheWritePrice, p.continuityRecencyHalfLifeTokens, p.continuityRecencyFloor,
       p.continuityStableHalfLife, p.continuityStableFloor, p.ageBandSteps,
       this.tBucket, this.kBucket, this.fBucket, options.maxTokens, this.cacheRelevant ? 1 : 0,
+      // Whether a presentation exists decides what new material is, even
+      // for a subtree none of whose leaves it covers.
+      options.presentation ? 1 : 0,
     ].join(':');
   }
 
@@ -807,8 +813,11 @@ export class SubtreeMemoSolver {
 
   private keyFor(label: Label): string | number {
     const t = this.tBucket > 0 ? Math.ceil(label.tokens / this.tBucket) : label.tokens;
-    const k = this.kBucket > 0 ? Math.floor(label.continuity / this.kBucket) : `c${label.continuity}`;
-    const f = this.fBucket > 0 ? Math.floor(label.fidelity / this.fBucket) : `f${label.fidelity}`;
+    // An unbucketed dimension is a wildcard, as in the packed engine: the
+    // labels then meet in one group and exact dominance decides between
+    // them, instead of every distinct value keeping its own survivor.
+    const k = this.kBucket > 0 ? Math.floor(label.continuity / this.kBucket) : 'c*';
+    const f = this.fBucket > 0 ? Math.floor(label.fidelity / this.fBucket) : 'f*';
     if (!this.cacheRelevant) return `${t}:${k}:${f}`;
     if (label.cache.intact) {
       const pending = label.pending.length === 0 ? '' :
