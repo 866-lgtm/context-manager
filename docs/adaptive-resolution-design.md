@@ -1062,8 +1062,12 @@ unit identity (siblings share one recall unit). Phase C therefore records
 may hold members below the fold level, and a hardcoded from/to drifts the
 ledger off the render — after which every later accept decision runs on
 corrupt arithmetic (observed: phase C walked an L3 fold all the way back to
-carried while its ledger believed it sat on target). Anyone editing the
-phases is editing against this invariant.
+carried while its ledger believed it sat on target). Each un-fold phase C
+tries prices each leaf it moves where the projection will put it, so the
+accept weighs it there: one level down, or deeper while the summary of the
+leaf's own lineage there is missing, doesn't list it, or is vetoed by a leaf
+below it, down to raw. A revert moves each leaf back from that level. Anyone
+editing the phases is editing against these invariants.
 
 **Memoization contracts** (`1c4c436`, `7f2d5e1`). Three memos are
 correctness-relevant, not just performance: group *eligibility* is memoized

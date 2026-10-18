@@ -517,13 +517,14 @@ test('phase C passes a landing summary that a leaf below it vetoes, as the proje
 // hard-protected, so x, below B, doesn't veto it, for the projection or for
 // phase C: the solve folds c to N, and phase C's un-fold lands c at B, 45
 // tokens against a target of 40, where counting x's veto would have sent c to
-// raw and kept N.
+// raw and kept N. d is 100 tokens, so un-folding C1 never brings the plan
+// closer to its target, whatever order phase C tries its un-folds in.
 test('phase C doesn\'t count a hard-protected leaf below a landing summary as a veto, as the projection doesn\'t', () => {
   const x = message('x', 0, 100, 'A1');
   x.lockedByAgent = true;
   x.currentResolution = 1;
   const { inputs, tree } = store(
-    [x, message('c', 1, 1_000, 'C1'), message('d', 2, 10, 'C1')],
+    [x, message('c', 1, 1_000, 'C1'), message('d', 2, 100, 'C1')],
     [
       summary('A1', 1, ['x'], 10, 'B'), summary('E1', 1, ['c'], 20, 'F2'), summary('C1', 1, ['d'], 5, 'B'),
       summary('B', 2, ['A1', 'E1'], 30, 'N'), summary('F2', 2, ['E1'], 15, 'N'), summary('N', 3, ['F2'], 8),
