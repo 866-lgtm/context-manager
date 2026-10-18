@@ -75,6 +75,7 @@ import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
+import { CAP_OMISSION_TEXT, capContent, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
@@ -134,6 +135,29 @@ const COMPRESSION_MARKER =
 export const COMBINED_RECALL_SEPARATOR_TEXT = '\n\n---\n\n';
 
 /**
+ * The Context Manager's turn between a recall answer and the agent's own raw
+ * turn right after it, in a compression or merge prompt (#116 review, R3-1).
+ * A recall answer is the agent's turn, so the agent's next turn would join
+ * it: `collapseConsecutiveMessages` merges consecutive messages of one
+ * participant, and the formatter merges consecutive messages of one role at
+ * the wire. The summarizer would then read that turn as the end of the memory
+ * it had just recalled, and the answer would no longer be the exact body the
+ * recall-curve variants look for. This turn ends the recall, so the raw turn
+ * after it reads as the conversation going on. Only a request with that
+ * adjacency carries it (`separateRecallAnswers`).
+ */
+export const RECALL_RESUME_TEXT = '[CM] The conversation resumes.';
+
+/** The summary id a `[CM] Recall memory <id>.` header names, or undefined for
+ *  any other message. A recall pair is such a header and the answer after it. */
+function recallHeaderId(message: { participant: string; content: ContentBlock[] }): string | undefined {
+  if (message.participant !== 'Context Manager' || message.content.length !== 1) return undefined;
+  const block = message.content[0];
+  if (block?.type !== 'text') return undefined;
+  return /^\[CM\] Recall memory (.+)\.$/.exec(block.text)?.[1];
+}
+
+/**
  * Retry-only line for tool_use compression rejections. Summarizer requests
  * declare the agent's live tools (the labclaude reasoning_extraction
  * requirement), so a think-first model can answer a mint prompt on-pattern —
@@ -157,10 +181,11 @@ const NO_TOOLS_RETRY_LINE =
 const PLAIN_PROSE_RETRY_LINE =
   '\n\nWrite the memory directly as plain prose — do not wrap it in <thinking> or any other tags; begin immediately with the memory text itself.';
 
-/** Clone a compression request with `line` appended to the final instruction message. */
-function withAppendedInstruction(request: NormalizedRequest, line: string): NormalizedRequest {
-  const messages = request.messages.map((m, i) => {
-    if (i !== request.messages.length - 1) return m;
+/** Messages with `line` appended to the final message's last block, when that
+ *  block is text. */
+function withLineAppended<M extends { content: ContentBlock[] }>(messages: readonly M[], line: string): M[] {
+  return messages.map((m, i) => {
+    if (i !== messages.length - 1) return m;
     const content = m.content.map((block, j) =>
       j === m.content.length - 1 && block.type === 'text'
         ? { ...block, text: block.text + line }
@@ -168,8 +193,15 @@ function withAppendedInstruction(request: NormalizedRequest, line: string): Norm
     );
     return { ...m, content };
   });
-  return { ...request, messages };
 }
+
+/** Clone a compression request with `line` appended to the final instruction message. */
+function withAppendedInstruction(request: NormalizedRequest, line: string): NormalizedRequest {
+  return { ...request, messages: withLineAppended(request.messages, line) };
+}
+
+/** The lines a retry of an L1 compression appends to its instruction. */
+const L1_RETRY_LINES = [NO_TOOLS_RETRY_LINE, PLAIN_PROSE_RETRY_LINE] as const;
 
 const withNoToolsLine = (request: NormalizedRequest): NormalizedRequest =>
   withAppendedInstruction(request, NO_TOOLS_RETRY_LINE);
@@ -390,19 +422,6 @@ function formatReadingMergeInstruction(
     `~${targetTokens} tokens. Output only the body of your consolidation — ` +
     `no preamble.`
   );
-}
-
-/**
- * Surrogate-safe string slice. Avoids cutting between a UTF-16 surrogate pair
- * which would produce invalid JSON ("no low surrogate in string" API errors).
- */
-function safeSlice(str: string, start: number, end: number): string {
-  if (end >= str.length) return str.slice(start);
-  const code = str.charCodeAt(end);
-  if (code >= 0xDC00 && code <= 0xDFFF) {
-    return str.slice(start, end - 1);
-  }
-  return str.slice(start, end);
 }
 
 /**
@@ -765,9 +784,18 @@ function sha256Json(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
 }
 
-/** Sources as readers iterate them: a non-empty list of ids. */
+/**
+ * Sources as readers iterate them: a non-empty list of ids. Every index is
+ * read, since `every` skips an empty slot of a sparse array, which the store
+ * can't write.
+ */
 function isIdList(ids: unknown): ids is string[] {
-  return Array.isArray(ids) && ids.length > 0 && ids.every((id) => typeof id === 'string' && id.length > 0);
+  if (!Array.isArray(ids) || ids.length === 0) return false;
+  for (let i = 0; i < ids.length; i++) {
+    const id: unknown = ids[i];
+    if (typeof id !== 'string' || id.length === 0) return false;
+  }
+  return true;
 }
 
 /** A range as readers dereference it: its first and last message ids. */
@@ -781,6 +809,25 @@ function isReadableRange(range: unknown): range is { first: string; last: string
 /** Text a recall or a merge can carry. */
 function hasSummaryText(summary: SummaryEntry): boolean {
   return typeof summary.content === 'string' && summary.content.trim().length > 0;
+}
+
+/**
+ * Why readers can't use a summary's sources, or above L1 its range, as it
+ * holds them, or null. By the open's predicates, sources must be a non-empty
+ * list of ids at every level, and above L1 the range two ids. The open drops
+ * a summary without them unless another copy has them or, for an L1, the
+ * compressed chunk record naming it does. A write has neither: the summary
+ * was just minted, and the package's L1 writers mark that record only after
+ * the push. An L1's range is its sources' ends, whatever it holds.
+ */
+function unreadableSourcesOrRange(summary: SummaryEntry): string | null {
+  const ids: unknown = summary.sourceIds;
+  const range: unknown = summary.sourceRange;
+  if (!isIdList(ids)) return `its sourceIds is ${JSON.stringify(ids)}, where readers need a non-empty list of ids`;
+  if (summary.level !== 1 && !isReadableRange(range)) {
+    return `its sourceRange is ${JSON.stringify(range)}, where readers need two message ids`;
+  }
+  return null;
 }
 
 /**
@@ -2264,15 +2311,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const loadedLevel = new Map([...copiesById].map(([id, copies]) => [id, (byId.get(id) ?? copies[0]!).level]));
     const notBelow = (summary: SummaryEntry) =>
       summary.sourceIds.some((sourceId) => (loadedLevel.get(sourceId) ?? 0) >= summary.level);
-    for (let changed = true; changed;) {
-      changed = false;
-      for (const [id, summary] of byId) {
-        if (!(summary.level > 1) || (!notBelow(summary) && summary.sourceIds.every((sourceId) => byId.has(sourceId)))) continue;
-        byId.delete(id);
-        (notBelow(summary) ? misplacedIds : ancestorIds).push(id);
-        changed = true;
+    const dropMissingAndMisplaced = (): void => {
+      for (let changed = true; changed;) {
+        changed = false;
+        for (const [id, summary] of byId) {
+          if (!(summary.level > 1) || (!notBelow(summary) && summary.sourceIds.every((sourceId) => byId.has(sourceId)))) continue;
+          byId.delete(id);
+          (notBelow(summary) ? misplacedIds : ancestorIds).push(id);
+          changed = true;
+        }
       }
-    }
+    };
+    dropMissingAndMisplaced();
 
     // A summary has one parent: the first of its own pointers, then its other
     // copies' (`parentId` before the older `mergedInto` in each, as readers
@@ -2288,8 +2338,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // reader sees the one parent that renders the summary. With no parent,
     // every pointer that isn't null is cleared, so the summary renders and
     // merges again. A null pointer counts as none.
+    //
+    // A summary that lists one it isn't the parent of is dropped, and the
+    // summaries naming it go with it, as for any dropped summary. A summary
+    // above L1 covers the messages of each summary it lists, so a summary two
+    // kept summaries list has its messages covered twice, and hierarchical
+    // mode, which shows summaries that have no parent, renders both. Two
+    // instances on one store can merge the same run, since compression
+    // coalesces across instances and merges don't: the run's pointers name
+    // the merge written last, and the other is dropped. Where a crash split
+    // the pointers between the two, each lists a source whose parent is the
+    // other, so both are dropped. A summary that two list and whose pointers
+    // name neither has no parent, so both are dropped and it merges again.
+    // Each summary's parent is chosen before any of these drops, so what is
+    // dropped doesn't depend on which summary the pass reaches first. The
+    // cost: when the pass drops a summary's chosen parent for listing another
+    // summary, the summary's other listers go too, though one of them could
+    // have been its parent, and the summary merges again.
     const reparentedIds: string[] = [];
     const clearedIds: string[] = [];
+    const notParentIds: string[] = [];
     const covers = (pointer: unknown, summary: SummaryEntry): pointer is string => {
       const parent = typeof pointer === 'string' ? byId.get(pointer) : undefined;
       return !!parent && parent.level > summary.level && parent.sourceIds.includes(summary.id);
@@ -2303,12 +2371,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         else listedBy.set(sourceId, [summary]);
       }
     }
-    this.summaries = [...byId.values()].map((summary) => {
+    const parentOf = new Map<string, string | undefined>();
+    for (const summary of byId.values()) {
       const pointers = [summary, ...copiesById.get(summary.id)!]
         .flatMap((copy) => [copy.parentId, copy.mergedInto] as unknown[]);
       const listers = (listedBy.get(summary.id) ?? []).filter((lister) => lister.level === summary.level + 1);
-      const parent = pointers.find((pointer): pointer is string => covers(pointer, summary)) ??
-        (listers.length === 1 ? listers[0]!.id : undefined);
+      parentOf.set(summary.id, pointers.find((pointer): pointer is string => covers(pointer, summary)) ??
+        (listers.length === 1 ? listers[0]!.id : undefined));
+    }
+    for (const [id, summary] of byId) {
+      if (summary.level > 1 && summary.sourceIds.some((sourceId) => parentOf.get(sourceId) !== id)) {
+        byId.delete(id);
+        notParentIds.push(id);
+      }
+    }
+    dropMissingAndMisplaced();
+    this.summaries = [...byId.values()].map((summary) => {
+      // A parent chosen above is the one kept summary that still lists this
+      // one; where the drops took it, nothing kept lists this one.
+      const chosen = parentOf.get(summary.id);
+      const parent = chosen !== undefined && byId.has(chosen) ? chosen : undefined;
       let repaired = summary;
       const edit = () => (repaired === summary ? (repaired = { ...summary }) : repaired);
       if (parent === undefined) {
@@ -2334,7 +2416,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       console.warn(
         `[autobiographical] repaired summary state: removed ${malformed} malformed entr(ies) and deduped ${dupes}; ` +
           `dropped empty [${emptyIds.join(', ')}], with unreadable sources or range [${unreadableIds.join(', ')}], ` +
-          `naming a missing summary [${ancestorIds.join(', ')}], naming one not below it [${misplacedIds.join(', ')}]; ` +
+          `naming a missing summary [${ancestorIds.join(', ')}], naming one not below it [${misplacedIds.join(', ')}], ` +
+          `naming one it isn't the parent of [${notParentIds.join(', ')}]; ` +
           `rebuilt sources or range of ` +
           `[${keptRebuiltIds.join(', ')}]; set the parent of [${reparentedIds.join(', ')}]; cleared ` +
           `the parent pointers of [${clearedIds.join(', ')}], which named no kept parent`,
@@ -2500,8 +2583,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // ============================================================================
 
   /**
-   * Pin a range of messages so they aren't compressed and render raw at
-   * their original position. Returns the pin id.
+   * Pin a range of messages. A pin's bound is its `level`, or without one
+   * its `maxLevel` (`normalizePinLevels`). A raw pin, with no bound or a
+   * bound of 0, keeps the messages out of compression and renders them raw
+   * at their original position. A bound above 0 is read only under
+   * `foldingStrategy: 'kv-stable'` and `'kv-unified'` with
+   * `adaptiveResolution` (`readsPinBounds`): there the range is still
+   * compressed, since only a summary can supply its level, and is held at
+   * `level`, or no deeper than `maxLevel`, as `ProtectedRange` describes.
+   * Anywhere else the range is raw. Where bounds are read and pins overlap at
+   * a message, the bound `ProtectedRange` names holds it
+   * (`resolvedPinBounds`), which can compress a message a raw pin covers.
+   * Returns the pin id.
    */
   pinRange(firstMessageId: string, lastMessageId: string, opts?: PinLevelOptions): string {
     this.requireLoadedBranch('pinRange');
@@ -2521,8 +2614,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Mark a single message as a "document" — semantically a body of
-   * information the agent wants to retain in full. Functionally a
-   * single-message pin with `kind: 'document'`.
+   * information the agent wants to keep. Functionally a single-message pin
+   * with `kind: 'document'`, and `opts` reads as `pinRange`'s: without a
+   * `level` or `maxLevel` the message is kept raw, while `{ maxLevel }` lets
+   * it fold no deeper than that level where the selector reads level bounds.
    */
   markDocument(messageId: string, opts?: PinLevelOptions): string {
     this.requireLoadedBranch('markDocument');
@@ -2839,23 +2934,51 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return out;
   }
 
-  /**
-   * Append a summary to the in-memory list and to the chronicle AppendLog.
-   * Single point so subclasses inherit persistence.
-   */
   /** Sliding-window timestamps of split-stitch sub-calls (compressionSplitMaxCallsPer10Min). */
   protected splitCallTimes: number[] = [];
   /** Accounting of the most recent split-stitch attempt (receipts/tests). */
   /** Aggregate details of the most recent stitched response (receipts/tests). */
   protected lastSplitDetails: NormalizedResponse['details'] | undefined;
-  protected lastSplitAttempted: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; complete: boolean } | undefined;
+  protected lastSplitAttempted: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; cacheCreationTokens?: number; cacheReadTokens?: number; complete: boolean } | undefined;
 
+  /**
+   * Append a summary to the in-memory list and to the chronicle AppendLog.
+   * Single point so subclasses inherit persistence. A summary readers can't
+   * use is refused with an error, and nothing is held or stored: empty text,
+   * `sourceIds` that aren't a non-empty list of ids, or above L1 a
+   * `sourceRange` that isn't two message ids. An L1 is stored with its range
+   * set to its sources' first and last ids, with a warning when it held
+   * another.
+   */
   protected pushSummary(entry: SummaryEntry): void {
     this.requireBranchMutation('pushSummary');
     if (typeof entry.content !== 'string' || entry.content.trim().length === 0) {
       throw new Error(
         `[autobiographical] refusing to persist empty summary ${entry.id} at L${entry.level}`,
       );
+    }
+    // Sources readers can't use, and above L1 a range they can't use, are
+    // refused here, where the code that built the summary is still on the
+    // stack. Persisted, it reaches readers that can't use it until an open
+    // rebuilds or drops it, and by then nothing says where it came from: the
+    // null `sourceIds` that #130 found in a real store has no known writer.
+    const unreadable = unreadableSourcesOrRange(entry);
+    if (unreadable) {
+      throw new Error(
+        `[autobiographical] refusing to persist summary ${entry.id} at L${entry.level}, a bug in the code ` +
+          `that built it: ${unreadable}`,
+      );
+    }
+    // The open rewrites any other range an L1 holds to its sources' ends, so
+    // the write stores that range now, and says what the summary held.
+    const ids = entry.sourceIds;
+    const range = entry.sourceRange as { first?: unknown; last?: unknown } | null | undefined;
+    if (entry.level === 1 && (range?.first !== ids[0] || range?.last !== ids[ids.length - 1])) {
+      console.warn(
+        `[autobiographical] storing summary ${entry.id} at L1 with its sourceRange set to its first and last ` +
+          `source, a bug in the code that built it: it held ${JSON.stringify(range)}`,
+      );
+      entry.sourceRange = { first: ids[0]!, last: ids[ids.length - 1]! };
     }
     this.summaries.push(entry);
     this.store?.appendToStateJson(this.summariesStateId, entry);
@@ -2927,7 +3050,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * point — observed empirically at ~chunk 118 in a 4000-message import.
    *
    * Per-summary +50 token overhead accounts for the "[CM] Recall memory
-   * <id>." question turn that wraps each recall body. Rough but defensive.
+   * <id>." question turn that wraps each recall body, and the resume turn
+   * after it where the agent's own turn follows (RECALL_RESUME_TEXT). Rough
+   * but defensive.
    *
    * Under `recallEnvelope: 'xml'` the answer body also carries the envelope
    * tags, so the estimate prices that summary's ACTUAL envelope string on top
@@ -3017,13 +3142,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let deepEnd = -1;
     let frontierEnd = -1;
     for (let i = 0; i < messages.length - 1; i++) {
-      const m = messages[i]!;
-      if (m.participant !== 'Context Manager' || m.content.length !== 1) continue;
-      const block = m.content[0];
-      if (block?.type !== 'text') continue;
-      const match = /^\[CM\] Recall memory (.+)\.$/.exec(block.text);
-      if (!match) continue;
-      const level = levelById.get(match[1]!);
+      const id = recallHeaderId(messages[i]!);
+      if (id === undefined) continue;
+      const level = levelById.get(id);
       if (level === undefined) continue;
       if (frontierEnd === -1 && i > 0) headEnd = i - 1;
       frontierEnd = i + 1;
@@ -6415,6 +6536,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         sourceRange: { first: messageIds[0], last: messageIds[messageIds.length - 1] },
         created: Date.now(),
         phaseType: chunk.phaseType,
+        // Stamped as an L1 of the same chunk would be, so a merge of
+        // inherited summaries that includes a quiet stretch stays witnessed.
+        ...(this.chunkIsWitnessed(chunk) ? { witnessed: true } : {}),
       };
       this.pushSummary(stub);
       chunk.compressed = true;
@@ -6727,7 +6851,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // bundles (a tool_result in an assistant message rejects the request);
       // for fresh imports the conhost importer splits at ingest time, but
       // already-warmed sessions hit this path. See `normalize-tool-messages.ts`.
-      const split = splitMixedToolMessages(llmMessages);
+      // First each recall answer is kept apart from the agent's own raw turn
+      // after it (RECALL_RESUME_TEXT), so the collapse below can't join them.
+      const split = splitMixedToolMessages(this.separateRecallAnswers(llmMessages));
 
       // Collapse consecutive same-participant messages for API compliance
       const collapsed = this.collapseConsecutiveMessages(split);
@@ -6772,8 +6898,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // replace some with placeholders. The raw's charge against the recall
     // budget also counts a pinned tool block whose partner isn't in the
     // request, which the request drops; the request's own price, of
-    // built.cleaned, doesn't. So the gate errs toward recall. A request
-    // without pins is always attempted, as before.
+    // built.cleaned, doesn't. So the gate errs toward recall. The request is
+    // priced with the longer of the lines a retry appends to the instruction
+    // (withNoToolsLine, withPlainProseLine), so a retry fits too. The
+    // recall-curve variants and the opt-in tool-prose rung aren't priced
+    // here: each is admitted on its own when the ladder reaches it
+    // (compressionAdmission). A request without pins is always attempted, as
+    // before.
     // Otherwise this compression lays history out as if no pin applied,
     // recalling the summaries the pins override, and says so once it goes
     // ahead. Waiting for the pins to fit would stall every later L1 too,
@@ -6783,7 +6914,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let pinsOverBudget: { history: typeof history; requestTokens?: number; contextBudget: number } | undefined;
     if (history.pinnedRawTokens > 0) {
       const contextBudget = this.normalizedCompressionContextBudget();
-      const requestTokens = history.pinnedRawTokens <= recallBudget ? priceRequest(built.cleaned) : undefined;
+      const requestTokens = history.pinnedRawTokens <= recallBudget
+        ? Math.max(...L1_RETRY_LINES.map((line) => priceRequest(withLineAppended(built.cleaned, line))))
+        : undefined;
       if (requestTokens === undefined || requestTokens > contextBudget) {
         pinsOverBudget = { history, requestTokens, contextBudget };
         history = layoutHistory(new Set());
@@ -7102,7 +7235,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }).map((pin) => pin.name ?? pin.id);
       const limit = requestTokens === undefined
         ? `exceeds compressionRecallBudgetTokens (${recallBudget})`
-        : `would bring the request to ~${requestTokens} tokens, over compressionContextBudgetTokens (${contextBudget})`;
+        : `would bring the request to ~${requestTokens} tokens, counting the line a retry adds, over compressionContextBudgetTokens (${contextBudget})`;
       console.warn(
         `autobio: L1 compression of ${chunk.messages.length} message(s) from ${chunkFirstId} recalls the summaries ` +
           `its pins override: the pinned history it would show raw (~${pinned.pinnedRawTokens} tokens in ` +
@@ -7721,7 +7854,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           let lastGood: NormalizedResponse | undefined;
           let calls = 0;
           let inputTokens = 0;
-          const attempted = { calls: 0, refused: 0, errors: 0, inputTokens: 0, outputTokens: 0 };
+          // Logged and persisted whole, so its cache sums appear only once some call has reported them.
+          const attempted: { calls: number; refused: number; errors: number; inputTokens: number; outputTokens: number; cacheCreationTokens?: number; cacheReadTokens?: number } = { calls: 0, refused: 0, errors: 0, inputTokens: 0, outputTokens: 0 };
+          // What the discarded calls (refused, incomplete or empty) reported of the cache.
+          const discardedCache = { cacheCreationTokens: 0, cacheReadTokens: 0, seen: false };
           const succ = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, cacheSeen: false };
           const leafModels = new Set<string>();
           let successfulLeaves = 0;
@@ -7773,10 +7909,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const assessment = this.assessFallbackCompressionResponse(res);
             const trace = attemptTraces[attemptTraces.length - 1]!;
             {
-              const u = (res as { usage?: { inputTokens?: number; outputTokens?: number } } | undefined)?.usage;
+              const r = res as { usage?: { inputTokens?: number; outputTokens?: number }; details?: { usage?: { cacheCreationTokens?: number; cacheReadTokens?: number } } } | undefined;
+              const u = r?.usage;
               attempted.inputTokens += u?.inputTokens ?? 0;
               attempted.outputTokens += u?.outputTokens ?? 0;
-              if (assessment.outcome !== 'valid') attempted.refused++;
+              // Cache counts are in the response's details, as succ reads them.
+              const du = r?.details?.usage;
+              const cacheReported = du?.cacheCreationTokens !== undefined || du?.cacheReadTokens !== undefined;
+              if (cacheReported) {
+                attempted.cacheCreationTokens = (attempted.cacheCreationTokens ?? 0) + (du?.cacheCreationTokens ?? 0);
+                attempted.cacheReadTokens = (attempted.cacheReadTokens ?? 0) + (du?.cacheReadTokens ?? 0);
+              }
+              if (assessment.outcome !== 'valid') {
+                attempted.refused++;
+                if (cacheReported) {
+                  discardedCache.seen = true;
+                  discardedCache.cacheCreationTokens += du?.cacheCreationTokens ?? 0;
+                  discardedCache.cacheReadTokens += du?.cacheReadTokens ?? 0;
+                }
+              }
             }
             if (assessment.outcome === 'valid') {
               trace.outcome = 'success';
@@ -7845,7 +7996,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                   outputTokens: succ.outputTokens,
                   ...(succ.cacheSeen ? { cacheCreationTokens: succ.cacheCreationTokens, cacheReadTokens: succ.cacheReadTokens } : {}),
                   // discardedAttempts exists on newer membrane DetailedUsage; older membranes ignore the extra field.
-                  discardedAttempts: { attempts: attempted.refused + attempted.errors, inputTokens: Math.max(0, attempted.inputTokens - succ.inputTokens), outputTokens: Math.max(0, attempted.outputTokens - succ.outputTokens) },
+                  discardedAttempts: {
+                    attempts: attempted.refused + attempted.errors,
+                    inputTokens: Math.max(0, attempted.inputTokens - succ.inputTokens),
+                    outputTokens: Math.max(0, attempted.outputTokens - succ.outputTokens),
+                    // Present once some discarded call reported cache counts, as the stitched
+                    // usage's are once some successful leaf did.
+                    ...(discardedCache.seen ? { cacheCreationTokens: discardedCache.cacheCreationTokens, cacheReadTokens: discardedCache.cacheReadTokens } : {}),
+                  },
                 } as NormalizedResponse['details']['usage'],
                 timing: { totalDurationMs: Date.now() - splitStart, attempts: attempted.calls },
                 // One identity only when EVERY successful leaf reported one and they all agree;
@@ -8804,8 +8962,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }],
     });
 
-    // Same bundled-tool-cycle defense as compressChunkHierarchical.
-    const split = splitMixedToolMessages(llmMessages);
+    // Same bundled-tool-cycle defense as compressChunkHierarchical, after the
+    // same separation of recall answers from the agent's raw turns: an L2
+    // target, or the raw middle, follows the last ladder answer.
+    const split = splitMixedToolMessages(this.separateRecallAnswers(llmMessages));
     const collapsed = this.collapseConsecutiveMessages(split);
     const cleaned = stripUnpairedToolBlocks(collapsed);
 
@@ -9040,8 +9200,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Append the new merged entry first, then mark sources. Persist each
       // mergedInto edit individually so chronicle reflects the same shape as
       // the in-memory mirror. (If the process crashes mid-loop, restart sees
-      // the new entry plus a partial set of marked sources; un-marked sources
-      // would re-trigger a merge — accept the rare duplicate over data loss.)
+      // the new entry plus a partial set of marked sources, and the open makes
+      // the new entry the parent of each unmarked one, as the one summary a
+      // level up that lists it, unless another instance's merge lists it too:
+      // see loadPersistedState.)
       this.pushSummary(newEntry);
 
       for (const source of sources) {
@@ -9872,14 +10034,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // eviction becomes reachable at all. Eviction is therefore a symptom of
     // plan drift, not of scarce foldable material: the picker either reaches
     // its target or raises OverBudgetError. Record the plan so rsEnd() can
-    // compare it against what was actually committed.
+    // compare it against what was actually committed (its other figures,
+    // `_plannedMeta`, once the changes are staged below).
     this._plannedTokens = result.finalTokens;
-    this._plannedMeta = {
-      budgetMet: result.budgetMet,
-      exhausted: result.exhausted,
-      moves: result.moves,
-      solver: picker.solverName,
-    };
 
     // Every trust-region override is loud (design §13.4) — silence was half
     // of the 2026-07-12 incident.
@@ -9905,7 +10062,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // appended after them). A change is staged against the saved level, not
     // the level the chunk was planned from, which is lower when the saved
     // level's summary is gone (reachableLevel), so the commit saves what this
-    // compile presents. A locked chunk keeps its saved level.
+    // compile presents. A locked chunk keeps its saved level. A dry run stages
+    // them too, so that its `moves` counts them, and commits none (below).
     for (let k = 0; k < middleChunkCount; k++) {
       const chunk = pickerChunks[k];
       const id = chunk.id;
@@ -9913,8 +10071,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (level > deepestLevel) deepestLevel = level;
       if (this.locked.has(id)) continue;
       const prev = this.resolutions.get(id) ?? 0;
-      if (prev !== level && !dryRun) pendingResolutionChanges.push([id, level]);
+      if (prev !== level) pendingResolutionChanges.push([id, level]);
     }
+    // `moves` reports the changes staged here, the saved levels the commit
+    // writes. The picker's own count compares each chunk with the level it was
+    // planned from, so it counts a locked chunk that a pin renders at another
+    // level, though the commit never stores that, and misses a chunk whose
+    // saved level's summary is gone, though the commit stores its new level
+    // (#195).
+    this._plannedMeta = {
+      budgetMet: result.budgetMet,
+      exhausted: result.exhausted,
+      moves: pendingResolutionChanges.length,
+      solver: picker.solverName,
+    };
     if (plan?.override) {
       console.error(
         `[kv-escalation] override=${plan.override} perturbation=${plan.perturbation}` +
@@ -10013,7 +10183,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         middleChunkCount: pickerChunks.length - headMessageIds.size - tailMessageIds.size,
         deepestLevel,
         resolutions: Object.fromEntries(result.finalResolutions),
-        moves: result.moves,
+        moves: pendingResolutionChanges.length,
         producedCount: result.produced.length,
       };
     }
@@ -12245,8 +12415,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * As-of perspective pin: true when the chunk's messages are all strictly
    * before the agent's first own turn (witnessedBeforeSequence) — inherited
    * record, not lived experience. Drives both the L1 instruction and the
-   * `witnessed` stamp on the minted summary (which merge consolidation
-   * honors and propagates upward).
+   * `witnessed` stamp on the minted summary or quiet-stretch stub (which
+   * merge consolidation honors and propagates upward).
    */
   protected chunkIsWitnessed(chunk: Chunk): boolean {
     const pin = this.config.witnessedBeforeSequence;
@@ -12637,8 +12807,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * recent window AND not kept raw by a pin. Returns messages from
    * [0, headStart) ∪ [headEnd, recentStart) minus any position a pin or
    * document mark keeps raw (forceRawPinPositions). A pin with a positive
-   * level or cap, under the strategies that honor one, is compressible: it
-   * renders at a level, which only a summary can supply.
+   * level or cap is compressible where bounds are read (kv-stable and
+   * kv-unified, with adaptive resolution: readsPinBounds): it renders at a
+   * level, which only a summary can supply.
    */
   protected getCompressibleMessages(store: MessageStoreView, exclude?: Uint8Array): StoredMessage[] {
     const messages = store.getAll();
@@ -14271,6 +14442,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Put the Context Manager's resume turn (RECALL_RESUME_TEXT) right after
+   * each recall answer that the agent's own raw turn follows: in the L1
+   * prompt, an opened chunk or the raw middle that starts with the agent's
+   * turn; in a merge prompt, an L2 target or the raw middle that does. A
+   * recall answer is the message after a `[CM] Recall memory <id>.` header
+   * (recallHeaderId), and it is the agent's, so a next message of the
+   * answer's participant is what the collapse below joins to it, and the
+   * formatter at the wire. The turn goes in when the message right after the
+   * answer is of that participant, or the first one after it that has any
+   * content is: the request drops a message with no content left once its
+   * unpaired tool blocks and empty text are stripped (stripUnpairedToolBlocks,
+   * stripEmptyTextBlocks and the filter after them), which would bring the
+   * two together. Splitting and collapsing don't change which tool blocks are
+   * paired, so they're stripped here as the request will strip them. Any
+   * other sequence comes back with the same messages.
+   */
+  protected separateRecallAnswers(
+    messages: Array<{ participant: string; content: ContentBlock[] }>,
+  ): Array<{ participant: string; content: ContentBlock[] }> {
+    const carried = stripUnpairedToolBlocks(messages);
+    const hasContent = (i: number): boolean => stripEmptyTextBlocks(carried[i]!.content).length > 0;
+    const separated: Array<{ participant: string; content: ContentBlock[] }> = [];
+    messages.forEach((message, i) => {
+      separated.push(message);
+      if (i === 0 || recallHeaderId(messages[i - 1]!) === undefined) return;
+      let withContent = i + 1;
+      while (withContent < messages.length && !hasContent(withContent)) withContent++;
+      if (messages[i + 1]?.participant === message.participant || messages[withContent]?.participant === message.participant) {
+        separated.push({ participant: 'Context Manager', content: [{ type: 'text', text: RECALL_RESUME_TEXT }] });
+      }
+    });
+    return separated;
+  }
+
+  /**
    * Collapse consecutive messages from the same participant into single messages.
    * Required because Claude API rejects consecutive same-role messages.
    */
@@ -14383,9 +14589,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Truncate a message's content blocks to fit within maxMessageTokens.
-   */
-  /**
    * Build the assistant-turn content for a replayed summary. When the
    * entry carries verbatim `responseContent` (signed thinking /
    * redacted_thinking + text in provider order), replay it unmutated —
@@ -14480,7 +14683,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * last makes opener and closer survive every cap by construction.
    *
    * The envelope is therefore NOT charged against `maxMessageTokens`; a
-   * capped enveloped answer runs over the cap by its own tag text. That is
+   * capped enveloped answer runs over the cap by its own tag text, and the
+   * legacy combined answer under `recallEnvelope: 'xml'` also by the omission
+   * marker it writes after its last envelope when summaries that hold anything
+   * are left out, unless that answer's own cut already wrote it inside its
+   * envelope. That is
    * the same soft-cap overshoot the truncator already takes for granted — it
    * appends its `[truncated — original was N tokens]` marker AFTER spending
    * the budget — and the envelope is priced where the accounting is load
@@ -14499,16 +14706,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * selected summary concatenated into one assistant turn with `---`
    * separators, under a single `maxMessageTokens` cap.
    *
-   * With the envelope off this is the pre-existing expression, byte for byte:
-   * concatenate, then truncate the whole turn. Those bytes are a
-   * compatibility promise and the flat truncation is what produces them.
+   * With the envelope off this is the pre-existing expression: concatenate,
+   * then truncate the whole turn, so its bytes are exactly what the flat
+   * truncator writes. That is the compatibility promise. The truncator now
+   * writes an omission marker where it drops text, so a capped answer differs
+   * from earlier versions' by that one block.
    *
    * With the envelope on the cap is spent summary by summary instead, each
    * summary's prose truncated against what the earlier ones left and then
    * enveloped intact. The emission shape matches the flat truncator's —
-   * whole summaries until the budget runs out, a truncation marker on the one
-   * that straddles it, nothing after — but a summary that would have been cut
-   * in half is dropped whole rather than emitted with a torn envelope.
+   * whole summaries until the budget runs out, the one that straddles it
+   * with its prose cut inside an intact envelope (a truncation suffix on the
+   * block the cap crosses, or the omission marker where the cap ends on a
+   * block boundary), then one omission marker for what the cap left out,
+   * unless that answer's own cut already wrote it. The answer ends at the
+   * summary where the cap ended, whatever budget the blocks the cap left out
+   * didn't spend, and a summary isn't admitted where the cap reaches it and
+   * leaves nothing of it that holds anything, as for a prose that holds
+   * nothing. An answer the cap admits no summary to is the marker alone.
+   * Before the cap ends, a summary is left out
+   * whole only where the budget can't pay for the separator in front of it
+   * and a token of its prose, below.
    *
    * The drop-whole boundary sits at the SEPARATOR: a summary is admitted only
    * when the remaining budget can pay for the separator in front of it AND buy
@@ -14527,8 +14745,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * The combined recall answer together with what of it survived the cap:
-   * each summary whose prose reached the answer, marked `partial` when its
-   * prose was cut. A summary the cap dropped entirely is not listed, so the
+   * each summary whose prose reached the answer, marked `partial` when the
+   * cap took something of it that held anything. A summary the cap dropped
+   * entirely is not listed, nor one that lost something that held anything
+   * while only text blocks of it that hold nothing reached the answer, so the
    * rendered layout never claims history is represented by a summary the
    * resident was not shown.
    */
@@ -14564,35 +14784,67 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return { content: out, refs: summaries.map((s) => ({ id: s.id, level: s.level })) };
       }
       // truncateContent keeps blocks in order: text until the budget runs
-      // out (the straddling block cut, later text dropped), and every
-      // non-text block (a tool_result possibly shortened). Align the two
-      // arrays: an unchanged block is the same object, a cut or shortened one
-      // is a new block of the same type in the same position, and a dropped
-      // one has no counterpart. A summary is whole when all its blocks
-      // survived unchanged, partial when any of them survived at all —
-      // including a retained thinking block whose text was dropped — and
-      // absent otherwise.
-      const kept = new Map<number, { whole: number; touched: number; total: number }>();
+      // out (the straddling block cut), the omission marker where the first
+      // dropped text block that held anything was, a text block that holds
+      // nothing (isEmptyTextBlock) only before the cap, as it was or as a
+      // copy that gave up a raw form, and every
+      // non-text block, before the cap or past it (a tool_result possibly
+      // shortened). Align the two arrays: an unchanged block is the same
+      // object, and a cut, shortened or copied one (a copy that gave up a
+      // raw form) is a new block of the same type in the same position. A
+      // block that holds nothing loses nothing either way: kept, it may be
+      // such a copy, which holds nothing too, and left out across or past
+      // the cap, it has no counterpart. It's kept only where every block
+      // before it was kept, as it was or as a copy, since across the cap the
+      // cap ends there, so a counterpart that holds nothing is never a later
+      // block's. The marker shows none of the block it replaces, and any
+      // other dropped block has no counterpart. A text block that holds
+      // nothing shows the resident nothing, so it counts as neither shown nor
+      // lost. A block that holds anything is lost unless it reached the
+      // answer as it was: a cut, or a copy that gave up its raw form and so no
+      // longer replays as its item, loses something. A summary is listed whole
+      // when it lost nothing and some block of it reached the answer, so one
+      // that holds nothing is listed whole before the cap and absent once the
+      // cap left it out. It's listed partial when it lost something and a
+      // block of it that holds anything reached the answer, as it was, cut or
+      // as a copy, including a retained thinking block whose text was
+      // dropped. Otherwise it's absent: one the marker alone replaced, or of
+      // which only blocks that hold nothing came before the marker, shows the
+      // resident none of its history. The marker is told apart by identity
+      // (isCapMarker), so a block whose text equals it, a copy included,
+      // counts as the block it is.
+      const kept = new Map<number, { whole: number; reached: number; shown: number; total: number }>();
       let j = 0;
       content.forEach((block, i) => {
         const owner = owners[i]!;
-        const tally = owner >= 0 ? (kept.get(owner) ?? { whole: 0, touched: 0, total: 0 }) : null;
+        const tally = owner >= 0 ? (kept.get(owner) ?? { whole: 0, reached: 0, shown: 0, total: 0 }) : null;
         if (tally) tally.total++;
         const counterpart = out[j];
+        const blank = isEmptyTextBlock(block);
         if (counterpart === block) {
           j++;
-          if (tally) { tally.whole++; tally.touched++; }
+          if (tally) { tally.whole++; tally.reached++; if (!blank) tally.shown++; }
+        } else if (blank) {
+          if (counterpart && isEmptyTextBlock(counterpart)) {
+            j++;
+            if (tally) tally.reached++;
+          }
+          if (tally) tally.whole++;
         } else if (counterpart && counterpart.type === block.type) {
           j++;
-          if (tally) tally.touched++;
+          if (tally && !isCapMarker(counterpart)) { tally.reached++; tally.shown++; }
         }
         if (tally) kept.set(owner, tally);
       });
       const refs: Array<{ id: string; level: number; partial?: true }> = [];
       summaries.forEach((s, idx) => {
         const tally = kept.get(idx);
-        if (!tally || tally.touched === 0) return;
-        refs.push(tally.whole === tally.total ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
+        if (!tally) return;
+        if (tally.whole === tally.total) {
+          if (tally.reached > 0) refs.push({ id: s.id, level: s.level });
+        } else if (tally.shown > 0) {
+          refs.push({ id: s.id, level: s.level, partial: true });
+        }
       });
       return { content: out, refs };
     }
@@ -14603,20 +14855,53 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       { content: [{ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT }] } as StoredMessage,
     );
     let remainingTokens = maxTokens;
+    let admitted = 0;
+    let omissionMarked = false;
     for (const [idx, s] of summaries.entries()) {
       const separatorTokens = idx > 0 ? separatorCost : 0;
       const proseBudget = remainingTokens - separatorTokens;
       if (maxTokens > 0 && proseBudget <= 0) break;
       const prose = this.liveWindowAnswerProse(s);
       const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
+      // The cap reached this summary and left nothing of it that shows: every
+      // block that survived holds nothing, besides the truncator's marker.
+      // That's so for a prose that holds nothing, which comes back as the
+      // marker alone, and for one whose only blocks before the cap hold
+      // nothing. It isn't admitted, and the answer ends at it.
+      if (capped !== prose && capped.every((b) => isEmptyTextBlock(b) || isCapMarker(b))) break;
+      // Whether this answer, so far the last, carries the truncator's own
+      // marker, told apart by identity from a block of the prose whose text
+      // equals it (isCapMarker).
+      omissionMarked = capped.some(isCapMarker);
       if (idx > 0) content = separated(content);
       content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
-      refs.push(capped === prose ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
+      refs.push(cappedWhole(prose, capped) ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
+      admitted++;
+      // The cap ended inside this answer, where it cut, dropped or left out a
+      // block, so the answer ends with it: no later summary is admitted,
+      // whatever budget the blocks it left out didn't spend.
+      if (capped !== prose) break;
       if (maxTokens > 0) {
         remainingTokens -=
           this.estimateTextOnlyTokens({ content: capped } as StoredMessage) + separatorTokens;
       }
     }
+    // Summaries the cap left out are said once, as the flat truncator says
+    // what it drops: after the last answer, whose trailing reasoning gives up
+    // its id first, as it does before a separator. Not again if the last
+    // answer's own prose already carries the marker, and not for summaries
+    // whose prose held nothing, which a store can still keep from before
+    // empty summaries were refused.
+    const leftOutContent = summaries.slice(admitted)
+      .some((s) => this.liveWindowAnswerProse(s).some((b) => !isEmptyTextBlock(b)));
+    if (leftOutContent && !omissionMarked) {
+      content = [...releaseTrailingReasoning(content), { type: 'text', text: CAP_OMISSION_TEXT }];
+    }
+    // The cap admitted no summary: nothing of the first that holds anything
+    // survived it, and the cap ended there. The answer is the marker alone, as
+    // the truncator gives content that holds nothing, so it's never empty, and
+    // it lists none.
+    if (admitted === 0 && summaries.length > 0) content = [{ type: 'text', text: CAP_OMISSION_TEXT }];
     return { content, refs };
   }
 
@@ -14629,7 +14914,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
     return {
       content: wrapRecallAnswerContent(capped, summary, this.config.recallEnvelope),
-      refs: [capped === prose ? { id: summary.id, level: summary.level } : { id: summary.id, level: summary.level, partial: true }],
+      refs: [cappedWhole(prose, capped) ? { id: summary.id, level: summary.level } : { id: summary.id, level: summary.level, partial: true }],
     };
   }
 
@@ -14671,63 +14956,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Cut a message's text and string tool-result content to `maxTokens`. A cut
-   * or dropped block gives up its raw replay form, along with every block
-   * sharing it, so the cut reaches the wire (see raw-forms.ts).
+   * Cut a message's text and string tool-result content to `maxTokens`, with
+   * the cap both strategies share (`capContent`, message-cap.ts). Whether it
+   * looks is decided by `estimateTextOnlyTokens`, which counts thinking and
+   * tool input too, so a thinking block alone can make it look.
    */
   protected truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
-    if (maxTokens <= 0) return content;
-    const est = this.estimateTextOnlyTokens({ content } as StoredMessage);
-    if (est <= maxTokens) return content;
-
-    const maxChars = maxTokens * 4;
-    const result: ContentBlock[] = [];
-    let remaining = maxChars;
-
-    for (const block of content) {
-      if (block.type === 'text') {
-        if (remaining <= 0) continue;
-        if (block.text.length <= remaining) {
-          result.push(block);
-          remaining -= block.text.length;
-        } else {
-          result.push({
-            type: 'text',
-            text: safeSlice(block.text, 0, remaining) + '\n\n[truncated — original was ' +
-              Math.ceil(block.text.length / 4) + ' tokens]',
-          });
-          remaining = 0;
-        }
-      } else if (block.type === 'tool_result') {
-        // tool_result blocks MUST always be included — the Anthropic API requires
-        // every tool_use to have a matching tool_result.  Dropping one causes a 400.
-        if (typeof block.content === 'string') {
-          const text = block.content;
-          if (remaining <= 0) {
-            // Budget exhausted — include with minimal content to preserve pairing
-            result.push({
-              ...block,
-              content: '[content omitted: this message reached its token limit before this result]',
-            });
-          } else if (text.length > remaining) {
-            result.push({
-              ...block,
-              content: safeSlice(text, 0, remaining) + '\n\n[truncated — original was ' +
-                Math.ceil(text.length / 4) + ' tokens]',
-            });
-            remaining = 0;
-          } else {
-            result.push(block);
-            remaining -= text.length;
-          }
-        } else {
-          result.push(block);
-        }
-      } else {
-        result.push(block);
-      }
-    }
-
-    return releaseEditedRawForms(content, result);
+    return capContent(content, maxTokens, (blocks) => this.estimateTextOnlyTokens({ content: blocks } as StoredMessage));
   }
 }

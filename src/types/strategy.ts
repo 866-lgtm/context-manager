@@ -328,7 +328,11 @@ export interface PreviewResult {
   deepestLevel: number;
   /** Fold level per chunk the layout would settle on. */
   resolutions: Record<string, number>;
-  /** Chunks whose resolution this layout would change vs the carried state. */
+  /** Chunks whose saved fold level this layout changes, which are the levels
+   *  a compile that commits this layout saves. They're counted whether or not
+   *  the layout fits. A locked chunk keeps its saved level, so it isn't
+   *  counted. The picker's own `moves` compares each chunk with the level it
+   *  was planned from instead. */
   moves: number;
   /** Summaries the layout needs that do not exist yet — real LLM work. */
   producedCount: number;
@@ -431,9 +435,15 @@ export function isResettableStrategy(s: ContextStrategy): s is ResettableStrateg
 }
 
 /**
- * Strategy that supports protected ranges (pins + documents).
- * Pinned ranges are excluded from compression and render raw at their
- * original chronological position. Implemented by AutobiographicalStrategy.
+ * Strategy that supports protected ranges (pins + documents). A pin's bound
+ * is its `level`, or without one its `maxLevel`. A range pinned raw, with no
+ * bound or a bound of 0, is excluded from compression and renders raw at its
+ * original chronological position. Where the selector reads level bounds
+ * (`foldingStrategy: 'kv-stable'` and `'kv-unified'`, with
+ * `adaptiveResolution`), a bound above 0 leaves the range compressible, and
+ * where pins overlap at a message, the bound `ProtectedRange` names holds
+ * it, so a raw pin there might not keep it raw. Implemented by
+ * AutobiographicalStrategy.
  */
 export interface PinnableStrategy extends ContextStrategy {
   pinRange(firstMessageId: string, lastMessageId: string, opts?: PinLevelOptions): string;
@@ -663,6 +673,10 @@ export interface RenderStats {
     delta: number;
     budgetMet: boolean;
     exhausted: boolean;
+    /** Chunks whose saved fold level this compile changed, or for a dry run
+     *  would change. A locked chunk keeps its saved level, so it isn't
+     *  counted. The picker's own `moves` compares each chunk with the level it
+     *  was planned from instead. */
     moves: number;
     /** Name of the fold solver that planned this compile (e.g. 'kv-stable',
      *  'flat-profile'). Surfaces the policy actually in force — a config
@@ -1075,8 +1089,9 @@ export interface AutobiographicalConfig {
    * open, this one included, and persists the repair: it keeps one of a
    * summary's duplicate copies, rebuilds sources and ranges it can recover,
    * drops summaries that are empty, whose sources or range it can't recover,
-   * or that list a summary at their own level or above, and the summaries
-   * above them, resolves each summary's parent pointers, and
+   * that list a summary at their own level or above, or that list one they
+   * aren't the parent of, and the summaries above them, resolves each
+   * summary's parent pointers, and
    * reopens or removes the chunk records and queued merges that name a
    * summary it doesn't keep. It also stores the summary-id counter when the
    * stored one trails the ids the store holds.
@@ -1274,13 +1289,16 @@ export interface AutobiographicalConfig {
    *
    * It also decides whether an L1 prompt shows pinned history raw: with the
    * raw that pins add, the canonical request must fit it, priced as the
-   * message store prices each pinned message (its tool blocks included, even
-   * where the request drops one whose partner it lacks, and before the image
-   * cap, which only replaces images), with serialized media priced as the markers
+   * message store prices the messages it would send (after splitting,
+   * collapsing and dropping unpaired tool blocks, before the image cap,
+   * which only replaces images), with serialized media priced as the markers
    * that replace them and thinking as the request carries it (the raw
    * messages' stripped, a recall answer's signed reasoning kept), with the
-   * system prompt, tools and output reserve. Otherwise that compression lays
-   * history out as it would without pins (see
+   * system prompt, tools and output reserve, and with the longer of the lines
+   * the no-tools and plain-prose retries add to its instruction, so either
+   * retry fits too. The tool-prose hoists aren't priced in this decision,
+   * since each is admitted on its own, as above. Otherwise that compression
+   * lays history out as it would without pins (see
    * `compressionRecallBudgetTokens`). A canonical request without pins is
    * still always attempted.
    */
@@ -1557,8 +1575,9 @@ export interface SummaryEntry {
   parentId?: string;
   /**
    * The slice this summarizes is inherited/witnessed record, not the agent's
-   * lived experience (witnessedBeforeSequence pin). Stamped at L1 mint;
-   * merges of all-witnessed sources keep the witnessed voice AND the flag —
+   * lived experience (witnessedBeforeSequence pin). Stamped at L1 mint, and
+   * on a quiet-stretch stub as on an L1 of its chunk; merges of all-witnessed
+   * sources keep the witnessed voice AND the flag —
    * without propagation the consolidation instruction re-first-persons
    * others' lives one level up (observed 2026-07-27: an L3 opening "I
    * remember the full arc of my relationship with Tavy" — another
@@ -1641,13 +1660,17 @@ export function getSummaryParentId(s: SummaryEntry): string | undefined {
 }
 
 /**
- * A range of messages protected from compression. Pins keep a span of raw
- * messages visible at their original position in the rendered context.
+ * A range of messages a pin protects. A pin's bound is its `level`, or
+ * without one its `maxLevel`. A raw pin, with no bound or a bound of 0, keeps
+ * the span raw at its original position in the rendered context and out of
+ * compression. Where the selector reads level bounds, a bound above 0 sets
+ * how far the span folds instead, and where pins overlap at a message, one
+ * bound holds it (see `level`), so a raw pin there might not keep it raw.
  *
  * - `kind: 'pin'` — generic protected range (any first/last span).
  * - `kind: 'document'` — typically a single message containing a body of
- *   information the agent wants to retain in full; semantically identical
- *   to a single-message pin, distinguished by metadata for tooling.
+ *   information the agent wants to keep; semantically identical to a
+ *   single-message pin, distinguished by metadata for tooling.
  */
 export interface ProtectedRange {
   /** Stable id assigned at pin time. */
