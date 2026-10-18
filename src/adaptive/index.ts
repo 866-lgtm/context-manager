@@ -147,6 +147,7 @@ export {
   OverBudgetError,
   UncoveredDropError,
   accountFrontier,
+  type OverBudgetClearedBy,
   type OverBudgetDiagnostics,
   type PickerInputs,
   type PickerResult,

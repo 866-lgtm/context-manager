@@ -54,6 +54,7 @@ async function forest(
   afterAdd?: (cm: ContextManager, ids: string[]) => void,
   content: (i: number, text: string) => unknown[] = (_i, text) => [{ type: 'text', text }],
   participant: (i: number) => string = (i) => (i % 2 ? 'Claude' : 'User'),
+  respond: (call: number) => unknown[] = (call) => [{ type: 'text', text: `Summary #${call}: ordinary events.` }],
 ) {
   const requests: any[] = [];
   let calls = 0;
@@ -66,8 +67,8 @@ async function forest(
         raw: { response: { stop_details: { category: 'reasoning_extraction' } } } };
     }
     if (scripted === 'tool_use') return { stopReason: 'tool_use', content: [], usage: { inputTokens: 500, outputTokens: 10 } };
-    const text = scripted === 'thinking-wrapped' ? '<thinking>a draft</thinking>' : `Summary #${calls}: ordinary events.`;
-    return { stopReason: 'end_turn', content: [{ type: 'text', text }], usage: { inputTokens: 500, outputTokens: 100 } }; } };
+    const content = scripted === 'thinking-wrapped' ? [{ type: 'text', text: '<thinking>a draft</thinking>' }] : respond(calls);
+    return { stopReason: 'end_turn', content, usage: { inputTokens: 500, outputTokens: 100 } }; } };
   const strategy = new AutobiographicalStrategy({ compressionModel: 'm', targetChunkTokens: 200, headWindowTokens: 0, recentWindowTokens: 0,
     autoTickOnNewMessage: false, minChunkCharsForLLM: 0, summaryParticipant: 'Claude', hierarchical: true, mergeThreshold: 6, adaptiveResolution: true,
     ...overrides });
@@ -517,6 +518,130 @@ describe('a pin holds whatever the linkage, and empty summaries keep their old c
     }
     for (const id of l1!.sourceIds) assert.ok(!texts.includes(textOf.get(id)!), `the empty L1's message ${id} isn't replayed raw`);
     cm.close();
+  });
+});
+
+describe('raw pins are priced as the request sends them, serialized media replaced', () => {
+  // A tool round whose result carries a serialized data URL, as a tool's JSON
+  // output does: message 4 calls the tool, message 5 holds its result. A text
+  // block that long would be sharded on ingress; a tool result isn't.
+  const withDataUrl = (n: number, prose = '') => (i: number, text: string) =>
+    i === 4 ? [{ type: 'text', text }, { type: 'tool_use', id: 'media-5', name: 'fetch', input: {} }]
+    : i === 5 ? [{ type: 'tool_result', toolUseId: 'media-5', content: `${text} ${prose}data:image/png;base64,${'A'.repeat(n)}` }]
+    : [{ type: 'text', text }];
+  const toolRound = (i: number) => (i === 4 ? 'Claude' : i === 5 ? 'User' : i % 2 ? 'Claude' : 'User');
+  // History with tool blocks waits for the host's tool definitions.
+  const withTools = (cm: ContextManager, ids: string[]) => {
+    if (ids.length === 1) cm.setToolDefinitions([{ name: 'fetch', description: 'fetch a url', inputSchema: { type: 'object' as const } }]);
+  };
+  const markerFor = (n: number) => `[embedded image/png data URL omitted from compression prompt: ${n} serialized payload characters]`;
+  /** The store's price of the payload alone, as a tool result's content. */
+  const payloadPrice = (cm: ContextManager, n: number): number =>
+    (cm as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore
+      .estimateTokens({ content: [{ type: 'tool_result', toolUseId: 'x', content: 'A'.repeat(n) }] });
+
+  it('a pinned tool result carrying a data URL is spent from the recall budget as its marker', async () => {
+    const { cm, internals, ids, requests } = await forest('media-recall-budget', {}, withTools, withDataUrl(20_000), toolRound);
+    // Half the payload's price: room for the pinned chunk as it is sent, and
+    // not for its payload.
+    internals.config.compressionRecallBudgetTokens = Math.floor(payloadPrice(cm, 20_000) / 2);
+    cm.pinRange(ids[5], ids[5], { name: 'media' });
+    const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
+    assert.ok(request, 'the compression ran');
+    assert.ok(!warnings.some((w) => w.includes('recalls the summaries its pins override')), `the pin is honored: ${JSON.stringify(warnings)}`);
+    const sent = JSON.stringify(request);
+    assert.ok(sent.includes(markerFor(20_000)) && !sent.includes('A'.repeat(4096)), 'the pinned result is raw, its payload replaced');
+    cm.close();
+  });
+
+  it('the same pin is spent from the recall budget: with no room for it, the summaries it overrides are recalled', async () => {
+    const { cm, internals, ids, requests } = await forest('media-recall-none', {}, withTools, withDataUrl(20_000), toolRound);
+    internals.config.compressionRecallBudgetTokens = 1;
+    cm.pinRange(ids[5], ids[5], { name: 'media' });
+    const { warnings } = await captureWarnings(() => nextL1(cm, requests));
+    assert.ok(warnings.some((w) => w.includes('recalls the summaries its pins override')), `the pin costs something: ${JSON.stringify(warnings)}`);
+    cm.close();
+  });
+
+  it('a request whose pinned raw carries a data URL is priced against compressionContextBudgetTokens as sent', async () => {
+    const { cm, internals, ids, requests } = await forest('media-context-budget', {}, withTools, withDataUrl(150_000), toolRound);
+    // The recall budget has room for the payload itself, and the limit is
+    // under any request, so the warning gives the request's price as the gate
+    // reckons it.
+    internals.config.compressionRecallBudgetTokens = 10_000_000;
+    internals.config.compressionContextBudgetTokens = 1;
+    cm.pinRange(ids[5], ids[5], { name: 'media' });
+    const { warnings } = await captureWarnings(() => nextL1(cm, requests));
+    const priced = warnings.map((w) => /would bring the request to ~(\d+) tokens/.exec(w)?.[1]).find((n) => n !== undefined);
+    assert.ok(priced !== undefined, `the gate priced the request with its pin: ${JSON.stringify(warnings)}`);
+    const payload = payloadPrice(cm, 150_000);
+    assert.ok(Number(priced) < payload, `the request is priced without the payload it never sends: ${JSON.stringify({ priced, payload })}`);
+    cm.close();
+  });
+
+  it('the gate counts the pinned content it sends: more prose beside the payload raises its price by that prose', async () => {
+    const pricedWith = async (name: string, prose: string): Promise<number> => {
+      const { cm, internals, ids, requests } = await forest(name, {}, withTools, withDataUrl(150_000, prose), toolRound);
+      internals.config.compressionRecallBudgetTokens = 10_000_000;
+      internals.config.compressionContextBudgetTokens = 1;
+      cm.pinRange(ids[5], ids[5], { name: 'media' });
+      const { warnings } = await captureWarnings(() => nextL1(cm, requests));
+      const priced = warnings.map((w) => /would bring the request to ~(\d+) tokens/.exec(w)?.[1]).find((n) => n !== undefined);
+      assert.ok(priced !== undefined, `the gate priced the request with its pin: ${JSON.stringify(warnings)}`);
+      cm.close();
+      return Number(priced);
+    };
+    const prose = 'note '.repeat(4000);
+    const without = await pricedWith('media-prose-without', '');
+    const withProse = await pricedWith('media-prose-with', prose);
+    const { cm } = await forest('media-prose-price', {}, withTools, withDataUrl(10), toolRound);
+    const prosePrice = (cm as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore
+      .estimateTokens({ content: [{ type: 'text', text: prose }] });
+    cm.close();
+    assert.ok(withProse - without >= prosePrice * 0.9, `the pinned prose is priced: ${JSON.stringify({ without, withProse, prosePrice })}`);
+  });
+});
+
+describe("the pins gate prices thinking as the request sends it", () => {
+  const STORE = (cm: ContextManager) => (cm as unknown as { messageStore: { estimateTokens(m: unknown): number } }).messageStore;
+  const signed = (chars: number) => ({ type: 'thinking', thinking: 'weighed it', signature: 'S'.repeat(chars) });
+
+  it("a pinned message's own signed thinking isn't sent, so it isn't spent from the recall budget", async () => {
+    // Message 5 carries a signature far past the budget; the request strips
+    // raw thinking as it inserts the message.
+    const withThinking = (i: number, text: string) => i === 5 ? [signed(80_000), { type: 'text', text }] : [{ type: 'text', text }];
+    const { cm, internals, ids, textOf, requests } = await forest('pin-own-thinking', {}, undefined, withThinking);
+    const opened = l1Holding(internals, ids[5]);
+    const pinnedTokens = opened.sourceIds.reduce((sum, id) => sum + internals.estimateTokens([{ type: 'text', text: textOf.get(id)! }]), 0);
+    assert.ok(STORE(cm).estimateTokens({ content: [signed(80_000)] }) > pinnedTokens + 100, 'setup: the signature alone is past the budget');
+    internals.config.compressionRecallBudgetTokens = pinnedTokens + 10;
+    cm.pinRange(ids[5], ids[5], { name: 'thinking' });
+    const { result: request, warnings } = await captureWarnings(() => nextL1(cm, requests));
+    assert.ok(request, 'the compression ran');
+    assert.ok(!warnings.some((w) => w.includes('recalls the summaries its pins override')), `the pin is honored: ${JSON.stringify(warnings)}`);
+    assert.ok(!JSON.stringify(request).includes('S'.repeat(1000)), 'the raw message is sent without its thinking');
+    cm.close();
+  });
+
+  it("a recall answer's signed reasoning is sent, and the gate prices it in full", async () => {
+    // Every summary carries signed reasoning, which a recall answer replays.
+    const pricedWith = async (name: string, chars: number) => {
+      const respond = (call: number) => [signed(chars), { type: 'text', text: `Summary #${call}: ordinary events.` }];
+      const { cm, internals, ids, requests } = await forest(name, {}, undefined, undefined, undefined, respond);
+      internals.config.compressionRecallBudgetTokens = 10_000_000;
+      internals.config.compressionContextBudgetTokens = 1;
+      cm.pinRange(ids[5], ids[5], { name: 'pin' });
+      const { warnings } = await captureWarnings(() => nextL1(cm, requests));
+      const priced = warnings.map((w) => /would bring the request to ~(\d+) tokens/.exec(w)?.[1]).find((n) => n !== undefined);
+      assert.ok(priced !== undefined, `the gate priced the request with its pin: ${JSON.stringify(warnings)}`);
+      const delta = STORE(cm).estimateTokens({ content: [signed(chars)] }) - STORE(cm).estimateTokens({ content: [signed(100)] });
+      cm.close();
+      return { priced: Number(priced), delta };
+    };
+    const short = await pricedWith('carrier-short', 100);
+    const long = await pricedWith('carrier-long', 20_100);
+    assert.ok(long.delta > 1000, 'setup: the longer signature costs more');
+    assert.ok(long.priced - short.priced >= long.delta, `at least one recall answer's signature is priced: ${JSON.stringify({ short, long })}`);
   });
 });
 

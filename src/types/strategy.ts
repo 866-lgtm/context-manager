@@ -1,11 +1,13 @@
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, ToolDefinition } from '@animalabs/membrane';
 import type { StoredMessage, MessageId, Sequence } from './message.js';
+import type { FoldDiff } from '../adaptive/fold-diff.js';
 import type {
   ContextEntry,
   TokenBudget,
   PendingWork,
 } from './context.js';
+import type { OverBudgetClearedBy } from '../adaptive/picker.js';
 
 /**
  * Read-only view of the message store for strategies.
@@ -270,7 +272,9 @@ export interface SelectOptions {
    * `previewContext` is where infeasibility is reported. The head-and-tail
    * check before the plan check, and any later stage that can't fit, still
    * throw as for a real compile, leaving nothing behind; `previewContext`
-   * reports an over-budget throw and passes any other throw through.
+   * reports an over-budget throw, as the plan's own preview when the plan was
+   * already over the budget (the live compile refuses it at the plan check),
+   * and passes any other throw through.
    *
    * A compression hold ends at its deadline, whoever looks: the manager
    * releases an expired hold at any compile or hold query, a dry compile
@@ -304,6 +308,16 @@ export interface PreviewResult {
   fits: boolean;
   /** True when the picker could not fold any further. */
   exhausted: boolean;
+  /**
+   * When the layout doesn't fit: what clears that refusal besides a larger
+   * budget, in the terms of the live compile's `OverBudgetError.clearedBy`.
+   * For a plan over the budget it's the plan's list, as the live compile's
+   * refusal at the plan check takes it. A dry run doesn't queue its plan's own
+   * work, so it names compression only for work queued when it takes the
+   * list, the chunks its own rebuild closed included; the live list can add
+   * compression for what the plan's own ops queue.
+   */
+  clearedBy?: readonly OverBudgetClearedBy[];
   /** Verbatim head / tail cost, and the foldable middle. */
   headTokens: number;
   tailTokens: number;
@@ -654,6 +668,11 @@ export interface RenderStats {
      *  'flat-profile'). Surfaces the policy actually in force — a config
      *  clobber that silently downgrades the solver is invisible without it. */
     solver?: string;
+    /** Which chunks moved between which levels, and where this request's
+     *  entries first differ from those of the last request the strategy
+     *  returned, past which no cached prefix reaches. Present only when a
+     *  compile that changed at least one saved level committed. */
+    foldDiff?: FoldDiff;
   };
 }
 
@@ -1177,7 +1196,11 @@ export interface AutobiographicalConfig {
    * argument moved into a call to `intoTool` — a note-taking tool the agent
    * really has — placed as its own round just before the original call, a short
    * stub left behind. If the source-only final rung is enabled and also refuses,
-   * it gets the same rewrite once. Nothing the agent wrote is dropped.
+   * it gets the same rewrite once. Nothing the agent wrote is dropped. Each
+   * rewrite is admitted against `compressionContextBudgetTokens` as a
+   * recall-curve variant is, measured against the request it rewrites; one
+   * over the budget is recorded as rejected and not sent. Each moved argument
+   * adds two messages, which the admission bound prices before their bytes.
    *
    * The rung is SKIPPED unless `intoTool` is among the tools the host declared:
    * the summarizer is the agent, and it must never be shown itself using a tool
@@ -1229,22 +1252,29 @@ export interface AutobiographicalConfig {
    * Total model context budget used to admit refusal-curve compression
    * requests, including the request input and the configured output reserve.
    * The canonical request remains unchanged and is always attempted first;
-   * only fallback variants are gated. Before authoritative canonical usage
-   * exists, admission uses a conservative complete normalized-request bound.
-   * After canonical refusal reports complete provider input usage, admission
-   * uses provider-total input plus a positive serialized expansion delta, then
-   * adds the output reserve. Zero, partial, or unknown usage contracts retain
-   * the conservative bound. Default: 200000.
+   * the recall-curve variants and the tool-prose hoists
+   * (`compressionToolProseFallback`) are gated. Before authoritative canonical
+   * usage exists, admission uses a conservative complete normalized-request
+   * bound. After a refusal reports complete provider input usage, a request
+   * is admitted on the provider-total input of the request it rewrites (the
+   * canonical, or the source-only fallback for that rung's hoist), plus a
+   * positive serialized expansion delta, then the output reserve. Zero,
+   * partial, or unknown usage contracts, and a count of the carrier-stripped
+   * copy a transport rejection made the request go as, retain the
+   * conservative bound of the request itself. Default: 200000.
    *
    * It also decides whether an L1 prompt shows pinned history raw: with the
    * raw that pins add, the canonical request must fit it, priced as the
    * message store prices the messages it would send (after splitting,
    * collapsing and dropping unpaired tool blocks, before the image cap,
-   * which only replaces images), with the system prompt, tools and output
-   * reserve, and with the longer of the lines the no-tools and plain-prose
-   * retries add to its instruction, so either retry fits too. The opt-in
-   * tool-prose rung isn't priced. Otherwise that compression lays history
-   * out as it would without pins (see
+   * which only replaces images), with serialized media priced as the markers
+   * that replace them and thinking as the request carries it (the raw
+   * messages' stripped, a recall answer's signed reasoning kept), with the
+   * system prompt, tools and output reserve, and with the longer of the lines
+   * the no-tools and plain-prose retries add to its instruction, so either
+   * retry fits too. The tool-prose hoists aren't priced in this decision,
+   * since each is admitted on its own, as above. Otherwise that compression
+   * lays history out as it would without pins (see
    * `compressionRecallBudgetTokens`). A canonical request without pins is
    * still always attempted.
    */
