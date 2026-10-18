@@ -5440,6 +5440,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): ContextEntry[] {
     this.requireLoadedBranch('select');
     this._selectStartedAt = performance.now();
+    this._selectMessages = store.length();
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     const _t0 = _diag ? Date.now() : 0;
     if (opts?.dryRun !== true) {
@@ -6091,6 +6092,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** `performance.now()` at the top of the current `select()`; rsEnd() stamps
    *  the compile's own elapsed time on the plan-vs-actual line from it. */
   private _selectStartedAt = 0;
+  /** Length of the strategy's view of the branch at the top of `select()`,
+   *  whichever chunker runs; rsEnd() logs it as `messages=`. */
+  private _selectMessages = 0;
 
   /** Fold diff of THIS compile, for `planVsActual`: reset with the other
    *  figures of the pass (`rsBegin`, dry runs included) and set only when a
@@ -6185,9 +6189,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // not added again here.
       const kt = m?.solver === 'kv-unified' ? this._lastKvUnified?.lastTimings : null;
       const solveMs = kt ? Math.round(kt.forestMs + kt.baseSolveMs + kt.demandMs) : undefined;
-      // The listing rebuildChunks consumed this select: every stored message
-      // on the branch, before chunking.
-      const messages = this._chunkByPosition?.listing.length ?? 0;
+      const messages = this._selectMessages;
+      // Dry runs and previews log the line too, and skip work a live compile
+      // does, so a journal reader must be able to drop them.
+      const dryRun = this._dryRunSelect;
       r.planVsActual = {
         planned,
         actual,
@@ -6195,10 +6200,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         budgetMet: m?.budgetMet ?? false,
         exhausted: m?.exhausted ?? false,
         moves: m?.moves ?? 0,
-        messages,
         ...(m?.solver !== undefined ? { solver: m.solver } : {}),
+        messages,
         compileMs,
         ...(solveMs !== undefined ? { solveMs } : {}),
+        ...(dryRun ? { dryRun: true as const } : {}),
         ...(this._lastFoldDiff ? { foldDiff: this._lastFoldDiff } : {}),
       };
       // Loud only when the emitter OVERRUNS the plan — that is the direction
@@ -6207,8 +6213,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const line =
         `[plan-vs-actual] planned=${planned} actual=${actual} delta=${delta >= 0 ? '+' : ''}${delta}` +
         ` (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) budgetMet=${m?.budgetMet} exhausted=${m?.exhausted}` +
-        ` moves=${m?.moves} messages=${messages} solver=${m?.solver} compileMs=${compileMs}` +
-        (solveMs !== undefined ? ` solveMs=${solveMs}` : '');
+        ` moves=${m?.moves} solver=${m?.solver} messages=${messages} compileMs=${compileMs}` +
+        (solveMs !== undefined ? ` solveMs=${solveMs}` : '') +
+        (dryRun ? ' dryRun=true' : '');
       if (loud) console.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
       else console.error(line);
     }

@@ -672,23 +672,31 @@ export interface RenderStats {
      *  counted. The picker's own `moves` compares each chunk with the level it
      *  was planned from instead. */
     moves: number;
-    /** Stored messages on the branch this compile read: the listing the
-     *  strategy chunked, before any folding. Logged as `messages=`, so a
-     *  compile time can be read against the history size it covered. Optional
-     *  so a custom strategy's stats still type-check. */
-    messages?: number;
     /** Name of the fold solver that planned this compile (e.g. 'kv-stable',
      *  'flat-profile'). Surfaces the policy actually in force — a config
      *  clobber that silently downgrades the solver is invisible without it. */
     solver?: string;
-    /** Wall time of the strategy's `select()` for this compile, in whole ms:
-     *  chunk rebuild, planning (the fold solver) and emission. Logged on the
-     *  `[plan-vs-actual]` line as `compileMs=`, so a solver change is
-     *  measurable from a production journal alone. */
+    /** Messages in the strategy's view of the branch this compile read (after
+     *  the view filter, auxiliary slots included), before any folding. Logged
+     *  as `messages=`, so a compile time can be read against the history size
+     *  it covered. The new fields here are optional so a custom strategy's
+     *  stats still type-check. */
+    messages?: number;
+    /** Time in the base `AutobiographicalStrategy.select()` up to the
+     *  `[plan-vs-actual]` line, in whole ms: chunk rebuild, planning (the fold
+     *  solver) and emission. It excludes a subclass's own `select()` override
+     *  and the `ContextManager` work around the call; a host that wants the
+     *  whole compile times `compile()` itself. After a provisional-calibration
+     *  retry it includes the refused first attempt. Logged as `compileMs=`. */
     compileMs?: number;
-    /** Under `foldingStrategy: 'kv-unified'` only: the forest build, solve
-     *  and latent-demand ranking inside `compileMs`, in whole ms (`solveMs=`). */
+    /** Under `foldingStrategy: 'kv-unified'` only: the forest build, solve and
+     *  latent-demand ranking of the final live pick inside `compileMs`, in
+     *  whole ms (`solveMs=`). */
     solveMs?: number;
+    /** Set on a dry run or preview (`dryRun: true`, `previewContext`), which
+     *  skips work a live compile does; logged as `dryRun=true`. Absent on a
+     *  live compile. */
+    dryRun?: true;
     /** Which chunks moved between which levels, and where this request's
      *  entries first differ from those of the last request the strategy
      *  returned, past which no cached prefix reaches. Present only when a

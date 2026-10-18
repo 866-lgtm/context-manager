@@ -1,7 +1,7 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, rmSync } from 'node:fs';
-import { ContextManager, AutobiographicalStrategy, OverBudgetError } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, KnowledgeStrategy, OverBudgetError } from '../src/index.js';
 import type { ContextEntry } from '../src/types/index.js';
 import type { KvUnifiedReceiptChain } from '../src/adaptive/kv-unified-receipts.js';
 
@@ -651,7 +651,7 @@ test('a usage report inside the calibration dead band keeps the kv-unified fores
   manager.close();
 });
 
-test('every compile stamps its own elapsed time on plan-vs-actual, with the kv-unified solve inside it', async () => {
+test('every adaptive compile that commits a plan stamps its own elapsed time on plan-vs-actual, with the kv-unified solve inside it', async () => {
   const manager = await ContextManager.open({ path: STORE, strategy: strategy() });
   const added = ['time me', 'timing you', 'and again'];
   for (const [i, text] of added.entries()) manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text }]);
@@ -729,4 +729,42 @@ test('the hysteresis certificate is on unless the recipe says false', async () =
   const off = await certified({ ...KV_UNIFIED, adoptEpsilon: 50, hysteresisCertificate: false });
   assert.equal(off.certificate, false, 'false: the full solver decides');
   assert.equal(off.certificateMs, 0, 'false: the certificate never ran');
+});
+
+test('the plan-vs-actual line keeps its old prefix, and marks dry runs', async () => {
+  const manager = await ContextManager.open({ path: STORE, strategy: strategy() });
+  manager.addMessage('user', [{ type: 'text', text: 'live then dry' }]);
+  const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+  const lines: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => {
+    if (typeof args[0] === 'string' && args[0].startsWith('[plan-vs-actual]')) lines.push(args[0]);
+    else error(...args);
+  };
+  try {
+    await manager.compile(budget);
+    assert.equal(manager.getRenderStats()!.planVsActual!.dryRun, undefined, 'a live compile is not marked');
+    await manager.compile(budget, undefined, { dryRun: true });
+  } finally {
+    console.error = error;
+  }
+  const shape = /^\[plan-vs-actual\] planned=\d+ actual=\d+ delta=[+-]\d+ \([+-]\d+\.\d%\) budgetMet=\w+ exhausted=\w+ moves=\d+ solver=kv-unified messages=1 compileMs=\d+ solveMs=\d+/;
+  assert.equal(lines.length, 2, lines.join('\n'));
+  assert.match(lines[0], shape);
+  assert.doesNotMatch(lines[0], /dryRun/);
+  assert.match(lines[1], shape);
+  assert.match(lines[1], / dryRun=true$/);
+  manager.close();
+});
+
+test('messages= counts the strategy view under a strategy with its own chunker', async () => {
+  // KnowledgeStrategy replaces the base chunker; the count must not depend on it.
+  const manager = await ContextManager.open({
+    path: STORE,
+    strategy: new KnowledgeStrategy({ adaptiveResolution: true, headWindowTokens: 0, recentWindowTokens: 100 }),
+  });
+  for (const text of ['one', 'two', 'three']) manager.addMessage('user', [{ type: 'text', text }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  assert.equal(manager.getRenderStats()!.planVsActual!.messages, 3);
+  manager.close();
 });
