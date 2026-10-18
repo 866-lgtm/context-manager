@@ -296,8 +296,8 @@ function relevanceCut(
   // boundary-cut members. Every pass decides it the same way, by the leaf's
   // own lineage at the node's level: a fold's eligibility and its moves, and
   // phase C's un-folds, count only the leaves the node renders, and the
-  // validity projection exempts the rest (projectToValidCut). The [kv-overlap]
-  // warning reads the emitted frontier (reportOverlap), not which folds ran,
+  // validity projection exempts the rest (projectToValidCut). The plan's
+  // `overlap` (findOverlap) reads the emitted frontier, not which folds ran,
   // so a plan built on carried folds reports them as a fresh one does.
   // Fold priority: cheapest information first — ascending salience, then oldest.
   const priority = [...ordered].sort((a, b) => {
@@ -928,6 +928,17 @@ export interface ControlPlan {
   override?: 'bootstrap' | 'infeasible' | 'quality-gap';
   /** No realizable progress fits inside a strict trust region. */
   blocked?: 'reach-floor' | 'target-floor';
+  /** The leaves a summary this plan renders disagrees with, where the store's
+   *  summary tree is non-nested (findOverlap). A caller that presents the plan
+   *  logs them loudly (`[kv-overlap]`, reportOverlap), as a compile does for
+   *  its own plan and replayControlled for each turn:
+   *  - `conflicting`: the summary lists the leaf, whose own lineage at that
+   *    level is another summary, or none;
+   *  - `unlisted`: the leaf's own lineage runs through the summary, which
+   *    doesn't list it.
+   *  A leaf that disagrees both ways is in `conflicting` only. Both are empty
+   *  when nothing the plan renders disagrees. */
+  overlap: { conflicting: readonly ChunkId[]; unlisted: readonly ChunkId[] };
 }
 
 /**
@@ -946,7 +957,11 @@ export interface ControlPlan {
  *
  * There is no emergency path and no spatial eligibility gate: cache continuity
  * is priced (and bounded by P) — never a reason a chunk can't move.
- * Pure and deterministic.
+ * It logs nothing about the overlap it finds: the plan carries it as
+ * `overlap`, for a caller that presents the plan to log with reportOverlap,
+ * as a compile does for its own plan beside `override`'s `[kv-escalation]`.
+ * So kv-stable's shadow production pick, which presents nothing, says
+ * nothing. Pure and deterministic.
  */
 export function planControlledFrontier(
   inputs: PickerInputs,
@@ -954,41 +969,33 @@ export function planControlledFrontier(
   p: ControlPlanParams,
 ): ControlPlan {
   const plan = planUnreported(inputs, tree, p);
-  reportOverlap(tree, inputs.chunks, plan.resolutions);
-  return plan;
+  return { ...plan, overlap: findOverlap(tree, inputs.chunks, plan.resolutions) };
 }
 
 /**
- * NEVER QUIET (2026-08-03): overlap tolerance is a degraded mode, not a
- * feature. A rendered summary whose listing disagrees with the lineage of the
- * window's leaves means the store's summary tree is NON-NESTED, and messages
- * are SEMANTICALLY DOUBLE-REPRESENTED in the window. Either direction says so:
+ * The leaves that a summary the frontier F renders disagrees with: a rendered
+ * summary whose listing disagrees with the lineage of the window's leaves
+ * means the store's summary tree is NON-NESTED. Either direction counts:
  * - the summary lists a leaf whose own lineage at that level is another
  *   summary, or none (two live lineages over one span): the summary's recall
- *   covers the leaf while it renders raw or through its own chain;
+ *   covers the leaf while it renders raw or through its own chain
+ *   (`conflicting`);
  * - a leaf's own lineage runs through the summary, but the summary doesn't
  *   list it (a summary written again without one of its sources): the leaf
  *   renders lower, and a summary of its lineage that lists it beside a leaf
- *   held above can render in both recalls, which neither listing shows.
- * Each direction has a line of its own: the first says a message is in the
- * window twice, and the second only that listing and lineage disagree, which
- * is all it shows. A leaf that disagrees both ways is named once, on the
- * first. The solve proceeding is the mitigation; the topology is the
- * disease. So every compile whose plan renders such a summary says so,
- * until the store is repaired (nesting reconciler, see the 2026-08-03 opus4
- * incident). kv-stable's shadow production pick plans through here too, in
- * a compile that isn't a dry run with `productionBudgetTokens` set below its
- * budget, and says so of its own plan, which no compile renders.
- * It reads the frontier the plan emits, so a plan that keeps carried folds
- * reports them as one that makes them does. A leaf that a lock or a pin holds
- * beside a summary of its own lineage that lists it renders in both recalls
- * too, and goes unreported: a protection put it there, not the topology.
+ *   held above can render in both recalls, which neither listing shows
+ *   (`unlisted`).
+ * A leaf that disagrees both ways is named once, in `conflicting`. It reads
+ * the frontier the plan emits, so a plan that keeps carried folds reports
+ * them as one that makes them does. A leaf that a lock or a pin holds beside
+ * a summary of its own lineage that lists it renders in both recalls too, and
+ * goes unreported: a protection put it there, not the topology.
  */
-function reportOverlap(
+function findOverlap(
   tree: SummaryTree,
   chunks: readonly PickerChunk[],
   F: ReadonlyMap<ChunkId, number>,
-): void {
+): ControlPlan['overlap'] {
   const rendered = new Map<string, ReadonlySet<ChunkId>>();
   const conflicting = new Set<ChunkId>();
   for (const c of chunks) {
@@ -1010,18 +1017,37 @@ function reportOverlap(
       if (listed && !listed.has(c.id)) { unlisted.add(c.id); break; }
     }
   }
-  if (conflicting.size > 0) {
+  return { conflicting: [...conflicting], unlisted: [...unlisted] };
+}
+
+/**
+ * NEVER QUIET (2026-08-03): overlap tolerance is a degraded mode, not a
+ * feature. A plan's `overlap` means the store's summary tree is NON-NESTED
+ * where the plan renders it. Each direction has a line of its own: the first
+ * says a message is SEMANTICALLY DOUBLE-REPRESENTED in the window, and the
+ * second only that listing and lineage disagree, which is all it shows. The
+ * solve proceeding is the mitigation; the topology is the disease. So every
+ * compile whose plan renders such a summary says so, until the store is
+ * repaired (nesting reconciler, see the 2026-08-03 opus4 incident).
+ * AutobiographicalStrategy calls this with its compile's own plan, beside
+ * `[kv-escalation]`, and replayControlled with each turn's. The planner
+ * doesn't, since kv-stable's shadow production pick plans the same way and
+ * renders nothing.
+ */
+export function reportOverlap(overlap: ControlPlan['overlap']): void {
+  const { conflicting, unlisted } = overlap;
+  if (conflicting.length > 0) {
     console.error(
-      `[kv-overlap] ⚠️ non-nested summary tree: ${conflicting.size} leaf(s) with ` +
+      `[kv-overlap] ⚠️ non-nested summary tree: ${conflicting.length} leaf(s) with ` +
         `conflicting lineage tolerated this compile (double-representation in window). ` +
-        `Store needs nesting repair. sample=${[...conflicting].slice(0, 5).join(',')}`,
+        `Store needs nesting repair. sample=${conflicting.slice(0, 5).join(',')}`,
     );
   }
-  if (unlisted.size > 0) {
+  if (unlisted.length > 0) {
     console.error(
-      `[kv-overlap] ⚠️ non-nested summary tree: ${unlisted.size} leaf(s) whose own lineage runs through ` +
+      `[kv-overlap] ⚠️ non-nested summary tree: ${unlisted.length} leaf(s) whose own lineage runs through ` +
         `a rendered summary that doesn't list them (listing and lineage disagree). ` +
-        `Store needs nesting repair. sample=${[...unlisted].slice(0, 5).join(',')}`,
+        `Store needs nesting repair. sample=${unlisted.slice(0, 5).join(',')}`,
     );
   }
 }
@@ -1030,7 +1056,7 @@ function planUnreported(
   inputs: PickerInputs,
   tree: SummaryTree,
   p: ControlPlanParams,
-): ControlPlan {
+): Omit<ControlPlan, 'overlap'> {
   const ordered = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence);
   const frozen = p.frozen ?? EMPTY_SET;
   const fixedLevels = p.fixedLevels ?? EMPTY_LEVEL_MAP;
@@ -1154,7 +1180,7 @@ function planUnreported(
     return { folded, expanded };
   };
 
-  const adoptIdeal = (override?: ControlPlan['override']): ControlPlan => ({
+  const adoptIdeal = (override?: ControlPlan['override']): Omit<ControlPlan, 'overlap'> => ({
     resolutions: ideal.F,
     tokens: ideal.tokens,
     ...flags(ideal.F),
@@ -1292,6 +1318,8 @@ export function replayControlled(fullInputs: PickerInputs, opts: ControlOptions)
       previous: fprev, foldAtTokens: HW, expandAtTokens: LW, targetTokens: LW,
       windowTokens: opts.windowTokens, reachTokens, rawZone: flatZone, now, mergeThreshold,
     });
+    // The replay renders each turn's plan, so it reports the plan's overlap.
+    reportOverlap(plan.overlap);
     const F = plan.resolutions;
     const folded = plan.folded || plan.expanded; // any active prefix change this turn
     const escalated = plan.escalated;

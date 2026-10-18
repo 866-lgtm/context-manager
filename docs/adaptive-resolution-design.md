@@ -998,10 +998,12 @@ another summary, or none, or that a leaf's own lineage runs through but
 that doesn't list it (a summary written again without one of its sources).
 So a plan that keeps carried folds reports them as one that makes them
 does. Each direction has a line of its own, the second saying only that
-listing and lineage disagree. A compile that isn't a dry run, with
-`productionBudgetTokens` set below its budget, also makes the shadow
-production pick, which plans the same way and warns about its own plan,
-though no compile renders it. A leaf that a lock or a pin holds beside a
+listing and lineage disagree. The planner only finds these leaves, as the
+plan's `overlap`, and the compile logs them for its own plan, beside
+`[kv-escalation]`. So the shadow production pick, which a compile that isn't
+a dry run makes when `productionBudgetTokens` is set below its budget, plans
+the same way and doesn't warn: no compile renders its plan. A leaf that a
+lock or a pin holds beside a
 summary of its own lineage that lists it renders in both recalls without a
 warning: a protection put it there, not the topology. A fold's eligibility
 and its moves, phase C's un-folds and the validity projection all decide

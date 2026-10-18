@@ -22,7 +22,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
-import { planControlledFrontier, type ControlPlanParams } from '../../src/adaptive/kv-control.js';
+import { planControlledFrontier, replayControlled, reportOverlap, type ControlPlanParams, type ControlResult } from '../../src/adaptive/kv-control.js';
 import { renderLayout, kvCost, type RenderLayout } from '../../src/adaptive/render-offsets.js';
 import { Picker } from '../../src/adaptive/picker.js';
 import { KvStableStrategy } from '../../src/adaptive/strategies/kv-stable.js';
@@ -122,20 +122,23 @@ function store(chunks: PickerChunk[], summaries: SummaryEntry[]): { inputs: Pick
 
 const unitsOf = (layout: RenderLayout): string[] => layout.units.map((u) => `${u.kind}:${u.key}`);
 
-/** Each test plans on purpose over a tree that makes the planner warn. */
-function quietOverlap<T>(fn: () => T): { result: T; overlapWarnings: number; overlapLines: string[] } {
+/** A plan's overlap when nothing it renders disagrees with a leaf. */
+const NO_OVERLAP = { conflicting: [], unlisted: [] };
+
+/** The [kv-overlap] lines logged while `fn` runs, caught rather than printed. */
+function overlapLines(fn: () => void): string[] {
   const original = console.error;
-  const overlapLines: string[] = [];
+  const lines: string[] = [];
   console.error = (...args: unknown[]) => {
-    if (String(args[0]).includes('[kv-overlap]')) overlapLines.push(String(args[0]));
+    if (String(args[0]).includes('[kv-overlap]')) lines.push(String(args[0]));
     else original(...args);
   };
   try {
-    const result = fn();
-    return { result, overlapWarnings: overlapLines.length, overlapLines };
+    fn();
   } finally {
     console.error = original;
   }
+  return lines;
 }
 
 /** m1's L1 A has no parent, but L2 G's sources are A, B and C, so G lists m1
@@ -214,10 +217,8 @@ for (const [kind, build, foldAtTokens, folded, pinCaps] of [
   test(`a held plan keeps the summary beside a leaf ${kind}`, () => {
     const { inputs, tree } = build();
     const params = { ...trio, foldAtTokens, ...(pinCaps ? { pinCaps } : {}) };
-    const { result: [first, second] } = quietOverlap(() => {
-      const first = planControlledFrontier(inputs, tree, { ...params, previous: new Map() });
-      return [first, planControlledFrontier(inputs, tree, { ...params, previous: first.resolutions })];
-    });
+    const first = planControlledFrontier(inputs, tree, { ...params, previous: new Map() });
+    const second = planControlledFrontier(inputs, tree, { ...params, previous: first.resolutions });
     assert.deepEqual(unitsOf(renderLayout(inputs, tree, first.resolutions)), folded);
     // The fullest fold is inside the [50, foldAt] band, so the second compile holds.
     assert.deepEqual(unitsOf(renderLayout(inputs, tree, second.resolutions)), folded);
@@ -231,10 +232,8 @@ test('a compile above foldAt that adopts the frontier it carried reports no fold
   // The fullest fold is 70 tokens, above foldAt, so nothing holds: each
   // compile adopts the ideal cut, which is the frontier it carried.
   const params = { ...trio, foldAtTokens: 60 };
-  const { result: [first, second] } = quietOverlap(() => {
-    const first = planControlledFrontier(inputs, tree, { ...params, previous: new Map() });
-    return [first, planControlledFrontier(inputs, tree, { ...params, previous: first.resolutions })];
-  });
+  const first = planControlledFrontier(inputs, tree, { ...params, previous: new Map() });
+  const second = planControlledFrontier(inputs, tree, { ...params, previous: first.resolutions });
   assert.deepEqual(unitsOf(renderLayout(inputs, tree, second.resolutions)), unitsOf(renderLayout(inputs, tree, first.resolutions)));
   assert.equal(second.perturbation, 0);
   assert.ok(!second.folded && !second.expanded);
@@ -365,10 +364,10 @@ test('suffix adoption takes a summary beside a lineage-disagreeing leaf', () => 
       summary('G', 2, ['A', 'B', 'C'], 40),
     ],
   );
-  const { result: plan } = quietOverlap(() => planControlledFrontier(inputs, tree, {
+  const plan = planControlledFrontier(inputs, tree, {
     ...trio, foldAtTokens: 300, reachTokens: 75,
     previous: new Map(inputs.chunks.map((c) => [c.id, 0])),
-  }));
+  });
   assert.equal(plan.override, undefined);
   assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['raw:m0', 'recall:A', 'recall:G']);
   assert.equal(plan.perturbation, 70);
@@ -390,10 +389,10 @@ test('phase C un-folds the leaves of a summary\'s own lineage: tree 228 settles 
     [summary('L1-0', 1, ['m0', 'm1', 'm2'], 43), summary('R-1', 1, ['m0', 'm1'], 13)],
   );
   const params = { targetTokens: 80, foldAtTokens: 130, windowTokens: 366, reachTokens: 366, rawZone: new Set<ChunkId>(), now: 3 };
-  const { result: first } = quietOverlap(() => planControlledFrontier(inputs, tree, { ...params, previous: new Map() }));
+  const first = planControlledFrontier(inputs, tree, { ...params, previous: new Map() });
   assert.deepEqual(unitsOf(renderLayout(inputs, tree, first.resolutions)), ['raw:m0', 'recall:L1-0']);
   assert.equal(first.tokens, 91);
-  const { result: second } = quietOverlap(() => planControlledFrontier(inputs, tree, { ...params, previous: first.resolutions }));
+  const second = planControlledFrontier(inputs, tree, { ...params, previous: first.resolutions });
   assert.equal(levelsOf(inputs, second.resolutions), levelsOf(inputs, first.resolutions));
   assert.equal(second.perturbation, 0);
 });
@@ -408,9 +407,9 @@ test('phase C un-folds a summary whose listed leaf of another lineage sits at an
     [message('m0', 0, 50), message('m1', 1, 60, 'X'), message('m2', 2, 60, 'X')],
     [summary('X', 1, ['m0', 'm1', 'm2'], 20)],
   );
-  const { result: plan } = quietOverlap(() => planControlledFrontier(inputs, tree, {
+  const plan = planControlledFrontier(inputs, tree, {
     ...trio, targetTokens: 150, foldAtTokens: 300, previous: new Map(),
-  }));
+  });
   assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['raw:m0', 'raw:m1', 'raw:m2']);
   assert.equal(plan.tokens, 170);
 });
@@ -438,8 +437,7 @@ const unlistedOwnL1 = (older: PickerChunk[] = [], olderSummaries: SummaryEntry[]
 test('phase C prices an un-fold where the projection leaves each leaf, and keeps a summary whose un-fold would render a leaf raw', () => {
   const { inputs, tree } = unlistedOwnL1();
   for (let compile = 1; compile <= 3; compile++) {
-    const { result } = quietOverlap(() =>
-      new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 100, slack: 0.1 }));
+    const result = new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 100, slack: 0.1 });
     const layout = renderLayout(inputs, tree, result.finalResolutions);
     assert.deepEqual(unitsOf(layout), ['recall:P'], `compile ${compile}`);
     assert.equal(layout.totalTokens, 20);
@@ -457,8 +455,7 @@ test('phase C moves a declined un-fold\'s leaves back from the levels they went 
     [message('g0', 0, 30, 'G'), message('g1', 1, 30, 'G')],
     [summary('G', 1, ['g0', 'g1'], 10)],
   );
-  const { result } = quietOverlap(() =>
-    new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 100, slack: 0.1 }));
+  const result = new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 100, slack: 0.1 });
   const layout = renderLayout(inputs, tree, result.finalResolutions);
   assert.deepEqual(unitsOf(layout), ['raw:g0', 'raw:g1', 'recall:P']);
   assert.equal(layout.totalTokens, 80);
@@ -477,8 +474,7 @@ test('phase C prices a leaf whose lineage skips the level below the summary wher
       summary('T', 3, ['M', 'N'], 10),
     ],
   );
-  const { result } = quietOverlap(() =>
-    new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 60, targetBudget: 30, slack: 0.1 }));
+  const result = new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 60, targetBudget: 30, slack: 0.1 });
   const layout = renderLayout(inputs, tree, result.finalResolutions);
   assert.deepEqual(unitsOf(layout), ['recall:M', 'recall:N']);
   assert.equal(layout.totalTokens, 35);
@@ -503,8 +499,7 @@ test('phase C passes a landing summary that a leaf below it vetoes, as the proje
     ],
   );
   for (let compile = 1; compile <= 2; compile++) {
-    const { result } = quietOverlap(() =>
-      new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 100, slack: 0.1 }));
+    const result = new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 100, slack: 0.1 });
     const layout = renderLayout(inputs, tree, result.finalResolutions);
     assert.deepEqual(unitsOf(layout), ['raw:x', 'recall:N', 'raw:d'], `compile ${compile}`);
     assert.equal(layout.totalTokens, 118);
@@ -530,8 +525,7 @@ test('phase C doesn\'t count a hard-protected leaf below a landing summary as a 
       summary('B', 2, ['A1', 'E1'], 30, 'N'), summary('F2', 2, ['E1'], 15, 'N'), summary('N', 3, ['F2'], 8),
     ],
   );
-  const { result } = quietOverlap(() =>
-    new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 40, slack: 0.1 }));
+  const result = new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 40, slack: 0.1 });
   const layout = renderLayout(inputs, tree, result.finalResolutions);
   assert.deepEqual(unitsOf(layout), ['recall:A1', 'recall:B', 'recall:C1']);
   assert.equal(layout.totalTokens, 45);
@@ -555,37 +549,37 @@ test('phase C lands leaves past a vetoed summary at the next summary of their li
       summary('B', 2, ['A1', 'C2'], 30, 'N'), summary('F2', 2, ['C2'], 15, 'N'), summary('N', 3, ['F2'], 8),
     ],
   );
-  const { result } = quietOverlap(() =>
-    new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 45, slack: 0.1 }));
+  const result = new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 150, targetBudget: 45, slack: 0.1 });
   const layout = renderLayout(inputs, tree, result.finalResolutions);
   assert.deepEqual(unitsOf(layout), ['recall:A1', 'recall:C2']);
   assert.equal(layout.totalTokens, 50);
 });
 
-// [kv-overlap] reads the frontier the plan emits, not which folds the solve
-// made: a hold that keeps R and A, which both list m0 and m1, warns though the
-// ideal cut folds neither, and a hold that renders neither stays quiet though
-// the ideal cut folds both (R1-2). m0's lineage is R, m1's is A.
+// The overlap a plan reports, which [kv-overlap] logs, reads the frontier the
+// plan emits, not which folds the solve made: a hold that keeps R and A, which
+// both list m0 and m1, reports each leaf of the other's lineage though the
+// ideal cut folds neither, and a hold that renders neither reports nothing
+// though the ideal cut folds both (R1-2). m0's lineage is R, m1's is A.
 const doubledPair = (): { inputs: PickerInputs; tree: SummaryTree } => {
   const chunks = [message('m0', 0, 100, 'R'), message('m1', 1, 100, 'A'), message('m2', 2, 100, 'B')];
   chunks[2].salience = 0.1; // folded first
   return store(chunks, [summary('A', 1, ['m0', 'm1'], 20), summary('R', 1, ['m0', 'm1'], 30), summary('B', 1, ['m2'], 20)]);
 };
-for (const [kind, previousLevels, targetTokens, warnings, units] of [
-  ['a held frontier that renders two summaries over one pair warns, though the ideal cut folds neither',
-    [1, 1, 0], 220, 1, ['recall:R', 'recall:A', 'raw:m2']],
-  ['a held frontier that renders neither stays quiet, though the ideal cut folds both',
-    [0, 0, 1], 60, 0, ['raw:m0', 'raw:m1', 'recall:B']],
+for (const [kind, previousLevels, targetTokens, conflicting, units] of [
+  ['a held frontier that renders two summaries over one pair reports both leaves, though the ideal cut folds neither',
+    [1, 1, 0], 220, ['m1', 'm0'], ['recall:R', 'recall:A', 'raw:m2']],
+  ['a held frontier that renders neither reports nothing, though the ideal cut folds both',
+    [0, 0, 1], 60, [], ['raw:m0', 'raw:m1', 'recall:B']],
 ] as const) {
-  test(`[kv-overlap] follows the emitted frontier: ${kind}`, () => {
+  test(`a plan's overlap follows the emitted frontier: ${kind}`, () => {
     const { inputs, tree } = doubledPair();
     const previous = new Map<ChunkId, number>(inputs.chunks.map((c, i) => [c.id, previousLevels[i]!]));
-    const { result: plan, overlapWarnings } = quietOverlap(() => planControlledFrontier(inputs, tree, {
+    const plan = planControlledFrontier(inputs, tree, {
       ...trio, targetTokens, expandAtTokens: 100, foldAtTokens: 300, previous,
-    }));
+    });
     assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), [...units]);
     assert.equal(plan.perturbation, 0);
-    assert.equal(overlapWarnings, warnings);
+    assert.deepEqual(plan.overlap, { conflicting: [...conflicting], unlisted: [] });
   });
 }
 
@@ -600,16 +594,18 @@ test('[kv-overlap] warns when a rendered summary doesn\'t list a leaf whose own 
     [summary('N1', 1, ['x'], 20, 'M'), summary('N2', 1, ['y'], 20, 'M'), summary('M', 2, ['N1'], 15)],
   );
   const previous = new Map<ChunkId, number>([['x', 2], ['y', 1]]);
-  const { result: plan, overlapLines } = quietOverlap(() => planControlledFrontier(inputs, tree, {
+  const plan = planControlledFrontier(inputs, tree, {
     ...trio, targetTokens: 30, expandAtTokens: 30, foldAtTokens: 300, previous,
-  }));
+  });
   assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['recall:M', 'recall:N2']);
   assert.equal(plan.perturbation, 0);
+  assert.deepEqual(plan.overlap, { conflicting: [], unlisted: ['y'] });
   // Its own phrase: M covers x and N2 covers y, so no message is in two
   // recalls here, and the warning says what disagrees.
-  assert.equal(overlapLines.length, 1);
-  assert.match(overlapLines[0]!, /1 leaf\(s\) whose own lineage runs through a rendered summary that doesn't list them \(listing and lineage disagree\)/);
-  assert.doesNotMatch(overlapLines[0]!, /double-representation/);
+  const lines = overlapLines(() => reportOverlap(plan.overlap));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0]!, /1 leaf\(s\) whose own lineage runs through a rendered summary that doesn't list them \(listing and lineage disagree\)/);
+  assert.doesNotMatch(lines[0]!, /double-representation/);
 });
 
 // m disagrees both ways. Its own L1 N1 names B as its parent, but B was
@@ -626,14 +622,36 @@ test('[kv-overlap] names a leaf that disagrees both ways once, on the first line
     ],
   );
   const previous = new Map<ChunkId, number>([['m', 1], ['p', 2], ['q', 2]]);
-  const { result: plan, overlapLines } = quietOverlap(() => planControlledFrontier(inputs, tree, {
+  const plan = planControlledFrontier(inputs, tree, {
     ...trio, targetTokens: 30, expandAtTokens: 30, foldAtTokens: 300, previous,
-  }));
+  });
   assert.deepEqual(Object.fromEntries(plan.resolutions), { m: 1, p: 2, q: 2 });
   assert.equal(plan.perturbation, 0);
-  assert.equal(overlapLines.length, 1);
-  assert.match(overlapLines[0]!, /1 leaf\(s\) with conflicting lineage/);
-  assert.match(overlapLines[0]!, /sample=m$/);
+  assert.deepEqual(plan.overlap, { conflicting: ['m'], unlisted: [] });
+  const lines = overlapLines(() => reportOverlap(plan.overlap));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0]!, /1 leaf\(s\) with conflicting lineage/);
+  assert.match(lines[0]!, /sample=m$/);
+});
+
+// replayControlled renders each turn's plan, so it logs each turn's overlap,
+// which the planner no longer logs itself. R and A each list m0 and m1, whose
+// own L1s are R and A, so every turn whose plan folds a leaf renders a summary
+// that lists a leaf of the other's lineage, and logs one line. m2, the newest,
+// has no summary and stays raw in the attended window.
+test('replayControlled logs [kv-overlap] for each turn whose plan renders a summary that disagrees', () => {
+  const { inputs } = store(
+    [message('m0', 0, 100, 'R'), message('m1', 1, 100, 'A'), message('m2', 2, 100)],
+    [summary('R', 1, ['m0', 'm1'], 30), summary('A', 1, ['m0', 'm1'], 20)],
+  );
+  let result: ControlResult | undefined;
+  const lines = overlapLines(() => {
+    result = replayControlled(inputs, { windowTokens: 1_000, budgetTokens: 200, attendedWindowTokens: 100 });
+  });
+  const folding = result!.steps.filter((step) => step.deepestLevel >= 1).length;
+  assert.ok(folding > 0, 'a turn renders R or A');
+  assert.equal(lines.length, folding, lines.join('\n'));
+  for (const line of lines) assert.match(line, /2 leaf\(s\) with conflicting lineage .*sample=m1,m0$/);
 });
 
 // The same links, through the strategy. y is pinned at L2, where its own
@@ -648,11 +666,11 @@ test('a pin-at-level held through KvStableStrategy lowers to where its own linea
     summary('M', 2, ['N1'], 15),
   ]);
   chunks[1]!.pinLevel = 2;
-  const { result, overlapWarnings } = quietOverlap(() =>
-    new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 100_000, targetBudget: 90_000, slack: 0.1 }));
+  const strategy = new KvStableStrategy();
+  const result = new Picker(strategy).run(inputs, { totalBudget: 100_000, targetBudget: 90_000, slack: 0.1 });
   assert.equal(result.finalResolutions.get('y'), 1, 'y is held at L1, where N2 lists it');
   assert.equal(result.finalResolutions.get('x') ?? 0, 0, 'x, which nothing pins, renders raw');
-  assert.equal(overlapWarnings, 0, 'M is no longer rendered, so nothing disagrees');
+  assert.deepEqual(strategy.lastPlan()?.overlap, NO_OVERLAP, 'M is no longer rendered, so nothing disagrees');
 });
 
 // The same links with v beside y under N2: the pin holds N2's whole group at
@@ -664,12 +682,12 @@ test('a pin-at-level lowered through KvStableStrategy holds the other leaves of 
     summary('M', 2, ['N1'], 15),
   ]);
   chunks[1]!.pinLevel = 2;
-  const { result, overlapWarnings } = quietOverlap(() =>
-    new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 100_000, targetBudget: 90_000, slack: 0.1 }));
+  const strategy = new KvStableStrategy();
+  const result = new Picker(strategy).run(inputs, { totalBudget: 100_000, targetBudget: 90_000, slack: 0.1 });
   assert.equal(result.finalResolutions.get('y'), 1, 'y is held at L1, where N2 lists it');
   assert.equal(result.finalResolutions.get('v'), 1, 'v is held with y, at N2');
   assert.equal(result.finalResolutions.get('x') ?? 0, 0, 'x, which nothing pins, renders raw');
-  assert.equal(overlapWarnings, 0);
+  assert.deepEqual(strategy.lastPlan()?.overlap, NO_OVERLAP);
 });
 
 // N2, y's own L1, was written again from v alone, so no summary of y's
@@ -682,8 +700,7 @@ test('a pin-at-level whose own lineage lists it at no level lowers to raw and ho
     summary('M', 2, ['N1'], 15),
   ]);
   chunks[1]!.pinLevel = 2;
-  const { result } = quietOverlap(() =>
-    new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 100_000, targetBudget: 90_000, slack: 0.1 }));
+  const result = new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 100_000, targetBudget: 90_000, slack: 0.1 });
   for (const id of ['x', 'y', 'v']) assert.equal(result.finalResolutions.get(id) ?? 0, 0, `${id} renders raw`);
 });
 
@@ -756,8 +773,8 @@ for (const yPin of [2, 3]) {
 // m0 is held at L1, where its own A renders it, and the plan folds m1 and m2
 // to their L2 P, which lists m0 too and is m0's own lineage there. So m0 is
 // in A's recall and P's. Every summary the plan renders lists exactly the
-// leaves whose own lineage runs through it, so [kv-overlap] stays quiet: a
-// hold put m0 beside P, not the tree.
+// leaves whose own lineage runs through it, so the plan reports no overlap and
+// [kv-overlap] stays quiet: a hold put m0 beside P, not the tree.
 for (const [hold, holds] of [
   ['a locked leaf', { frozen: new Set<ChunkId>(['m0']) }],
   ['a pinned leaf', { fixedLevels: new Map<ChunkId, number>([['m0', 1]]) }],
@@ -767,12 +784,12 @@ for (const [hold, holds] of [
       [message('m0', 0, 100, 'A'), message('m1', 1, 100, 'B'), message('m2', 2, 100, 'B')],
       [summary('A', 1, ['m0'], 30, 'P'), summary('B', 1, ['m1', 'm2'], 30, 'P'), summary('P', 2, ['A', 'B'], 20)],
     );
-    const { result: plan, overlapWarnings } = quietOverlap(() => planControlledFrontier(inputs, tree, {
+    const plan = planControlledFrontier(inputs, tree, {
       ...trio, targetTokens: 50, foldAtTokens: 200, previous: new Map<ChunkId, number>([['m0', 1]]), ...holds,
-    }));
+    });
     assert.deepEqual([...plan.resolutions.entries()].sort(), [['m0', 1], ['m1', 2], ['m2', 2]]);
     assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['recall:A', 'recall:P']);
-    assert.equal(overlapWarnings, 0);
+    assert.deepEqual(plan.overlap, NO_OVERLAP);
   });
 }
 
@@ -785,9 +802,9 @@ test('a listed leaf of another lineage doesn\'t veto a summary\'s fold with its 
     [message('m1', 0, 100, 'N'), message('m2', 1, 100, 'N'), message('z', 2, 100, 'Z')],
     [summary('N', 1, ['m1', 'm2', 'z'], 20), summary('Z', 1, ['z'], 20)],
   );
-  const { result: plan } = quietOverlap(() => planControlledFrontier(inputs, tree, {
+  const plan = planControlledFrontier(inputs, tree, {
     ...trio, targetTokens: 150, foldAtTokens: 200, pinCaps: new Map([['z', 0]]), previous: new Map(),
-  }));
+  });
   assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['recall:N', 'raw:z']);
 });
 
@@ -916,8 +933,7 @@ test('after a summary loses a source between compiles, every leaf renders throug
   let staleLocked = 0;
   for (let t = 0; t < 300; t++) {
     const { inputs, tree, params, corruptions } = randomNonNested(rng);
-    const { result: first } = quietOverlap(() =>
-      planControlledFrontier(inputs, tree, { ...params, reachTokens: params.windowTokens, previous: new Map() }));
+    const first = planControlledFrontier(inputs, tree, { ...params, reachTokens: params.windowTokens, previous: new Map() });
     const relinkable = [...inputs.summaries.values()].filter((s) => s.sourceIds.length >= 2);
     if (relinkable.length === 0) continue;
     const s = relinkable[Math.floor(rng() * relinkable.length)];
@@ -940,8 +956,7 @@ test('after a summary loses a source between compiles, every leaf renders throug
     }).map((c) => c.id);
     if (staleIds.length > 0) stale++;
     if (staleIds.some((id) => frozen.has(id))) staleLocked++;
-    const { result: second } = quietOverlap(() =>
-      planControlledFrontier(changed, after, { ...params, frozen, reachTokens: params.windowTokens, previous: first.resolutions }));
+    const second = planControlledFrontier(changed, after, { ...params, frozen, reachTokens: params.windowTokens, previous: first.resolutions });
     for (const c of changed.chunks) {
       const level = second.resolutions.get(c.id) ?? 0;
       const node = level > 0 ? after.ancestorAt(c.id, level) : null;
@@ -962,7 +977,7 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
   const sameLevels = (a: ReadonlyMap<ChunkId, number>, b: ReadonlyMap<ChunkId, number>): boolean =>
     a.size === b.size && [...a].every(([id, level]) => (b.get(id) ?? 0) === level);
   const rng = mulberry32(1);
-  let warned = 0;
+  let withOverlap = 0;
   for (let t = 0; t < 300; t++) {
     const { inputs, tree, params, corruptions } = randomNonNested(rng);
     // From nothing, the first plan adopts the ideal cut. From an all-raw
@@ -999,43 +1014,44 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
       }
       return undefined;
     };
-    const { overlapWarnings } = quietOverlap(() => {
-      for (const start of starts) {
-        let previous: ReadonlyMap<ChunkId, number> = start.previous;
-        // The first plan's perturbation counts from the carried frontier,
-        // which applies those levels to where it starts.
-        let before = renderLayout(inputs, tree, new Map(inputs.chunks.map((c) => [c.id, heldLevel(c, previous) ?? previous.get(c.id) ?? 0])));
-        for (let turn = 1; turn <= 4; turn++) {
-          const plan = planControlledFrontier(inputs, tree, { ...params, reachTokens: start.reachTokens, previous });
-          const after = renderLayout(inputs, tree, plan.resolutions);
-          ideal ??= plan.resolutions;
-          const where = `tree ${t} (${corruptions.join('; ')}), turn ${turn}: ${unitsOf(before).join(' ')} → ${unitsOf(after).join(' ')}`;
-          assert.equal(plan.perturbation, kvCost(before, after), `perturbation is the change from the last plan's render, ${where}`);
-          for (const c of inputs.chunks) {
-            const level = plan.resolutions.get(c.id) ?? 0;
-            const held = heldLevel(c, previous);
-            if (held !== undefined) assert.equal(level, held, `${c.id} keeps its protected level, ${where}`);
-            const cap = params.pinCaps!.get(c.id);
-            if (cap !== undefined && !params.fixedLevels!.has(c.id)) assert.ok(level <= cap, `${c.id} stays at or below its pin cap, ${where}`);
-            // A leaf renders through its own lineage at its level, which has to
-            // list it; a level with no summary renders raw.
-            const node = level > 0 ? tree.ancestorAt(c.id, level) : null;
-            if (held === undefined && level > 0) assert.ok(node, `${c.id}, which no protection holds, at L${level} has a summary of its lineage there, ${where}`);
-            if (node) assert.ok(node.leafChunkIds.includes(c.id), `${c.id} at L${level} renders through a summary that lists it, ${where}`);
-          }
-          if (turn > 1 && sameLevels(previous, ideal)) {
-            assert.ok(sameLevels(plan.resolutions, ideal), `the adopted ideal cut stays put, ${where}`);
-          }
-          if (turn > 1 && sameLevels(previous, plan.resolutions)) {
-            assert.ok(!plan.folded && !plan.expanded, `an unchanged plan reports no fold or un-fold, ${where}`);
-          }
-          previous = plan.resolutions;
-          before = after;
+    let overlapped = false;
+    for (const start of starts) {
+      let previous: ReadonlyMap<ChunkId, number> = start.previous;
+      // The first plan's perturbation counts from the carried frontier,
+      // which applies those levels to where it starts.
+      let before = renderLayout(inputs, tree, new Map(inputs.chunks.map((c) => [c.id, heldLevel(c, previous) ?? previous.get(c.id) ?? 0])));
+      for (let turn = 1; turn <= 4; turn++) {
+        const plan = planControlledFrontier(inputs, tree, { ...params, reachTokens: start.reachTokens, previous });
+        if (plan.overlap.conflicting.length > 0 || plan.overlap.unlisted.length > 0) overlapped = true;
+        const after = renderLayout(inputs, tree, plan.resolutions);
+        ideal ??= plan.resolutions;
+        const where = `tree ${t} (${corruptions.join('; ')}), turn ${turn}: ${unitsOf(before).join(' ')} → ${unitsOf(after).join(' ')}`;
+        assert.equal(plan.perturbation, kvCost(before, after), `perturbation is the change from the last plan's render, ${where}`);
+        for (const c of inputs.chunks) {
+          const level = plan.resolutions.get(c.id) ?? 0;
+          const held = heldLevel(c, previous);
+          if (held !== undefined) assert.equal(level, held, `${c.id} keeps its protected level, ${where}`);
+          const cap = params.pinCaps!.get(c.id);
+          if (cap !== undefined && !params.fixedLevels!.has(c.id)) assert.ok(level <= cap, `${c.id} stays at or below its pin cap, ${where}`);
+          // A leaf renders through its own lineage at its level, which has to
+          // list it; a level with no summary renders raw.
+          const node = level > 0 ? tree.ancestorAt(c.id, level) : null;
+          if (held === undefined && level > 0) assert.ok(node, `${c.id}, which no protection holds, at L${level} has a summary of its lineage there, ${where}`);
+          if (node) assert.ok(node.leafChunkIds.includes(c.id), `${c.id} at L${level} renders through a summary that lists it, ${where}`);
         }
+        if (turn > 1 && sameLevels(previous, ideal)) {
+          assert.ok(sameLevels(plan.resolutions, ideal), `the adopted ideal cut stays put, ${where}`);
+        }
+        if (turn > 1 && sameLevels(previous, plan.resolutions)) {
+          assert.ok(!plan.folded && !plan.expanded, `an unchanged plan reports no fold or un-fold, ${where}`);
+        }
+        previous = plan.resolutions;
+        before = after;
       }
-    });
-    if (overlapWarnings > 0) warned++;
+    }
+    if (overlapped) withOverlap++;
   }
-  // The trees exercise the exemption: at least a third of them make some plan warn.
-  assert.ok(warned >= 100, `${warned} of 300 trees made some plan warn`);
+  // The trees exercise the exemption: at least a third of them make some plan
+  // report an overlap.
+  assert.ok(withOverlap >= 100, `${withOverlap} of 300 trees made some plan report an overlap`);
 });

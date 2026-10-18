@@ -131,6 +131,7 @@ export {
 export {
   replayControlled,
   planControlledFrontier,
+  reportOverlap,
   foldDepthCap,
   PRICE,
   MAX_FOLD_LEVEL,

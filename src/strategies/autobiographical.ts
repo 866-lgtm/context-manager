@@ -52,6 +52,7 @@ import { createHash } from 'node:crypto';
 import { Picker, OverBudgetError, UncoveredDropError, type OverBudgetClearedBy, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
+import { reportOverlap } from '../adaptive/kv-control.js';
 import { KvUnifiedStrategy, type KvUnifiedReuse } from '../adaptive/strategies/kv-unified.js';
 import { SummaryTree } from '../adaptive/summary-tree.js';
 import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
@@ -10104,6 +10105,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       moves: pendingResolutionChanges.length,
       solver: picker.solverName,
     };
+    // This compile's own plan reports the leaves its summaries disagree with
+    // here, beside [kv-escalation], rather than in the planner: the shadow
+    // production pick below plans the same way and renders nothing (design
+    // §13.6). A dry run reports the plan it previews, as it reports an
+    // override.
+    if (plan) reportOverlap(plan.overlap);
     if (plan?.override) {
       console.error(
         `[kv-escalation] override=${plan.override} perturbation=${plan.perturbation}` +
@@ -11526,7 +11533,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /** The kv-stable strategy instance behind the most recent compile — kept for
-   *  `[kv-escalation]` observability (design §13.4: every override is loud). */
+   *  `[kv-escalation]` and `[kv-overlap]` observability (design §13.4: every
+   *  override is loud; §13.6). */
   private _lastKvStable: KvStableStrategy | null = null;
   private _lastKvUnified: KvUnifiedStrategy | null = null;
   /** Structures kv-unified may derive from across compiles (validated on use). */
