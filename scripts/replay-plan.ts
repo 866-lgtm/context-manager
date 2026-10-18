@@ -60,10 +60,9 @@ async function main() {
     }
   }
   for (const { id, level } of fixedPins) {
-    const eff = Math.min(level, tree.maxLevel(id));
-    if (eff <= 0) { rawZone.add(id); continue; }
-    const node = tree.ancestorAt(id, eff);
-    if (!node) { fixedLevels.set(id, eff); continue; }
+    const eff = tree.renderableLevel(id, level);
+    const node = tree.ancestorAt(id, eff); // null at level 0
+    if (!node) { rawZone.add(id); continue; }
     for (const leaf of node.leafChunkIds) {
       if (rawZone.has(leaf)) continue;
       const prev = fixedLevels.get(leaf);

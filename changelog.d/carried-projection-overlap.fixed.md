@@ -20,19 +20,20 @@
   did, the turn was refused with `UncoveredDropError`. The projection now
   lowers such a leaf, and the base lowers a locked or pinned leaf's level the
   same way, so a lock or a pin can now render below the level it holds when
-  the summary there doesn't list the leaf. A held level with no summary at
-  all is kept, as before, and renders raw. For a pin-at-level
+  the summary there doesn't list the leaf. For a pin-at-level
   (`pinAtLevel`, `ProtectedRange.level`), kv-stable now lowers the level the
   same way before it holds the pin's summary there, so a summary it holds for
   the pin lists the pinned chunk, and the chunk is held with that summary's
   other leaves. It used to hold the leaves of the summary that doesn't list
   the chunk, which nothing pins, and leave the pinned chunk unheld, so it
   rendered raw when there was room.
-- kv-stable: where two pins-at-level overlap a chunk and one of them holds it
-  at a level where its lineage has no summary, the finer level now holds it.
-  The other pin used to replace the finer level when kv-stable read it
-  second, and the chunk rendered raw, with the picker reporting a level it
-  can't realize.
+- kv-stable: where two pins-at-level overlap a chunk, it is now held at the
+  finer of the levels the two pins hold it at, whichever pin kv-stable reads
+  second; a pin whose chunk has no summary at or below its level holds the
+  chunk raw. A pin at a level where the chunk's lineage had no summary used
+  to set that level for the chunk, replacing a finer pin's level when
+  kv-stable read it second, and the chunk rendered raw, with the picker
+  reporting a level it can't realize.
 - kv-stable: on a store whose summary tree isn't nested, the solve's
   un-fold pass now moves the leaves a summary renders, decided by each
   leaf's own lineage as the projection decides. It used to leave out any
@@ -52,17 +53,12 @@
   Where a leaf below vetoed the summary there, the plan it took wasn't the one
   the projection rendered, and a compile could end exhausted where a plan fit.
 - kv-stable: `[kv-overlap]` now reads the frontier the plan emits. It warns
-  for every compile whose plan renders a summary whose listing disagrees with
-  the lineage of a leaf in the window, and only then: the summary lists a leaf
-  of another lineage, or a leaf's own lineage runs through it and it doesn't
-  list the leaf, as after the summary was written again without one of its
-  sources. The second case has a line of its own, which says that listing and
-  lineage disagree. It used to report the
-  folds the compile made, so a plan that kept the carried folds could render
-  the overlap without a warning, a plan that didn't render it could still
-  warn, and a summary that had lost a source never warned. A lock or a pin can
-  still hold a leaf beside a summary of its own lineage that lists it, which
-  renders the leaf in both recalls without a warning.
+  for every compile whose plan renders a summary that lists a leaf of another
+  lineage, and only then. It used to report the folds the compile made, so a
+  plan that kept the carried folds could render the overlap without a
+  warning, and a plan that didn't render it could still warn. A lock or a pin
+  can still hold a leaf beside a summary of its own lineage that lists it,
+  which renders the leaf in both recalls without a warning.
 - kv-stable: a locked chunk with a pin-max-level is lowered to the cap at
   plan start, as the cap promises. It used to keep its carried level above
   the cap. A chunk under another range's pin-at-level keeps that level, as

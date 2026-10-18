@@ -26,10 +26,11 @@ import { planControlledFrontier, replayControlled, reportOverlap, type ControlPl
 import { renderLayout, kvCost, type RenderLayout } from '../../src/adaptive/render-offsets.js';
 import { Picker } from '../../src/adaptive/picker.js';
 import { KvStableStrategy } from '../../src/adaptive/strategies/kv-stable.js';
-import { buildChronicleWithChain, type MockChronicle } from './harness.js';
+import { buildChronicleWithChain, MockChronicle } from './harness.js';
 import type { PickerChunk, PickerInputs } from '../../src/adaptive/picker.js';
 import type { ChunkId } from '../../src/adaptive/folding-strategy.js';
 import type { SummaryEntry } from '../../src/types/strategy.js';
+import { getSummaryParentId } from '../../src/types/strategy.js';
 
 function inputsOf(ch: MockChronicle): PickerInputs {
   return {
@@ -122,8 +123,40 @@ function store(chunks: PickerChunk[], summaries: SummaryEntry[]): { inputs: Pick
 
 const unitsOf = (layout: RenderLayout): string[] => layout.units.map((u) => `${u.kind}:${u.key}`);
 
+/** The summary a leaf's lineage reaches at a level, walking the inputs' links
+ *  as the renderer does: the leaf's L1, then each parent above it. */
+function lineageAt(inputs: PickerInputs, id: ChunkId, level: number): SummaryEntry | undefined {
+  const chunk = inputs.chunks.find((c) => c.id === id);
+  let cur = chunk?.l1Id === undefined ? undefined : inputs.summaries.get(chunk.l1Id);
+  while (cur && cur.level < level) {
+    const parentId = getSummaryParentId(cur);
+    const parent = parentId === undefined ? undefined : inputs.summaries.get(parentId);
+    if (!parent || parent.level <= cur.level) return undefined;
+    cur = parent;
+  }
+  return cur?.level === level ? cur : undefined;
+}
+
+/** Whether a summary lists a message, through its sources. */
+function listsLeaf(inputs: PickerInputs, s: SummaryEntry, id: ChunkId, seen = new Set<string>()): boolean {
+  if (seen.has(s.id)) return false;
+  seen.add(s.id);
+  if (s.sourceLevel === 0) return s.sourceIds.includes(id);
+  return s.sourceIds.some((child) => {
+    const entry = inputs.summaries.get(child);
+    return entry !== undefined && listsLeaf(inputs, entry, id, seen);
+  });
+}
+
+/** The summary a leaf renders through at a level, read from the inputs: the
+ *  one its lineage reaches there, when that summary lists the leaf. */
+function rendersThrough(inputs: PickerInputs, id: ChunkId, level: number): SummaryEntry | undefined {
+  const s = level > 0 ? lineageAt(inputs, id, level) : undefined;
+  return s && listsLeaf(inputs, s, id) ? s : undefined;
+}
+
 /** A plan's overlap when nothing it renders disagrees with a leaf. */
-const NO_OVERLAP = { conflicting: [], unlisted: [] };
+const NO_OVERLAP: readonly ChunkId[] = [];
 
 /** The [kv-overlap] lines logged while `fn` runs, caught rather than printed. */
 function overlapLines(fn: () => void): string[] {
@@ -298,10 +331,9 @@ for (const [kind, bParent, m2Level] of [
 }
 
 // The same store with m1 held at L2, locked there or pinned there (or pinned
-// at L3, which the base first clamps to m1's deepest summary, L2). The
-// projection never lowers a held leaf, so the base lowers the held level
-// while its own-lineage summary doesn't list m1, rather than keep m1 in no
-// recall for as long as the hold lasts.
+// at L3). The projection never lowers a held leaf, so the base lowers the held
+// level to the next one down where m1's own lineage has a summary, A at L1,
+// rather than hold m1 where it can't render for as long as the hold lasts.
 for (const [kind, hold] of [
   ['a locked leaf', { frozen: new Set<ChunkId>(['m1']) }],
   ['a pinned leaf', { fixedLevels: new Map<ChunkId, number>([['m1', 2]]) }],
@@ -319,17 +351,41 @@ for (const [kind, hold] of [
   });
 }
 
-// A held level with no summary of the leaf's lineage at all is kept, as the
-// renderer renders it raw: m1 locked at L2, while its L1 A has no parent.
-test('a locked leaf carried at a level with no summary of its lineage is kept there, and renders raw', () => {
+// A held level above the top of the leaf's lineage is lowered to the deepest
+// summary the lineage has: m1 locked at L2, while its L1 A has no parent,
+// renders through A. It used to be kept at L2 and render raw.
+test('a locked leaf carried above the top of its lineage is lowered to its deepest summary', () => {
   const { inputs, tree } = store(
     [message('m1', 1, 100, 'A'), message('m2', 2, 100, 'B')],
     [summary('A', 1, ['m1'], 30), summary('B', 1, ['m2'], 30)],
   );
   const previous = new Map<ChunkId, number>([['m1', 2], ['m2', 1]]);
   const plan = planControlledFrontier(inputs, tree, { ...trio, targetTokens: 30, foldAtTokens: 1_000, previous, frozen: new Set<ChunkId>(['m1']) });
-  assert.equal(plan.resolutions.get('m1'), 2);
-  assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['raw:m1', 'recall:B']);
+  assert.equal(plan.resolutions.get('m1'), 1);
+  assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['recall:A', 'recall:B']);
+});
+
+// The same lock through KvStableStrategy and the picker: m1, locked by the
+// agent at L2 above the top of its lineage, renders through A, and the picker
+// reports no level it can't realize. It used to stay at L2 and render raw,
+// and the picker reported it; the test catches the picker's log lines.
+test('a lock carried above the top of its lineage renders through its deepest summary in a kv-stable compile', () => {
+  const chunks = [message('m1', 1, 100, 'A'), message('m2', 2, 100, 'B')];
+  chunks[0]!.lockedByAgent = true;
+  chunks[0]!.currentResolution = 2;
+  const { inputs, tree } = store(chunks, [summary('A', 1, ['m1'], 30), summary('B', 1, ['m2'], 30)]);
+  const original = console.error;
+  const lines: string[] = [];
+  console.error = (...args: unknown[]) => { lines.push(String(args[0])); };
+  let result;
+  try {
+    result = new Picker(new KvStableStrategy()).run(inputs, { totalBudget: 100_000, targetBudget: 90_000, slack: 0.1 });
+  } finally {
+    console.error = original;
+  }
+  assert.equal(result.finalResolutions.get('m1'), 1, 'm1 is held at L1, through A');
+  assert.ok(unitsOf(renderLayout(inputs, tree, result.finalResolutions)).includes('recall:A'), 'm1 renders in A\'s recall');
+  assert.deepEqual(lines.filter((l) => l.includes('[picker-unrealizable]')), []);
 });
 
 // kv-stable passes a chunk that is both capped and locked in pinCaps and in
@@ -579,41 +635,35 @@ for (const [kind, previousLevels, targetTokens, conflicting, units] of [
     });
     assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), [...units]);
     assert.equal(plan.perturbation, 0);
-    assert.deepEqual(plan.overlap, { conflicting: [...conflicting], unlisted: [] });
+    assert.deepEqual(plan.overlap, [...conflicting]);
   });
 }
 
 // M's sources were N1 and N2, but M was written again without N2, while N2
-// still names M as its parent: y's own lineage runs through M, which no
-// longer lists y. A held plan that renders M (through x) and N2 (y, at L1)
-// warns, though each summary it renders lists only leaves of its own
-// lineage.
-test('[kv-overlap] warns when a rendered summary doesn\'t list a leaf whose own lineage runs through it', () => {
+// still names M as its parent: y's own lineage runs through M, which doesn't
+// list y, so y has no summary at L2. A held plan that renders M (through x)
+// and N2 (y, at L1) has each message in one recall, and reports no overlap.
+test('[kv-overlap] stays quiet about a summary on a leaf\'s lineage that doesn\'t list it, which the leaf can\'t render through', () => {
   const { inputs, tree } = store(
     [message('x', 0, 100, 'N1'), message('y', 1, 100, 'N2')],
     [summary('N1', 1, ['x'], 20, 'M'), summary('N2', 1, ['y'], 20, 'M'), summary('M', 2, ['N1'], 15)],
   );
+  assert.equal(tree.maxLevel('y'), 1, 'y has no summary above N2');
   const previous = new Map<ChunkId, number>([['x', 2], ['y', 1]]);
   const plan = planControlledFrontier(inputs, tree, {
     ...trio, targetTokens: 30, expandAtTokens: 30, foldAtTokens: 300, previous,
   });
   assert.deepEqual(unitsOf(renderLayout(inputs, tree, plan.resolutions)), ['recall:M', 'recall:N2']);
   assert.equal(plan.perturbation, 0);
-  assert.deepEqual(plan.overlap, { conflicting: [], unlisted: ['y'] });
-  // Its own phrase: M covers x and N2 covers y, so no message is in two
-  // recalls here, and the warning says what disagrees.
-  const lines = overlapLines(() => reportOverlap(plan.overlap));
-  assert.equal(lines.length, 1);
-  assert.match(lines[0]!, /1 leaf\(s\) whose own lineage runs through a rendered summary that doesn't list them \(listing and lineage disagree\)/);
-  assert.doesNotMatch(lines[0]!, /double-representation/);
+  assert.deepEqual(plan.overlap, NO_OVERLAP);
+  assert.deepEqual(overlapLines(() => reportOverlap(plan.overlap)), []);
 });
 
-// m disagrees both ways. Its own L1 N1 names B as its parent, but B was
-// written from N2 alone, and A lists m through N1, one of A's sources. A held
-// plan renders m through N1, p through B and q through A, so A lists a leaf of
-// another lineage and B doesn't list a leaf of its own. The warning names m
-// once, on the first line.
-test('[kv-overlap] names a leaf that disagrees both ways once, on the first line', () => {
+// m's own L1 N1 names B as its parent, but B was written from N2 alone, so
+// m has no summary at L2. A lists m through N1, one of A's sources. A held
+// plan renders m through N1, p through B and q through A, so A lists a leaf
+// of another lineage: m is named, once.
+test('[kv-overlap] names a leaf that a rendered summary lists while its own lineage\'s summary there doesn\'t', () => {
   const { inputs, tree } = store(
     [message('m', 0, 100, 'N1'), message('p', 1, 100, 'N2'), message('q', 2, 100, 'N3')],
     [
@@ -627,7 +677,7 @@ test('[kv-overlap] names a leaf that disagrees both ways once, on the first line
   });
   assert.deepEqual(Object.fromEntries(plan.resolutions), { m: 1, p: 2, q: 2 });
   assert.equal(plan.perturbation, 0);
-  assert.deepEqual(plan.overlap, { conflicting: ['m'], unlisted: [] });
+  assert.deepEqual(plan.overlap, ['m']);
   const lines = overlapLines(() => reportOverlap(plan.overlap));
   assert.equal(lines.length, 1);
   assert.match(lines[0]!, /1 leaf\(s\) with conflicting lineage/);
@@ -655,11 +705,11 @@ test('replayControlled logs [kv-overlap] for each turn whose plan renders a summ
 });
 
 // The same links, through the strategy. y is pinned at L2, where its own
-// lineage is M, which doesn't list it. The pin holds y where its lineage lists
-// it, at L1 through N2, and M's own leaves stay unpinned, so with room to
-// spare x renders raw. Expanding the pin through M used to hold x, which
-// nothing pins, at L2 and leave y raw.
-test('a pin-at-level held through KvStableStrategy lowers to where its own lineage lists it', () => {
+// lineage reaches M, which doesn't list it, so y has no summary there. The
+// pin holds y at L1 through N2, and M's own leaves stay unpinned, so with
+// room to spare x renders raw. Expanding the pin through M used to hold x,
+// which nothing pins, at L2 and leave y raw.
+test('a pin-at-level held through KvStableStrategy lowers to where its own lineage has a summary', () => {
   const chunks = [message('x', 0, 100, 'N1'), message('y', 1, 100, 'N2'), message('z', 2, 100, 'N3'), message('w', 3, 100, 'N3')];
   const { inputs } = store(chunks, [
     summary('N1', 1, ['x'], 20, 'M'), summary('N2', 1, ['y'], 20, 'M'), summary('N3', 1, ['z', 'w'], 20),
@@ -690,10 +740,11 @@ test('a pin-at-level lowered through KvStableStrategy holds the other leaves of 
   assert.deepEqual(strategy.lastPlan()?.overlap, NO_OVERLAP);
 });
 
-// N2, y's own L1, was written again from v alone, so no summary of y's
-// lineage lists it. The pin lowers to raw: y renders raw, and no summary's
-// leaves are held for it, neither M's x at L2 nor N2's v at L1.
-test('a pin-at-level whose own lineage lists it at no level lowers to raw and holds no summary', () => {
+// N2, y's own L1, was written again from v alone, so it doesn't list y, and
+// neither does M above it: y has no summary at any level. The pin lowers to
+// raw: y renders raw, and no summary's leaves are held for it, neither M's x
+// at L2 nor N2's v at L1.
+test('a pin-at-level on a chunk whose L1 doesn\'t list it lowers to raw and holds no summary', () => {
   const chunks = [message('x', 0, 100, 'N1'), message('y', 1, 100, 'N2'), message('v', 2, 100, 'N2'), message('z', 3, 100, 'N3'), message('w', 4, 100, 'N3')];
   const { inputs } = store(chunks, [
     summary('N1', 1, ['x'], 20, 'M'), summary('N2', 1, ['v'], 20, 'M'), summary('N3', 1, ['z', 'w'], 20),
@@ -704,20 +755,21 @@ test('a pin-at-level whose own lineage lists it at no level lowers to raw and ho
   for (const id of ['x', 'y', 'v']) assert.equal(result.finalResolutions.get(id) ?? 0, 0, `${id} renders raw`);
 });
 
-// y's own L1 N2 names T, an L3, as its parent, so y's lineage skips L2, and T,
-// written from M alone, doesn't list y. Pinned at L3, y lowers to L2, where its
-// lineage has no summary. The lowering stops there, as the base's does for a
-// held level, so y is held at L2 and renders raw, though N2 lists it. The
-// picker then reports y's level as one it can't realize, as it does at `main`
-// for a pin at such a level (#194 takes up whether the lowering should go on
-// past it), so the test catches its log lines rather than print them.
-test('a pin-at-level lowered to a level its own lineage skips is held there, and renders raw', () => {
+// y's own L1 N2 names T, an L3, as its parent, and T lists N2 among its
+// sources beside M, so y's lineage skips L2. Pinned at L2, y lowers to the
+// next level down that has a summary, L1, and renders in N2's recall. It used
+// to be held at L2, where its lineage has no summary, and render raw, while
+// the picker reported y's level as one it can't realize; the test catches
+// the picker's log lines rather than print them.
+test('a pin-at-level at a level its own lineage skips holds the chunk at the next level down', () => {
   const chunks = [message('x', 0, 100, 'N1'), message('y', 1, 100, 'N2'), message('z', 2, 100, 'N3'), message('w', 3, 100, 'N3')];
   const { inputs, tree } = store(chunks, [
-    summary('N1', 1, ['x'], 20, 'M'), summary('M', 2, ['N1'], 15, 'T'), summary('T', 3, ['M'], 10),
+    summary('N1', 1, ['x'], 20, 'M'), summary('M', 2, ['N1'], 15, 'T'), summary('T', 3, ['M', 'N2'], 10),
     summary('N2', 1, ['y'], 20, 'T'), summary('N3', 1, ['z', 'w'], 20),
   ]);
-  chunks[1]!.pinLevel = 3;
+  assert.equal(tree.ancestorAt('y', 2), null, 'premise: y\'s lineage skips L2');
+  assert.equal(tree.ancestorAt('y', 3)?.id, 'T', 'premise: T, which lists N2, is y\'s L3');
+  chunks[1]!.pinLevel = 2;
   const original = console.error;
   const lines: string[] = [];
   console.error = (...args: unknown[]) => { lines.push(String(args[0])); };
@@ -727,22 +779,22 @@ test('a pin-at-level lowered to a level its own lineage skips is held there, and
   } finally {
     console.error = original;
   }
-  assert.equal(result.finalResolutions.get('y'), 2, 'y is held at L2, the level its lineage skips');
-  assert.ok(unitsOf(renderLayout(inputs, tree, result.finalResolutions)).includes('raw:y'), 'y renders raw');
+  assert.equal(result.finalResolutions.get('y'), 1, 'y is held at L1, through N2');
+  assert.ok(unitsOf(renderLayout(inputs, tree, result.finalResolutions)).includes('recall:N2'), 'y renders in N2\'s recall');
+  assert.deepEqual(lines.filter((l) => l.includes('[picker-unrealizable]')), []);
   assert.equal(result.finalResolutions.get('x') ?? 0, 0, 'x, which nothing pins, renders raw');
 });
 
 // From Greptile's second review of #186: N, the L1 of x and y, names T, an L3,
-// as its parent, so their lineage skips L2, and T, written from M alone, lists
-// neither. x is pinned at L1, which holds N's leaves there, y among them. y is
-// pinned at L2, or at L3 and lowered to L2, and either way held at L2 alone,
-// since its lineage has no summary there. The finer level, x's, holds y in
-// either order. When y's pin came second, its L2 replaced x's L1, and y
-// rendered raw beside N's recall: 143 tokens against a window of 60, and the
-// picker reported y's level as one it can't realize.
+// as its parent, and T, written from M alone, lists neither, so neither has a
+// summary above N. x is pinned at L1, which holds N's leaves there, y among
+// them. y is pinned at L2 or L3, which lowers to L1, where N holds y with x,
+// in either order. When y's pin came second, it used to hold y at L2,
+// replacing x's L1, and y rendered raw beside N's recall: 143 tokens against
+// a window of 60, and the picker reported y's level as one it can't realize.
 for (const yPin of [2, 3]) {
   for (const order of ['x first', 'y first'] as const) {
-    test(`a pin at L${yPin} that holds y at L2, which y's lineage skips, leaves y at a finer pin's level (${order})`, () => {
+    test(`a pin at L${yPin} on y, whose L1's parent doesn't list the L1, holds y at L1 with x's pin (${order})`, () => {
       const x = message('x', 0, 100, 'N'), y = message('y', 1, 100, 'N'), z = message('z', 2, 10, 'Z');
       x.pinLevel = 1;
       y.pinLevel = yPin;
@@ -951,21 +1003,17 @@ test('after a summary loses a source between compiles, every leaf renders throug
     // a summary that doesn't list its leaf? (The test needs such trees.)
     const staleIds = changed.chunks.filter((c) => {
       const level = first.resolutions.get(c.id) ?? 0;
-      const node = level > 0 ? after.ancestorAt(c.id, level) : null;
-      return node !== null && !node.leafChunkIds.includes(c.id);
+      const node = level > 0 ? lineageAt(changed, c.id, level) : undefined;
+      return node !== undefined && !listsLeaf(changed, node, c.id);
     }).map((c) => c.id);
     if (staleIds.length > 0) stale++;
     if (staleIds.some((id) => frozen.has(id))) staleLocked++;
     const second = planControlledFrontier(changed, after, { ...params, frozen, reachTokens: params.windowTokens, previous: first.resolutions });
     for (const c of changed.chunks) {
       const level = second.resolutions.get(c.id) ?? 0;
-      const node = level > 0 ? after.ancestorAt(c.id, level) : null;
-      if (level > 0 && !frozen.has(c.id) && !params.fixedLevels!.has(c.id)) {
-        assert.ok(node, `tree ${t}: ${c.id}, which no protection holds, at L${level} has a summary of its lineage there`);
-      }
-      if (node) {
-        assert.ok(node.leafChunkIds.includes(c.id),
-          `tree ${t} (${corruptions.join('; ')}; ${s.id} lost ${s.sourceIds[s.sourceIds.length - 1]}): ${c.id} at L${level} renders through a summary that lists it`);
+      if (level > 0) {
+        assert.ok(rendersThrough(changed, c.id, level),
+          `tree ${t} (${corruptions.join('; ')}; ${s.id} lost ${s.sourceIds[s.sourceIds.length - 1]}): ${c.id} at L${level} renders through a summary of its lineage that lists it`);
       }
     }
   }
@@ -987,26 +1035,22 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
       { reachTokens: Math.max(1, Math.floor(params.targetTokens / 2)), previous: new Map(inputs.chunks.map((c) => [c.id, 0])) },
     ];
     let ideal: ReadonlyMap<ChunkId, number> | null = null;
-    // A held level, lowered while its own-lineage summary exists but doesn't
-    // list the leaf (a level with no summary renders raw, so it stays).
+    // A held level, lowered to the next level down where the leaf renders
+    // through a summary of its lineage, or to raw.
     const renderable = (id: ChunkId, level: number): number => {
       let k = level;
-      while (k > 0) {
-        const node = tree.ancestorAt(id, k);
-        if (!node || node.leafChunkIds.includes(id)) break;
-        k--;
-      }
+      while (k > 0 && !rendersThrough(inputs, id, k)) k--;
       return k;
     };
     // The level a protection sets, which every plan must keep: the raw zone
-    // raw, a pinned leaf at its level (as deep as its summaries go) and a
-    // locked leaf at its carried level, each lowered where its summary
-    // doesn't list it. A lock's carried level is the one the plan is given,
-    // or on a first plan from nothing the chunk's own, as the base reads it.
+    // raw, a pinned leaf at its level and a locked leaf at its carried level,
+    // each lowered to where it renders through a summary. A lock's carried
+    // level is the one the plan is given, or on a first plan from nothing the
+    // chunk's own, as the base reads it.
     const heldLevel = (c: PickerChunk, carried: ReadonlyMap<ChunkId, number>): number | undefined => {
       if (params.rawZone.has(c.id)) return 0;
       const k = params.fixedLevels!.get(c.id);
-      if (k !== undefined) return k === 0 ? 0 : renderable(c.id, Math.min(k, tree.maxLevel(c.id)));
+      if (k !== undefined) return renderable(c.id, k);
       if (params.frozen!.has(c.id)) {
         const level = carried.get(c.id) ?? c.currentResolution;
         const cap = params.pinCaps!.get(c.id);
@@ -1022,7 +1066,7 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
       let before = renderLayout(inputs, tree, new Map(inputs.chunks.map((c) => [c.id, heldLevel(c, previous) ?? previous.get(c.id) ?? 0])));
       for (let turn = 1; turn <= 4; turn++) {
         const plan = planControlledFrontier(inputs, tree, { ...params, reachTokens: start.reachTokens, previous });
-        if (plan.overlap.conflicting.length > 0 || plan.overlap.unlisted.length > 0) overlapped = true;
+        if (plan.overlap.length > 0) overlapped = true;
         const after = renderLayout(inputs, tree, plan.resolutions);
         ideal ??= plan.resolutions;
         const where = `tree ${t} (${corruptions.join('; ')}), turn ${turn}: ${unitsOf(before).join(' ')} → ${unitsOf(after).join(' ')}`;
@@ -1034,10 +1078,8 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
           const cap = params.pinCaps!.get(c.id);
           if (cap !== undefined && !params.fixedLevels!.has(c.id)) assert.ok(level <= cap, `${c.id} stays at or below its pin cap, ${where}`);
           // A leaf renders through its own lineage at its level, which has to
-          // list it; a level with no summary renders raw.
-          const node = level > 0 ? tree.ancestorAt(c.id, level) : null;
-          if (held === undefined && level > 0) assert.ok(node, `${c.id}, which no protection holds, at L${level} has a summary of its lineage there, ${where}`);
-          if (node) assert.ok(node.leafChunkIds.includes(c.id), `${c.id} at L${level} renders through a summary that lists it, ${where}`);
+          // list it.
+          if (level > 0) assert.ok(rendersThrough(inputs, c.id, level), `${c.id} at L${level} renders through a summary of its lineage that lists it, ${where}`);
         }
         if (turn > 1 && sameLevels(previous, ideal)) {
           assert.ok(sameLevels(plan.resolutions, ideal), `the adopted ideal cut stays put, ${where}`);
@@ -1054,4 +1096,77 @@ test('on unchanged inputs, each plan reports its change from the last plan, and 
   // The trees exercise the exemption: at least a third of them make some plan
   // report an overlap.
   assert.ok(withOverlap >= 100, `${withOverlap} of 300 trees made some plan report an overlap`);
+});
+
+// #194's stream, from #156's review: a base-6 chain at 50 raw / 100 recall,
+// one leaf appended per turn, every frontier carried into the next solve, and
+// the oldest L1's parent re-pointed at L2-6, an L2 in another L3's subtree,
+// which doesn't list it. L2-0, which still lists that L1, and the L3 above it
+// render beside its leaves. Every plan renders each leaf through a summary of
+// its own lineage that lists it, and re-planned on unchanged inputs it stays
+// put.
+test('a re-pointed L1 across carried growth: each leaf renders through a summary that lists it, and each plan settles', () => {
+  const ch = new MockChronicle({ mergeThreshold: 6, recallPairTokens: 100 });
+  let n = 0;
+  const add = () => { ch.addChunk({ id: `c-${String(n).padStart(5, '0')}`, rawTokens: 50 }); n++; };
+  const produce = () => {
+    for (let i = 0; i + 6 <= ch.chunks.length; i += 6) {
+      if (!ch.chunks[i]!.l1Id) ch.produceL1(ch.chunks.slice(i, i + 6).map((c) => c.id));
+    }
+    ch.preProduceUpperLevels();
+  };
+  for (let i = 0; i < 1296; i++) add();
+  produce();
+  ch.summaries.get('L1-0')!.parentId = 'L2-6';
+  // Each summary's leaves, through its sources, and the summary a chunk's
+  // lineage reaches at a level, as the renderer walks it.
+  const leaves = new Map<string, ReadonlySet<string>>();
+  const leavesOf = (id: string): ReadonlySet<string> => {
+    let set = leaves.get(id);
+    if (!set) {
+      const s = ch.summaries.get(id)!;
+      set = new Set(s.sourceLevel === 0 ? s.sourceIds : s.sourceIds.flatMap((child) => [...leavesOf(child)]));
+      leaves.set(id, set);
+    }
+    return set;
+  };
+  const lineageAtLevel = (c: PickerChunk, level: number): SummaryEntry | undefined => {
+    let cur = c.l1Id === undefined ? undefined : ch.summaries.get(c.l1Id);
+    while (cur && cur.level < level) {
+      const parentId = getSummaryParentId(cur);
+      cur = parentId === undefined ? undefined : ch.summaries.get(parentId);
+    }
+    return cur?.level === level ? cur : undefined;
+  };
+  let previous = new Map<ChunkId, number>();
+  let folds = 0;
+  let overlapped = 0;
+  for (let t = 0; t < 120; t++) {
+    add(); produce();
+    const tail = new Set(ch.chunks.slice(-6).map((c) => c.id));
+    const inputs: PickerInputs = {
+      chunks: ch.chunks.map((c) => ({ ...c, currentResolution: previous.get(c.id) ?? 0 })),
+      summaries: ch.summaries, recallPairTokens: ch.recallPairTokens,
+      headTokens: 0, tailTokens: 300, headChunkIds: new Set(), tailChunkIds: tail,
+    };
+    const tree = new SummaryTree(inputs);
+    const params = (prev: ReadonlyMap<ChunkId, number>) => ({
+      previous: prev, foldAtTokens: 2150, expandAtTokens: 1600, targetTokens: 1600, windowTokens: 2150,
+      rawZone: tail, now: n - 1, mergeThreshold: 6,
+    });
+    const plan = planControlledFrontier(inputs, tree, params(previous));
+    for (const c of inputs.chunks) {
+      const level = plan.resolutions.get(c.id) ?? 0;
+      if (level === 0) continue;
+      const s = lineageAtLevel(c, level);
+      assert.ok(s && leavesOf(s.id).has(c.id), `turn ${t}: ${c.id} at L${level} renders through ${s?.id ?? 'no summary'}, which lists it`);
+    }
+    const again = planControlledFrontier(inputs, tree, params(plan.resolutions));
+    assert.deepEqual(again.resolutions, plan.resolutions, `turn ${t}: re-planned on unchanged inputs, the plan stays put`);
+    if (t > 0 && plan.folded) folds++;
+    if (plan.overlap.some((id) => leavesOf('L1-0').has(id))) overlapped++;
+    previous = plan.resolutions;
+  }
+  assert.ok(folds >= 2, `premise: the plans crossed W at least twice (folds=${folds})`);
+  assert.ok(overlapped > 0, 'premise: a plan renders a summary over the re-pointed L1\'s leaves beside them');
 });

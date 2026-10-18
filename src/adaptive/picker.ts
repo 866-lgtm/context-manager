@@ -299,10 +299,10 @@ export interface PickerChunk {
    * folding strategies that read it (kv-stable, kv-unified, with adaptive
    * resolution). Such a chunk is NOT `pinned` (the controller must be able to
    * move it to its level), but the controller holds it there and never
-   * folds/un-folds it. Under kv-stable, a level deeper than the chunk's
-   * summaries go is clamped to the deepest, and a level whose own-lineage
-   * summary exists but doesn't list the chunk is lowered until one does, or
-   * to raw. A level its lineage has no summary at is kept, and renders raw.
+   * folds/un-folds it. Under kv-stable, a level where the chunk has no
+   * summary (deeper than its summaries go, one its lineage skips, or one
+   * whose own-lineage summary doesn't list it) is lowered to the next one
+   * down where it has one (`SummaryTree.renderableLevel`), or to raw.
    */
   pinLevel?: number;
   /**
