@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import type { PickerInputs } from '../../src/adaptive/picker.js';
-import { CanonicalSummaryForest } from '../../src/adaptive/kv-unified.js';
+import { CanonicalSummaryForest, SparseLabelCeilingError } from '../../src/adaptive/kv-unified.js';
 import { ParetoKvUnifiedPolicySolver, type ParetoSolveOptions } from '../../src/adaptive/kv-unified-pareto.js';
 import type { KvUnifiedReuse } from '../../src/adaptive/kv-unified-reuse.js';
 import { ExactKvUnifiedPolicySolver, type ExactPolicyCandidate } from '../../src/adaptive/kv-unified-policy.js';
@@ -185,6 +185,11 @@ test('the subtree engine reuses the deltas of unchanged summaries across compile
   assert.deepEqual(warm.selected.frontier, cold.selected.frontier, 'the warm solve is the cold solve');
   assert.equal(warm.selected.score, cold.selected.score);
   assert.deepEqual(metrics(warm.candidates), metrics(cold.candidates));
+  assert.deepEqual(warm.propagation, cold.propagation, 'reuse charges what the cold solve counts, its peaks included');
+  // A reused set is held to the solve's ceiling as a fresh one would be.
+  const ceiling = cold.propagation!.maxLabelsPerState - 1;
+  assert.throws(() => new ParetoKvUnifiedPolicySolver(second, new CanonicalSummaryForest(second)).solve({ ...options, reuse: {}, labelCeiling: ceiling }), SparseLabelCeilingError);
+  assert.throws(() => new ParetoKvUnifiedPolicySolver(second, forestB).solve({ ...options, reuse, labelCeiling: ceiling }), SparseLabelCeilingError, 'a warm solve under a lower ceiling fails like the cold one');
   // A full rebuild (new summary objects, the same ids and structure) still
   // reads the holder's sets: the entries rebind to the new objects.
   const solverD = new ParetoKvUnifiedPolicySolver(second, new CanonicalSummaryForest(second));
@@ -232,4 +237,81 @@ test('the subtree engine walks internal holes and gap-bearing ownership like the
   assert.ok(packed.feasible);
   assert.equal(solver.lastSubtreeStats, null);
   assert.equal(packed.propagation?.storageMode, 'packed');
+});
+
+test('a child whose recall cost changed invalidates the sets of its ancestors after a rebuild', () => {
+  // Two L1 pairs under an L2. A rebuild with one L1 priced at 300 instead
+  // of 30 makes new objects for every summary; the L2's own structure is
+  // unchanged, but its sets were composed from the child's old ones.
+  const chronicle = buildChronicleWithChain({ chunkCount: 4, tokensPerChunk: 30, mergeThreshold: 2, recallPairTokens: 30 });
+  const l1 = [...chronicle.summaries.values()].filter((summary) => summary.level === 1);
+  assert.equal(l1.length, 2);
+  assert.ok([...chronicle.summaries.values()].some((summary) => summary.level === 2));
+  const options: ParetoSolveOptions = { maxTokens: 130, labelCeiling: 100_000, engine: 'subtree' };
+  const reuse: KvUnifiedReuse = {};
+  const first = inputsOf(chronicle);
+  const before = new ParetoKvUnifiedPolicySolver(first, new CanonicalSummaryForest(first)).solve({ ...options, reuse });
+  assert.ok(before.feasible);
+  chronicle.recallPairTokens.set(l1[1].id, 300);
+  const second = inputsOf(chronicle);
+  const warm = new ParetoKvUnifiedPolicySolver(second, new CanonicalSummaryForest(second)).solve({ ...options, reuse });
+  const cold = new ParetoKvUnifiedPolicySolver(second, new CanonicalSummaryForest(second)).solve({ ...options, reuse: {} });
+  assert.ok(warm.feasible && cold.feasible);
+  assert.ok(warm.selected.renderedTokens <= 130, `the warm cut fits the wall (${warm.selected.renderedTokens})`);
+  assert.deepEqual(warm.selected.frontier, cold.selected.frontier);
+  assert.deepEqual(metrics(warm.candidates), metrics(cold.candidates));
+});
+
+test('a delta representative that crosses the wall with the prefix leaves no feasible cut uncovered', () => {
+  // Four 30-token leaves, two 55-token L1s, a 100-token L2, a 100-token
+  // head and a 210-token wall on a coarse grid: the subtree's raw (120),
+  // L1 (110) and L2 (100) cuts share a bucket, and the raw cut, which
+  // covers the L1 cut's error, crosses the wall once the head is added.
+  // The L1 cut is the oracle's answer; the reported bound has to cover it.
+  const chronicle = new MockChronicle({ recallPairTokens: 55 });
+  for (let i = 0; i < 4; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 30 });
+  const a = chronicle.produceL1(['c0', 'c1']);
+  const b = chronicle.produceL1(['c2', 'c3']);
+  const parent = chronicle.produceUpper(2, [a.id, b.id]);
+  chronicle.recallPairTokens.set(parent.id, 100);
+  const inputs = inputsOf(chronicle, { headTokens: 100 });
+  const forest = new CanonicalSummaryForest(inputs);
+  const options: ParetoSolveOptions = {
+    maxTokens: 210, tokenBucketSize: 200, continuityBucketSize: 100, fidelityBucketSize: 1000, labelCeiling: 100_000,
+    policy: { continuityLambda: 0, cacheLambda: 0, budgetUnderLambda: 0, budgetOverLambda: 0 },
+  };
+  const oracle = new ExactKvUnifiedPolicySolver(inputs, forest).solve(options);
+  const subtree = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, engine: 'subtree' });
+  assert.ok(oracle.feasible && subtree.feasible);
+  const bound = subtree.propagation!.approximationScoreErrorBound;
+  assert.ok(subtree.selected.score <= oracle.selected.score + bound + 1e-6,
+    `subtree ${subtree.selected.score} vs oracle ${oracle.selected.score} + bound ${bound}`);
+});
+
+test('an accepted leaf that is a protected hole keeps its summary from counting as new material', () => {
+  // The only presented leaf is pinned inside an L1: the DAG engines and the
+  // terminal evaluator decide new material over every leaf the summary
+  // owns, so recalling that L1 is a re-rendering, not an extension.
+  const chronicle = new MockChronicle({ recallPairTokens: 30 });
+  for (let i = 0; i < 8; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 70, pinned: i === 1 });
+  chronicle.produceL1(['c0', 'c1', 'c2', 'c3']);
+  chronicle.produceL1(['c4', 'c5', 'c6', 'c7']);
+  const inputs = inputsOf(chronicle);
+  const forest = new CanonicalSummaryForest(inputs);
+  assert.ok(forest.hasInternalProtectedHoles());
+  const layout = renderLayout(inputs, new SummaryTree(inputs), new Map(inputs.chunks.map((chunk) => [chunk.id, 0])));
+  const options: ParetoSolveOptions = {
+    maxTokens: 400, labelCeiling: 100_000,
+    presentation: { currentSeq: 2, leaves: new Map([['c1', { level: 0, repHash: 'raw:c1', lastChangedSeq: 1 }]]) },
+    cache: { immutablePrefixHash: 'p', layout, markers: [{ unitIndex: layout.units.length, offset: layout.totalTokens }] },
+    currentImmutablePrefixHash: 'p',
+    policy: { continuityLambda: 50, cacheLambda: 100, continuityScale: 100, cacheScale: 100 },
+  };
+  const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
+  const reference = solver.solve({ ...options, storage: 'objects' });
+  const subtree = solver.solve({ ...options, engine: 'subtree' });
+  assert.ok(reference.feasible && subtree.feasible);
+  assert.equal(subtree.selected.score, reference.selected.score);
+  assert.deepEqual(subtree.selected.frontier, reference.selected.frontier);
+  assert.deepEqual(metrics(subtree.candidates), metrics(reference.candidates));
 });

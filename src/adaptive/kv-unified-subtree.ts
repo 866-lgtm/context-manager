@@ -17,6 +17,7 @@ import {
   fidelityLeafBase,
   frontierSignature,
   normalizePolicy,
+  withBestScoreUnder,
   type KvUnifiedWelfarePolicy,
   type PresentedLeaf,
 } from './kv-unified-policy.js';
@@ -120,7 +121,8 @@ interface MemoEntry {
    * object with the same structure rebinds the entry (a full forest build
    * makes new objects for unchanged summaries). */
   summary: CanonicalSummary;
-  readonly structure: string;
+  /** The subtree's structure: this summary's own and every descendant's. */
+  readonly structure: number;
   readonly solveKey: string;
   readonly hashA: number;
   readonly hashB: number;
@@ -130,9 +132,10 @@ interface MemoEntry {
   /** Deltas for an intact entry at receipt unit `units`, over the receipt's
    * units covering this span (`slice`). */
   intact: { readonly units: number; readonly slice: string; readonly deltas: readonly Delta[] } | null;
-  /** The solver that computed each set: a set read by another solver is a
-   * reuse across compiles, which is what the stats report. Within one
-   * solve a parent's two entry modes read the same child set. */
+  /** The solve that computed each set (a token, so an entry keeps no
+   * solver alive): a set read by another solve is a reuse across compiles,
+   * which is what the stats report. Within one solve a parent's two entry
+   * modes read the same child set. */
   brokenBy: object | null;
   intactBy: object | null;
 }
@@ -208,6 +211,12 @@ export class SubtreeMemoSolver {
   private maximum = 1;
   private summariesSolved = 0;
   private summariesReused = 0;
+  /** Identifies this solve in the memo entries it computes. */
+  private readonly token = {};
+  /** The largest label set since the delta computation in progress began. */
+  private peak = 0;
+  /** Subtree structures for this forest, computed once per summary. */
+  private readonly structures = new Map<CanonicalSummary, number>();
   /** KVU_SUBTREE_DIAG=1: per-level counts of sets computed, their labels,
    * compositions and time, printed at the end of the solve. */
   private readonly diag = typeof process !== 'undefined' && !!process.env?.KVU_SUBTREE_DIAG
@@ -422,8 +431,11 @@ export class SubtreeMemoSolver {
       approximation.fidelity = Math.max(approximation.fidelity, label.approximation.fidelity);
       approximation.cache = Math.max(approximation.cache, label.approximation.cache);
     }
-    return {
-      ...scored,
+    const out: Extract<ParetoPolicySolveResult, { feasible: true }> = {
+      feasible: true, selected: scored.selected, cacheFloor: scored.cacheFloor,
+      continuityFloor: scored.continuityFloor, cacheRelevant: scored.cacheRelevant,
+      enumeration: scored.enumeration,
+      get candidates() { return scored.candidates; },
       propagation: {
         storageMode: 'objects',
         terminalEvaluationMode: full ? 'full' : 'selective',
@@ -444,6 +456,7 @@ export class SubtreeMemoSolver {
         approximationCacheErrorBound: approximation.cache,
       },
     };
+    return scored.bestScoreUnder ? withBestScoreUnder(out, scored.bestScoreUnder) : out;
   }
 
   // ---- composition ----
@@ -492,17 +505,19 @@ export class SubtreeMemoSolver {
     const hashA = this.hashA[to] ^ this.hashA[from];
     const hashB = this.hashB[to] ^ this.hashB[from];
     let entry = this.memo ? this.memo.get(summary.id) : unheld.get(summary);
-    let structure: string | undefined;
+    // The structure covers the descendants too: a child whose recall cost
+    // changed is a new object under a parent that may not be, and the
+    // parent's sets were composed from the child's old ones.
+    const structure = this.structure(summary);
     if (entry && entry.summary !== summary) {
       // A new object for this id: the same summary after a full build, or a
-      // changed one. Its structure decides, once per object.
-      structure = structureOf(summary);
+      // changed one.
       if (entry.structure === structure) entry.summary = summary;
       else entry = undefined;
     }
-    if (!entry || entry.solveKey !== this.solveKey || entry.hashA !== hashA || entry.hashB !== hashB) {
+    if (!entry || entry.structure !== structure || entry.solveKey !== this.solveKey || entry.hashA !== hashA || entry.hashB !== hashB) {
       entry = {
-        summary, structure: structure ?? structureOf(summary), solveKey: this.solveKey, hashA, hashB,
+        summary, structure, solveKey: this.solveKey, hashA, hashB,
         broken: null, intact: null, brokenBy: null, intactBy: null, brokenWork: null, intactWork: null,
       };
       if (this.memo) this.memo.set(summary.id, entry); else unheld.set(summary, entry);
@@ -510,11 +525,24 @@ export class SubtreeMemoSolver {
     return entry;
   }
 
+  private structure(summary: CanonicalSummary): number {
+    let value = this.structures.get(summary);
+    if (value === undefined) {
+      value = ownStructure(summary);
+      for (const id of summary.childSummaryIds) {
+        const child = this.forest.summary(id);
+        if (child) value = mix(value, this.structure(child));
+      }
+      this.structures.set(summary, value);
+    }
+    return value;
+  }
+
   private deltasBroken(summary: CanonicalSummary): readonly Delta[] {
     const entry = this.entry(summary);
     if (entry.broken) {
       if (this.diag) this.note(summary.level, 0, 1, 0, 0, 0);
-      if (entry.brokenBy !== this) { this.summariesReused++; entry.brokenBy = this; }
+      if (entry.brokenBy !== this.token) { this.summariesReused++; entry.brokenBy = this.token; }
       this.charge(entry.brokenWork!);
       return entry.broken;
     }
@@ -526,7 +554,7 @@ export class SubtreeMemoSolver {
     entry.broken = this.processSummary(zero, summary, undefined, Number.POSITIVE_INFINITY).map((label) => toDelta(label, false));
     if (this.diag) this.note(summary.level, 1, 0, entry.broken.length, this.diagPairs - p0, performance.now() - t0);
     entry.brokenWork = this.workSince(before);
-    entry.brokenBy = this;
+    entry.brokenBy = this.token;
     return entry.broken;
   }
 
@@ -550,12 +578,12 @@ export class SubtreeMemoSolver {
     if (resolvable < end) slice += '#';
     if (entry.intact && entry.intact.units === units && entry.intact.slice === slice) {
       if (this.diag) this.note(summary.level, 0, 1, 0, 0, 0);
-      if (entry.intactBy !== this) { this.summariesReused++; entry.intactBy = this; }
+      if (entry.intactBy !== this.token) { this.summariesReused++; entry.intactBy = this.token; }
       this.charge(entry.intactWork!);
       return entry.intact.deltas;
     }
     this.summariesSolved++;
-    entry.intactBy = this;
+    entry.intactBy = this.token;
     const zero: Label = {
       tokens: 0, extension: 0, continuity: 0, fidelity: 0,
       cache: { intact: true, matchedUnits: units, cachedTokens: Number.NaN, cachedUnits: -1 },
@@ -576,22 +604,35 @@ export class SubtreeMemoSolver {
     this.diag!.set(level, d);
   }
 
+  /** A mark before a delta computation. `maximum` carries the peak of the
+   * enclosing computation, which resumes when this one ends. */
   private work(): Work {
-    return { states: this.states, created: this.created, expanded: this.expanded, dominated: this.dominated, maximum: this.maximum };
+    const mark = { states: this.states, created: this.created, expanded: this.expanded, dominated: this.dominated, maximum: this.peak };
+    this.peak = 0;
+    return mark;
   }
 
+  /** The work since `before`, with the peak reached inside it alone, so a
+   * reuse replays what this subtree cost and not what an earlier branch of
+   * that solve happened to reach. */
   private workSince(before: Work): Work {
-    return {
+    const work = {
       states: this.states - before.states, created: this.created - before.created,
-      expanded: this.expanded - before.expanded, dominated: this.dominated - before.dominated, maximum: this.maximum,
+      expanded: this.expanded - before.expanded, dominated: this.dominated - before.dominated, maximum: this.peak,
     };
+    this.peak = Math.max(before.maximum, this.peak);
+    return work;
   }
 
+  /** A reused set counts as computed again, ceiling included: a set that
+   * needed more labels than this solve allows is not an answer for it. */
   private charge(work: Work): void {
     this.states += work.states;
     this.created += work.created;
     this.expanded += work.expanded;
     this.dominated += work.dominated;
+    if (work.maximum > this.ceiling) throw new SparseLabelCeilingError(this.ceiling, work.maximum);
+    this.peak = Math.max(this.peak, work.maximum);
     this.maximum = Math.max(this.maximum, work.maximum);
   }
 
@@ -620,7 +661,10 @@ export class SubtreeMemoSolver {
         continuity += this.continuity(i, summary.level);
         if (this.leaves[i].sequence < firstEmission) firstEmission = this.leaves[i].sequence;
       }
-      const extension = this.isExtension(participants);
+      // New material is decided over every leaf the summary owns, as the
+      // DAG engines and the terminal evaluator do: an accepted leaf that is
+      // a hole here still makes the recall a re-rendering, not new material.
+      const extension = this.isExtension(indices);
       const assigned: Label = {
         ...start,
         continuity: start.continuity + continuity,
@@ -676,9 +720,9 @@ export class SubtreeMemoSolver {
     return this.continuityBase[i] * Math.max(1, Math.abs(level - previous));
   }
 
-  private isExtension(indices: readonly number[]): boolean {
+  private isExtension(indices: ArrayLike<number>): boolean {
     if (!this.options.presentation || indices.length === 0) return false;
-    for (const i of indices) if (this.previousLevel[i] >= 0) return false;
+    for (let k = 0; k < indices.length; k++) if (this.previousLevel[indices[k]] >= 0) return false;
     return true;
   }
 
@@ -817,6 +861,7 @@ export class SubtreeMemoSolver {
     }
     this.created += result.length;
     this.maximum = Math.max(this.maximum, result.length);
+    this.peak = Math.max(this.peak, result.length);
     if (result.length > this.ceiling) throw new SparseLabelCeilingError(this.ceiling, result.length);
     if (this.states % 1000 === 0) this.options.onProgress?.({
       phase: 'propagate', elapsedMs: performance.now() - this.started, states: this.states, labels: result.length,
@@ -825,16 +870,24 @@ export class SubtreeMemoSolver {
   }
 }
 
-/** What a delta set reads from a summary besides its leaves: level, recall
- * cost, which leaves and children it owns. Leaf changes are the span hash's. */
-function structureOf(summary: CanonicalSummary): string {
-  let leaves = 0;
-  for (const id of summary.leafIds) leaves = mix(leaves, hashString(id));
-  let children = 0;
-  for (const id of summary.childSummaryIds) children = mix(children, hashString(id));
-  let direct = 0;
-  for (const id of summary.directLeafIds) direct = mix(direct, hashString(id));
-  return `${summary.level}:${summary.recallTokens}:${summary.leafIds.length}:${leaves}:${children}:${direct}:${summary.parentId ?? ''}`;
+/** What a delta set reads from a summary besides its leaves and children:
+ * level, recall cost, which leaves and children it owns. Leaf changes are
+ * the span hash's; a summary object is immutable, so this is kept per
+ * object, and the subtree structure composes it with the children's. */
+const ownStructures = new WeakMap<CanonicalSummary, number>();
+function ownStructure(summary: CanonicalSummary): number {
+  let value = ownStructures.get(summary);
+  if (value !== undefined) return value;
+  const view = new DataView(new ArrayBuffer(8));
+  view.setFloat64(0, summary.recallTokens);
+  value = mix(summary.level + 1, view.getUint32(0) ^ view.getUint32(4));
+  value = mix(value, summary.leafIds.length);
+  for (const id of summary.leafIds) value = mix(value, hashString(id));
+  for (const id of summary.childSummaryIds) value = mix(value, hashString(id) ^ 0x5bd1e995);
+  for (const id of summary.directLeafIds) value = mix(value, hashString(id) ^ 0x1b873593);
+  value = mix(value, hashString(summary.parentId ?? ''));
+  ownStructures.set(summary, value);
+  return value;
 }
 
 function hashString(value: string): number {
@@ -944,6 +997,13 @@ function bucketRepresentatives(pool: readonly Label[], cacheRelevant: boolean, o
   return result;
 }
 
+/** The DAG engines' envelope accounting, with one more rule: a label is
+ * covered only by a representative with no more tokens than its own. These
+ * labels are measured from the subtree's origin, so the wall is applied
+ * again at every ancestor with the prefix added; a representative that
+ * crosses it then can only take with it labels that would have crossed
+ * too, and the error it carries for them is never owed. The cheapest
+ * representative always qualifies, so every label is covered. */
 function coverApproximationPool(pool: readonly Label[], representatives: readonly Label[], cacheRelevant: boolean): Label[] {
   const envelopes = representatives.map((label) => ({ ...label.approximation }));
   for (const source of pool) {
@@ -951,6 +1011,7 @@ function coverApproximationPool(pool: readonly Label[], representatives: readonl
     let chosenCost = Number.POSITIVE_INFINITY;
     for (let i = 0; i < representatives.length; i++) {
       const candidate = representatives[i];
+      if (candidate.tokens > source.tokens) continue;
       const cost =
         Math.abs(candidate.tokens - source.tokens) +
         Math.max(0, candidate.continuity - source.continuity) +

@@ -88,12 +88,20 @@ composes with the memoized broken sets at every child. Those forests are the
 common case on real stores (the resident store copy carries two gap-bearing L2s), so
 the engine runs on every forest; `engine: 'dag'` asks for the packed engine.
 
-**Memo validity.** The memo is a module-level `WeakMap` keyed by the
-`CanonicalSummary` object, which every forest derived from one build shares
-(the live forest and the latent-demand what-if forests alike; a summary
-whose leaves or children changed is a new object). An entry is valid while
-its *solve key* (policy terms that enter propagation, the grid, the wall,
-cache relevance) and the *span hash* match. The span hash is two 32-bit
+**Memo validity.** The memo lives in the solve's reuse holder
+(`KvUnifiedReuse.subtree`), a `Map` keyed by summary id, so it survives a
+full forest build (which makes new objects for unchanged summaries; a
+forest with gap-bearing ownership is rebuilt on every summary arrival). A
+solve without a holder uses a module-level `WeakMap` keyed by the summary
+object instead. A latent-demand what-if starts from a copy of the live
+holder's map and keeps its own, which goes with its holder when the
+candidate is gone. An entry is valid while its *structure* (the summary's
+level, recall cost, owned leaves and children, composed with every
+descendant's, since a parent's sets are built from its children's), its
+*solve key* (policy terms that enter propagation, the grid, the wall,
+cache relevance) and the *span hash* match; a reused set whose computation
+needed more labels than the solve's ceiling allows is refused the way a
+fresh computation would be. The span hash is two 32-bit
 lanes of a position-mixed hash over everything a delta reads from a leaf
 (fidelity and continuity bases, accepted level and whether it still matches,
 allowed levels, zone, raw tokens), kept as xor prefix arrays so a span's

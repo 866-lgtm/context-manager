@@ -454,8 +454,12 @@ function solveWithLatentCandidate(
   // from last compile's what-if when only leaves were appended since. The
   // first what-if borrows unchanged nodes from the live certificate graph.
   const key = `${candidate.id}\0${recallTokens}`;
+  // The what-if starts from a copy of the live memo: it reads the live
+  // subtrees' sets and keeps its own candidate's, and its copy goes with
+  // the holder when the candidate is gone, instead of leaving every merge
+  // ever considered in the live map.
   const holder: KvUnifiedReuse = whatIf.kept?.get(key) ?? whatIf.carried?.get(key) ??
-    { certificate: whatIf.live?.certificate, subtree: whatIf.live?.subtree };
+    { certificate: whatIf.live?.certificate, subtree: whatIf.live?.subtree && new Map(whatIf.live.subtree) };
   whatIf.kept?.set(key, holder);
   const forest = (holder.forest ? CanonicalSummaryForest.derive(holder.forest, candidateInputs, forestOptions) : null) ??
     CanonicalSummaryForest.derive(whatIf.base, candidateInputs, forestOptions) ??
