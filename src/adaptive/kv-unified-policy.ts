@@ -486,8 +486,8 @@ export function normalizePolicy(
   if (policy.budgetLowRatio > policy.budgetHighRatio) {
     throw new KvUnifiedPolicyError('budgetLowRatio must not exceed budgetHighRatio');
   }
-  if (!Number.isFinite(policy.ageBandSteps) || policy.ageBandSteps < 0) {
-    throw new KvUnifiedPolicyError('ageBandSteps must be finite and non-negative');
+  if (!Number.isInteger(policy.ageBandSteps) || policy.ageBandSteps < 0) {
+    throw new KvUnifiedPolicyError('ageBandSteps must be a non-negative integer');
   }
   return policy;
 }
@@ -525,10 +525,12 @@ export function continuityLeafBase(
 ): number {
   const halfLife = positive(policy.continuityRecencyHalfLifeTokens);
   const recencyAge = bandedAge(midpointAgeTokens, policy.ageBandSteps);
-  // With banding on, recency is the floor from eight half-lives out: the
-  // decayed share is below 2^-8 of the range there, and every band edge
-  // past it would re-price the old history for less than that.
-  const recency = policy.ageBandSteps > 0 && recencyAge >= 8 * halfLife
+  // With banding on, recency is the floor from eight half-lives out (the
+  // exact age, so the cutoff sits where it is documented rather than at the
+  // first band edge past it): the decayed share is below 2^-8 of the range
+  // there, and every band edge past it would re-price the old history for
+  // less than that.
+  const recency = policy.ageBandSteps > 0 && midpointAgeTokens >= 8 * halfLife
     ? policy.continuityRecencyFloor
     : policy.continuityRecencyFloor + (1 - policy.continuityRecencyFloor) * 2 ** (-recencyAge / halfLife);
   // With banding on, stability is 1 for the first half of a half-life after

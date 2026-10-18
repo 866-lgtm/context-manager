@@ -813,7 +813,11 @@ export interface KvUnifiedConfig {
      * is priced at the lower edge of its band, so a leaf's weight changes
      * only when it crosses a band edge instead of on every append. 4 unless
      * set (a band is a factor of 2^(1/4) ≈ 1.19 wide); 0 prices exact ages,
-     * which is what the solver itself does when the key is absent.
+     * which is what the solver itself does when the key is absent. Two
+     * continuity readings differ from the plain band rule whenever banding
+     * is on, whatever the count: recency is at its floor from eight
+     * half-lives out, and stability is 1 for the first half of a half-life
+     * after a move and then read at whole doublings of the turns since.
      */
     ageBandSteps?: number;
   };

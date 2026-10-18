@@ -1653,4 +1653,34 @@ test('banded ages move a weight only when the age crosses a band edge', () => {
   assert.equal(normalizePolicy({}).ageBandSteps, 0, 'the solver-level default is exact');
   assert.throws(() => normalizePolicy({ ageBandSteps: -1 }), KvUnifiedPolicyError);
   assert.throws(() => normalizePolicy({ ageBandSteps: Number.NaN }), KvUnifiedPolicyError);
+  assert.throws(() => normalizePolicy({ ageBandSteps: 0.5 }), KvUnifiedPolicyError, 'a band count is an integer');
+});
+
+test('banded continuity holds stability, reads it at doublings, and saturates recency', () => {
+  const chunk = { id: 'c', sequence: 100, rawTokens: 1000, currentResolution: 0, pinned: false, lockedByAgent: false };
+  const banded = normalizePolicy({ ageBandSteps: 4 });
+  const exact = normalizePolicy({ ageBandSteps: 0 });
+  const previous = { repHash: 'raw:c', level: 0, lastChangedSeq: 100 };
+  const continuity = (midpointTokens: number, currentSeq: number, policy = banded) =>
+    continuityLeafBase(chunk, previous, currentSeq, midpointTokens, policy);
+  const moved = 100;
+  const stableHalfLife = banded.continuityStableHalfLife;
+  // Stability is 1 for the first half of a half-life after a move, whatever
+  // the band count; exact ages decay from the first turn.
+  const hold = Math.ceil(stableHalfLife / 2) - 1;
+  assert.equal(continuity(1, moved), continuity(1, moved + hold), 'held for half a half-life');
+  assert.notEqual(continuity(1, moved), continuity(1, moved + hold + 1), 'then it decays');
+  assert.notEqual(continuity(1, moved, exact), continuity(1, moved + 1, exact), 'exact decays at once');
+  // From there it is read at whole doublings, not at the 4 bands per doubling
+  // the other ages use.
+  const doubling = 2 ** Math.ceil(Math.log2(Math.max(1, stableHalfLife / 2)));
+  assert.equal(continuity(1, moved + doubling), continuity(1, moved + 2 * doubling - 1), 'one band per doubling');
+  assert.notEqual(continuity(1, moved + doubling), continuity(1, moved + 2 * doubling), 'the doubling is the edge');
+  assert.notEqual(continuity(1, moved + doubling, exact), continuity(1, moved + doubling + 1, exact));
+  // Recency is at its floor from eight half-lives out; exact ages keep decaying.
+  const halfLife = banded.continuityRecencyHalfLifeTokens;
+  assert.equal(continuity(8 * halfLife, moved), continuity(16 * halfLife, moved), 'saturated at eight half-lives');
+  assert.equal(continuity(8 * halfLife, moved), continuity(64 * halfLife, moved));
+  assert.notEqual(continuity(4 * halfLife, moved), continuity(8 * halfLife, moved), 'not before');
+  assert.notEqual(continuity(8 * halfLife, moved, exact), continuity(16 * halfLife, moved, exact));
 });
