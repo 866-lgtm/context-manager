@@ -2698,6 +2698,52 @@ describe('prepared requests are logged when they are sent', () => {
       fx.manager.close();
     }
   });
+
+  it('logs nothing again for the retries an attempt makes from a sent request (R2-5)', async () => {
+    const payload = 'V'.repeat(20000);
+    const toolUse: AttemptHandler = {
+      raw: {
+        stopReason: 'tool_use',
+        content: [{ type: 'tool_use', id: 'tu-1', name: 'think', input: { content: 'draft…' } }],
+        usage: { inputTokens: 100, outputTokens: 50 },
+      },
+    };
+    const carrierRejection = Object.assign(
+      new Error('invalid_request_error: thinking blocks in this position cannot be modified'), { httpStatus: 400 },
+    );
+    const cases: Array<[string, AttemptHandler[], boolean]> = [
+      ['no-tools and tools-less', [toolUse, toolUse, { stop: 'end_turn', text: 'prose after the tools-less retry' }], false],
+      ['carrier-stripped', [{ error: carrierRejection }, { stop: 'end_turn', text: 'prose after the carrier-stripped retry' }], true],
+    ];
+    for (const [name, handlers, carriers] of cases) {
+      const mock = flexibleMembrane(handlers);
+      const fx = await fixture(mock.membrane, { compressionRefusalCurveFallbacks: 0 });
+      if (carriers) {
+        for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+        fx.strategy.flushSummaries();
+      }
+      fx.target.messages = fx.target.messages.map((m, i) => i ? m : {
+        ...m, content: [text('data:image/png;base64,' + payload)],
+      });
+      const logs: string[] = [];
+      const original = console.error;
+      console.error = (...parts: unknown[]) => { logs.push(parts.map(String).join(' ')); };
+      try {
+        await fx.strategy.run(fx.target, managerContext(fx.manager));
+      } finally { console.error = original; }
+      assert.equal(mock.calls.length, handlers.length, `${name}: every retry was sent`);
+      assert.ok(mock.calls.every((call) => !JSON.stringify(call.request).includes(payload)), `${name}: each send carries the marker`);
+      assert.equal(fx.target.compressed, true, `${name}: the last retry's answer is the L1`);
+      if (carriers) {
+        assert.ok(logs.some((line) => line.includes('transport rejected reasoning carriers')), 'the carrier fallback ran');
+        assert.ok(JSON.stringify(mock.calls[0]!.request).includes('private-'), 'the first send carried reasoning');
+        assert.ok(!JSON.stringify(mock.calls[1]!.request).includes('private-'), 'the retry was stripped of it');
+      }
+      const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
+      assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), ['[canonical]'], `${name}: ${JSON.stringify(lines)}`);
+      fx.manager.close();
+    }
+  });
 });
 
 describe('prepared source-only identity', () => {
@@ -2719,6 +2765,345 @@ describe('prepared source-only identity', () => {
     };
     const actualHash = createHash('sha256').update(JSON.stringify(mock.calls[1].request)).digest('hex');
     assert.equal(record.normalizedConfig.sourceOnlyFallbackRequestHash, actualHash);
+    fx.manager.close();
+  });
+});
+
+describe('tool-prose hoist admission', () => {
+  after(cleanup);
+
+  const PROSE = {
+    compressionToolProseFallback: { intoTool: 'journal', field: 'content', minChars: 100, fromTools: ['skip_reply'] },
+  };
+
+  /** The chunk becomes one skip_reply round whose long reason a hoist moves into journal. */
+  function hoistableChunk(fx: Fixture): void {
+    fx.manager.setToolDefinitions(['journal', 'skip_reply'].map(name => ({
+      name, description: name, inputSchema: { type: 'object' },
+    })));
+    fx.target.messages = fx.target.messages.map((m, i) => ({
+      ...m, participant: i ? 'User' : 'Claude',
+      content: i ? [{ type: 'tool_result', toolUseId: 't', content: '{"skipped":true}' } as ContentBlock]
+        : [{ type: 'tool_use', id: 't', name: 'skip_reply', input: { reason: 'a private note '.repeat(40) } } as ContentBlock],
+    }));
+  }
+
+  /** Whether a request carries a hoisted call: a journal call in its messages (the tools declare journal anyway). */
+  const hoisted = (request: NormalizedRequest) => request.messages.some((m) => m.content.some(
+    (block) => block.type === 'tool_use' && (block as { name: string }).name === 'journal',
+  ));
+
+  function exhaustedOutcomes(fx: Fixture): Array<{ curveLabel: string; outcome: string; admittedTokens?: number; budgetTokens?: number }> {
+    const exhausted = quarantineEvents(fx.manager).find(e => e.kind === 'exhausted') as {
+      outcomes: Array<{ curveLabel: string; outcome: string; admittedTokens?: number; budgetTokens?: number }>;
+    };
+    return exhausted.outcomes;
+  }
+
+  it("admits the canonical's hoist on the canonical's count plus what the hoist adds, and records one over the budget without sending it", async () => {
+    const counted = 50_000;
+    // Room for it: the hoist is sent.
+    const open = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const roomy = await fixture(open.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: 1_000_000, ...PROSE });
+    hoistableChunk(roomy);
+    await roomy.strategy.run(roomy.target, managerContext(roomy.manager));
+    assert.equal(open.calls.length, 2);
+    assert.ok(!hoisted(open.calls[0]!.request) && hoisted(open.calls[1]!.request), 'the second call is the hoist');
+    const reserve = open.calls[0]!.request.config.maxTokens;
+    const added = roomy.strategy.inputBound(open.calls[1]!.request) - roomy.strategy.inputBound(open.calls[0]!.request);
+    assert.ok(added >= 256, `the hoist adds two messages and their bytes (${added})`);
+    roomy.manager.close();
+
+    // A budget the canonical fits with one token to spare: what the hoist adds
+    // takes it over, so it's recorded and not sent.
+    const budget = counted + reserve + 1;
+    const tight = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const fx = await fixture(tight.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: budget, ...PROSE });
+    hoistableChunk(fx);
+    const logPath = `${freshPath()}-trace.jsonl`;
+    paths.push(logPath);
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = logPath;
+    try {
+      await fx.strategy.run(fx.target, managerContext(fx.manager));
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+    }
+    assert.equal(tight.calls.length, 1, 'only the canonical is sent');
+    const expected = { outcome: 'admission_rejected', admittedTokens: counted + added + reserve, budgetTokens: budget };
+    const rejected = exhaustedOutcomes(fx).find(o => o.curveLabel === 'tool-prose-hoist');
+    assert.deepEqual(
+      { outcome: rejected?.outcome, admittedTokens: rejected?.admittedTokens, budgetTokens: rejected?.budgetTokens },
+      expected,
+    );
+    // Its attempt trace records the same, as a rejected variant's does.
+    const traces = readFileSync(logPath, 'utf8').trim().split('\n')
+      .map((line) => JSON.parse(line) as { event?: string; metadata?: Record<string, unknown> })
+      .filter((entry) => entry.event === 'compression:attempt' && entry.metadata?.curveLabel === 'tool-prose-hoist');
+    assert.equal(traces.length, 1);
+    const trace = traces[0]!.metadata!;
+    assert.deepEqual(
+      { outcome: trace.outcome, admittedTokens: trace.admittedTokens, budgetTokens: trace.budgetTokens, latencyMs: trace.latencyMs, persisted: trace.persisted },
+      { ...expected, latencyMs: 0, persisted: false },
+    );
+    fx.manager.close();
+  });
+
+  it("prices what a hoist adds from the fields both requests send, so a raw replay form the edit releases isn't credited against it", async () => {
+    const counted = 50_000;
+    /** The same chunk, its call and result carrying the raw XML the XML formatter replays in their place. */
+    function withRawXml(fx: Fixture): void {
+      hoistableChunk(fx);
+      const reason = 'a private note '.repeat(40);
+      const xmlCall = `<function_calls>\n<invoke name="skip_reply">\n<parameter name="reason">${reason}</parameter>\n</invoke>\n</function_calls>`;
+      const xmlResult = '<function_results>\n<result>\n<tool_use_id>t</tool_use_id>\n<output>{"skipped":true}</output>\n</result>\n</function_results>';
+      fx.target.messages = fx.target.messages.map((m, i) => ({
+        ...m, content: m.content.map((b) => ({ ...b, rawXml: i ? xmlResult : xmlCall }) as ContentBlock),
+      }));
+    }
+    const stripped = (r: NormalizedRequest) => ({ ...r, messages: r.messages.map((m) => ({ ...m, content: m.content.map((b) => {
+      const c = { ...b } as Record<string, unknown>; delete c.rawXml; delete c.rawItem; return c as unknown as ContentBlock;
+    }) })) }) as NormalizedRequest;
+    // Room for it: the hoist is sent, and its edit released the call's raw form.
+    const open = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const roomy = await fixture(open.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: 1_000_000, ...PROSE });
+    withRawXml(roomy);
+    await roomy.strategy.run(roomy.target, managerContext(roomy.manager));
+    assert.equal(open.calls.length, 2);
+    const [base, hoist] = [open.calls[0]!.request, open.calls[1]!.request];
+    const reserve = base.config.maxTokens;
+    assert.ok(roomy.strategy.inputBound(hoist) < roomy.strategy.inputBound(base), "the complete bound falls: the released raw form's copy is gone");
+    const added = roomy.strategy.inputBound(stripped(hoist)) - roomy.strategy.inputBound(stripped(base));
+    assert.ok(added >= 256, `what the fields add (${added})`);
+    roomy.manager.close();
+
+    // A budget the hoist misses by what its fields add, though the complete
+    // bounds' difference would let it through.
+    const budget = counted + reserve + Math.floor(added / 2);
+    const tight = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const fx = await fixture(tight.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: budget, ...PROSE });
+    withRawXml(fx);
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(tight.calls.length, 1, 'only the canonical is sent');
+    const rejected = exhaustedOutcomes(fx).find(o => o.curveLabel === 'tool-prose-hoist');
+    assert.deepEqual(
+      { outcome: rejected?.outcome, admittedTokens: rejected?.admittedTokens, budgetTokens: rejected?.budgetTokens },
+      { outcome: 'admission_rejected', admittedTokens: counted + added + reserve, budgetTokens: budget },
+    );
+    fx.manager.close();
+  });
+
+  it("admits the canonical's hoist on its own bound when the canonical's response carries no usage", async () => {
+    // Room for it: the hoist is sent.
+    const open = flexibleMembrane([{ stop: 'refusal', omitUsage: true }, { stop: 'refusal' }]);
+    const roomy = await fixture(open.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: 1_000_000, ...PROSE });
+    hoistableChunk(roomy);
+    await roomy.strategy.run(roomy.target, managerContext(roomy.manager));
+    assert.equal(open.calls.length, 2);
+    assert.ok(hoisted(open.calls[1]!.request), 'the second call is the hoist');
+    const reserve = open.calls[0]!.request.config.maxTokens;
+    const bound = roomy.strategy.inputBound(open.calls[1]!.request);
+    roomy.manager.close();
+
+    // A budget the hoist's own bound misses by one token. Read as a count of
+    // 0, the missing usage would admit it on what it adds alone.
+    const budget = bound + reserve - 1;
+    const tight = flexibleMembrane([{ stop: 'refusal', omitUsage: true }, { stop: 'refusal' }]);
+    const fx = await fixture(tight.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: budget, ...PROSE });
+    hoistableChunk(fx);
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(tight.calls.length, 1, 'only the canonical is sent');
+    const rejected = exhaustedOutcomes(fx).find(o => o.curveLabel === 'tool-prose-hoist');
+    assert.deepEqual(
+      { outcome: rejected?.outcome, admittedTokens: rejected?.admittedTokens, budgetTokens: rejected?.budgetTokens },
+      { outcome: 'admission_rejected', admittedTokens: bound + reserve, budgetTokens: budget },
+    );
+    fx.manager.close();
+  });
+
+  it("admits the canonical's hoist on its own bound when the provider counted only the canonical's carrier-stripped copy", async () => {
+    const carrierRejection = Object.assign(
+      new Error('invalid_request_error: thinking blocks in this position cannot be modified'), { httpStatus: 400 },
+    );
+    const withCarriers = (fx: Fixture) => {
+      for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+      fx.strategy.flushSummaries();
+    };
+    // The carrier fallback says so on stderr, every time.
+    const quietly = async (run: () => Promise<unknown>) => {
+      const original = console.error;
+      console.error = () => {};
+      try { await run(); } finally { console.error = original; }
+    };
+    const counted = 1_000;
+    // Room for it: the canonical goes as its stripped copy, then the hoist,
+    // built from the canonical with its carriers and first sent with them.
+    const open = flexibleMembrane([{ error: carrierRejection }, { stop: 'refusal', inputTokens: counted }, { error: carrierRejection }, { stop: 'refusal' }]);
+    const roomy = await fixture(open.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: 1_000_000, ...PROSE });
+    withCarriers(roomy);
+    hoistableChunk(roomy);
+    await quietly(() => roomy.strategy.run(roomy.target, managerContext(roomy.manager)));
+    assert.equal(open.calls.length, 4, 'the canonical, its stripped copy, the hoist and its stripped copy');
+    assert.ok(JSON.stringify(open.calls[0]!.request).includes('private-'), 'the canonical carried reasoning');
+    assert.ok(hoisted(open.calls[2]!.request) && JSON.stringify(open.calls[2]!.request).includes('private-'), 'so did the hoist, first');
+    const reserve = open.calls[0]!.request.config.maxTokens;
+    const bound = roomy.strategy.inputBound(open.calls[2]!.request);
+    assert.ok(roomy.strategy.inputBound(open.calls[0]!.request) > counted + 1, 'the stripped count is below what the canonical sends');
+    roomy.manager.close();
+
+    // A budget the hoist's own bound misses by one token. Priced on the
+    // stripped copy's count, it would fit.
+    const budget = bound + reserve - 1;
+    const tight = flexibleMembrane([{ error: carrierRejection }, { stop: 'refusal', inputTokens: counted }]);
+    const fx = await fixture(tight.membrane, { compressionRefusalCurveFallbacks: 0, compressionContextBudgetTokens: budget, ...PROSE });
+    withCarriers(fx);
+    hoistableChunk(fx);
+    await quietly(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+    assert.equal(tight.calls.length, 2, 'only the canonical and its stripped copy are sent');
+    const rejected = exhaustedOutcomes(fx).find(o => o.curveLabel === 'tool-prose-hoist');
+    assert.deepEqual(
+      { outcome: rejected?.outcome, admittedTokens: rejected?.admittedTokens, budgetTokens: rejected?.budgetTokens },
+      { outcome: 'admission_rejected', admittedTokens: bound + reserve, budgetTokens: budget },
+    );
+    fx.manager.close();
+  });
+
+  it("plans the recall-curve variants on their own bound when the provider counted only the canonical's carrier-stripped copy", async () => {
+    const carrierRejection = Object.assign(
+      new Error('invalid_request_error: thinking blocks in this position cannot be modified'), { httpStatus: 400 },
+    );
+    const withCarriers = (fx: Fixture) => {
+      for (const entry of fx.strategy.summariesView()) entry.responseContent = carrierBlocks(entry.id, entry.content);
+      fx.strategy.flushSummaries();
+    };
+    const quietly = async (run: () => Promise<unknown>) => {
+      const original = console.error;
+      console.error = () => {};
+      try { await run(); } finally { console.error = original; }
+    };
+    const counted = 1_000;
+    // Room for one variant: the canonical goes as its stripped copy, then the
+    // variant, built from the canonical with its carriers and first sent with them.
+    const open = flexibleMembrane([
+      { error: carrierRejection }, { stop: 'refusal', inputTokens: counted },
+      { error: carrierRejection }, { stop: 'end_turn', text: 'the variant, sent as its stripped copy' },
+    ]);
+    const roomy = await fixture(open.membrane, { compressionRefusalCurveFallbacks: 1, compressionContextBudgetTokens: 1_000_000 });
+    withCarriers(roomy);
+    await quietly(() => roomy.strategy.run(roomy.target, managerContext(roomy.manager)));
+    assert.equal(open.calls.length, 4, 'the canonical, its stripped copy, the variant and its stripped copy');
+    assert.ok(JSON.stringify(open.calls[2]!.request).includes('private-'), 'the variant carried reasoning, first');
+    assert.notEqual(JSON.stringify(open.calls[2]!.request), JSON.stringify(open.calls[0]!.request), 'the third call is a variant');
+    const reserve = open.calls[2]!.request.config.maxTokens;
+    const bound = roomy.strategy.inputBound(open.calls[2]!.request);
+    assert.ok(roomy.strategy.inputBound(open.calls[0]!.request) > counted + 1, 'the stripped count is below what the canonical sends');
+    roomy.manager.close();
+
+    // A budget the variant's own bound misses by one token. Planned on the
+    // stripped copy's count, it would fit.
+    const budget = bound + reserve - 1;
+    const tight = flexibleMembrane([{ error: carrierRejection }, { stop: 'refusal', inputTokens: counted }]);
+    const fx = await fixture(tight.membrane, { compressionRefusalCurveFallbacks: 1, compressionContextBudgetTokens: budget });
+    withCarriers(fx);
+    await quietly(() => fx.strategy.run(fx.target, managerContext(fx.manager)));
+    assert.equal(tight.calls.length, 2, 'only the canonical and its stripped copy are sent');
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
+      .record as Record<string, unknown>;
+    assert.equal(record.canonicalProviderInputTokens, undefined);
+    // A rejected variant spends no attempt, so the plan goes on to the next.
+    const plan = record.plan as Array<Record<string, unknown>>;
+    assert.ok(plan.length >= 1);
+    assert.ok(plan.every((item) => item.accountingSource === 'complete_normalized_request_bound' && item.disposition === 'admission_rejected'));
+    assert.deepEqual(
+      { admittedTokens: plan[0]!.admittedTokens, budgetTokens: plan[0]!.budgetTokens },
+      { admittedTokens: bound + reserve, budgetTokens: budget },
+    );
+    fx.manager.close();
+  });
+
+  it("prices a variant's added recall answers as their route sends them: a redacted_thinking block by its reasoning item alone, whose summary only the item holds", async () => {
+    const counted = 10_000;
+    // Only L2-201's children carry the item, so the variant that swaps
+    // L2-201's pair for theirs adds two of them, and L2-200's adds none.
+    const withItems = (fx: Fixture) => {
+      for (const entry of fx.strategy.summariesView()) {
+        if (entry.id !== 'L1-102' && entry.id !== 'L1-103') continue;
+        // Both Responses routes send the item alone in the block's place,
+        // its summary and its encrypted content; the block's own data
+        // doesn't go out beside it.
+        const encrypted = 'E'.repeat(4_000);
+        entry.responseContent = [{
+          type: 'redacted_thinking', data: encrypted,
+          rawItem: { type: 'reasoning', id: `rs_${entry.id}`, summary: [{ type: 'summary_text', text: 'S'.repeat(4_000) }], encrypted_content: encrypted },
+        } as unknown as ContentBlock, { type: 'text', text: entry.content }];
+      }
+      fx.strategy.flushSummaries();
+    };
+    const open = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'end_turn', text: 'the variant' }]);
+    const roomy = await fixture(open.membrane, { compressionRefusalCurveFallbacks: 1, compressionContextBudgetTokens: 1_000_000 });
+    withItems(roomy);
+    await roomy.strategy.run(roomy.target, managerContext(roomy.manager));
+    assert.equal(open.calls.length, 2, 'the canonical, then the first variant');
+    assert.ok(JSON.stringify(open.calls[1]!.request).includes('S'.repeat(100)), "the first variant is L2-201's, carrying the items");
+    const reserve = open.calls[1]!.request.config.maxTokens;
+    roomy.manager.close();
+
+    // A budget the two items overrun (16,000 and more), though the blocks'
+    // fields alone (8,000 and more) fit.
+    const budget = counted + reserve + 12_000;
+    const tight = flexibleMembrane([{ stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const fx = await fixture(tight.membrane, { compressionRefusalCurveFallbacks: 1, compressionContextBudgetTokens: budget });
+    withItems(fx);
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    // L2-201's variant is rejected and spends no attempt, so L2-200's goes.
+    assert.equal(tight.calls.length, 2);
+    assert.equal(JSON.stringify(tight.calls[1]!.request).includes('S'.repeat(100)), false, "L2-201's variant isn't sent");
+    const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!.record as Record<string, unknown>;
+    const rejected = (record.plan as Array<Record<string, unknown>>).find((item) => item.curveLabel === 'expand:L2-201')!;
+    assert.equal(rejected.accountingSource, 'canonical_provider_usage_plus_expansion');
+    assert.equal(rejected.disposition, 'admission_rejected');
+    // The items, not the whole blocks, whose data adds 8,000 more.
+    const delta = rejected.expansionDeltaTokens as number;
+    assert.ok(delta >= 16_000 && delta < 24_000, `the two items are priced, not the whole blocks (${delta})`);
+    fx.manager.close();
+  });
+
+  it("admits the source-only hoist on source-only-final's own count, not the canonical's", async () => {
+    const budget = 200_000;
+    // The canonical over the budget, as a model with a larger context accepts it.
+    const canonical = { stop: 'refusal' as const, inputTokens: budget };
+    const open = flexibleMembrane([canonical, { stop: 'refusal', inputTokens: 1_000 }, { stop: 'refusal' }]);
+    const roomy = await fixture(open.membrane, {
+      compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true, compressionContextBudgetTokens: budget, ...PROSE,
+    });
+    hoistableChunk(roomy);
+    await roomy.strategy.run(roomy.target, managerContext(roomy.manager));
+    assert.equal(open.calls.length, 3, 'the canonical, source-only-final and its hoist');
+    assert.ok(!hoisted(open.calls[1]!.request) && hoisted(open.calls[2]!.request));
+    const outcomes = exhaustedOutcomes(roomy);
+    assert.equal(outcomes.find(o => o.curveLabel === 'tool-prose-hoist')?.outcome, 'admission_rejected', "the canonical's hoist is over the budget");
+    assert.equal(outcomes.find(o => o.curveLabel === 'source-only-tool-prose-hoist')?.outcome, 'refusal', 'the source-only hoist was sent');
+    const reserve = open.calls[1]!.request.config.maxTokens;
+    const added = roomy.strategy.inputBound(open.calls[2]!.request) - roomy.strategy.inputBound(open.calls[1]!.request);
+    roomy.manager.close();
+
+    // Source-only-final's count with one token to spare: its hoist's own
+    // addition takes it over, where the request's bound alone would admit it.
+    const counted = budget - reserve - 1;
+    assert.ok(roomy.strategy.inputBound(open.calls[2]!.request) + reserve <= budget, 'its bound alone fits');
+    const tight = flexibleMembrane([canonical, { stop: 'refusal', inputTokens: counted }, { stop: 'refusal' }]);
+    const fx = await fixture(tight.membrane, {
+      compressionRefusalCurveFallbacks: 0, compressionSourceOnlyFallback: true, compressionContextBudgetTokens: budget, ...PROSE,
+    });
+    hoistableChunk(fx);
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+    assert.equal(tight.calls.length, 2, 'the canonical and source-only-final');
+    const rejected = exhaustedOutcomes(fx).find(o => o.curveLabel === 'source-only-tool-prose-hoist');
+    assert.deepEqual(
+      { outcome: rejected?.outcome, admittedTokens: rejected?.admittedTokens, budgetTokens: rejected?.budgetTokens },
+      { outcome: 'admission_rejected', admittedTokens: counted + added + reserve, budgetTokens: budget },
+    );
     fx.manager.close();
   });
 });
