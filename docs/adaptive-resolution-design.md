@@ -762,9 +762,9 @@ and re-introducing one via the objective notation would repeat it.
   (`kvCost` in `render-offsets.ts`) — precisely what the provider will re-read
   for the plan's own choices. `F_prev` here is the carried frontier: the
   persisted one with this compile's protections applied first (the raw zone
-  raw, pins at their level and locks at theirs, each lowered where its
-  own-lineage summary doesn't list it, and a tightened pin-max-level, a
-  lock's included) and projected to a valid cut (§13.6). A change every plan must make is in it already, so no plan's
+  raw, pins at their level and locks at theirs, each lowered to a level where
+  the leaf has a summary of its own lineage that lists it, and a tightened
+  pin-max-level, a lock's included) and projected to a valid cut (§13.6). A change every plan must make is in it already, so no plan's
   perturbation counts it.
 - `P` (`reachTokens`, re-priced) — a **trust region on per-turn divergence**,
   not a spatial eligibility gate. It bounds how much perturbation an ordinary
@@ -993,12 +993,10 @@ every exempted leaf means messages are semantically
 a covering recall also renders). The solve proceeding is the mitigation; the
 topology is the disease. `[kv-overlap]` warns on **every** affected compile
 until the store gets nesting repair. It reads the frontier the plan emits: a
-rendered summary that lists a leaf whose own lineage at that level is
-another summary, or none, or that a leaf's own lineage runs through but
-that doesn't list it (a summary written again without one of its sources).
-So a plan that keeps carried folds reports them as one that makes them
-does. Each direction has a line of its own, the second saying only that
-listing and lineage disagree. The planner only finds these leaves, as the
+rendered summary that lists a leaf whose own summary at that level
+(`SummaryTree.ancestorAt`) is another one, or that has none there. So a plan
+that keeps carried folds reports them as one that makes them does. The
+planner only finds these leaves, as the
 plan's `overlap`, and the compile logs them for its own plan, beside
 `[kv-escalation]`. So the shadow production pick, which a compile that isn't
 a dry run makes when `productionBudgetTokens` is set below its budget, plans
@@ -1025,11 +1023,15 @@ recall beside it, boundary-cut tolerance extended to a lock. On a non-nested
 tree an unheld leaf can stay too, overlap like the rest of this section's.
 Only a listed leaf of the group's own lineage rendered in more detail than
 the group vetoes it, and a hard-protected leaf (raw zone, pinned or locked)
-never does. A leaf also stays at its level only where its own lineage there
-lists it: a level carried from before the tree's links changed can point
-through a summary that no longer covers the leaf. The projection lowers such
-a leaf, and the base clamps a locked or pinned leaf's level the same way,
-since the projection holds those. Every projection applies
+never does. A leaf also stays at its level only where it has a summary there:
+the summary its own lineage reaches at that level, when that summary lists
+it (`SummaryTree.ancestorAt`). A level carried from before the tree's links
+changed can point through a summary that no longer covers the leaf. The
+projection lowers such a leaf, and the base lowers a locked or pinned leaf's
+level to the next one down where it has a summary
+(`SummaryTree.renderableLevel`), since the projection holds those: past a
+summary that doesn't list it, a level its lineage skips, or the top of its
+lineage. Every projection applies
 the rule alike, the ideal cut's, the carried frontier's and each
 suffix-adoption candidate's, so a frontier the planner emitted projects to
 itself on unchanged inputs. Before this rule,
