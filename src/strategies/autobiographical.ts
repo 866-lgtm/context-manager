@@ -4515,7 +4515,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private _summaryIndex: { source: readonly SummaryEntry[]; length: number; byId: Map<string, SummaryEntry> } | null = null;
-  protected summaryById(id: string): SummaryEntry | undefined {
+  private summaryById(id: string): SummaryEntry | undefined {
     const cached = this._summaryIndex;
     if (!cached || cached.source !== this.summaries || cached.length !== this.summaries.length) {
       this._summaryIndex = { source: this.summaries, length: this.summaries.length, byId: new Map(this.summaries.map((s) => [s.id, s] as const)) };
@@ -11099,17 +11099,39 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected _prevCacheKeys?: string[];
 
   /**
+   * The markers each three-slot request placed: its first slot, whether that
+   * was the deep band's end rather than the head, and every index it marked.
+   * Keyed by that request's cache keys array, so it goes back wherever
+   * `select` puts `_prevCacheKeys` back (a refused select, a dry run), and a
+   * baseline set any other way carries none. Weak keys keep no earlier
+   * request alive.
+   */
+  private readonly placedMarks = new WeakMap<readonly string[], { first: number; band: boolean; marks: readonly number[] }>();
+
+  /**
    * Index of the last entry of the deep band: the leading run, immediately
    * after the head, of recall pairs rendered at the deepest summary level
    * emitted in `[lastHead+1, historyEnd]`. A recall pair is its Context
    * Manager question (no source id, no layout key) followed by the answer
    * carrying `cacheLayoutKey = summary id`; a layout key that resolves to no
    * summary (merged raw shards carry their last message id) is raw, and so
-   * stops the run. Returns -1 when no summary is emitted or the run is empty:
-   * the first middle entry is neither an answer at the deepest level nor a
-   * question entry immediately followed by one (a band's first entry is its
-   * question, which has no source id or layout key — the only keyless entry
-   * the run accepts).
+   * stops the run. A keyless entry joins the run only when an answer at the
+   * deepest level follows it, as a pair's question does, so a band normally
+   * starts with its question.
+   *
+   * The run starts after the entries right after the head that hold only
+   * repair stubs `enforceToolPairing` generated, for a head that ends in a
+   * tool_use whose result isn't next. Such an entry renders the same on every
+   * compile while the head ends in that call and no genuine result for it is
+   * within `enforceToolPairing`'s look-ahead, so the band behind it is a
+   * prefix nothing arrives to change. Once a genuine result comes within
+   * reach, `enforceToolPairing` moves it into that place, so the entry after
+   * the head is no longer stubs alone. It is no recall pair either, so there
+   * is no band and the first slot falls back to the head. Only generated
+   * stubs pass, by identity (`generatedToolResultStubs`), not an entry shaped
+   * like one.
+   *
+   * Returns -1 when no summary is emitted or the run is empty.
    *
    * The level is the deepest over the whole middle, not the leading run's
    * own. Deliberately conservative: when a shallower leading run sits in
@@ -11118,9 +11140,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * left shallower, so it is the part a merge or re-cut is still due to
    * change — and the leading run is not a prefix nothing arrives to change.
    * Then there is no band and the first slot falls back to the head, which
-   * is never worse than before this hook existed.
+   * is never worse than before the band.
    */
-  protected deepBandEnd(entries: readonly ContextEntry[], lastHead: number, historyEnd: number): number {
+  private deepBandEnd(entries: readonly ContextEntry[], lastHead: number, historyEnd: number): number {
     const levelAt = (i: number): number | undefined => {
       const key = entries[i]?.cacheLayoutKey;
       if (!key) return undefined;
@@ -11132,8 +11154,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (lvl !== undefined && lvl > maxLevel) maxLevel = lvl;
     }
     if (maxLevel === 0) return -1;
-    let end = -1;
+    const isRepairStub = (e: ContextEntry): boolean =>
+      e.content.length > 0 && e.content.every((block) => this.generatedToolResultStubs.has(block));
     let i = lastHead + 1;
+    while (i <= historyEnd && isRepairStub(entries[i]!)) i++;
+    let end = -1;
     while (i <= historyEnd) {
       const lvl = levelAt(i);
       if (lvl === maxLevel) { end = i; i++; continue; }
@@ -11149,32 +11174,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Place message-level `cache_control` breakpoints across the final ordered
-   * entries. The first slot is the end of the deep band (`deepBandEnd`) when
-   * the compile emitted one, else the last head message.
-   *
-   * `kv-unified` owns all four provider slots. With a deep band they are
-   * {band end, the legal boundary nearest the token midpoint between the
-   * band end and `historyEnd`, `historyEnd`, tail end}; when no legal
-   * boundary lies after the band (or the band reaches `historyEnd`) the
-   * middle slots collapse and fewer markers are placed. Without a band they
-   * are the legal boundaries nearest the rendered-token thirds of non-tail
-   * history (33/66/100%) plus the tail end. Other strategies keep the
-   * three-slot contract: first slot (band end, else head), measured
-   * stable-prefix boundary, and end.
+   * entries. `kv-unified` owns all four provider slots and uses rendered-token
+   * thirds of non-tail history plus the tail end. Other strategies retain the
+   * legacy three-slot contract: first slot, measured stable-prefix boundary,
+   * and end. Their first slot is the end of the deep band (`deepBandEnd`)
+   * when the compile emitted one, else the last head message.
    *
    * The trade on membrane's native formatter: native puts a cache marker on
    * the system block only when ZERO message markers arrive. So there the
    * head marker was the one marker whose prefix (tools+system+head) stayed
    * byte-identical turn to turn, and every turn read at least that from
    * cache. With the first marker at the band's end instead, a turn whose
-   * band changes (a merge one level up, or the solver lowering the band's
-   * youngest group) has no marker matching an earlier request's prefix and
-   * reads NOTHING from cache on native — before, it read tools+system+head.
-   * On the XML formatter membrane marks the system block on every request,
-   * so a band change still reads tools+system there. The head marker bought
-   * little (244 tokens on Fable) against the band (~73k), so the trade is
-   * taken, but it pays off only where band changes are rare: land this
-   * after the change that stops the solver's raises (#156).
+   * band changes inside it (a merge one level up, or the solver re-cutting
+   * the band's youngest group to a shallower level) reads from cache on
+   * native only a prefix an earlier request marked within what survived,
+   * which is usually none, so it usually reads NOTHING — before, it read
+   * tools+system+head. On the XML formatter membrane marks the system
+   * block itself on these requests (its default `cacheMarkers:
+   * 'membrane-system'`, which agent-framework leaves in place for every
+   * strategy but kv-unified), so a band change still reads tools+system there.
+   * The head marker bought little (244 tokens on Fable) against the band
+   * (~73k), so the trade is taken; it pays off where changes inside the band
+   * are rarer than folds after it.
    *
    * The stable-prefix mark used to sit at the folded-history/tail seam
    * (`historyEnd`) on the assumption that the folded region is stable
@@ -11264,39 +11285,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const historyEnd = firstTail - 1; // last non-tail entry
 
-    // The deep band: the leading run of recall pairs, right after the head,
-    // rendered at the deepest level this compile emitted. Nothing ARRIVES to
-    // change it — a new max-level summary lands after the run; a merge one
-    // level up is the rare exception (one event per mergeThreshold landings
-    // at that level). The solver can still LOWER it: kv-stable's ideal cut
-    // may raise the band's youngest group when the budget no longer needs it
-    // (see #156), and `Picker.run` applies whatever the solver returns — so
-    // this is the cheapest stable prefix after system+tools, not an
-    // immutable one, and when it does move the measured marker below still
-    // covers what survived. It is what the head marker was standing in for:
-    // on Fable (2026-10-06)
-    // the head marker cached 244 tokens of bootstrap messages while 14
-    // complete L3 pairs (~73k) sat unmarked behind it, and 24 of 51 large
-    // rewrites in a week re-read exactly the system+tools prefix.
-    // -1 when no summary was emitted or the run is empty.
-    const deepBandEnd = this.deepBandEnd(entries, lastHead, historyEnd);
-
     if (this.config.foldingStrategy === 'kv-unified') {
-      // CM owns all four slots in kv-unified mode. With a deep band the
-      // slots are the design's v1 layout (unified-solve-design.md §5A.3):
-      // system+deep-band | mid-history | historyEnd | end — the first
-      // marker sits at the end of the deep band. The mid marker does NOT
-      // follow §5A.4's placement rule (just before the earliest `pending`
-      // landing when there is one) — this placer has no pending labels — so
-      // it always takes that rule's fallback: the legal boundary nearest the
-      // token midpoint of the stretch between the band end and historyEnd. If no
-      // legal boundary follows the band, the mid and historyEnd slots
-      // collapse onto the band marker. Without
-      // one (no summaries yet), three history breakpoints at the nearest
-      // legal rendered-token boundaries to 33%/66%/100%, plus one at the
-      // end of the tail. There is deliberately no separate early/system
-      // marker: every history prefix already includes tools, system, and
-      // the raw head on the provider wire.
+      // CM owns all four slots in kv-unified mode. Place three history
+      // breakpoints at the nearest legal rendered-token boundaries to
+      // 33%/66%/100%, plus one at the end of the tail. There is deliberately
+      // no separate early/system marker: every history prefix already
+      // includes tools, system, and the raw head on the provider wire.
       const marks = new Set<number>();
       if (historyEnd >= 0) {
         const cumulative: number[] = [0];
@@ -11313,29 +11307,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               ? [index]
               : [],
           );
-        // Nearest legal boundary (by cumulative rendered tokens) to a token
-        // target, among boundaries strictly after `minIndex`.
-        const nearestBoundary = (target: number, minIndex = -1): number | undefined => {
-          let best: number | undefined;
-          for (const index of legalBoundaries) {
-            if (index <= minIndex) continue;
+        const nearestBoundary = (fraction: number): number => {
+          const target = cumulative[cumulative.length - 1]! * fraction;
+          let best = legalBoundaries[0]!;
+          for (const index of legalBoundaries.slice(1)) {
             if (
-              best === undefined ||
-              Math.abs(cumulative[index + 1]! - target) < Math.abs(cumulative[best + 1]! - target)
+              Math.abs(cumulative[index + 1]! - target) <
+              Math.abs(cumulative[best + 1]! - target)
             ) best = index;
           }
           return best;
         };
-        const total = cumulative[cumulative.length - 1]!;
-        if (legalBoundaries.length > 0 && deepBandEnd >= 0 && legalBoundaries.includes(deepBandEnd)) {
-          marks.add(deepBandEnd);
-          const bandEndTokens = cumulative[deepBandEnd + 1]!;
-          const mid = nearestBoundary((bandEndTokens + total) / 2, deepBandEnd);
-          if (mid !== undefined) marks.add(mid);
-          marks.add(legalBoundaries.at(-1)!);
-        } else if (legalBoundaries.length > 0) {
-          marks.add(nearestBoundary(total / 3)!);
-          marks.add(nearestBoundary((total * 2) / 3)!);
+        if (legalBoundaries.length > 0) {
+          marks.add(nearestBoundary(1 / 3));
+          marks.add(nearestBoundary(2 / 3));
           marks.add(legalBoundaries.at(-1)!);
         }
       }
@@ -11363,18 +11348,54 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // it within the new end marker's 20-block backward-search window.
     const stableEnd = prev ? firstDiff - 1 : historyEnd;
 
+    // The deep band: the leading run of recall pairs after the head (and after
+    // any repair stubs there), rendered at the deepest level this compile
+    // emitted. Nothing ARRIVES to change it — a new max-level summary lands
+    // after the run; a merge one level up is the rare exception (one event per
+    // mergeThreshold landings at that level). The solver can still re-cut the
+    // band's youngest group to a shallower level when the budget no longer
+    // needs it (kv-stable's ideal cut; #156 reduces those re-cuts), and
+    // `Picker.run` applies whatever the solver returns — so this is the
+    // cheapest stable prefix after system+tools, not an immutable one. It is
+    // what the head marker was standing in for: on Fable (2026-10-06) the head
+    // marker cached 244 tokens of bootstrap messages while 14 complete L3
+    // pairs (~73k) sat unmarked behind it, and 24 of 51 large rewrites in a
+    // week re-read exactly the system+tools prefix.
+    // -1 when no summary was emitted or the run is empty.
+    const deepBandEnd = this.deepBandEnd(entries, lastHead, historyEnd);
+    // The previous request's markers, read before this one's are recorded.
+    const prevPlaced = prev ? this.placedMarks.get(prev) : undefined;
+
     const marks = new Set<number>();
     // First slot: the end of the deep band when there is one, else the head.
-    // The band starts right after the head, so the prefix through the band's
-    // end contains the head and strictly extends what the head marker
-    // cached — while the band is unchanged (see the native-formatter trade in
-    // the doc comment for what a band change costs); when the measured divergence falls inside
-    // the band (a merge one level up landed), both markers are still placed —
-    // the band entry is re-written once, the measured one covers what
-    // survived.
+    // The band comes after the head, so the prefix through the band's end
+    // contains the head and extends what the head marker cached, for as
+    // long as the band stands (the doc comment says what a change inside the
+    // band costs). A band end that just moved keeps this slot too, so the
+    // next request can read it.
     const first = deepBandEnd >= 0 ? deepBandEnd : lastHead;
     if (first >= 0) marks.add(first);                  // system+deep band / head
-    if (stableEnd > lastHead) marks.add(stableEnd);    // measured stable prefix (the big one)
+    // Measured slot: the last entry of the measured stable prefix, except on a
+    // compile where the first slot moves with a band before or after it (the
+    // band forms, deepens, shrinks or goes). Then it marks the furthest entry
+    // the previous request marked that is still in the unchanged prefix, such
+    // as the head when a fold forms the band right after it, the old band end
+    // on a deepen or when the band goes, or the previous request's measured or
+    // end marker when the change comes after it. Membrane's XML formatter
+    // packs the conversation into one text block between markers (images
+    // aside), so a cache entry there is read back only through a marker on
+    // the same entry, and the move would otherwise leave unread what the
+    // previous request wrote. When that entry is the new first slot, or
+    // nothing the previous request marked is still unchanged, the measured
+    // slot marks the stable prefix as before. A move with no band on either
+    // side, as when the head window moves, leaves the measured slot at the
+    // stable prefix too.
+    let measured = stableEnd > lastHead ? stableEnd : -1;
+    if (prevPlaced && prevPlaced.first !== first && (prevPlaced.band || deepBandEnd >= 0)) {
+      const kept = Math.max(-1, ...prevPlaced.marks.filter((m) => m <= stableEnd));
+      if (kept >= 0 && kept !== first) measured = kept;
+    }
+    if (measured >= 0) marks.add(measured);            // measured stable prefix (the big one)
     marks.add(n - 1);                                  // end → pure-append reuse
 
     // First-claim cap (see the slot contract above). Structurally ≤3 today;
@@ -11389,6 +11410,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
     }
 
+    this.placedMarks.set(keys, { first, band: deepBandEnd >= 0, marks: [...marks] });
     for (const idx of marks) if (idx >= 0 && idx < n) entries[idx].cacheMarker = true;
     return firstChanged;
   }
