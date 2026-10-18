@@ -137,6 +137,11 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     this.config.minChunkCharsForLLM = chars;
   }
 
+  /** Sets compressionContextBudgetTokens, as a host restarted with another configuration does. */
+  setContextBudget(tokens: number): void {
+    this.config.compressionContextBudgetTokens = tokens;
+  }
+
   /** Sets the head window's size, as a host restarted with another configuration does. */
   setHeadWindowTokens(tokens: number): void {
     this.config.headWindowTokens = tokens;
@@ -1196,6 +1201,40 @@ describe('OverBudgetError.clearedBy', () => {
       }
       assert.equal(strategy.chunkInFlight(), undefined, 'premise: the call has ended');
       assert.equal(strategy.countsCompressionWork(), false, 'premise: with nothing in flight, the quarantined chunks queued count nothing');
+    }, { membrane });
+  });
+
+  it("names compression for a quarantined chunk whose call goes out, a new request family's fresh attempt, while the call runs", async () => {
+    const { strategy, drive } = quarantining();
+    // Refuses at once, as quarantining's membrane does, until `held` is set; then holds the call open.
+    let held: { reached: () => void; release?: () => void } | undefined;
+    const membrane = {
+      complete: async () => {
+        const at = held;
+        if (at) {
+          at.reached();
+          await new Promise<void>((resolve) => { at.release = resolve; });
+        }
+        return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'reasoning_extraction' } } } };
+      },
+    } as unknown as Membrane;
+    await withManager(strategy, async (manager) => {
+      const queued = await drive(manager);
+      // A new context budget is a new request family, and the chunk's one quarantine record is under the shape
+      // cap, so tick's gate gives the chunk a fresh call, though the quarantine holds its source hash.
+      strategy.setContextBudget(123_456);
+      let reached!: () => void;
+      const out = new Promise<void>((resolve) => { reached = resolve; });
+      const hold: { reached: () => void; release?: () => void } = { reached };
+      held = hold;
+      const ticking = manager.tick();
+      await out;
+      assert.deepEqual(strategy.chunkInFlight(), queued[0], 'premise: tick took the quarantined chunk, and its call is out');
+      assert.equal(strategy.chunkInFlightSkipped(), false, "premise: its call wasn't skipped");
+      assert.equal(strategy.countsCompressionWork(), true, 'its call counts while it runs');
+      held = undefined;
+      hold.release!();
+      await ticking;
     }, { membrane });
   });
 

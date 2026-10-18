@@ -1632,8 +1632,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * mirrors first (requireLoadedBranch does unless an initializer is still
    * current), and pendingCompression is then set with nothing recorded
    * beside it until tick's finally. A chunk's record is marked `skipped`
-   * when its call skips it for the quarantine, making no model call; the
-   * call still yields a macrotask before tick's finally.
+   * when its call skips it for the quarantine, which makes no model call;
+   * tick's hop after the call keeps it in flight until tick's finally.
    */
   protected pendingCompressionWork: { chunk: Chunk; skipped?: true } | { sourceIds: readonly string[] } | null = null;
   protected compressionQueue: number[] = [];
@@ -6439,8 +6439,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.pendingCompressionWork = work;
       const compression = this.compressChunkHierarchical(chunk, ctx, () => {
         quarantineSkipped = true;
-        // No model call follows, so the work in flight stops counting
-        // (compressionWorkQueued) through the hop below.
+        // No model call follows: from here the work in flight stops
+        // counting (compressionWorkQueued), through the hop below too.
         work.skipped = true;
       }).then(async () => {
         // Quarantine checks build compression contexts too. As in the
@@ -11327,8 +11327,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if ('chunk' in work) {
         // Its result has landed once the chunk is compressed; until then,
         // chunkHasHeldMessage's rule over its messages. A chunk its call
-        // skipped for the quarantine makes no model call, so it doesn't count
-        // while the call yields after the skip.
+        // skipped for the quarantine makes no model call, so it doesn't count,
+        // though tick's hop after the call keeps it in flight.
         const ids = work.chunk.messages.map((m) => m.id);
         const reached = held !== null && ids.some((id) => held.has(id));
         if (!work.skipped && !work.chunk.compressed && !reached && ids.some((id) => foldable.has(id))) return true;
