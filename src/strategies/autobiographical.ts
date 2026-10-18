@@ -779,6 +779,11 @@ interface CompressionFamilyProgress {
   /** The canonical's input tokens as the provider counted them, when it answered:
    *  the fallback plan is recomputed from them. */
   canonicalProviderInputTokens?: number;
+  /** source-only-final's input tokens as the provider counted them, when it
+   *  answered: its hoist's admission is priced from them, so a resumed ladder
+   *  admits that hoist as it did before. Absent on entries written before it
+   *  was added. */
+  sourceOnlyProviderInputTokens?: number;
   updated: number;
 }
 
@@ -4101,15 +4106,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * provider's count of the request it rewrites (its base), plus what the
    * rewrite adds in the complete normalized bound, plus the output reserve,
    * against compressionContextBudgetTokens. Each base is a request the
-   * provider has just answered: the canonical, for the variants after a
-   * refusal or an incomplete answer and for the canonical's hoist after a
-   * refusal, and source-only-final, for its own hoist after a refusal.
-   * Where the base has no count, or the provider counted only its
-   * carrier-stripped copy, the rewrite is admitted on its own complete
-   * bound. Source-only-final and the split parts aren't admitted: they send
-   * the canonical's chunk, whole (source-only-final sends the canonical's own
-   * messages from the chunk on) or in parts, without the recall pairs, and
-   * the provider has just taken the canonical, which sends all of it.
+   * provider answered: the canonical, for the variants after a refusal or
+   * an incomplete answer and for the canonical's hoist after a refusal, and
+   * source-only-final, for its own hoist after a refusal. Its count is the
+   * one the family's ladder took, in this process or, kept in the family's
+   * progress, before a restart. Where the base has no count, or the
+   * provider counted only its carrier-stripped copy, the rewrite is admitted
+   * on its own complete bound. Source-only-final and the split parts
+   * aren't admitted: they send the canonical's chunk, whole
+   * (source-only-final sends the canonical's own messages from the chunk
+   * on) or in parts, without the recall pairs, and the provider has taken
+   * the canonical, which sends all of it.
    * Admission prices what a rung adds to the request it rewrites, by that
    * request's count, and the rung's own bound where there's none. What a
    * rung adds is read from both requests with each block priced as the most
@@ -4918,6 +4925,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     record: CompressionRefusalQuarantineRecord,
     outcomes: CompressionRefusalOutcomeRecord[],
     canonicalProviderInputTokens: number | undefined,
+    sourceOnlyProviderInputTokens: number | undefined,
     sourceIds: readonly string[],
   ): void {
     if (!this.store || !this.isCompressionBranchCurrent(source)) return;
@@ -4928,12 +4936,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const outcome of existing?.outcomes ?? []) merged.set(answerKey(outcome), outcome);
     for (const outcome of outcomes) if (!merged.has(answerKey(outcome))) merged.set(answerKey(outcome), { ...outcome });
     const tokens = canonicalProviderInputTokens ?? existing?.canonicalProviderInputTokens;
+    const sourceOnlyTokens = sourceOnlyProviderInputTokens ?? existing?.sourceOnlyProviderInputTokens;
     progress.set(record.familyKey, {
       familyKey: record.familyKey,
       chunkSourceHash: record.chunkSourceHash,
       sourceIds: [...sourceIds],
       outcomes: [...merged.values()],
       ...(tokens !== undefined ? { canonicalProviderInputTokens: tokens } : {}),
+      ...(sourceOnlyTokens !== undefined ? { sourceOnlyProviderInputTokens: sourceOnlyTokens } : {}),
       updated: Date.now(),
     });
     this.writeCompressionFamilyProgress(progress);
@@ -5175,9 +5185,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * withdrawal, which say nothing about anything, it keeps its place: at the
    * head, or among the failed if it failed before (orderCompressionQueue).
    * Queued again meanwhile without a rebuild, as a plan's demand queues it
-   * at the tail, it moves there too, once. A rebuild during the call
-   * (`superseded`) re-decided the chunk's eligibility: it is put back only if
-   * that rebuild queued it, and a rebuild's withdrawal of it stands.
+   * at the tail, it moves from the tail to that place, once. A rebuild
+   * during the call (`superseded`) re-decided the chunk's eligibility: it is
+   * put back only if that rebuild queued it, and a rebuild's withdrawal of
+   * it stands.
    */
   private requeuePendingChunk(key: string, place: 'head' | 'back', superseded: boolean): void {
     if (place === 'back') this.compressionFailureOrder.set(key, ++this.compressionFailureSequence);
@@ -8801,6 +8812,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
        */
       const familyRecord: CompressionRefusalOutcomeRecord[] = [...progressOutcomes];
       let progressCanonicalInputTokens = progress?.canonicalProviderInputTokens;
+      // source-only-final's count, the base its hoist is admitted against.
+      let progressSourceOnlyInputTokens = progress?.sourceOnlyProviderInputTokens;
       // Whether this family's progress has been in the slot during this
       // ladder: found there when it began, or written by it since.
       let progressSeen = progress !== undefined;
@@ -8856,7 +8869,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // The check and the write are synchronous, with no await between them.
         if (!familyOpen()) return;
         this.recordCompressionFamilyProgress(
-          sourceBranch, quarantineRecord, progressOutcomes, progressCanonicalInputTokens,
+          sourceBranch, quarantineRecord, progressOutcomes, progressCanonicalInputTokens, progressSourceOnlyInputTokens,
           chunk.messages.map((message) => message.id),
         );
         progressSeen = true;
@@ -9151,9 +9164,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // One bounded attempt of a tool-prose-hoisted request. Same receipts
         // as the source-only final rung; provider errors never escalate. It
         // is admitted as a recall variant is, against the request it rewrites
-        // (`base`), which the provider has just counted and whose answer was a
-        // refusal or came back incomplete (compressionAdmission): a rejection
-        // is recorded as a variant's is, and nothing is sent.
+        // (`base`), whose answer was a refusal: by the provider's count of
+        // that request, as this ladder took it or as the family's progress
+        // kept it from an earlier one, or on the hoist's own bound where there
+        // is none (compressionAdmission). A rejection is recorded as a
+        // variant's is, and nothing is sent.
         const runToolProseRung = async (
           hoistedRequest: NormalizedRequest,
           base: { request: NormalizedRequest; providerInputTokens: number | undefined },
@@ -9385,8 +9400,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // (Sol, #106 review: a thrown server_error on source-only-final still
         // bought a fourth call).
         let sourceOnlyOutcome: CompressionAttemptOutcome | 'incomplete' | undefined;
-        // Its count, the base its hoist is admitted against.
-        let sourceOnlyProviderInputTokens: number | undefined;
         if (!fallbackResponse && sourceOnlyFallbackRequest) {
           const curveLabel = 'source-only-final';
           const requestHash = sha256Json(sourceOnlyFallbackRequest);
@@ -9399,7 +9412,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           } else {
             const trace = attemptTraces[attemptTraces.length - 1]!;
             const assessment = this.assessFallbackCompressionResponse(result.response);
-            sourceOnlyProviderInputTokens = baseInputTokens(result.response);
+            progressSourceOnlyInputTokens = baseInputTokens(result.response);
             if (assessment.outcome === 'valid') {
               trace.outcome = 'success';
               fallbackResponse = assessment.response;
@@ -9429,7 +9442,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (hoistedSourceOnly) {
             await runToolProseRung(
               hoistedSourceOnly,
-              { request: sourceOnlyFallbackRequest, providerInputTokens: sourceOnlyProviderInputTokens },
+              { request: sourceOnlyFallbackRequest, providerInputTokens: progressSourceOnlyInputTokens },
               'source-only-tool-prose-hoist',
               [], [],
               sha256Json(chunk.messages.map((message) => message.id)),
@@ -11289,6 +11302,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (const leaf of leaves) if (foldable.has(leaf)) return true;
       return false;
     };
+    // The quarantine's projection, read once for the work in flight and the
+    // walk; undefined when it can't be read.
+    let quarantineRead = false;
+    let quarantinedSources: Set<string> | undefined;
+    const readQuarantined = (): Set<string> | undefined => {
+      if (!quarantineRead) {
+        quarantinedSources = this.quarantinedChunkSources();
+        quarantineRead = true;
+      }
+      return quarantinedSources;
+    };
     // Work in flight counts when it folds something now and no compression
     // hold placed since reaches it, since its landing checks the hold and
     // discards what the call returns: a chunk's L1, tick then taking the next
@@ -11304,10 +11328,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (work === null) return true;
       if ('chunk' in work) {
         // Its result has landed once the chunk is compressed; until then,
-        // chunkHasHeldMessage's rule over its messages.
+        // chunkHasHeldMessage's rule over its messages. A chunk the
+        // quarantine holds is skipped without a model call, as the walk below
+        // reads it, so it doesn't count while its call yields after the skip.
         const ids = work.chunk.messages.map((m) => m.id);
         const reached = held !== null && ids.some((id) => held.has(id));
-        if (!work.chunk.compressed && !reached && ids.some((id) => foldable.has(id))) return true;
+        if (!work.chunk.compressed && !reached && ids.some((id) => foldable.has(id))
+          && !readQuarantined()?.has(sha256Json(ids))) return true;
       } else if (!this.mergeBlockedByHold([...work.sourceIds], store, held) && mergeFolds(work.sourceIds)) {
         return true;
       }
@@ -11358,7 +11385,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       (this.hostContext?.tools?.length ?? 0) > 0 ? () => false
         : isToolsLessRefusingSummarizer(this.config.compressionModel ?? '') ? () => true
           : this.requestCarriesToolBlocks(store);
-    const quarantined = this.quarantinedChunkSources();
+    const quarantined = readQuarantined();
     // A chunk that folds nothing frees no room once it has an L1. Tick still
     // takes such a chunk in turn, so the walk goes past it where tick does.
     // Tick takes the queued chunks in order, one a call, and a host's tick

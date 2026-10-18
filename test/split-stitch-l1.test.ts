@@ -578,11 +578,15 @@ describe('split-stitch L1 fallback', () => {
         cacheReadTokens: stub.leaves() * 3 + splitRefusals(stub) * 11,
       });
       const events = readFileSync(logPath, 'utf8').trim().split('\n')
-        .map((line) => JSON.parse(line) as { event: string; metadata?: { attempted?: { cacheCreationTokens?: number; cacheReadTokens?: number } } });
+        .map((line) => JSON.parse(line) as { event: string; metadata?: { reason?: string; piecesDiscarded?: number; attempted?: { cacheCreationTokens?: number; cacheReadTokens?: number } } });
       const landedEvent = events.find((e) => e.event === 'compression:split-stitch');
       const abandonedEvent = events.find((e) => e.event === 'compression:split-stitch-abandoned');
       assert.ok(landedEvent && abandonedEvent, 'both runs logged their split-stitch event');
       assert.ok(splitRefusals(abandoned) >= 1 && abandoned.leaves() >= 1, 'the abandoned run completed calls of both kinds first');
+      // The premise: raw-3's rejection, its last call, abandoned it, after other pieces folded.
+      assert.equal(abandonedEvent.metadata?.reason, 'provider-error:invalid_request', "abandoned by the piece's rejection");
+      assert.ok((abandonedEvent.metadata?.piecesDiscarded ?? 0) >= 1, 'after other pieces folded');
+      assert.ok(JSON.stringify(abandoned.calls.at(-1)).includes('raw-3'), 'the last call was the piece holding raw-3');
       assert.deepEqual(cacheOf(landedEvent.metadata?.attempted), sums(landed));
       assert.deepEqual(cacheOf((fx.strategy.entries()[0]!.stitched as { attempted: object }).attempted), sums(landed));
       assert.deepEqual(cacheOf(abandonedEvent.metadata?.attempted), sums(abandoned));

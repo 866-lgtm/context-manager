@@ -66,6 +66,10 @@ class ProbeStrategy extends AutobiographicalStrategy {
   adopt(chunk: Chunk): void { this.chunks.push(chunk); }
   klaxon(): Promise<void> { return (this as unknown as { soundQuarantineAlarmIfNeeded(): Promise<void> }).soundQuarantineAlarmIfNeeded(); }
   compressionQueueView(): number[] { return [...this.compressionQueue]; }
+  /** A request's complete normalized bound, as admission prices one without a count (white-box). */
+  inputBound(request: NormalizedRequest): number {
+    return (this as unknown as { compressionRequestInputBoundTokens(r: NormalizedRequest): number }).compressionRequestInputBoundTokens(request);
+  }
   setCompressionModel(model: string): void { this.config.compressionModel = model; }
   private lanePause(): RawPause | null {
     return (this as unknown as { compressionPause: RawPause | null }).compressionPause;
@@ -164,7 +168,7 @@ const progressSlot = (manager: ContextManager): unknown[] => {
   return Array.isArray(value) ? value : [];
 };
 
-interface Opts { hoist?: boolean; sourceOnlyFallback?: boolean; path?: string }
+interface Opts { hoist?: boolean; sourceOnlyFallback?: boolean; path?: string; budget?: number }
 function config(opts: Opts) {
   return {
     compressionModel: 'same-model', targetChunkTokens: 100, recentWindowTokens: 0, headWindowTokens: 100_000,
@@ -172,6 +176,7 @@ function config(opts: Opts) {
     compressionRefusalCurveFallbacks: 0,
     compressionSourceOnlyFallback: opts.sourceOnlyFallback,
     ...(opts.hoist ? { compressionToolProseFallback: { intoTool: 'journal', fromTools: ['skip_reply'] } } : {}),
+    ...(opts.budget !== undefined ? { compressionContextBudgetTokens: opts.budget } : {}),
   } as never;
 }
 /** The tool-prose-hoist fixture's shape: a head, one seeded L1, and a target chunk with a long skip_reply. */
@@ -220,6 +225,38 @@ describe('compression ladder: transient failures never spend it', () => {
     assert.ok(!isCanonical(second.calls[0]!));
     assert.ok(b.strategy.summariesView().some((s) => s.level === 1 && s.content === 'memory after the outage'));
     assert.equal(progressSlot(b.manager).length, 0, 'the mint drops the progress');
+    b.manager.close();
+  });
+
+  it("a resumed ladder admits source-only-final's hoist on that rung's count, which progress keeps", async () => {
+    // Calibration, with a budget that admits everything: the four requests every rung's refusal sends.
+    const calibrate = scripted([REFUSAL]);
+    const c = await build(calibrate.membrane, { sourceOnlyFallback: true, hoist: true, budget: 1_000_000 });
+    await c.strategy.run(c.target(), managerContext(c.manager));
+    assert.equal(calibrate.calls.length, 4, 'premise: the canonical, its hoist, source-only-final and its hoist');
+    const [, , sourceOnly, hoist] = calibrate.calls as [NormalizedRequest, NormalizedRequest, NormalizedRequest, NormalizedRequest];
+    const reserve = hoist.config.maxTokens as number;
+    const hoistBound = c.strategy.inputBound(hoist);
+    const sourceOnlyBound = c.strategy.inputBound(sourceOnly);
+    c.manager.close();
+    // On its own bound the hoist doesn't fit; on source-only-final's count of 100, plus what it adds, it does.
+    const budget = hoistBound + reserve - 50;
+    assert.ok(100 + (hoistBound - sourceOnlyBound) + reserve <= budget, 'premise: the count admits it');
+
+    const path = freshPath();
+    const first = scripted([REFUSAL, REFUSAL, REFUSAL, { throw: failure('server', { httpStatus: 503 }) }]);
+    const a = await build(first.membrane, { sourceOnlyFallback: true, hoist: true, budget, path });
+    await assert.rejects(a.strategy.run(a.target(), managerContext(a.manager)), /zz server failure/);
+    assert.equal(first.calls.length, 4, "premise: the hoist was admitted on the rung's count, and an outage interrupted its call");
+    const kept = (progressSlot(a.manager) as Array<{ sourceOnlyProviderInputTokens?: number }>)[0]!;
+    assert.equal(kept.sourceOnlyProviderInputTokens, 100, "progress keeps source-only-final's count");
+    a.manager.close();
+
+    const second = scripted([REFUSAL]);
+    const b = await build(second.membrane, { sourceOnlyFallback: true, hoist: true, budget, path });
+    await b.strategy.run(b.target(), managerContext(b.manager));
+    assert.equal(second.calls.length, 1, 'the rungs before the hoist are known, and the hoist is admitted again');
+    assert.ok(!isCanonical(second.calls[0]!) && toolNames(second.calls[0]!) === toolNames(first.calls[3]!), "it's source-only-final's hoist");
     b.manager.close();
   });
 

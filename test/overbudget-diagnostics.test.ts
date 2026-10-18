@@ -1159,6 +1159,22 @@ describe('OverBudgetError.clearedBy', () => {
     return { strategy, calls, membrane, drive };
   };
 
+  it("names nothing for a quarantined chunk while tick's call yields after skipping it", async () => {
+    const { strategy, membrane, drive } = quarantining();
+    await withManager(strategy, async (manager) => {
+      const queued = await drive(manager);
+      const ticking = manager.tick();
+      // Tick's call skips the chunk without a model call, then yields a macrotask before its finally:
+      // a timer set now fires while the skipped chunk is still the work in flight.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      assert.deepEqual(strategy.chunkInFlight(), queued[0], 'premise: the skipped chunk is the work in flight');
+      assert.deepEqual((await refusal(manager)).clearedBy, [], 'a chunk the quarantine skips frees no room');
+      assert.deepEqual(strategy.chunkInFlight(), queued[0], 'premise: still in flight when the count was taken');
+      await ticking;
+      assert.equal(strategy.chunkInFlight(), undefined, 'premise: the call has ended');
+    }, { membrane });
+  });
+
   for (const settle of ['adopts', 'stubs'] as const) {
     it(`names compression for quarantined chunks tick ${settle === 'adopts' ? 'adopts an exact L1 for' : 'stubs'} without a model call, before it reads the quarantine`, async () => {
       const { strategy, calls, membrane, drive } = quarantining();
@@ -2705,8 +2721,15 @@ describe('OverBudgetError.clearedBy', () => {
         if (hold) {
           // Nothing failed: tick keeps the answer out and returns, the merge still queued.
           await manager.tick();
+          assert.equal(calls.n, 1, 'premise: tick asked the model once, and the hold reached its answer');
           assert.equal(strategy.summaryIds().length, summaries, 'no L2 is written');
           assert.equal(strategy.queuedMergeCount(), 1, 'the merge stays at the head');
+          const lane = strategy as unknown as { mergeFailureOrder: Map<string, number>; mergeFailureRuns: Map<string, unknown>; compressionPause: unknown };
+          assert.deepEqual(
+            { order: lane.mergeFailureOrder.size, runs: lane.mergeFailureRuns.size, pause: lane.compressionPause },
+            { order: 0, runs: 0, pause: null },
+            'and the discard counts no failure: no failure order, no failure run, no pause',
+          );
           await manager.tick();
           assert.equal(calls.n, 1, 'the next tick returns at the held head without a model call');
           manager.releaseCompression([ids[3]!]);
