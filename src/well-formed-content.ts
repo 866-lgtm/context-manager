@@ -25,12 +25,14 @@
  * which is what a read turns the blob back into, and, but for an image, a
  * string `mediaType`: a read gives an image the type its bytes' signature
  * names, where they carry one, and nothing else names a document's, audio's
- * or video's. Three shapes a read gives still meet a write's refusal, each in
- * a record the store's writes don't make: inline media at the top of the
- * content without a media type the store can give it, where the store keeps
- * a blob; a `blob_ref` inside a `tool_result`, which resolution leaves as it
- * is, since it resolves the content's own blocks; and an image's `blob_ref`
- * without a string `mediaType` whose bytes carry no signature
+ * or video's. The rule holds at any depth, as the read's other checks do.
+ * Three shapes a read gives still meet a write's refusal, each in a record
+ * the store's writes don't make: inline media at the top of the content,
+ * where the store keeps a blob, whose source it can't keep as one
+ * (unstorableSource: data it can't read, or no media type it can give it); a
+ * `blob_ref` the read takes inside a `tool_result`, which resolution leaves
+ * as it is, since it resolves the content's own blocks; and an image's
+ * `blob_ref` without a string `mediaType` whose bytes carry no signature
  * (refHasMediaType). Leaving out the first two would take a read that knows
  * where a block sits, which these walks don't.
  *
