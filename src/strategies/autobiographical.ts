@@ -3266,12 +3266,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
     };
     // membrane (0.6.0 and later, in the host's instance) states usage with
-    // uncached input, cache writes and cache reads as disjoint counts for
-    // every adapter whose convention it knows, Gemini's included, so the
-    // prompt's total is their sum whatever the provider, and a full cache hit
-    // is a zero input count beside a positive cache read. An adapter whose
-    // convention membrane marks unknown keeps the counts its provider gives,
-    // and in 0.6.0 none of those reports cache reads.
+    // uncached input, cache writes and cache reads as disjoint counts
+    // wherever it knows the convention, Gemini's included, so the prompt's
+    // total is their sum whatever the provider, and a full cache hit is a
+    // zero input count beside a positive cache read. A usage whose
+    // convention membrane can't establish keeps the counts its provider
+    // gives: in 0.6.0 that's openai-compatible's and openai-completions',
+    // which never report cache reads, and an OpenRouter response with no
+    // cache field, so the sum is its input count.
     const input = read('inputTokens');
     // Usage without an input count, or with a zero total, is no observation
     // of the prompt: the complete normalized request bound stands instead.
