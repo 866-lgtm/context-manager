@@ -1,8 +1,7 @@
 /**
  * The live window's image accounting counts every `image` block, whatever its
- * source (base64, a `data:` URL, a remote URL, or MCP's `data` beside
- * `mimeType`), and every `generated_image`, top-level or nested in a tool
- * result. The strip, the post-strip estimates, the image watermark and the
+ * source (base64, a `data:` URL or a remote URL), and every `generated_image`,
+ * top-level or nested in a tool result. The strip, the post-strip estimates, the image watermark and the
  * store's price all see the same images and agree on how deep each one is,
  * and a strip releases the raw replay form of a tool result whose nested
  * image it replaces, from every block of its message that shares it.
@@ -29,8 +28,6 @@ const generatedImage = (bytes = 5000): ContentBlock =>
   ({ type: 'generated_image', data: 'C'.repeat(bytes), mimeType: 'image/png' }) as unknown as ContentBlock;
 const dataUrlImage = (bytes: number): ContentBlock =>
   ({ type: 'image', source: { type: 'url', url: 'data:image/png;base64,' + 'A'.repeat(bytes) } }) as unknown as ContentBlock;
-const mcpImage = (bytes: number): ContentBlock =>
-  ({ type: 'image', data: 'B'.repeat(bytes), mimeType: 'image/png' }) as unknown as ContentBlock;
 
 /**
  * A tool round whose result nests an image beside a text label. With `raw`,
@@ -149,21 +146,19 @@ describe('live image accounting', () => {
     cm.close();
   });
 
-  it('counts a data: URL source, an MCP image and a generated image by their inline bytes (bytes cap)', async () => {
+  it('counts a data: URL source and a generated image by their inline bytes (bytes cap)', async () => {
     const cm = await ContextManager.open({
       path: fresh(),
       strategy: new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 1_000_000, maxLiveImages: 0, imageStripDepthTokens: 0, maxLiveImageBytes: 6000 }),
     });
     const shapes: Array<[string, ContentBlock]> = [
       ['url-image', dataUrlImage(5000)],
-      ['mcp-image', mcpImage(5000)],
       ['generated', generatedImage(5000)],
     ];
     for (const [label, image] of shapes) toolRound(cm, label, image);
     const { messages } = await cm.compile(BUDGET);
     assert.equal(stateOf(messages, 'generated'), 'image', 'the newest, 5000 bytes, fits in 6000');
-    assert.equal(stateOf(messages, 'mcp-image'), 'stripped', 'a second 5000 bytes is over 6000');
-    assert.equal(stateOf(messages, 'url-image'), 'stripped', 'so is a third');
+    assert.equal(stateOf(messages, 'url-image'), 'stripped', 'a second 5000 bytes is over 6000');
     cm.close();
   });
 
@@ -298,15 +293,15 @@ describe('live image accounting', () => {
     cm.close();
   });
 
-  it('windowed passthrough counts a data: URL and an MCP image by their inline bytes', async () => {
+  it('windowed passthrough counts a data: URL and a nested generated image by their inline bytes', async () => {
     const cm = await ContextManager.open({
       path: fresh(),
       strategy: new WindowedPassthroughStrategy({ maxLiveImages: 0, imageStripDepthTokens: 0, maxLiveImageBytes: 6000 }),
     });
     toolRound(cm, 'wp-url', dataUrlImage(5000));
-    toolRound(cm, 'wp-mcp', mcpImage(5000));
+    toolRound(cm, 'wp-gen', generatedImage(5000));
     const { messages } = await cm.compile(BUDGET);
-    assert.equal(stateOf(messages, 'wp-mcp'), 'image', 'the newest, 5000 bytes, fits in 6000');
+    assert.equal(stateOf(messages, 'wp-gen'), 'image', 'the newest, 5000 bytes, fits in 6000');
     assert.equal(stateOf(messages, 'wp-url'), 'stripped', 'a second 5000 bytes is over 6000');
     cm.close();
   });

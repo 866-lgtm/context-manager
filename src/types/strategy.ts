@@ -959,9 +959,8 @@ export interface AutobiographicalConfig {
    *  compiled context. Counted newest-first across the whole window; images
    *  beyond this many are replaced with a text placeholder. 0 = unlimited.
    *  A hard ceiling for dense bursts that pack many images into the live window.
-   *  Every `image` block counts, whatever its source (base64, a `data:` URL,
-   *  a remote URL, or MCP's `data` beside `mimeType`), and so does every
-   *  generated image, top-level or nested in a tool result (see
+   *  Every `image` block counts, whatever its source (base64, a `data:` URL
+   *  or a remote URL), and so does every generated image, top-level or nested in a tool result (see
    *  inline-images.ts). An image inside an opaque provider item, such as a
    *  Responses `image_generation_call` replayed from its raw form, doesn't. */
   maxLiveImages?: number;
@@ -983,7 +982,7 @@ export interface AutobiographicalConfig {
   /**
    * Byte wall for live images (2026-07-12): keep inline images newest-first
    * only while their cumulative inline size (a base64 source, a `data:` URL's
-   * payload, an MCP or generated image's `data`; 0 for a remote URL) stays
+   * payload, a generated image's `data`; 0 for a remote URL) stays
    * under this budget — on top
    * of `maxLiveImages` / `imageStripDepthTokens`. It keeps the images it
    * counts from pushing the compiled window past the API's total request size
