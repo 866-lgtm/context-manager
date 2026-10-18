@@ -141,11 +141,12 @@ the earlier campaign noted.
 | configuration | warm mean ms (turns 1–20) | max |
 |---|---:|---:|
 | packed DAG, exact ages | 140 | 242 |
-| packed DAG, 4 bands | 158 | 250 |
+| packed DAG, 4 bands | 158 (156 on the review rerun) | 250 |
 | subtree, 4 bands | 94 | 172 |
+| subtree, 4 bands, after review | 72 | 141 |
 | subtree, 4 bands, certificate on | 131 | 245 |
 
-Warm turns with nothing but an append settle at 75–85 ms, with ~200 of
+Before the review fixes, warm turns with nothing but an append settled at 75–85 ms, with ~200 of
 ~2,270 delta sets computed and ~250 reused (the rest are reached only
 through a parent that was reused whole). The remaining time is §4's floor
 plus the spine: the ancestors of the newest leaf are recomputed every turn,
@@ -160,6 +161,12 @@ and each is a fold over its children's sets.
   weight change below 2^-8 of the range; it is now the floor there.
 - The tail units were rebuilt per final label and a subtree's span looked
   up a leaf per leaf per visit; both were the first profile's top entries.
+- The solve result was built by spreading the selectively scored result,
+  which ran its lazy `candidates` getter and dropped its non-enumerable
+  `bestScoreUnder`: every terminal candidate was scored on every solve.
+  Building the result as the packed engine does (review) took the warm
+  mean from 94 to 72 ms; after that the terminal evaluation is the bound
+  scoring the packed engine pays too.
 
 ### 5.3 Real store (`scratch-kvu/kr-replay-memo.mjs`)
 
@@ -185,7 +192,7 @@ the holder, every summary arrival (a full forest build on a gap-bearing
 forest, since `extend` declines it) recomputed all ~830 sets.
 
 The gain grows with the forest: at 25k leaves and 2,270 summaries (§5.1)
-the packed engine's warm solve is 140–158 ms and the memoized one 94.
+the packed engine's warm solve is 140–158 ms and the memoized one 72 (94 before the review fixes).
 
 ## 6. Not verified
 
