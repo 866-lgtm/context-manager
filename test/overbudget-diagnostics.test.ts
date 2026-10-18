@@ -232,9 +232,11 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
    * configuration has no opt-in rung. The strategy hashes a record as it
    * builds it, and the store gives the record back with its objects' keys in
    * another order, so the normalized config goes back into the order
-   * compressionRefusalQuarantineRecord builds it in.
+   * compressionRefusalQuarantineRecord builds it in. With `hoisted`, each
+   * exhausted event also gains a tool-prose hoist's outcome, so its version-2
+   * record no longer counts.
    */
-  ageQuarantine(version: 1 | 2 = 1): void {
+  ageQuarantine(version: 1 | 2 = 1, hoisted = false): void {
     const id = this.compressionRefusalQuarantineLedgerStateId;
     const ledger = this.store?.getStateJson(id);
     const events = structuredClone(Array.isArray(ledger) ? ledger : []) as Array<Record<string, any>>;
@@ -269,6 +271,9 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     };
     for (const event of events) {
       if (typeof event.key === 'string') event.key = `${prefix}${event.key}`;
+      if (hoisted && event.kind === 'exhausted') {
+        event.outcomes = [...(event.outcomes ?? []), { curveLabel: 'tool-prose-hoist', requestHash: 'zz-hoisted', outcome: 'refusal' }];
+      }
       age(event.record);
       for (const item of Array.isArray(event.active) ? event.active : []) age(item?.record);
     }
@@ -1389,9 +1394,23 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.ageQuarantine(2);
       assert.deepEqual((await refusal(manager)).clearedBy, [], 'the quarantine still holds the queued chunks');
       // The premise: tick asks the model about none of them.
+      assert.ok(strategy.queuedChunkIds().length > 0, 'chunks are queued for tick');
       const before = calls.n;
       for (let i = 0; i < 30 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
       assert.equal(calls.n, before, 'no model call');
+    }, { membrane });
+  });
+
+  it('names compression for quarantined chunks whose version-2 records ran a tool-prose hoist, which tick tries again', async () => {
+    const { strategy, calls, membrane, drive } = quarantining();
+    await withManager(strategy, async (manager) => {
+      await drive(manager);
+      strategy.ageQuarantine(2, true);
+      assert.deepEqual((await refusal(manager)).clearedBy, ['compression']);
+      // The premise: tick asks the model again about the chunks they held.
+      const before = calls.n;
+      for (let i = 0; i < 30 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+      assert.ok(calls.n > before, 'a model call');
     }, { membrane });
   });
 

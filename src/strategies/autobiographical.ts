@@ -3269,15 +3269,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const value = (usage as Record<string, unknown>)[key];
       return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
     };
-    // membrane (0.6.0 and later, in the host's instance) states usage with
-    // uncached input, cache writes and cache reads as disjoint counts
-    // wherever it knows the convention, Gemini's included, so the prompt's
-    // total is their sum whatever the provider, and a full cache hit is a
-    // zero input count beside a positive cache read. A usage whose
-    // convention membrane can't establish keeps the counts its provider
-    // gives: in 0.6.0 that's openai-compatible's and openai-completions',
-    // which never report cache reads, and an OpenRouter response with no
-    // cache field, so the sum is its input count.
+    // membrane 0.6.0 and later states usage with uncached input, cache writes
+    // and cache reads as disjoint counts wherever it knows the convention,
+    // Gemini's included, so the prompt's total is their sum whatever the
+    // provider, and a full cache hit is a zero input count beside a positive
+    // cache read. The usage comes from the host's instance (ctx.membrane),
+    // which this package's range doesn't bind: a host on an older membrane
+    // passes Gemini's counts raw, with the cached span inside the input
+    // count, so the sum counts that span twice and admission is stricter. A
+    // usage whose convention membrane can't establish keeps the counts its
+    // provider gives: in 0.6.0 that's openai-compatible's and
+    // openai-completions', which never report cache reads, and an OpenRouter
+    // response with no cache field, so the sum is its input count.
     const input = read('inputTokens');
     // Usage without an input count, or with a zero total, is no observation
     // of the prompt: the complete normalized request bound stands instead.
@@ -3285,7 +3288,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // providers can omit it report zero, and Anthropic's and Bedrock's APIs
     // always send one. So a missing one comes only from a caller outside
     // membrane, and a cache-only report through membrane reads as a full
-    // cache hit.
+    // cache hit. That includes a provider's omitted input count beside cache
+    // counts, which a response can't tell apart: membrane flags an omitted
+    // count only in a streamed round's report (unreportedUsage).
     if (input === undefined) return undefined;
     const total = input + (read('cacheCreationTokens') ?? 0) + (read('cacheReadTokens') ?? 0);
     return total > 0 ? total : undefined;
@@ -4356,10 +4361,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * version-2 record does when its plan rejected every recall-curve variant
    * on the provider's count of the canonical request, as an empty plan does,
    * and it ran no tool-prose hoist. Version 3 changed only how that count is
-   * read. Where version 2 had a count, version 3's is the same or larger,
-   * since it adds cache writes and reads, so a variant rejected on version
-   * 2's count is rejected on version 3's, and the ladder comes out as version
-   * 2 would plan it now. Any other record's chunk gets a fresh attempt:
+   * read, besides the label every family key hashes, which is why
+   * previousAccountingFamilyKey rebuilds version 2's key. Where version 2
+   * had a count, version 3's is the same or larger, since it adds cache
+   * writes and reads, so a variant rejected on version 2's count is rejected
+   * on version 3's, and the ladder comes out as version 2 would plan it now.
+   * Any other record's chunk gets a fresh attempt:
    * - a variant admitted on the count may be rejected on the larger one,
    *   which frees its attempt for a variant that fits;
    * - a variant priced on the complete request bound, because version 2 read
@@ -4372,16 +4379,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * A record names its model but not its provider, and one model can run
    * through more than one adapter, so this can't spare a record because its
    * provider's count was already right. Every release at version 2 stored a
-   * plan with each record and the outcomes with each exhausted event.
+   * plan with each record and the outcomes with each exhausted event; a
+   * record without either can't show its ladder, so it doesn't count.
    */
   private countsUnderCurrentAccounting(active: ActiveCompressionQuarantine): boolean {
     const version = active.record.normalizedConfig?.accountingVersion;
     if (version === COMPRESSION_BUDGET_ACCOUNTING_VERSION) return true;
     if (version !== 2) return false;
-    return active.record.plan.every((entry) =>
+    const { plan } = active.record;
+    const { outcomes } = active;
+    return Array.isArray(plan) && Array.isArray(outcomes) &&
+      plan.every((entry) =>
         entry.accountingSource === 'canonical_provider_usage_plus_expansion' &&
         entry.disposition === 'admission_rejected') &&
-      !active.outcomes.some((outcome) =>
+      !outcomes.some((outcome) =>
         outcome.curveLabel === 'tool-prose-hoist' || outcome.curveLabel === 'source-only-tool-prose-hoist');
   }
 

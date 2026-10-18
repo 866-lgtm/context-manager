@@ -146,15 +146,21 @@ function asVersionTwo(record: Record<string, unknown>, overrides: Record<string,
 }
 
 /**
- * A family key as the strategy computes it (compressionFamilyKey) for a
- * request with no recall variants, under an accounting label and version. The
+ * A family key as the strategy computes it (compressionFamilyKey), under an
+ * accounting label and version, for the request's recall variants. The
  * strategy hashes the record as it builds it, and the store gives the record
  * back with its objects' keys in another order, so this puts the normalized
  * config back in the order compressionRefusalQuarantineRecord builds it, with
- * the request config's model before maxTokens. It takes a configuration
- * without the opt-in rungs, whose fields it doesn't place.
+ * the request config's model before maxTokens, and each variant's fields in
+ * the order the key lists them. It takes a configuration without the opt-in
+ * rungs, whose fields it doesn't place.
  */
-function familyKeyOf(record: Record<string, unknown>, accountingSource: string, accountingVersion: number): string {
+function familyKeyOf(
+  record: Record<string, unknown>,
+  accountingSource: string,
+  accountingVersion: number,
+  variants: Array<Record<string, unknown>> = [],
+): string {
   const config = record.normalizedConfig as Record<string, unknown>;
   const requestConfig = config.requestConfig as Record<string, unknown>;
   assert.deepEqual(Object.keys(config).sort(), ['accountingVersion', 'contextBudgetTokens', 'fallbackLimit', 'requestConfig']);
@@ -171,7 +177,11 @@ function familyKeyOf(record: Record<string, unknown>, accountingSource: string, 
       contextBudgetTokens: config.contextBudgetTokens,
       requestConfig: { model: requestConfig.model, maxTokens: requestConfig.maxTokens },
     },
-    variants: [],
+    variants: variants.map((variant) => ({
+      parentId: variant.parentId,
+      childIds: variant.childIds,
+      requestHash: variant.requestHash,
+    })),
   })).digest('hex');
 }
 
@@ -1714,23 +1724,44 @@ describe('compression refusal recall curves', () => {
   });
 
   it('a version-2 record that the corrected count would plan the same still holds its request family', async () => {
-    // With no recall budget the chunk has no frontier, so its family has no
-    // variants, and both runs build the same request.
+    // The frontier has recall variants, and the count rejects every one, so
+    // the plan lists them all, in the order the family key hashes them, and
+    // both runs build the same request.
     const run = await rerunOverVersionTwoRecords((current) => {
       const config = current.record.normalizedConfig as Record<string, unknown>;
+      const variants = current.record.plan as Array<Record<string, unknown>>;
+      assert.ok(variants.length > 0);
+      assert.ok(variants.every((entry) => entry.disposition === 'admission_rejected'));
       assert.equal(
-        familyKeyOf(current.record, String(current.record.accountingSource), Number(config.accountingVersion)),
+        familyKeyOf(current.record, String(current.record.accountingSource), Number(config.accountingVersion), variants),
         current.record.familyKey,
         'the family key is the stored one, recomputed',
       );
       const record = asVersionTwo(current.record, {
         key: 'legacy-key-0',
-        familyKey: familyKeyOf(current.record, ACCOUNTING_SOURCE_V2, 2),
+        familyKey: familyKeyOf(current.record, ACCOUNTING_SOURCE_V2, 2, variants),
       });
       return [{ record, outcomes: current.outcomes }];
-    }, { options: { compressionRecallBudgetTokens: 0 } });
+    }, {
+      options: { compressionContextBudgetTokens: 50_000, compressionRefusalCurveFallbacks: 3 },
+      first: [{ stop: 'refusal', inputTokens: 90_000 }],
+      retry: [{ stop: 'end_turn', text: 'must never be called' }],
+    });
     assert.equal(run.calls, 0, 'one record of the same request holds it, as before the upgrade');
     assert.equal(run.compressed, false);
+  });
+
+  it('a version-2 record without a plan or outcomes to read does not block the current version', async () => {
+    const run = await rerunOverVersionTwoRecords((current) => threeFamilies(current).map(({ record, outcomes }, i) => {
+      if (i < 2) {
+        const withoutPlan = { ...record };
+        delete withoutPlan.plan;
+        return { record: withoutPlan, outcomes };
+      }
+      return { record, outcomes: undefined as unknown as Array<Record<string, unknown>> };
+    }));
+    assert.equal(run.calls, 1, "a record that can't show its ladder lets the chunk have a fresh attempt");
+    assert.equal(run.compressed, true);
   });
 
   it('restart with fallback limit 1→3 invalidates the exhausted plan key', async () => {
