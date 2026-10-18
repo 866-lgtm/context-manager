@@ -25,7 +25,14 @@
  * which is what a read turns the blob back into, and, but for an image, a
  * string `mediaType`: a read gives an image the type its bytes' signature
  * names, where they carry one, and nothing else names a document's, audio's
- * or video's.
+ * or video's. Three shapes a read gives still meet a write's refusal, each in
+ * a record the store's writes don't make: inline media at the top of the
+ * content without a media type the store can give it, where the store keeps
+ * a blob; a `blob_ref` inside a `tool_result`, which resolution leaves as it
+ * is, since it resolves the content's own blocks; and an image's `blob_ref`
+ * without a string `mediaType` whose bytes carry no signature
+ * (refHasMediaType). Leaving out the first two would take a read that knows
+ * where a block sits, which these walks don't.
  *
  * Every reader of stored content, from the token estimators to compression
  * and the formatters, is written against `ContentBlock`, and a reader that
@@ -120,10 +127,12 @@ function wellFormed(block: unknown, side: Side): boolean {
  * Whether a blob reference of a known `originalType` names the media type it
  * reads back with: a string `mediaType`, which nothing else names for a
  * document, audio or video, and without which a write refuses the media it
- * reads back as. An image's reference passes without one, since a read gives
- * an image the type its bytes' signature names (blockFromBlob), and only the
- * blob's bytes can say whether they carry one: an image whose bytes have no
- * png, jpeg, gif or webp signature still reads back without a type.
+ * reads back as. An image's reference passes whatever its `mediaType` holds,
+ * since a read gives an image the type its bytes' signature names
+ * (blockFromBlob), and only the blob's bytes can say whether they carry one:
+ * an image whose bytes carry no png, jpeg, gif or webp signature still reads
+ * back with the reference's `mediaType`, which a write refuses unless it's a
+ * string.
  */
 function refHasMediaType(ref: Record<string, unknown>): boolean {
   return typeof ref.mediaType === 'string' || ref.originalType === 'image';

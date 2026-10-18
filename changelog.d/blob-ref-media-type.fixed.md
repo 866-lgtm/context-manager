@@ -2,10 +2,11 @@
   reference has no string `mediaType`, and log the line naming it, such as
   `content[2].ref.mediaType is undefined, not a string`, as they do one whose
   `originalType` isn't image, document, audio or video. Before, it read back
-  as media without a media type, which a write refuses, so a host copying
-  messages as read with blobs resolved couldn't store that message. The
-  store's own writes don't make such a reference, since every write path
-  refuses inline media the store can't give a type. An image's reference
-  without a `mediaType` still reads back with the type its bytes' signature
-  names, and without one when its bytes carry no png, jpeg, gif or webp
-  signature.
+  as media without a string media type, which the store's write can't keep,
+  so a host copying messages as read with blobs resolved couldn't store that
+  message. The store's own writes don't make such a reference: it keeps media
+  as a blob only at the top of a message's or context entry's content, where
+  every write path refuses media it can't give a type. An image's reference
+  still reads back with the type its bytes' signature names, whatever its
+  `mediaType` holds, and with that `mediaType` when its bytes carry no png,
+  jpeg, gif or webp signature.
