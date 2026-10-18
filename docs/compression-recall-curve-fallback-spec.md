@@ -112,13 +112,12 @@ adapters whose providers can omit a prompt total report it as zero, and
 Anthropic's and Bedrock's APIs always send one. So "no input count" covers
 only a caller outside membrane, and a cache-only report through membrane
 reads as a full cache hit. The provider total is `inputTokens +
-cacheCreationTokens + cacheReadTokens` for every provider: membrane (0.5.81
-and later) states each adapter's counts as disjoint, subtracting the cached
-span from `inputTokens` for adapters whose providers report it inside, such
-as OpenAI. An adapter whose convention membrane marks unknown keeps its
-provider's counts, so where that provider reports cache reads inside
-`inputTokens` (Gemini, until membrane counts its cache the same way), the
-total counts the cached span twice.
+cacheCreationTokens + cacheReadTokens` for every provider: membrane (0.6.0
+and later, in the host's instance) states each adapter's counts as disjoint,
+subtracting the cached span from `inputTokens` for adapters whose providers
+report it inside, such as OpenAI and Gemini. An adapter whose convention
+membrane marks unknown keeps its provider's counts, and in 0.6.0 none of
+those reports cache reads, so its total is its input count.
 Physical request-byte enforcement remains a separate provider/transport
 constraint. A positive complete provider total is authoritative even when it is
 smaller than the deterministic byte bound: canonical refusal proves that exact

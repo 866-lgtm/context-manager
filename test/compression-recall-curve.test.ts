@@ -972,9 +972,9 @@ describe('compression refusal recall curves', () => {
   });
 
   it('a cached non-Anthropic refusal counts its cache reads in the canonical total', async () => {
-    // membrane (0.5.81 and later) states every provider's usage with the
-    // cached span outside inputTokens: 200,000 fresh plus 150,000 read from
-    // cache is a 350,000-token prompt, on OpenAI as on Anthropic.
+    // membrane states usage with the cached span outside inputTokens for
+    // every adapter whose convention it knows: 200,000 fresh plus 150,000 read
+    // from cache is a 350,000-token prompt, on OpenAI as on Anthropic.
     const mock = flexibleMembrane([
       { stop: 'refusal', inputTokens: 200_000, cacheReadTokens: 150_000, provider: 'openai-responses-api' },
       { stop: 'end_turn', text: 'must never be called' },
