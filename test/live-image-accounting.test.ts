@@ -1,10 +1,11 @@
 /**
  * The live window's image accounting counts every `image` block, whatever its
  * source (base64, a `data:` URL or a remote URL), and every `generated_image`,
- * top-level or nested in a tool result. The strip, the post-strip estimates, the image watermark and the
- * store's price all see the same images and agree on how deep each one is,
- * and a strip releases the raw replay form of a tool result whose nested
- * image it replaces, from every block of its message that shares it.
+ * top-level or nested in a tool result. The strip, the post-strip estimates,
+ * the image watermark and the store's price all see the same images and agree
+ * on how deep each one is, and a strip releases the raw replay form of a tool
+ * result whose nested image it replaces, from every block of its message that
+ * shares it.
  */
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';

@@ -960,9 +960,10 @@ export interface AutobiographicalConfig {
    *  beyond this many are replaced with a text placeholder. 0 = unlimited.
    *  A hard ceiling for dense bursts that pack many images into the live window.
    *  Every `image` block counts, whatever its source (base64, a `data:` URL
-   *  or a remote URL), and so does every generated image, top-level or nested in a tool result (see
-   *  inline-images.ts). An image inside an opaque provider item, such as a
-   *  Responses `image_generation_call` replayed from its raw form, doesn't. */
+   *  or a remote URL), and so does every generated image, top-level or
+   *  nested in a tool result (see inline-images.ts). An image inside an
+   *  opaque provider item, such as a Responses `image_generation_call`
+   *  replayed from its raw form, doesn't. */
   maxLiveImages?: number;
   /** Token depth from the newest message beyond which images are stripped to a
    *  text placeholder, even though the surrounding text stays verbatim. Measured

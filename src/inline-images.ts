@@ -18,7 +18,8 @@ export function isImageBlock(block: { type?: unknown }): boolean {
 
 /**
  * Inline payload characters of an image: a base64 source, a `data:` URL
- * source, or a generated image's `data` field. 0 for a remote URL.
+ * source, or a `data` field beside `mimeType`, as a generated image carries.
+ * 0 for a remote URL.
  */
 export function inlineImageBytes(block: unknown): number {
   const image = block as { data?: unknown; source?: { data?: unknown; url?: unknown } };

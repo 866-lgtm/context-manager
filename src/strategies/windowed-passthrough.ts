@@ -267,9 +267,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     // from the newest message down to the anchor (liveImagePolicy), so the
     // window is priced without the images the strip takes out, and
     // truncation. A message the cap cuts is priced as the autobiographical
-    // strategy prices one, at min(estimate, cap + 50), which leaves out the
-    // images truncation keeps. That price isn't a bound on what renders: the
-    // cut's suffix, a string result's omission notice and the omission
+    // strategy prices one, at min(estimate, cap + 50). At cap + 50 the price
+    // leaves out the images truncation keeps. That price isn't a bound on what
+    // renders: the cut's suffix, a string result's omission notice and the omission
     // marker can take a capped message past it. A message the truncator
     // leaves whole renders whole and is priced at its estimate, even past
     // the cap, where the autobiographical strategy prices every message at
