@@ -1092,8 +1092,10 @@ export class ContextManager {
    * Accepts optional context injections (e.g., from MCPL servers) and merges
    * them into the compiled output by position:
    * - "system": returned separately in `systemInjections` (caller appends to system prompt)
-   * - "beforeUser": inserted before the last user message
-   * - "afterUser": inserted after the last user message
+   * - "beforeUser": inserted before the last user message, or, when the
+   *   messages hold none, at the end, ahead of any "afterUser" injections
+   * - "afterUser": inserted after the last user message, or at the end when
+   *   the messages hold none
    *
    * May block if strategy has pending work.
    */
@@ -1228,20 +1230,24 @@ export class ContextManager {
     const injectionSources = (list: ContextInjection[]): CompiledMessageSources[] =>
       list.map((inj) => ({ kind: 'injection', namespace: inj.namespace }));
 
-    // Insert beforeUser injections before last user message
-    if (beforeUser.length > 0 && lastUserIdx >= 0) {
+    // Insert beforeUser injections before the last user message. Messages
+    // with none take them at the end, as afterUser's fallback below does, so
+    // afterUser's land after them.
+    if (beforeUser.length > 0) {
+      const insertIdx = lastUserIdx >= 0 ? lastUserIdx : messages.length;
       const injectedMessages: NormalizedMessage[] = beforeUser.map((inj) => ({
         participant: `system_context:${inj.namespace}`,
         content: inj.content,
       }));
-      messages.splice(lastUserIdx, 0, ...injectedMessages);
-      messageSources.splice(lastUserIdx, 0, ...injectionSources(beforeUser));
+      messages.splice(insertIdx, 0, ...injectedMessages);
+      messageSources.splice(insertIdx, 0, ...injectionSources(beforeUser));
       injectedContent.push(...beforeUser.map((inj) => inj.content));
       // Adjust lastUserIdx to account for inserted messages
-      lastUserIdx += injectedMessages.length;
+      if (lastUserIdx >= 0) lastUserIdx += injectedMessages.length;
     }
 
-    // Insert afterUser injections after last user message
+    // Insert afterUser injections after the last user message. Messages with
+    // none take them at the end, after the beforeUser injections placed there.
     if (afterUser.length > 0) {
       const insertIdx = lastUserIdx >= 0 ? lastUserIdx + 1 : messages.length;
       const injectedMessages: NormalizedMessage[] = afterUser.map((inj) => ({
