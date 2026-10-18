@@ -22,6 +22,7 @@ import {
   WindowedPassthroughStrategy,
   filterMessageStoreView,
   mergeMessageStoreViews,
+  OverBudgetError,
 } from '../src/index.js';
 import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
 
@@ -347,7 +348,12 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
     const path = freshPath();
     const manager = await ContextManager.open({ path, strategy: new WindowedPassthroughStrategy() });
     manager.addMessage('u', text('x'.repeat(2000))); // ~500 tokens
-    await assert.rejects(manager.compile(budget), (err: Error) => err.name === 'OverBudgetError');
+    await assert.rejects(manager.compile(budget), (err: Error) => {
+      assert.ok(err instanceof OverBudgetError);
+      // No compression here: only a newer message that fits, or a larger budget, clears it.
+      assert.deepStrictEqual(err.clearedBy, ['newer-message']);
+      return true;
+    });
     await manager.close();
   });
 

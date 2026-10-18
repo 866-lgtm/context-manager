@@ -17,6 +17,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import {
   ContextManager,
   AutobiographicalStrategy,
+  OverBudgetError,
   concatBodyGroups,
   bodyStart,
   bodyEnd,
@@ -192,7 +193,12 @@ describe('two copies of one document', () => {
     cm.removeMessages(cm.getAllMessages().at(-1)!.id, cm.getAllMessages().at(-1)!.id);
     await cm.compile(BUDGET);
     for (const m of second) strategy.drop.add(m.id);
-    await assert.rejects(cm.compile(BUDGET), /did not retain the newest turn/);
+    await assert.rejects(cm.compile(BUDGET), (err: unknown) => {
+      assert.ok(err instanceof OverBudgetError);
+      assert.match(err.message, /did not retain the newest turn/);
+      assert.deepEqual(err.clearedBy, [], 'nothing but room for the newest turn clears it');
+      return true;
+    });
     cm.close();
   });
 

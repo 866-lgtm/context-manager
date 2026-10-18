@@ -109,6 +109,7 @@ async function fixture(
   options: ConstructorParameters<typeof Probe>[0] = {},
   path = freshPath(),
   seedAndQueue = true,
+  rawText = (i: number) => `raw-${i} ` + 'substance '.repeat(10),
 ): Promise<Fixture> {
   const strategy = new Probe({
     compressionModel: MODEL,
@@ -124,7 +125,7 @@ async function fixture(
   const manager = await ContextManager.open({ path, strategy, membrane: membrane as never });
   const ids: string[] = [];
   for (let i = 0; i < 8; i++) {
-    ids.push(manager.addMessage(i % 2 ? 'Claude' : 'User', [t(`raw-${i} ` + 'substance '.repeat(10))]));
+    ids.push(manager.addMessage(i % 2 ? 'Claude' : 'User', [t(rawText(i))]));
   }
   const l1 = (id: string, a: number, b: number): SummaryEntry => ({
     id,
@@ -333,6 +334,40 @@ describe('Merge terminal-disposition gate', () => {
     );
     assert.equal(fx.strategy.summariesView().filter((s) => s.level === 2).length, 1, 'merge canonized');
     assert.equal(fx.strategy.mergeQueueView().length, 0, 'queue drained');
+    await fx.manager.close();
+  });
+
+  it('a merge retried after tool_use is prepared again from its sources, and logged again', async () => {
+    // An L1 attempt's retries are made from its sent request and log
+    // nothing again; a merge's retry is built from its sources on a later
+    // tick, so what preparation replaced in it is logged again (R2-5).
+    const payload = 'P'.repeat(20000);
+    const mock = scripted([
+      {
+        raw: {
+          stopReason: 'tool_use',
+          content: [{ type: 'tool_use', id: 'tu-1', name: 'think', input: { content: 'draft…' } }],
+        },
+      },
+      { stop: 'end_turn', text: 'the merged memory body, written as prose' },
+    ]);
+    const fx = await fixture(mock.membrane, {}, freshPath(), true,
+      (i) => i === 0 ? `raw-0 data:image/png;base64,${payload}` : `raw-${i} ` + 'substance '.repeat(10));
+    const logs: string[] = [];
+    const original = console.error;
+    console.error = (...parts: unknown[]) => { logs.push(parts.map(String).join(' ')); };
+    try {
+      await fx.strategy.tick(ctx(fx.manager)); // attempt 1: rejected on tool_use
+      await fx.strategy.tick(ctx(fx.manager)); // attempt 2: built again
+    } finally { console.error = original; }
+    assert.equal(mock.calls.length, 2);
+    for (const call of mock.calls) {
+      const flat = JSON.stringify(call);
+      assert.ok(flat.includes('raw-0') && !flat.includes(payload), 'each attempt replays the span with the marker');
+    }
+    const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
+    assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), ['[merge-l2]', '[merge-l2]']);
+    assert.equal(fx.strategy.summariesView().filter((s) => s.level === 2).length, 1, 'merge canonized');
     await fx.manager.close();
   });
 
