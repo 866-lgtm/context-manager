@@ -10,10 +10,12 @@
   15 tokens, where it was priced at 51. In the autobiographical strategy, a
   message the cap leaves whole is priced as it is with no cap, where it was
   priced at no more than the cap plus 50. In the adaptive selection's middle,
-  a body sharded at ingress is priced whole, as it renders there, where a cap
-  smaller than a shard had the plan count it cut, so emission could overrun
-  the plan and refuse. A compile's render stats count each message at its new
-  price.
+  a body sharded at ingress is priced whole where the plan keeps it raw, as
+  it renders there, where a cap smaller than a shard had the plan count it
+  cut, so emission could overrun the plan and refuse. A compile's render
+  stats count each message at its new price. A `maxMessageTokens` that isn't
+  a positive number, such as NaN, is no cap in the windowed strategy too,
+  which cut away a message's text and left the cap's notices in its place.
   - Where `maxMessageTokens` is set, a compile fits fewer raw messages in its
     budget where capped messages carry images, tool calls or thinking, and at
     large caps such as connectome-host's 10,000. The autobiographical

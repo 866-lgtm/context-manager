@@ -147,10 +147,12 @@ describe('capContent', () => {
     assert.equal(out[1], part, 'the kept part keeps its item, since the item still ships whole through it');
   });
 
-  it('returns the content itself for a cap of 0 or less, which means no cap', () => {
+  it("returns the content itself for a cap that isn't a positive number, which means no cap", () => {
     const content = [text('x'.repeat(2000)), text('dropped')];
     assert.equal(capContent(content, 0, textEstimate), content);
     assert.equal(capContent(content, -1, textEstimate), content);
+    assert.equal(capContent(content, Number.NaN, textEstimate), content);
+    assert.equal(capContent(content, undefined as unknown as number, textEstimate), content);
   });
 
   it("reads a text block without string text as holding nothing, so, given an estimate that doesn't read its text, it passes before the cap", () => {

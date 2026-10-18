@@ -9835,9 +9835,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = segStart; i < segEnd && i < messages.length; i++) {
       const msg = messages[i];
       const ch = chunkAtPosition ? chunkAtPosition[i] : chunksByMessageId.get(msg.id);
-      // A body's shards render whole here, their raw runs joined into one
-      // entry without the cap (the shard path in step 5), so they're priced
-      // uncapped. The head and recent windows cut a shard as they emit it.
+      // This is the chunk's raw price, and a body's raw shards render whole
+      // here: the shard path in step 5 joins their raw runs into one entry
+      // without the cap, so they're priced uncapped. A shard the plan folds
+      // is priced as its summary. The head and recent windows cut a shard as
+      // they emit it.
       const tokens = msg.bodyGroupId ? pse[i] : pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       const bound = pinBounds.size > 0 ? pinBounds.get(i) : undefined;
       const l1Id = ch?.summaryId ?? l1ByMessage.get(msg.id);
@@ -14881,8 +14883,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * gives an uncapped one, so the cut is priced as it renders: the plan's
    * chunks, the head and tail reservations, the refusal's floor, the
    * emission checks, the recent window's eviction walk and the render stats.
-   * A body's shards in the adaptive middle render whole, so their chunks
-   * take no extra.
+   * A body's raw shards in the adaptive middle render whole, so their
+   * chunks' raw prices take no extra.
    * A site that emits the message sends `content`. The head and recent
    * windows' sizes and the image strip's depth are measured before the cap
    * (getHeadWindowEnd, getUnheldRecentWindowStart, getImageStripStart), in
@@ -14896,11 +14898,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     msg: StoredMessage,
     msgCap: number,
   ): { content: ContentBlock[]; extra: number } {
-    // A cap that isn't a positive number is no cap: a caller's explicit
-    // `maxMessageTokens: undefined` stays in the config, and capContent would
-    // cut at NaN characters.
-    if (!(msgCap > 0)) return { content: msg.content, extra: 0 };
-    // capContent estimates the content it's given, which is msg.content.
+    // capContent reads a cap that isn't a positive number as no cap, such as
+    // a caller's explicit `maxMessageTokens: undefined`, which stays in the
+    // config, and returns the content itself, so the extra is 0. It
+    // estimates the content it's given, which is msg.content.
     const content = capContent(msg.content, msgCap, () => this.estimateTextOnlyTokens(msg));
     return { content, extra: cappedPriceExtra(store, msg, content) };
   }
