@@ -1062,10 +1062,9 @@ describe('compression refusal recall curves', () => {
 
   it('zero usage, or usage without an input count, falls back to the complete request bound', async () => {
     // Cache counts with no input count beside them are no observation of the
-    // prompt. Through membrane the input count is always a number, since the
-    // adapters whose providers can omit it report zero and Anthropic's and
-    // Bedrock's APIs always send one, so this shape comes only from a caller
-    // outside it.
+    // prompt. membrane's Anthropic and Bedrock adapters pass the provider's
+    // input count through, so this shape reaches the strategy where such a
+    // provider sends none, as from a caller outside membrane.
     const withoutInputCount = response('refusal');
     (withoutInputCount as { usage: Record<string, number> }).usage = { outputTokens: 0 };
     (withoutInputCount as unknown as { details: unknown }).details = {
@@ -1092,7 +1091,9 @@ describe('compression refusal recall curves', () => {
       const record = quarantineEvents(fx.manager).find((event) => event.kind === 'exhausted')!
         .record as Record<string, unknown>;
       assert.equal(record.canonicalProviderInputTokens, undefined, label);
-      assert.ok((record.plan as Array<Record<string, unknown>>).every(
+      const plan = record.plan as Array<Record<string, unknown>>;
+      assert.ok(plan.length > 0, `${label}: the plan has entries`);
+      assert.ok(plan.every(
         (item) => item.accountingSource === 'complete_normalized_request_bound',
       ), label);
       fx.manager.close();
@@ -1423,6 +1424,65 @@ describe('compression refusal recall curves', () => {
     await restarted.run(chunk, ctx);
     assert.equal(restartMock.calls.length, 1, 'stale claim cannot suppress canonical retry');
     assert.equal(chunk.compressed, true);
+    manager.close();
+  });
+
+  it('a quarantine record an earlier release wrote with the old count still holds its chunk', async () => {
+    // An earlier release counted this refusal at its fresh input alone, 2,000,
+    // where this one counts 10,000, so its record carries another count and
+    // another key. It wrote accounting version 2, as this release does, and
+    // the family key hashes no count, so the record goes on holding the
+    // chunk's request family.
+    const path = freshPath();
+    const firstMock = flexibleMembrane([
+      { stop: 'refusal', inputTokens: 2_000, cacheReadTokens: 8_000, provider: 'openai-responses-api' },
+    ]);
+    const first = await fixture(firstMock.membrane, { compressionRefusalCurveFallbacks: 0 }, path);
+    const targetIds = first.target.messages.map((message) => message.id);
+    await first.strategy.run(first.target, managerContext(first.manager));
+    const exhausted = quarantineEvents(first.manager).find((event) => event.kind === 'exhausted')!;
+    const current = exhausted.record as Record<string, unknown>;
+    assert.equal(current.canonicalProviderInputTokens, 10_000, 'premise: this release counts the cached span');
+    await first.strategy.clearCompressionRefusalQuarantine(String(current.key));
+    const earlier: Record<string, unknown> = {
+      ...structuredClone(current),
+      key: 'earlier-release-key',
+      canonicalProviderInputTokens: 2_000,
+      accountingSource: 'provider_total_input+positive_serialized_delta_or_complete_normalized_request_utf8_bound+output_reserve:v2',
+      normalizedConfig: { ...(current.normalizedConfig as Record<string, unknown>), accountingVersion: 2 },
+    };
+    first.manager.getStore().appendToStateJsonWithIdentity(
+      'default/autobio:compression-refusal-quarantine-events',
+      { kind: 'exhausted', key: earlier.key, record: earlier, outcomes: [], created: Date.now() },
+      'eventId',
+      'sequence',
+    );
+    first.manager.close();
+
+    const retryMock = scriptedMembrane(['end_turn']);
+    const retried = new ProbeStrategy({
+      compressionModel: MODEL,
+      targetChunkTokens: 100,
+      recentWindowTokens: 0,
+      headWindowTokens: 0,
+      autoTickOnNewMessage: false,
+      minChunkCharsForLLM: 0,
+      mergeThreshold: 99,
+      compressionRefusalCurveFallbacks: 0,
+    });
+    const manager = await ContextManager.open({ path, strategy: retried, membrane: retryMock.membrane });
+    const ctx = managerContext(manager);
+    const chunk: Chunk = {
+      index: 999,
+      startIndex: 10,
+      endIndex: 12,
+      messages: targetIds.map((id) => ctx.messageStore.get(id)!).filter(Boolean),
+      tokens: 100,
+      compressed: false,
+    };
+    await retried.run(chunk, ctx);
+    assert.equal(retryMock.calls.length, 0, 'the earlier record holds the chunk');
+    assert.equal(chunk.compressed, false);
     manager.close();
   });
 
