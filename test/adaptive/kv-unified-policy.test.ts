@@ -2016,10 +2016,12 @@ test('a remembered joint ceiling failure is forgotten when the wall changes', ()
   const carried = build(405, reuse);
   assert.equal(carried.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again at the new wall');
   assert.deepEqual(carried.result.produced, fresh.result.produced);
-  // A pin changes the levels a leaf may take, and so the label count, too.
-  const pinned = (budget: number, holder: KvUnifiedReuse) => {
+  // A pin, or a head window, changes the levels a leaf may take, and so the
+  // label count, too.
+  const pinned = (budget: number, holder: KvUnifiedReuse, head = false) => {
     const inputs = fixture();
-    inputs.chunks[1].pinned = true;
+    if (head) { inputs.headChunkIds = new Set(['latent-0']); inputs.headTokens = 90; }
+    else inputs.chunks[1].pinned = true;
     const strategy = new KvUnifiedStrategy({
       policy: { alpha: 0.7, budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0, budgetOverLambda: 100_000, cacheLambda: 0, continuityLambda: 0 },
       tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 40, adoptEpsilon: 90_000, reuse: holder,
@@ -2035,6 +2037,13 @@ test('a remembered joint ceiling failure is forgotten when the wall changes', ()
   const carriedPinned = pinned(500, again);
   assert.equal(carriedPinned.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again after the pins');
   assert.deepEqual(carriedPinned.result.produced, freshPinned.result.produced);
+  const once: KvUnifiedReuse = {};
+  build(500, once);
+  const freshHead = pinned(500, {}, true);
+  assert.equal(freshHead.strategy.lastTimings?.demandSolves, 1, 'premise: with a head leaf the joint forest fits at 500');
+  const carriedHead = pinned(500, once, true);
+  assert.equal(carriedHead.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again after the head window');
+  assert.deepEqual(carriedHead.result.produced, freshHead.result.produced);
 });
 
 test('a root the forest treeified away from a crossed parent is not a merge candidate', () => {

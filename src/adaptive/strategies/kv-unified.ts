@@ -391,7 +391,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
     // exceed it again: its holder says so, and is kept so that it still
     // says so next compile.
     const key = whatIfKey(conservative);
-    const failure = jointFailureSignature(inputs, this.options, budget.totalBudget, policy);
+    const failure = jointFailureSignature(inputs, whatIf.base, this.options, budget.totalBudget, policy);
     const remembered = whatIf.carried?.get(key);
     if (remembered?.jointFailure === failure) {
       whatIf.kept?.set(key, remembered);
@@ -619,15 +619,20 @@ function latentHigherLevelCandidates(
 /** What decides how many labels a joint what-if solve creates, besides the
  * candidate set (the holder's key): the ceiling, the wall, the grid, the
  * policy terms that enter propagation, whether a presentation exists, the
- * forest's size, and the leaves' pins and locks, which decide the levels a
- * leaf may take. A remembered ceiling failure is valid while these hold. */
-function jointFailureSignature(inputs: PickerInputs, options: KvUnifiedOptions, maxTokens: number, policy: KvUnifiedWelfarePolicy): string {
-  let pins = 0;
+ * forest's size, and the levels each leaf may take as the live forest
+ * resolved them (pins, locks, head and tail membership, constraints: every
+ * input that narrows a leaf's levels ends up in that list). A remembered
+ * ceiling failure is valid while these hold. */
+function jointFailureSignature(
+  inputs: PickerInputs, forest: CanonicalSummaryForest, options: KvUnifiedOptions, maxTokens: number, policy: KvUnifiedWelfarePolicy,
+): string {
+  let levels = 0;
   for (let i = 0; i < inputs.chunks.length; i++) {
-    const chunk = inputs.chunks[i];
-    if (!chunk.pinned && !chunk.lockedByAgent && chunk.pinLevel === undefined && chunk.pinMaxLevel === undefined) continue;
-    const code = (chunk.pinned ? 1 : 0) | (chunk.lockedByAgent ? 2 : 0) | ((chunk.pinLevel ?? 0) + 1 << 2) | ((chunk.pinMaxLevel ?? 0) + 1 << 8);
-    pins = Math.imul(pins ^ (i + 1), 0x9e3779b1) ^ code;
+    const leaf = forest.leaf(inputs.chunks[i].id);
+    if (!leaf) continue;
+    let code = leaf.externallyAccounted ? 1 : 0;
+    for (const level of leaf.allowedLevels) code = Math.imul(code, 31) + level + 1;
+    levels = Math.imul(levels ^ (i + 1), 0x9e3779b1) ^ code;
   }
   return [
     options.labelCeiling ?? '', maxTokens,
@@ -635,7 +640,7 @@ function jointFailureSignature(inputs: PickerInputs, options: KvUnifiedOptions, 
     policy.alpha, policy.budgetLowRatio, policy.budgetHighRatio, policy.budgetUnderLambda, policy.budgetOverLambda,
     policy.cacheLambda, policy.cacheScale, policy.continuityLambda, policy.continuityScale, policy.ageBandSteps,
     options.presentation ? 1 : 0, inputs.headTokens, inputs.tailTokens, inputs.chunks.length, inputs.summaries.size,
-    pins >>> 0,
+    levels >>> 0,
   ].join(':');
 }
 
