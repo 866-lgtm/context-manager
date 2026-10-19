@@ -122,9 +122,15 @@ the absolute prefix, needs few (twelve L1 pairs under a 9,950-token head
 and a 10,000 wall, no grid: the packed engine peaks at one label, the
 subtree engine passes 1,000). With `engine: 'auto'` (the default) such a
 solve runs once more on the packed engine and the stats say so
-(`ceilingFallback`); `engine: 'subtree'` reports the ceiling instead.
-Production grids keep the per-origin cell count small, and the real-store
-replay never came near it.
+(`ceilingFallback`); `engine: 'subtree'` reports the ceiling instead. The
+fallback still drops departed ids from the memo and reports the sets the
+engine computed and reused before it gave up. A composition is pruned as
+it grows: the product of the incoming labels and a summary's deltas is
+pruned every time it passes the ceiling, so the labels held at once stay
+within the ceiling plus one label's expansion (`peakTemporaryLabels`)
+where two sets of ten thousand would otherwise be a hundred million
+labels in memory before the ceiling was asked. Production grids keep the
+per-origin cell count small, and the real-store replay never came near it.
 
 **Stats.** `ParetoKvUnifiedPolicySolver.lastSubtreeStats` and
 `KvUnifiedTimings.subtree` report the delta sets a solve computed and the

@@ -166,6 +166,9 @@ export interface SubtreeSolveStats {
   readonly summariesSolved: number;
   /** Delta sets this solve read that an earlier solve computed. */
   readonly summariesReused: number;
+  /** The most labels held at once while composing a step, before a prune:
+   * at most the ceiling plus one label's expansion. */
+  readonly peakTemporaryLabels: number;
   /** True when the subtree engine exceeded the label ceiling and the solve
    * ran again on the packed DAG engine (see kv-unified-pareto.ts). */
   readonly ceilingFallback?: boolean;
@@ -228,7 +231,22 @@ export class SubtreeMemoSolver {
   private readonly diag = typeof process !== 'undefined' && !!process.env?.KVU_SUBTREE_DIAG
     ? new Map<number, { solved: number; reused: number; labels: number; pairs: number; ms: number }>() : null;
   private diagPairs = 0;
-  lastStats: SubtreeSolveStats = { summariesSolved: 0, summariesReused: 0 };
+  lastStats: SubtreeSolveStats = { summariesSolved: 0, summariesReused: 0, peakTemporaryLabels: 0 };
+  /** The most labels held at once while composing, before a prune. */
+  private temporaries = 0;
+
+  /** The counters as they stand, for a solve that ended early. */
+  get stats(): SubtreeSolveStats {
+    return { summariesSolved: this.summariesSolved, summariesReused: this.summariesReused, peakTemporaryLabels: this.temporaries };
+  }
+
+  /** Drop the memo entries of summaries no longer in the forest (store
+   * surgery, a rebuild that replaced them); otherwise their delta arrays
+   * stay until the holder is reset. Run at the end of every solve, and by
+   * the Pareto solver when this engine gives up on the ceiling. */
+  dropDeparted(): void {
+    if (this.memo) for (const id of this.memo.keys()) if (!this.forest.summary(id)) this.memo.delete(id);
+  }
 
   constructor(
     private readonly inputs: PickerInputs,
@@ -428,10 +446,8 @@ export class SubtreeMemoSolver {
           terminal.map((candidate) => evaluator.candidate(candidate.trace, candidate.tokens)), options, stats, this.cacheRelevant)
       : scoreBoundedCandidates(
           terminal.map((candidate) => evaluator.estimate(candidate.trace, candidate.tokens)), options, stats, this.cacheRelevant, evaluator.orderedLeafIds);
-    this.lastStats = { summariesSolved: this.summariesSolved, summariesReused: this.summariesReused };
-    // An id that left the forest (store surgery, a rebuild that replaced it)
-    // would otherwise keep its two delta arrays until the holder is reset.
-    if (this.memo) for (const id of this.memo.keys()) if (!forest.summary(id)) this.memo.delete(id);
+    this.lastStats = this.stats;
+    this.dropDeparted();
     if (this.diag) {
       const rows = [...this.diag].sort((a, b) => a[0] - b[0]).map(([level, d]) =>
         `L${level}: solved=${d.solved} reused=${d.reused} labels=${d.labels} pairs=${d.pairs} ms=${d.ms.toFixed(0)}`);
@@ -483,7 +499,7 @@ export class SubtreeMemoSolver {
    * is any label under a restriction. */
   private combine(incoming: readonly Label[], summary: CanonicalSummary, active: ReadonlySet<number> | undefined, flushLimit: number): Label[] {
     this.expanded += incoming.length;
-    const out: Label[] = [];
+    let out: Label[] = [];
     let broken: readonly Delta[] | null = null;
     for (const label of incoming) {
       if (active) {
@@ -495,8 +511,20 @@ export class SubtreeMemoSolver {
         broken ??= this.deltasBroken(summary);
         for (const delta of broken) out.push(compose(label, delta));
       }
+      // The product of the incoming labels and the deltas is pruned as it
+      // grows, not once at the end: two sets of ten thousand would otherwise
+      // be a hundred million labels in memory before the ceiling was asked.
+      // Pruning a part and going on gives the same set (a dominated label
+      // stays dominated; a covered one stays covered by its representative),
+      // and holds the temporaries to the ceiling plus one label's expansion.
+      if (out.length > this.ceiling) {
+        if (this.diag) this.diagPairs += out.length;
+        this.temporaries = Math.max(this.temporaries, out.length);
+        out = this.prune(out, this.options.maxTokens);
+      }
     }
     if (this.diag) this.diagPairs += out.length;
+    this.temporaries = Math.max(this.temporaries, out.length);
     return this.prune(out, this.options.maxTokens);
   }
 

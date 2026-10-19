@@ -188,7 +188,8 @@ export class ParetoKvUnifiedPolicySolver {
             // pruning from the absolute prefix, needs few. Asked for no engine
             // in particular, the solve runs once more on the packed engine.
             if (!(error instanceof SparseLabelCeilingError) || options.engine === 'subtree') throw error;
-            this.lastSubtreeStats = { ...subtree.lastStats, ceilingFallback: true };
+            subtree.dropDeparted();
+            this.lastSubtreeStats = { ...subtree.stats, ceilingFallback: true };
           }
         }
         return new PackedDagSolver(this.inputs, this.forest, options, buffered, bound, feasibility).solve();

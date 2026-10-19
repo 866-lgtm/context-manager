@@ -442,6 +442,97 @@ test('a subtree pruned from its own origin that exceeds the ceiling runs again o
   assert.equal(auto.selected.score, packed.selected.score);
 });
 
+test('a composition whose product would dwarf the ceiling is pruned as it grows', () => {
+  // Two L2s over eleven varied L1 pairs each and an L3 over both, with a
+  // receipt and no buckets: each L2's set is ~10,000 labels and the L3
+  // combines them, a product of ~10^8 labels if formed before pruning. The
+  // product is pruned as it grows, so the labels held at once stay within
+  // the ceiling plus one expansion, and the cut is the packed engine's.
+  let seed = 7;
+  const random = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  const pairsPerL2 = 11;
+  const chronicle = new MockChronicle({ recallPairTokens: 40 });
+  const l2s = [];
+  for (let group = 0; group < 2; group++) {
+    const l1s = [];
+    for (let pair = 0; pair < pairsPerL2; pair++) {
+      const i = group * pairsPerL2 * 2 + pair * 2;
+      chronicle.addChunk({ id: `c${i}`, rawTokens: 60 + Math.floor(random() * 80) });
+      chronicle.addChunk({ id: `c${i + 1}`, rawTokens: 60 + Math.floor(random() * 80) });
+      l1s.push(chronicle.produceL1([`c${i}`, `c${i + 1}`]));
+    }
+    l2s.push(chronicle.produceUpper(2, l1s.map((summary) => summary.id)));
+  }
+  chronicle.produceUpper(3, l2s.map((summary) => summary.id));
+  const inputs = inputsOf(chronicle);
+  for (let i = 0; i < inputs.chunks.length; i++) inputs.chunks[i].salience = 0.2 + random() * 0.7;
+  const forest = new CanonicalSummaryForest(inputs);
+  const layout = renderLayout(inputs, new SummaryTree(inputs), new Map(inputs.chunks.map((chunk) => [chunk.id, 0])));
+  const ceiling = 100_000;
+  const options: ParetoSolveOptions = {
+    maxTokens: 300 * pairsPerL2 * 2, labelCeiling: ceiling,
+    presentation: {
+      currentSeq: 2,
+      leaves: new Map(inputs.chunks.map((chunk) => [chunk.id, { level: 0, repHash: `raw:${chunk.id}`, lastChangedSeq: 1 }])),
+    },
+    cache: { immutablePrefixHash: 'p', layout, markers: [{ unitIndex: layout.units.length, offset: layout.totalTokens }] },
+    currentImmutablePrefixHash: 'p',
+    policy: { continuityLambda: 50, cacheLambda: 100, continuityScale: 100, cacheScale: 100 },
+  };
+  const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
+  const packed = solver.solve({ ...options, engine: 'dag' });
+  const subtree = solver.solve({ ...options, engine: 'subtree' });
+  assert.ok(packed.feasible && subtree.feasible);
+  const peak = subtree.propagation!.maxLabelsPerState;
+  assert.ok(peak > 10_000, `premise: the sets are large (${peak})`);
+  const stats = solver.lastSubtreeStats!;
+  assert.ok(stats.peakTemporaryLabels > peak, `premise: a step grew past its pruned size (${stats.peakTemporaryLabels})`);
+  assert.ok(stats.peakTemporaryLabels <= ceiling + peak, `held to the ceiling plus one expansion: ${stats.peakTemporaryLabels}`);
+  assert.deepEqual(subtree.selected.frontier, packed.selected.frontier);
+  assert.equal(subtree.selected.score, packed.selected.score);
+});
+
+test('the ceiling fallback drops departed ids from the memo and reports the work the engine did', () => {
+  // The twelve-pair fixture of the fallback test, solved first in a form the
+  // subtree engine fits (no head), with a holder; then with the head that
+  // sends it over the ceiling, twice. The sets computed before the overflow
+  // are reused on the second attempt and the stats say so, and an id that
+  // left the forest between the solves is gone from the memo although the
+  // engine never reached the end of a solve.
+  const build = (head: number, extra: boolean) => {
+    const chronicle = new MockChronicle({ recallPairTokens: 40 });
+    const l1s = [];
+    for (let i = 0; i < 12; i++) {
+      chronicle.addChunk({ id: `a${i}`, rawTokens: 100 + 2 ** i });
+      chronicle.addChunk({ id: `b${i}`, rawTokens: 100 });
+      l1s.push(chronicle.produceL1([`a${i}`, `b${i}`]));
+    }
+    chronicle.produceUpper(2, l1s.map((summary) => summary.id));
+    let departing: string | null = null;
+    if (extra) {
+      chronicle.addChunk({ id: 'x0', rawTokens: 50 });
+      chronicle.addChunk({ id: 'x1', rawTokens: 50 });
+      departing = chronicle.produceL1(['x0', 'x1']).id;
+    }
+    const inputs = inputsOf(chronicle, { headTokens: head });
+    return { inputs, forest: new CanonicalSummaryForest(inputs), departing };
+  };
+  const options: ParetoSolveOptions = { maxTokens: 10_000, labelCeiling: 1_000, policy: { alpha: 0 } };
+  const reuse: KvUnifiedReuse = {};
+  const roomy = build(0, true);
+  new ParetoKvUnifiedPolicySolver(roomy.inputs, roomy.forest).solve({ ...options, labelCeiling: 100_000, reuse });
+  assert.ok(reuse.subtree?.has(roomy.departing!), 'premise: the extra L1 has an entry');
+  const tight = build(9_950, false);
+  const first = new ParetoKvUnifiedPolicySolver(tight.inputs, tight.forest);
+  assert.ok(first.solve({ ...options, reuse }).feasible);
+  assert.equal(first.lastSubtreeStats?.ceilingFallback, true, 'premise: the packed engine finished it');
+  assert.equal(reuse.subtree?.has(roomy.departing!), false, 'the departed id is dropped on the fallback path too');
+  const second = new ParetoKvUnifiedPolicySolver(tight.inputs, tight.forest);
+  assert.ok(second.solve({ ...options, reuse }).feasible);
+  assert.equal(second.lastSubtreeStats?.ceilingFallback, true);
+  assert.ok(second.lastSubtreeStats!.summariesReused > 0, `the sets computed before the overflow were reused: ${JSON.stringify(second.lastSubtreeStats)}`);
+});
+
 test('the memo drops the ids of summaries that left the forest', () => {
   const build = (withParent: boolean) => {
     const chronicle = new MockChronicle({ recallPairTokens: 30 });
