@@ -340,6 +340,44 @@ test('without a grid the engine prunes by dominance across values, as the packed
     `peak ${subtree.propagation!.maxLabelsPerState} vs ${reference.propagation!.maxLabelsPerState}`);
 });
 
+test('an exact search whose one step expands past any argument list still completes under the ceiling', () => {
+  // 52 L1 pairs under one L2 with a pinned hole, leaves of varied size and
+  // salience, a matching receipt and no buckets: the walk through the L2
+  // expands one label into ~160,000, more than a call can take as spread
+  // arguments (about 125,000 on node 22 and 24), and below the ceiling. The
+  // expansion is appended label by label, so the search reaches its ceiling
+  // and not a RangeError.
+  let seed = 7;
+  const random = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  const pairs = 52;
+  const chronicle = new MockChronicle({ recallPairTokens: 40 });
+  for (let i = 0; i < pairs * 2; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 60 + Math.floor(random() * 80), pinned: i === 1 });
+  const l1s = [];
+  for (let i = 0; i < pairs * 2; i += 2) l1s.push(chronicle.produceL1([`c${i}`, `c${i + 1}`]));
+  chronicle.produceUpper(2, l1s.map((summary) => summary.id));
+  const inputs = inputsOf(chronicle);
+  for (let i = 0; i < inputs.chunks.length; i++) inputs.chunks[i].salience = 0.2 + random() * 0.7;
+  const forest = new CanonicalSummaryForest(inputs);
+  assert.ok(forest.hasInternalProtectedHoles(), 'premise: the hole takes every label through the walk');
+  const layout = renderLayout(inputs, new SummaryTree(inputs), new Map(inputs.chunks.map((chunk) => [chunk.id, 0])));
+  const options: ParetoSolveOptions = {
+    maxTokens: 300 * pairs, labelCeiling: 1_000_000,
+    presentation: {
+      currentSeq: 2,
+      leaves: new Map(inputs.chunks.map((chunk) => [chunk.id, { level: 0, repHash: `raw:${chunk.id}`, lastChangedSeq: 1 }])),
+    },
+    cache: { immutablePrefixHash: 'p', layout, markers: [{ unitIndex: layout.units.length, offset: layout.totalTokens }] },
+    currentImmutablePrefixHash: 'p',
+    policy: { continuityLambda: 50, cacheLambda: 100, continuityScale: 100, cacheScale: 100 },
+  };
+  const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
+  const subtree = solver.solve({ ...options, engine: 'subtree' });
+  assert.ok(subtree.feasible);
+  assert.ok(subtree.propagation!.maxLabelsPerState > 130_000, `premise: ${subtree.propagation!.maxLabelsPerState} labels in one step`);
+  assert.throws(() => solver.solve({ ...options, engine: 'subtree', labelCeiling: 100_000 }), SparseLabelCeilingError,
+    'the ceiling, not the call, bounds the step');
+});
+
 test('a presentation appearing elsewhere invalidates the sets of a subtree it does not cover', () => {
   // Whether a presentation exists decides what new material is: with none,
   // nothing is an extension; with one that covers other leaves, this

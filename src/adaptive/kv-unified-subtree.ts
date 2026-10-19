@@ -478,9 +478,9 @@ export class SubtreeMemoSolver {
     let broken: readonly Delta[] | null = null;
     for (const label of incoming) {
       if (active) {
-        out.push(...this.processSummary(label, summary, active, flushLimit));
+        for (const next of this.processSummary(label, summary, active, flushLimit)) out.push(next);
       } else if (label.cache.intact) {
-        if (this.buffered) out.push(...this.processSummary(label, summary, undefined, flushLimit));
+        if (this.buffered) for (const next of this.processSummary(label, summary, undefined, flushLimit)) out.push(next);
         else for (const delta of this.deltasIntact(summary, label.cache.matchedUnits)) out.push(compose(label, delta));
       } else {
         broken ??= this.deltasBroken(summary);
@@ -866,7 +866,7 @@ export class SubtreeMemoSolver {
           ));
       const covered = coverApproximationPool(pool, representatives, cacheRelevant);
       this.dominated += pool.length - covered.length;
-      result.push(...covered);
+      for (const label of covered) result.push(label);
     }
     this.created += result.length;
     this.maximum = Math.max(this.maximum, result.length);
