@@ -864,7 +864,9 @@ export interface AutobiographicalConfig {
    * memories (observed 2026-07-26: an inheriting resident's L1s
    * first-personing scenes from before his arrival). Chunks that straddle
    * the boundary use the standard instruction — the agent's own turns are
-   * present in them.
+   * present in them. Reading mode (a portion of a much larger message, or a
+   * merge of portions of one) keeps its own instructions, which have no
+   * witnessed variant.
    */
   witnessedBeforeSequence?: number;
   /**
@@ -932,6 +934,11 @@ export interface AutobiographicalConfig {
    * to speak in its own voice as the reader. The split rung's pieces and a
    * merge retried after a refusal take the witnessed instruction instead of
    * the reading one.
+   *
+   * The reminder follows the target whatever instruction it gets: a
+   * subclass override that doesn't read the pin, such as KnowledgeStrategy's
+   * phase prompts and merge instruction, keeps its own instruction, and a
+   * wholly inherited target still takes this reminder.
    *
    * Unset: every target uses `identityReminder` (unchanged behavior).
    */

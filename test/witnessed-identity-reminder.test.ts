@@ -262,7 +262,7 @@ describe('witnessedIdentityReminder', () => {
     for (const [kind, count] of Object.entries(seen)) assert.ok(count > 0, `the run reached a ${kind} target (${JSON.stringify(seen)})`);
   });
 
-  it('unset or blank: every request is the no-reminder run\'s request with the live reminder appended (unchanged behavior)', async () => {
+  it('unset or blank: every request is the no-reminder run\'s request with the live reminder appended', async () => {
     const bare = await run({ witnessedBeforeSequence: PIN });
     const live = await run({ witnessedBeforeSequence: PIN, identityReminder: LIVE });
     const blank = await run({ witnessedBeforeSequence: PIN, identityReminder: LIVE, witnessedIdentityReminder: ' \n\t ' });

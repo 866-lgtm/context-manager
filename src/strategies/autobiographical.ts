@@ -10856,8 +10856,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // reminder. A mixed merge takes the live instruction and reminder, and
       // its request shows inherited and lived material together, with no
       // label saying which is which. The sources' witnessed stamps decide
-      // this predicate, the merge instruction and the new summary's stamp;
-      // the request never shows them.
+      // this predicate and the new summary's stamp, and the request never
+      // shows them. They choose the merge instruction too, except in reading
+      // mode, whose instruction has no witnessed variant, and in an override
+      // that doesn't read them, such as KnowledgeStrategy's.
       sources.length > 0 && sources.every((s) => s.witnessed),
     );
     if (mergeSourceOnly) {
@@ -14586,7 +14588,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * As-of perspective pin: true when the chunk's messages are all strictly
    * before the agent's first own turn (witnessedBeforeSequence) — inherited
-   * record, not lived experience. Drives both the L1 instruction and the
+   * record, not lived experience. Drives the L1 instruction, the identity
+   * reminder of the L1 request and of each split-rung piece, and the
    * `witnessed` stamp on the minted summary or quiet-stretch stub (which
    * merge consolidation honors and propagates upward).
    */
@@ -14604,8 +14607,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Append the configured identity reminder (if any) to a compression or
-   * merge instruction. Applied at the llmMessages call sites (L1 chunk,
-   * split L1, and merge) rather than inside the format functions so subclass
+   * merge instruction. Applied where each request's instruction is built
+   * (the L1 chunk's request, each split-rung piece's in buildSub, and the
+   * merge's) rather than inside the format functions, so subclass
    * instruction overrides are covered too. See
    * `AutobiographicalConfig.identityReminder` for rationale (identity flip
    * over pure-witness chunks in multi-resident channels).
