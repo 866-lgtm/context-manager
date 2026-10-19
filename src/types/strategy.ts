@@ -696,6 +696,15 @@ export interface RenderStats {
      *  latent-demand ranking of the compile's final pick inside `compileMs`,
      *  in whole ms (`solveMs=`). */
     solveMs?: number;
+    /** Under `foldingStrategy: 'kv-unified'` only, where the label ceiling
+     *  stopped a search in the compile's final pick (#252): `live` where the
+     *  compile took the minimum-token cut, `joint` where the joint
+     *  latent-demand forest's solve exceeded it and the candidates were
+     *  ranked one at a time, `gate` where no merge was demanded because the
+     *  base solve without the certificate exceeded it, and `whatIfs:N` for
+     *  N individual what-if solves it stopped or, remembered from a compile
+     *  on the same inputs, skipped, joined by `+` (`ceiling=`). */
+    ceiling?: string;
     /** Set on a dry run or preview (`dryRun: true`, `previewContext`), which
      *  skips work a live compile does; logged as `dryRun=true`. Absent on a
      *  live compile. A caller reads a dry pass's stats only from
@@ -831,6 +840,16 @@ export interface KvUnifiedConfig {
   tokenBucketSize: number;
   continuityBucketSize: number;
   fidelityBucketSize: number;
+  /**
+   * The most labels a kv-unified search may hold at one state (or make in
+   * all, on the `leaf` engine). It bounds a search, not the compile (#252):
+   * a live solve that exceeds it takes the minimum-token cut and demands no
+   * merge, and the strategy's first solve that does warns. A latent-demand
+   * search that exceeds it measures nothing: its candidate isn't demanded,
+   * or keeps the gain an earlier search showed; a joint forest's candidates
+   * are ranked one at a time; and where the base solve that decides the
+   * gate exceeds it, nothing is demanded that compile.
+   */
   labelCeiling: number;
   adoptEpsilon: number;
   treeifyNonContiguousSummaries: boolean;

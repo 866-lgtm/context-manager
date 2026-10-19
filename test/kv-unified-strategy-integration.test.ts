@@ -5,6 +5,8 @@ import { createHash } from 'node:crypto';
 import { ContextManager, AutobiographicalStrategy, KnowledgeStrategy, OverBudgetError, PassthroughStrategy } from '../src/index.js';
 import type { ContextEntry, StoredMessage } from '../src/types/index.js';
 import type { KvUnifiedReceiptChain } from '../src/adaptive/kv-unified-receipts.js';
+import { ParetoKvUnifiedPolicySolver, type ParetoSolveOptions } from '../src/adaptive/kv-unified-pareto.js';
+import { SparseLabelCeilingError } from '../src/adaptive/kv-unified.js';
 
 const STORE = './test-kv-unified-integration-store';
 
@@ -77,6 +79,41 @@ test('a submission superseded before it settled is logged with its namespace', a
       'superseded by s2 ns=agents/wren',
   ]);
   manager.close();
+});
+
+// #252: a live solve past the label ceiling compiles on the minimum-token cut.
+// The first such solve in the strategy's life is said where its operator
+// reads, naming the ceiling, the labels and the engine, and the plan line
+// marks each compile whose own solve took it.
+test('a live solve past the label ceiling compiles anyway, warns once and marks every plan line', async (t) => {
+  const warned: string[] = [];
+  const planLines: string[] = [];
+  const original = console.error.bind(console);
+  t.mock.method(console, 'warn', (...args: unknown[]) => { warned.push(args.map(String).join(' ')); });
+  t.mock.method(console, 'error', (...args: unknown[]) => {
+    const line = args.map(String).join(' ');
+    if (line.startsWith('[plan-vs-actual]')) planLines.push(line);
+    else original(...args);
+  });
+  t.mock.method(ParetoKvUnifiedPolicySolver.prototype, 'solve', (options: ParetoSolveOptions) => {
+    throw new SparseLabelCeilingError(options.labelCeiling!, options.labelCeiling! + 1);
+  });
+  const live = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: live, namespace: 'agents/wren' });
+  manager.addMessage('user', [{ type: 'text', text: 'hello continuity' }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  manager.addMessage('assistant', [{ type: 'text', text: 'and once more' }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  assert.equal(manager.getRenderStats()?.planVsActual?.ceiling, 'live');
+  manager.close();
+  assert.deepEqual(warned.filter((line) => line.includes('labelCeiling')), [
+    '[kv-unified] labelCeiling 10000 exceeded at 10001 labels (engine: packed, after subtree); ' +
+      'that solve took the minimum-token cut, as each one that exceeds it will. A high enough labelCeiling ' +
+      'lets this forest\'s search fit, and larger bucket sizes may (said once; [plan-vs-actual] shows ' +
+      'ceiling=live for each compile whose own solve did) ns=agents/wren',
+  ]);
+  assert.equal(planLines.length, 2, planLines.join('\n'));
+  for (const line of planLines) assert.ok(line.includes(' ceiling=live'), line);
 });
 
 test('kv-unified presentation commits only after acceptance and survives restart', async () => {
