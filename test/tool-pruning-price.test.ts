@@ -404,9 +404,9 @@ describe('tool pruning, priced as sent', () => {
     cm.addMessage('u', text('next'));
     const compiled = await cm.compile(BUDGET);
     const LAST_ONE_AND_A_HALF = "[result of tool 'lookup' left out: this context shows only the tool's last 1.5 results]";
-    assert.deepEqual(['call-1', 'call-2', 'call-3'].map((id) => resultOf(compiled, id)!.slice(0, 3)),
-      [LAST_ONE_AND_A_HALF.slice(0, 3), LAST_ONE_AND_A_HALF.slice(0, 3), '3 l']);
-    assert.equal(resultOf(compiled, 'call-1'), LAST_ONE_AND_A_HALF, 'the marker names the limit as given, as it always has');
+    assert.deepEqual(['call-1', 'call-2'].map((id) => resultOf(compiled, id)), [LAST_ONE_AND_A_HALF, LAST_ONE_AND_A_HALF],
+      'the marker names the limit as given, as it always has');
+    assert.match(resultOf(compiled, 'call-3')!, /^3 lorem/);
     cm.close();
   });
 
@@ -602,7 +602,22 @@ describe('tool pruning, priced as sent', () => {
       assert.equal(reprices(two, at({ toolResultMaxLastN: 2 }), view(two)), false, 'a limit nothing reaches');
       assert.equal(reprices(two, at({}), view(two)), false, 'no limit');
       assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: null } }), view(two)), true, "a tool's null limit, read as 0 before");
+      assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: '1' } }), view(two)), true, "a tool's string limit, read as a number before");
+      assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: true } }), view(two)), true, "a tool's limit of true, read as 1 before");
+      assert.equal(reprices(two, at({ toolResultMaxLastN: Object.create({ lookup: null }) }), view(two)), true, 'an inherited null limit, which the count reads too');
       assert.equal(reprices(two, at({ toolResultMaxLastN: { other: null } }), view(two)), false, 'a null limit for a tool with no results');
+      assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: undefined } }), view(two)), false, 'a limit left undefined, which set none before either');
+      assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: 5 } }), view(two)), false, 'a number the results never pass');
+      assert.equal(reprices(two, at({ toolResultMaxLastN: null }), view(two)), false, 'a null for every tool, which threw before, so learned nothing');
+      // Only an answered call counts, paired as the count pairs them.
+      const unanswered = [msg('u', text('go')), msg('a', [call('n1', 'lookup')]), msg('u', text('never mind')),
+        msg('a', [call('o1', 'other')]), msg('u', [result('o1', 'r')])];
+      assert.equal(reprices(unanswered, at({ toolResultMaxLastN: { lookup: null } }), view(unanswered)), false, 'a call no result answers');
+      const bundled = [msg('u', text('go')), msg('a', [call('b1', 'lookup'), result('b1', 'r')]), msg('u', text('next'))];
+      assert.equal(reprices(bundled, at({ toolResultMaxLastN: { lookup: null } }), view(bundled)), false, "a result in its call's own message");
+      const reused = [msg('u', text('go')), msg('a', [call('x1', 'lookup')]), msg('u', text('wait')),
+        msg('a', [call('x1', 'other')]), msg('u', [result('x1', 'r')])];
+      assert.equal(reprices(reused, at({ toolResultMaxLastN: { lookup: null } }), view(reused)), true, 'a reused id answers its earliest call');
       const big = conversation(1, { body: 'x'.repeat(2_000) });
       assert.equal(reprices(big, at({ toolUseInputMaxTokens: 100 }), view(big)), true, 'an input over the cap');
       assert.equal(reprices(big, at({ toolUseInputMaxTokens: 1_000 }), view(big)), false, 'an input under the cap');

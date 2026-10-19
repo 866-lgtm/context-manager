@@ -504,6 +504,60 @@ type ToolPruningDecision = {
   readonly inputCap: number;
 };
 
+/** A tool call the conversation answers: its message's place in the listing,
+ *  the place of the result that first answered it, and every result that
+ *  answers it, by message and place in its content. */
+type AnsweredCall = { message: number; place: number; results: Array<{ message: MessageId; index: number }> };
+
+/**
+ * Each tool's answered calls, as toolPruning counts them. A result answers
+ * the earliest call with its id, in an earlier message, that no result has
+ * answered yet; a result with no such call goes with the call its id last
+ * answered, as a further result; a result with neither answers none. Epoch
+ * 4's predicate reads the same calls, so it sees what the count sees.
+ */
+function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, AnsweredCall[]> {
+  type Waiting = { toolName: string; call: AnsweredCall };
+  // Calls no result has answered yet, oldest first, by id, and the call
+  // each id's latest first answer went to.
+  const waiting = new Map<string, Waiting[]>();
+  const answeredLast = new Map<string, AnsweredCall>();
+  const byTool = new Map<string, AnsweredCall[]>();
+  let place = 0;
+  for (let at = 0; at < messages.length; at++) {
+    const m = messages[at]!;
+    // A message's calls wait from the next message on: pairing repair
+    // drops a result in its call's own message.
+    const opened: Array<[string, Waiting]> = [];
+    for (let i = 0; i < m.content.length; i++, place++) {
+      const block = m.content[i]!;
+      if (block.type === 'tool_use') {
+        opened.push([block.id, { toolName: block.name, call: { message: at, place: -1, results: [] } }]);
+      } else if (block.type === 'tool_result') {
+        const first = waiting.get(block.toolUseId)?.shift();
+        let call: AnsweredCall | undefined;
+        if (first) {
+          call = first.call;
+          call.place = place;
+          answeredLast.set(block.toolUseId, call);
+          let answered = byTool.get(first.toolName);
+          if (!answered) byTool.set(first.toolName, (answered = []));
+          answered.push(call);
+        } else {
+          call = answeredLast.get(block.toolUseId);
+        }
+        call?.results.push({ message: m.id, index: i });
+      }
+    }
+    for (const [id, entry] of opened) {
+      let queue = waiting.get(id);
+      if (!queue) waiting.set(id, (queue = []));
+      queue.push(entry);
+    }
+  }
+  return byTool;
+}
+
 /** Whether two messages' replacements (each result's place and marker) are
  *  the same; two absent ones are. */
 function sameMarkers(a: ReadonlyMap<number, string> | undefined, b: ReadonlyMap<number, string> | undefined): boolean {
@@ -13132,22 +13186,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     },
     // 4: a tool result the per-tool limit replaces, or a tool_use input over
     // the input cap, under the host's config: both were priced whole before.
-    // So was every result of a tool whose limit in a map isn't a number, such
-    // as a null from a caller outside TypeScript. Before, such a limit was
-    // read as one (null as 0, replacing each result); now it sets none, and
-    // its results are priced as they are sent, whole.
+    // So, before, were the results of a tool whose limit in a map isn't a
+    // number: such a limit was read by arithmetic (a null as 0, a "2" as 2,
+    // true as 1), replacing results the plan priced whole. Now it sets none.
+    // A store with an answered call of such a tool discards, as the count
+    // pairs calls (answeredToolCalls). A value that replaced nothing before,
+    // such as a non-numeric string, or a limit the results never passed,
+    // discards too, at the cost of one compile at 1.
     4: (messages, strategy, store) => {
       const pruning = strategy.toolPruning(store);
       if (pruning.replaced.size > 0) return true;
       const limits = strategy.config.toolResultMaxLastN as Record<string, unknown> | number | null | undefined;
       if (typeof limits === 'object' && limits !== null) {
-        const unread = new Set(Object.keys(limits).filter((tool) => limits[tool] !== undefined && typeof limits[tool] !== 'number'));
-        const tools = new Map<string, string>();
-        for (const m of unread.size > 0 ? messages : []) {
-          for (const b of m.content) {
-            if (b.type === 'tool_use') tools.set(b.id, b.name);
-            else if (b.type === 'tool_result' && unread.has(tools.get(b.toolUseId) ?? '')) return true;
-          }
+        for (const toolName of answeredToolCalls(messages).keys()) {
+          const limit = limits[toolName];
+          if (limit !== undefined && typeof limit !== 'number') return true;
         }
       }
       if (!(pruning.inputCap > 0)) return false;
@@ -16728,43 +16781,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (memo && memo.messages === messages && memo.limitsKey === limitsKey && memo.inputCap === inputCap) return memo.pruning;
     const replaced = new Map<MessageId, Map<number, string>>();
     if (limited) {
-      type Call = { toolName: string; message: number; place: number; results: Array<{ message: MessageId; index: number }> };
-      // Calls no result has answered yet, oldest first, by id, and the call
-      // each id's latest first answer went to.
-      const waiting = new Map<string, Call[]>();
-      const answeredLast = new Map<string, Call>();
-      const answeredByTool = new Map<string, Call[]>();
-      let place = 0;
-      for (let at = 0; at < messages.length; at++) {
-        const m = messages[at]!;
-        // A message's calls wait from the next message on: pairing repair
-        // drops a result in its call's own message.
-        const opened: Array<[string, Call]> = [];
-        for (let i = 0; i < m.content.length; i++, place++) {
-          const block = m.content[i]!;
-          if (block.type === 'tool_use') {
-            opened.push([block.id, { toolName: block.name, message: at, place: -1, results: [] }]);
-          } else if (block.type === 'tool_result') {
-            let call = waiting.get(block.toolUseId)?.shift();
-            if (call) {
-              call.place = place;
-              answeredLast.set(block.toolUseId, call);
-              let answered = answeredByTool.get(call.toolName);
-              if (!answered) answeredByTool.set(call.toolName, (answered = []));
-              answered.push(call);
-            } else {
-              call = answeredLast.get(block.toolUseId);
-            }
-            call?.results.push({ message: m.id, index: i });
-          }
-        }
-        for (const [id, call] of opened) {
-          let queue = waiting.get(id);
-          if (!queue) waiting.set(id, (queue = []));
-          queue.push(call);
-        }
-      }
-      for (const [toolName, answered] of answeredByTool) {
+      for (const [toolName, answered] of answeredToolCalls(messages)) {
         const limit = typeof limits === 'number' ? limits : (limits as Record<string, number | null | undefined>)[toolName];
         if (typeof limit !== 'number' || !(limit >= 0)) continue;
         // A fractional limit keeps its whole part and names itself in the

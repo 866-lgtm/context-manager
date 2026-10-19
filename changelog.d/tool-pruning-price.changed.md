@@ -13,8 +13,10 @@
     repair moves the batch's results: it sends those first, in call order.
     It moves them when a recall pair or pin comes between the calls and
     their results, and moves the part of a batch stored in a later message.
-  - A limit of null, for every tool or for one, sets no limit: a null for
-    every tool threw, and a null for one replaced each of its results.
+  - A per-tool limit that isn't a number of 0 or more, such as null, sets
+    no limit. `main` read such a value by arithmetic: a null replaced every
+    result of its tool, a string such as "2" all but two, and true all but
+    one. A null for every tool, which threw, sets no limit too.
   - The marker's text is unchanged. In a message the cap
     (`maxMessageTokens`) still cuts after the replacement, the cap can cut
     or omit the marker as it would any result.
