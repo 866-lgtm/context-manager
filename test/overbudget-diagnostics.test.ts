@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AutobiographicalStrategy, ContextManager, OverBudgetError } from '../src/index.js';
-import type { SummaryEntry, SummaryLevel } from '../src/types/index.js';
+import type { StoredMessage, SummaryEntry, SummaryLevel } from '../src/types/index.js';
 import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
 import type { FoldingBudget } from '../src/adaptive/folding-strategy.js';
 import type { ContentBlock, Membrane } from '@animalabs/membrane';
@@ -22,7 +22,7 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   useRealPicker = false;
   /** When set, the fixture solver asks for an L1 over the middle, as a plan with summaries still to produce does. */
   produce = false;
-  /** Holds the drain at the speculative cap, as unmerged L1s past maxSpeculativeL1s do. */
+  /** Puts the unmerged L1s past maxSpeculativeL1s, so the cap holds L1 production while an L1 merge is queued. */
   atCap = false;
   /** Blocks every queued merge, as a hold on a message its sources cover does. */
   holdBlocksMerges = false;
@@ -808,7 +808,14 @@ describe('OverBudgetError.clearedBy', () => {
     });
   });
 
-  it('prices the newest turn as the cap prices it, and names a smaller window when the head and that turn just fit', async () => {
+  /** What a compile with room sends, as the store estimates it. */
+  async function sentTotal(manager: ContextManager): Promise<number> {
+    const store = (manager as unknown as { messageStore: { estimateTokens(message: StoredMessage): number } }).messageStore;
+    const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+    return compiled.messages.reduce((sum, m) => sum + store.estimateTokens({ content: m.content } as StoredMessage), 0);
+  }
+
+  it('prices the newest turn as it renders under the cap, and names a smaller window when the head and that turn fit', async () => {
     const strategy = new AutobiographicalStrategy({
       adaptiveResolution: true,
       headWindowTokens: 0,
@@ -819,14 +826,45 @@ describe('OverBudgetError.clearedBy', () => {
       speculativeProduction: false,
     });
     await withManager(strategy, async (manager) => {
-      // Each message is over the cap, so each costs exactly 50 + 50 tokens:
-      // the newest alone is the whole 100-token budget, and six are over it.
+      // Each message is over the cap, so each costs what its first 200
+      // characters and the cut's suffix estimate at: the newest alone fits
+      // the 100-token budget, and six are over it.
       for (let i = 0; i < 6; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]);
+      const sent = await sentTotal(manager);
+      // The six messages are the same length, so each sends a sixth of it.
+      assert.ok(sent / 6 <= 100, `premise: the newest turn alone fits: ${sent / 6}`);
       const error = await refusal(manager);
       assert.match(error.message, /^Head\/tail reservation exceeded budget/);
       assert.equal(error.budget, 100);
-      assert.equal(error.diagnostics.tailTokens, 600);
+      assert.equal(error.diagnostics.tailTokens, sent);
       assert.deepEqual(error.clearedBy, ['smaller-recent-window']);
+    });
+  });
+
+  it('names no smaller window when the newest turn renders past the budget, though the cap alone would have priced it within', async () => {
+    const strategy = new AutobiographicalStrategy({
+      adaptiveResolution: true,
+      headWindowTokens: 0,
+      recentWindowTokens: 100_000,
+      maxMessageTokens: 50,
+      overBudgetGraceRatio: 0.25,
+      autoTickOnNewMessage: false,
+      speculativeProduction: false,
+    });
+    await withManager(strategy, async (manager) => {
+      // The newest message is over the cap and carries an image, which the cap
+      // keeps whole: it renders past the budget, where the cap plus 50 was 100.
+      for (let i = 0; i < 5; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(200) }]);
+      manager.addMessage('user', [
+        { type: 'text', text: 'message 5 ' + 'word '.repeat(200) },
+        { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AAAA' } } as ContentBlock,
+      ]);
+      const sent = await sentTotal(manager);
+      const error = await refusal(manager);
+      assert.match(error.message, /^Head\/tail reservation exceeded budget/);
+      assert.equal(error.diagnostics.tailTokens, sent);
+      // The newest turn's image alone is the store's 1,600 tokens.
+      assert.deepEqual(error.clearedBy, [], 'a smaller recent window still holds the newest turn');
     });
   });
 
@@ -2313,8 +2351,19 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
-  for (const merge of [false, true]) {
-    it(`names ${merge ? 'compression' : 'nothing'} for queued chunks the speculative cap holds ${merge ? 'when a merge is queued to relieve it' : 'with no merge queued'}`, async () => {
+  // Past the speculative cap, the cap holds the queued chunks only while an
+  // L1 merge is queued to relieve it (speculativeCapHolds, #240). With none
+  // queued, nothing the cap waits for can come, so the chunks count. With one
+  // queued, they wait for it: the merge counts, or nothing does while a hold
+  // blocks it.
+  for (const merge of ['none', 'queued', 'blocked'] as const) {
+    const named = merge === 'blocked' ? 'nothing' : 'compression';
+    const when = {
+      none: 'with no merge queued, since the cap holds nothing then',
+      queued: 'when a merge is queued to relieve it',
+      blocked: 'while the merge queued to relieve it is blocked',
+    }[merge];
+    it(`names ${named} for queued chunks past the speculative cap ${when}`, async () => {
       const strategy = new DiagnosticStrategy({
         adaptiveResolution: false,
         hierarchical: true,
@@ -2326,10 +2375,11 @@ describe('OverBudgetError.clearedBy', () => {
         speculativeProduction: false,
       });
       strategy.atCap = true;
+      strategy.holdBlocksMerges = merge === 'blocked';
       await withManager(strategy, async (manager) => {
         const ids = Array.from({ length: 12 }, (_, i) =>
           manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
-        if (merge) {
+        if (merge !== 'none') {
           // A merge whose sources in memory cover messages the compile can fold.
           strategy.seedL1('L1-a', [ids[0]!]);
           strategy.seedL1('L1-b', [ids[1]!]);
@@ -2338,7 +2388,7 @@ describe('OverBudgetError.clearedBy', () => {
         assert.equal(strategy.checkReadiness().ready, false, 'chunks are queued');
         const error = await refusal(manager);
         assert.match(error.message, /^Hierarchical emission overran the budget/);
-        assert.deepEqual(error.clearedBy, merge ? ['compression'] : []);
+        assert.deepEqual(error.clearedBy, merge === 'blocked' ? [] : ['compression']);
       });
     });
   }
@@ -2583,8 +2633,11 @@ describe('OverBudgetError.clearedBy', () => {
         const ticking = manager.tick().then(() => undefined, (error: unknown) => error);
         await Promise.race([model.called, ticking]);
         assert.equal(model.calls.n, 1, 'premise: tick asked the model for the first chunk, and waits');
-        // At the cap the walk takes no queued chunk, so only the work in flight can count.
+        // Past the cap with an L1 merge queued, one that covers no message and
+        // so counts nothing, the cap holds and the walk takes no queued chunk:
+        // only the work in flight can count.
         strategy.atCap = true;
+        strategy.queueMerge();
         assert.deepEqual((await refusal(manager)).clearedBy, pinned ? [] : ['compression']);
         model.release();
         assert.match(String(await ticking), /released by the test/);

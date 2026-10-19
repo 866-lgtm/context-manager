@@ -140,7 +140,8 @@ export interface ContextStrategy {
 
   /** Maximum tokens per individual message. Used by the framework to truncate
    *  tool results in-flight (yielding stream) and at storage time.
-   *  0 or undefined = no limit. */
+   *  A value that isn't a positive number, such as 0, undefined, a negative
+   *  or NaN, means no limit. */
   readonly maxMessageTokens?: number;
 
   /**
@@ -974,7 +975,8 @@ export interface AutobiographicalConfig {
    */
   compressionMaxTokens?: number;
   /** Maximum tokens per individual message in compiled output. Messages exceeding
-   *  this limit have their text/tool_result content truncated. 0 = no limit. */
+   *  this limit have their text/tool_result content truncated. A value that
+   *  isn't a positive number, such as 0 or NaN, means no limit. */
   maxMessageTokens: number;
 
   /**
@@ -1400,11 +1402,19 @@ export interface AutobiographicalConfig {
   toolUseInputMaxTokens?: number;
 
   /**
-   * Cap on the number of speculative L1 summaries the strategy will hold
-   * (queued + unmerged). When `count(unmerged L1s) + count(queued chunks)`
-   * exceeds this cap, `onNewMessage`'s auto-tick is held back. Chunks
-   * still form and queue, but compression is deferred until a manual
-   * `tick()` or `compile()` triggers it.
+   * Cap on the number of produced, unmerged L1 summaries. Past it, while an
+   * L1→L2 merge is queued and `hierarchical` is on, `tick` takes no chunk
+   * to compress into an L1, whether the background drain or a manual
+   * `tick()` calls it, and runs the merge, which brings the count back down.
+   * Production waits for that merge as long as the merge waits, such as on
+   * a compression hold over its sources. Chunks still form and queue, and
+   * queued chunks don't count toward the cap.
+   *
+   * With no L1 merge queued, the cap holds nothing. No merge forms below
+   * `mergeThreshold` unmerged L1s, so a cap below `mergeThreshold - 1` lets
+   * them rise to the threshold. Unmerged L1s that can never merge count
+   * toward the cap without holding production. Under `hierarchical: false`
+   * tick runs no merge, so the cap holds nothing.
    *
    * Default: undefined (no cap; compression fires eagerly on every
    * new message when `autoTickOnNewMessage` is true).
@@ -1716,10 +1726,13 @@ export interface ProtectedRange {
   created: number;
   /**
    * Pin-AT-level-k (V2 dynamic pins, `docs/best-fit-frontier-resolution.md` §7).
-   * Fix the covered chunks to render at EXACTLY this fold level (0 = raw): the
+   * Fix the covered chunks to render at this fold level (0 = raw): the
    * frontier cut passes through the L_k node — neither folded deeper nor
-   * un-folded shallower. Takes precedence over `maxLevel`. Omitted → not a
-   * fixed-level pin.
+   * un-folded shallower. Under kv-stable, a chunk with no summary at k (its
+   * summaries stop below k, its lineage skips k with a parent more than one
+   * level up, or its own-lineage summary at k doesn't list it) renders at the
+   * next level down where it has one, or raw. Takes precedence over
+   * `maxLevel`. Omitted → not a fixed-level pin.
    *
    * Honored by the folding strategies that read level bounds
    * (`foldingStrategy: 'kv-stable'` and `'kv-unified'`, with
@@ -1751,7 +1764,9 @@ export interface ProtectedRange {
 /** Optional fold-depth bounds for a V2 dynamic pin (see `ProtectedRange`). */
 export interface PinLevelOptions {
   name?: string;
-  /** Pin AT exactly this level (0 = raw). Fixes the cut through the L_k node. */
+  /** Pin at this level (0 = raw): fixes the cut through the L_k node, with
+   *  kv-stable's exceptions for a chunk its summaries don't reach there
+   *  (`ProtectedRange.level`). */
   level?: number;
   /** Fold no deeper than this level (hard cap; `0` ≡ classic pin-raw). */
   maxLevel?: number;

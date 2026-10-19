@@ -1161,9 +1161,11 @@ export class ContextManager {
     // Raw bodies are judged as stored: the view filter can hide a shard of a
     // body from the strategy, but the body's identity (shard 0, the id
     // addMessage returned) and its membership are the stored group's. The
-    // layout stays on the filtered view the strategy rendered.
-    const storedMessages = this.viewFilter ? this.mergedMessageView().getAll() : viewMessages;
-    const attribution = attributeEntries(entries, storedMessages);
+    // layout stays on the filtered view the strategy rendered. Attribution
+    // reads only around the messages the raw entries name.
+    const storedView = this.viewFilter ? this.mergedMessageView() : view;
+    const storedMessages = this.viewFilter ? storedView.getAll() : viewMessages;
+    const attribution = attributeEntries(entries, storedMessages, (id) => storedView.get(id)?.sequence);
 
     // Convert to NormalizedMessage[]. We split each entry individually
     // so we know the output-count per input and can re-attach cache
@@ -1363,8 +1365,12 @@ export class ContextManager {
    * after an uncertain failure learns the outcome, and a receipt can come
    * back again (key on its id and compileId: a receipt lost to Chronicle's
    * rot exception can have its id go to a later receipt). A provenance of
-   * another namespace is refused with an error: accept a compile on the
-   * manager that compiled it.
+   * another namespace is refused with an error, and so is one whose branch
+   * this store doesn't know, live or recorded in this namespace, such as
+   * another store's: accept a compile on the manager that compiled it. So is
+   * a layout whose shape changed after compile returned it: members out of
+   * order, unit counts that aren't positive whole numbers adding up to the
+   * members, or not one id for each member.
    */
   acceptRound(args: {
     provenance: CompileProvenance;
@@ -1547,8 +1553,11 @@ export class ContextManager {
   }
 
   /**
-   * V2 dynamic pin-at-level-k: fix a range to render at EXACTLY fold level
-   * `level` (0 = raw) — the frontier cut passes through that L_k node. Honored
+   * V2 dynamic pin-at-level-k: fix a range to render at fold level `level`
+   * (0 = raw) — the frontier cut passes through that L_k node. Under
+   * kv-stable, a chunk whose summaries stop below `level` renders at the
+   * deepest it has, and one whose own-lineage summary at `level` doesn't list
+   * it renders where one does, or raw (`ProtectedRange.level`). Honored
    * by `foldingStrategy: 'kv-stable'` and `'kv-unified'` with adaptive
    * resolution; under any other selector the range is raw, in the live view
    * and in the canonical L1 compression prompt where its budgets allow (see

@@ -65,9 +65,10 @@ export interface OverBudgetDiagnostics {
  *   running or queued, as `tick` would take it: a compression in flight;
  *   the queued chunks, in `tick`'s order, while the speculative cap lets it
  *   take one, the cap read as it stands when the count is asked (an L1
- *   `tick` makes on the way can bring the drain to the cap before it reaches
- *   a chunk that counts, and a merge that folds nothing can relieve the cap
- *   when it lands); and after them, with `hierarchical` merging on and a
+ *   `tick` makes on the way can take the drain past the cap and queue a
+ *   merge before it reaches a chunk that counts, and the merge that holds
+ *   the cap may fold nothing and release it when it lands); and after
+ *   them, with `hierarchical` merging on and a
  *   compression model, the queued merges, in `tick`'s order up to one a
  *   compression hold blocks, where `tick` stops. Each counts only when the
  *   compile can fold now one of the messages its summary would cover: one
@@ -294,12 +295,15 @@ export interface PickerChunk {
    */
   pinned: boolean;
   /**
-   * V2 dynamic pin — fix this chunk at EXACTLY this fold level, above 0 (a
-   * level of 0 arrives as `pinned`). Set from a `ProtectedRange.level`, only
-   * under the folding strategies that read it (kv-stable, kv-unified, with
-   * adaptive resolution). Such
-   * a chunk is NOT `pinned` (the controller must be able to move it to its
-   * level), but the controller holds it there and never folds/un-folds it.
+   * V2 dynamic pin — fix this chunk at this fold level, above 0 (a level of 0
+   * arrives as `pinned`). Set from a `ProtectedRange.level`, only under the
+   * folding strategies that read it (kv-stable, kv-unified, with adaptive
+   * resolution). Such a chunk is NOT `pinned` (the controller must be able to
+   * move it to its level), but the controller holds it there and never
+   * folds/un-folds it. Under kv-stable, a level where the chunk has no
+   * summary (deeper than its summaries go, one its lineage skips, or one
+   * whose own-lineage summary doesn't list it) is lowered to the next one
+   * down where it has one (`SummaryTree.renderableLevel`), or to raw.
    */
   pinLevel?: number;
   /**
