@@ -9,6 +9,9 @@
  * about what no one namespace owns, such as the store's own records or a
  * message slot the managers share, is logged as it is, through `console`,
  * which is a Diagnostics too.
+ *
+ * As with console, a message followed by arguments is a format string, so a
+ * value put into it that may hold a '%' is doubled first.
  */
 export interface Diagnostics {
   error(message: string, ...rest: unknown[]): void;

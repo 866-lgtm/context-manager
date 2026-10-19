@@ -4,11 +4,13 @@
  * can be told apart.
  */
 
+import { spawnSync } from 'node:child_process';
 import { describe, it, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { format } from 'node:util';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager } from '../src/index.js';
@@ -56,7 +58,7 @@ describe('the manager\'s diagnostics', () => {
     assert.match(select[0]!, / ns=agents\/tern$/);
   });
 
-  it('names an isolated slot\'s namespace on its cache lines, and the shared slot\'s none (CM_CACHE_DIAG)', async (t) => {
+  it('names an isolated slot\'s namespace on its write-version lines, and the shared slot\'s none (CM_CACHE_DIAG)', async (t) => {
     const dir = mkdtempSync(join(tmpdir(), 'cm-cache-slot-'));
     t.after(() => rmSync(dir, { recursive: true, force: true }));
     const prior = process.env.CM_CACHE_DIAG;
@@ -78,6 +80,46 @@ describe('the manager\'s diagnostics', () => {
     assert.equal(bumps.length, 2, lines.join('\n'));
     assert.ok(bumps[0]!.startsWith('[cm-cache] writeVersion bump agents/tern/messages ') && bumps[0]!.endsWith(' ns=agents/tern'), bumps[0]);
     assert.ok(bumps[1]!.startsWith('[cm-cache] writeVersion bump messages ') && !bumps[1]!.includes(' ns='), bumps[1]);
+  });
+
+  // message-store.ts reads CM_CACHE_DIAG for its cache-miss and write-through lines when it
+  // loads, so they print only in a process started with it set: this test runs one.
+  it('names an isolated slot\'s namespace on its cache-miss and write-through lines, and the shared slot\'s none (CM_CACHE_DIAG at start)', (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-cache-start-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const script = `
+      import { JsStore } from '@animalabs/chronicle';
+      import { MessageStore } from ${JSON.stringify(fileURLToPath(new URL('../src/index.js', import.meta.url)))};
+      for (const [name, namespace] of [['isolated', 'agents/tern'], ['shared', undefined]]) {
+        const store = JsStore.openOrCreate({ path: ${JSON.stringify(dir)} + '/' + name });
+        MessageStore.register(store, namespace);
+        // Each store's cache starts cold, a miss. The sibling's cache is stale once the other
+        // store appends, so its own append's write-through fails.
+        const own = new MessageStore(store, { namespace });
+        const sibling = new MessageStore(store, { namespace });
+        own.append('User', [{ type: 'text', text: 'one' }]);
+        sibling.append('User', [{ type: 'text', text: 'two' }]);
+        store.close();
+      }
+    `;
+    // In the repository's root, so the script finds its packages there.
+    const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
+      cwd: fileURLToPath(new URL('../../', import.meta.url)),
+      env: { ...process.env, CM_CACHE_DIAG: '1' },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const cacheLines = result.stderr.split('\n').filter((line) =>
+      line.startsWith('[cm-cache] getAllInternal MISS') ||
+      line.startsWith('[cm-cache] append write-through FAILED (cache was stale before the append)'));
+    const linesOf = (slot: string) => cacheLines.filter((line) => line.includes(` stateId=${slot} `));
+    const isolated = linesOf('agents/tern/messages');
+    const shared = linesOf('messages');
+    for (const lines of [isolated, shared]) {
+      assert.ok(lines.some((line) => line.includes(' MISS ')) && lines.some((line) => line.includes(' FAILED ')), result.stderr);
+    }
+    assert.ok(isolated.every((line) => line.endsWith(' ns=agents/tern')), isolated.join('\n'));
+    assert.ok(shared.every((line) => !line.includes(' ns=')), shared.join('\n'));
   });
 
   /**

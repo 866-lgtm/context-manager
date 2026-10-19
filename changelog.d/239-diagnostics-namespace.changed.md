@@ -21,7 +21,7 @@
 - The JSON diagnostics `config:effective` and
   `compression:quarantine-alert`, each `[debugLogContext]` entry, and each
   entry of the compression log (`CONTEXT_MANAGER_COMPRESSION_LOG`) gain a
-  `namespace` field, once the strategy has one.
+  `namespace` field, the compression log's once the strategy has one.
 - `persistMintRequestPreimage` takes an optional fourth argument, a
   `Diagnostics`, now exported as a type, which its lines go through.
   `AutobiographicalStrategy` has a new protected `diag`, the strategy's
