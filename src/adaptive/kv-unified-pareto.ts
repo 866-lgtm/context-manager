@@ -461,7 +461,9 @@ export class ParetoKvUnifiedPolicySolver {
             ));
         const covered = coverApproximationPool(pool, representatives, cacheRelevant);
         labelsDominated += pool.length - covered.length;
-        result.push(...covered);
+        // Appended one by one: a group can hold more labels than a call takes
+        // as spread arguments (about 125,000), below the label ceiling (#255).
+        for (const label of covered) result.push(label);
       }
       labelsCreated += result.length;
       maxLabelsPerState = Math.max(maxLabelsPerState, result.length);
