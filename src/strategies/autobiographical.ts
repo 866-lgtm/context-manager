@@ -1181,7 +1181,8 @@ interface CompressionInFlightResult {
   error?: unknown;
   /** The producer's strategy generation moved (a detach or a
    *  reinitialization) before it settled. It may have written nothing, so a
-   *  waiter that finds no L1 does the work itself. */
+   *  waiter that finds no L1 hands the chunk back to its tick
+   *  (onJoinedWorkDiscarded), which starts it at its next scan. */
   discarded?: boolean;
   /** The membrane the producer's failed call went through: a wait the provider stated binds that route alone. */
   membrane?: unknown;
@@ -7021,6 +7022,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       let quarantineSkipped = false;
       let requestStopped = false;
+      let joinedWorkDiscarded = false;
       const work: { chunk: Chunk; skipped?: true } = { chunk };
       this.pendingCompressionWork = work;
       const compression = this.compressChunkHierarchical(chunk, ctx, () => {
@@ -7030,6 +7032,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         work.skipped = true;
       }, () => {
         requestStopped = true;
+      }, () => {
+        joinedWorkDiscarded = true;
       }).then(async () => {
         // Quarantine checks build compression contexts too. As in the
         // speculative drain, a macrotask hop keeps those builds from starving
@@ -7098,6 +7102,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+      if (joinedWorkDiscarded) {
+        // The work this compression joined was thrown away, its strategy let
+        // go of, and nothing here asked the provider. The chunk goes back at
+        // the head, unless a rebuild during the wait re-decided it, and the
+        // scan goes on to the work behind it, as after a joined call's split
+        // window wait: the next scan starts the chunk through the gates above.
+        this.requeuePendingChunk(key, 'head', this.compressionQueueGeneration !== queueGeneration);
+        continue;
+      }
       if (quarantineSkipped) {
         // Skipped: quarantined, still raw, and queued again at every rebuild
         // (every inbound message). It takes a failure order, as a failed
@@ -7167,7 +7180,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._drainProgress++; // executing a merge is real work, even if a
       // follow-on merge gets enqueued and the queue length nets out unchanged
       // Whether the merge wrote its parent (see executeMerge): a skipped
-      // entry made no call and wrote nothing.
+      // entry wrote nothing.
       let merged = false;
       // executeMerge builds its request before its first await, so this is
       // the model the call names.
@@ -7197,10 +7210,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.dequeueMerge();
         }
         this.mergeFailureOrder.delete(mergeFailureKey(merge));
-        // Only a written merge is a landing. A skip (a stale entry, a missing
-        // source, a crossed merge refused) made no call, so it is neither a
-        // landing nor an answer: counting it would let an outage advance a
-        // domain's evidence, and resuming would reset the lane's backoff.
+        // Only a written merge is a landing. A skip before the call (a stale
+        // entry, a missing source, a crossed merge refused) made no call, so
+        // it is neither a landing nor an answer: counting it would let an
+        // outage advance a domain's evidence, and resuming would reset the
+        // lane's backoff. A merge whose sources were parented while its call
+        // was out got an answer, which executeMerge has already counted by
+        // resuming the lane, and wrote nothing, so it is no landing either.
         if (merged) {
           this.resumeCompressionLane(mergeMembrane, mergeModel);
           // The merge's summary is written and its entry dequeued: it has landed.
@@ -8455,6 +8471,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // exhaustion whose record the ledger holds. tick ends the chunk's runs
     // on it (endChunkFailureRuns).
     onRequestStopped?: () => void,
+    // The work this compression joined was thrown away, its strategy let go
+    // of, and left no L1 and no quarantine: no call was made here, and the
+    // chunk is still to do. tick puts it back at the head of its queue.
+    onJoinedWorkDiscarded?: () => void,
   ): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('compressChunkHierarchical');
     phaseChannel.report('compress-chunk'); // liveness-watchdog phase
@@ -9226,17 +9246,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // Past the checks above, a producer whose strategy was let go of
       // (detached, or reinitialized) left no L1 for this chunk, and the
-      // ledger holds no quarantine of its request family. The waiter takes
-      // the chunk over by compressing it afresh, through this method's own
-      // checks: the quarantine skip, and this coalescing, which waits on a
-      // waiter that took it over first. A hold placed on the chunk's span
-      // while it waited stops it first, as tick's gate would have before
-      // this compression started: the rebuild after the release queues the
-      // chunk again. Nothing awaits from a compression's start to
-      // registering below, so only one waiter takes it.
-      if (!result.discarded) return;
-      if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) return;
-      return this.compressChunkHierarchical(chunk, ctx, onQuarantineSkip, onRequestStopped);
+      // ledger holds no quarantine of its request family. The chunk goes
+      // back to tick, which starts it at its next scan through its own gates,
+      // from the chunk its table holds then: a rebuild during the wait may
+      // have replaced this one or withdrawn it.
+      if (result.discarded) onJoinedWorkDiscarded?.();
+      return;
     }
 
     // The warnings for the layout sent: section 1's ownership, the recall

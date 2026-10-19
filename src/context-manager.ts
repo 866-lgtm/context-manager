@@ -1763,15 +1763,15 @@ export class ContextManager {
     // A listener of that add may have closed the manager, set a strategy or
     // moved the store's branch. The add stands and the strategy isn't told,
     // and the refusal says the message is stored. It gives the reason without
-    // the advice to retry or to recover, since a retry would store a second
-    // transition.
+    // the advice to retry or to recover: a retry that got past this check, as
+    // one on the intended branch would, would store a second transition.
     try {
       this.requireInitialized('resetHeadWindow', attempt, false);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       throw new Error(
         `${reason.endsWith('.') ? reason : `${reason}.`} Its transition add finished: message ${msgId} is ` +
-          "stored, and the head window wasn't reset, so a retry would store a second transition.",
+          "stored, and the head window wasn't reset.",
       );
     }
 
