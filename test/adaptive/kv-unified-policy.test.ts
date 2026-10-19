@@ -2016,6 +2016,25 @@ test('a remembered joint ceiling failure is forgotten when the wall changes', ()
   const carried = build(405, reuse);
   assert.equal(carried.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again at the new wall');
   assert.deepEqual(carried.result.produced, fresh.result.produced);
+  // A pin changes the levels a leaf may take, and so the label count, too.
+  const pinned = (budget: number, holder: KvUnifiedReuse) => {
+    const inputs = fixture();
+    inputs.chunks[1].pinned = true;
+    const strategy = new KvUnifiedStrategy({
+      policy: { alpha: 0.7, budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0, budgetOverLambda: 100_000, cacheLambda: 0, continuityLambda: 0 },
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 40, adoptEpsilon: 90_000, reuse: holder,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode: 'joint' },
+    });
+    return { strategy, result: strategy.solve(inputs, { totalBudget: budget, targetBudget: budget * 0.9, slack: 0.1 }) };
+  };
+  const again: KvUnifiedReuse = {};
+  const failed = build(500, again);
+  assert.ok(failed.strategy.lastTimings!.demandSolves > 1, 'premise: failed at 500');
+  const freshPinned = pinned(500, {});
+  assert.equal(freshPinned.strategy.lastTimings?.demandSolves, 1, 'premise: with a leaf pinned the joint forest fits at 500');
+  const carriedPinned = pinned(500, again);
+  assert.equal(carriedPinned.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again after the pins');
+  assert.deepEqual(carriedPinned.result.produced, freshPinned.result.produced);
 });
 
 test('a root the forest treeified away from a crossed parent is not a merge candidate', () => {
