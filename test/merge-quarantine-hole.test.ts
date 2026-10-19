@@ -422,6 +422,44 @@ describe('AutobiographicalStrategy: a quarantined merge leaves a hole, and merge
     again.close();
   });
 
+  it('queues a cleared group in store order when its record lists the group in another order', async () => {
+    // A record that lists its group out of store order, as one an older version wrote can.
+    const { membrane, state } = provider([1]);
+    const strategy = lane({ mergeThreshold: 99 });
+    const manager = await ContextManager.open({ path: PATH, strategy, membrane: membrane as never });
+    await arrive(manager, 10);
+    const l1s = inOrder(strategy, manager);
+    assert.ok(l1s.length >= 7, `premise: enough L1s (${l1s.length})`);
+    const group = l1s.slice(1, 4);
+    strategy.queueMerge(2, group);
+    await ticks(manager, 1);
+    assert.deepEqual(strategy.quarantinedGroups(), [group], 'premise: the group is quarantined');
+    const reversed = [...group].reverse();
+    const [record] = strategy.records();
+    strategy.persistQuarantine([{ ...record!, key: keyOf(reversed), sourceIds: reversed }]);
+    manager.close();
+
+    const reopened = lane({ mergeThreshold: 99 });
+    const again = await ContextManager.open({ path: PATH, strategy: reopened, membrane: membrane as never });
+    assert.deepEqual(reopened.quarantinedGroups(), [reversed], 'premise: the record loads as written');
+    assert.equal(reopened.heldIds().size, 3, 'premise: it holds its sources');
+    state.refusing = false;
+    const warn = console.warn;
+    console.warn = () => {};
+    try { reopened.clearMergeQuarantine(); } finally { console.warn = warn; }
+    assert.deepEqual(reopened.queue.map((m) => m.sourceIds), [group], 'the group is queued in store order');
+    await ticks(again, 2);
+    const byId = new Map(reopened.all.map((s) => [s.id, s] as const));
+    const merged = byId.get(byId.get(group[0]!)!.mergedInto ?? '');
+    assert.ok(merged, 'the group merges');
+    assert.deepEqual(merged.sourceIds, group);
+    assert.deepEqual(merged.sourceRange, {
+      first: byId.get(group[0]!)!.sourceRange.first,
+      last: byId.get(group[2]!)!.sourceRange.last,
+    }, "its range runs from the first L1's first message to the last L1's last");
+    again.close();
+  });
+
   it('lifts a record whose group holds an operator hold without queuing its group, and the sources after the hold merge', async () => {
     const { membrane, state } = provider([1]);
     const strategy = lane({ mergeThreshold: 99 });

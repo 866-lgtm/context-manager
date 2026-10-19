@@ -6146,8 +6146,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Operator action: lift merge quarantine for one key (or all). A group the
-   * record held out of merges is queued again as it stands, at the queue's
-   * tail with a fresh attempt budget, unless one of its sources is still held
+   * record held out of merges is queued again as it stands, in store order (a
+   * record an older version wrote can list its sources in another order, and
+   * executeMerge takes the order it's given), at the queue's tail with a fresh
+   * attempt budget, unless one of its sources is still held
    * (an operator hold, or another record holding it) or already queued:
    * threshold selection alone might not offer it (a group short of the
    * threshold, alone at its level). Then the `checkMergeThreshold` pass
@@ -6173,8 +6175,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const queued = new Set(this.mergeQueue.flatMap((m) => m.sourceIds));
     for (const record of retry) {
       if (record.sourceIds.some((id) => queued.has(id))) continue;
+      // A record that holds is one run in store order (mergeTopologyProblem).
+      const [run] = this.contiguousSourceRuns(record.sourceIds.map((id) => this.summaryById(id)!), position);
       const before = this.mergeQueue.length;
-      this.enqueueMerge({ level: record.level, sourceIds: [...record.sourceIds] });
+      this.enqueueMerge({ level: record.level, sourceIds: run!.map((s) => s.id) });
       if (this.mergeQueue.length > before) for (const id of record.sourceIds) queued.add(id);
     }
     this.checkMergeThreshold();
