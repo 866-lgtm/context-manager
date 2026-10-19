@@ -19,8 +19,10 @@ export interface MessageStoreView {
   get(id: MessageId): StoredMessage | null;
   /**
    * A message's sequence, as `get(id)?.sequence` answers it, without reading
-   * the message (optional — MessageStore provides it; a reader without it
-   * falls back to `get`).
+   * the message where the view can (optional — a reader without it falls
+   * back to `get`). MessageStore answers from its listing while that is
+   * cached, as it is during a compile, and reads the item otherwise; a merged
+   * view asks each source's, and the source's `get` where it has none.
    */
   sequenceOf?(id: MessageId): number | undefined;
   /** Get messages from a specific index */
