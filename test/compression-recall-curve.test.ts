@@ -1389,7 +1389,7 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
-  it('preserves canonical empty/error behavior; canonical max_tokens is never canonized', async () => {
+  it('an empty canonical answer exhausts after its plain-prose retry, a truncated one is never canonized, and malformed answers, and two transport failures with nothing landing between them, quarantine nothing', async () => {
     {
       // cm #55 (2026-08-06): an empty generation is no longer a silent
       // skip — after the plain-prose retry also comes back empty, the

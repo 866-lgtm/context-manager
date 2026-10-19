@@ -49,7 +49,7 @@ This demonstrates a prefix/KV-shape boundary, not a content-presence boundary. E
 7. **No future leakage.** The alternate request must retain the same as-of boundary; no tail-after-chunk.
 8. **Coverage proof.** A replacement is valid only if recursively expanded leaf message IDs exactly equal the parent’s leaf coverage.
 9. **Store once.** Only the first successful response may become the chunk’s L1 summary. Refused/aborted diagnostic outputs are never persisted as memory.
-10. **Bounded where it is decided.** A deterministic outcome (an answer, a rejection attributable to the request, or a rung decided by `COMPRESSION_PERSISTENT_FAILURES` transient failures: its first, and each later one after compression landed on the same membrane and model since the one before) is recorded durably and never requested again, and the family exhausts after its bounded curve. A transient failure decides nothing by itself: it is paced by the lane's backoff and any wait the provider stated, and counted only within the process. So an outage, or a restart before the bound, retries the same request with pacing for as long as it lasts, and never spends the ladder.
+10. **Bounded where it is decided.** A deterministic outcome (an answer, a rejection attributable to the request, or a rung decided by `COMPRESSION_PERSISTENT_FAILURES` transient failures: its first, and each later one after compression landed on the same membrane and model since the one before) is recorded durably and never requested again, and the family exhausts after its bounded curve. Split-stitch is one exception: it is one retry unit, so a transient failure inside it re-runs the whole rung, the pieces it had settled included. A compression hold placed during a call is the other: it discards the call's answer before anything records it, so the chunk is asked for again once the hold is released. A transient failure decides nothing by itself: it is paced by the lane's backoff and any wait the provider stated, and counted only within the process. So however long an outage lasts, it adds at most one failure to a run, which decides the rung only where it is the run's eighth, and a restart starts every run again. Meanwhile the same request is retried with pacing.
 
 ## Fallback algorithm
 
@@ -57,9 +57,9 @@ This demonstrates a prefix/KV-shape boundary, not a content-presence boundary. E
 
 Build and issue the request exactly as current `compressChunkHierarchical()` does.
 
-If `stopReason !== "refusal"`, preserve existing behavior.
+If the canonical stage answers `end_turn` with persistable text, mint it as before. A refusal or an incomplete answer takes the bounded curve below. A request-attributable rejection, or a rung its failures decided, goes to source-only-final once (see Durable refusal quarantine), and an answer whose text strips to empty gets one plain-prose retry.
 
-If `stopReason === "refusal"`, retain the complete canonical request and canonical selected recall frontier for variant construction.
+On a refusal or an incomplete answer, retain the complete canonical request and canonical selected recall frontier for variant construction.
 
 ### Candidate nodes
 
@@ -145,7 +145,7 @@ the one before: their outcome,
 `provider_error:persistent-<class>`, is recorded like a rejection. A canonical rejection
 attributable to the request skips the variants and the canonical hoist: it goes
 to source-only-final once when that rung is configured, and otherwise exhausts
-the family. Canonical non-refusal behavior is otherwise unchanged.
+the family.
 
 ### Optional later variants
 
@@ -158,8 +158,41 @@ Do not include these in v1 unless single-node expansion proves insufficient acro
 
 ## Durable refusal quarantine
 
-If canonical refuses and every allowed variant refuses, is rejected by
-admission, throws a provider/validation error, or returns no persistable text:
+A family exhausts when its ladder ends without a summary, in one of three
+ways:
+
+- the canonical stage refuses or answers incompletely, and every later rung
+  the ladder reaches ends without one: the canonical's tool-prose hoist
+  (when the canonical's own first call refused; a refusal of its no-tools
+  or tools-less retry leaves the stage incomplete, and the hoist doesn't
+  run), the recall variants, source-only-final and its hoist (after a
+  refusal), and split-stitch;
+- the canonical stage (the canonical, or its no-tools or tools-less retry)
+  throws a request-attributable provider error (`context_length`,
+  `invalid_request`, `safety`, `unsupported`), or one its failures decided:
+  no hoist, variant or split is tried, since each variant only adds recall
+  to the canonical request. Source-only-final is tried once where it is
+  configured, and the family exhausts if it ends without a summary, or at
+  once where it isn't configured;
+- the answer the ladder accepted strips to empty. The canonical stage's
+  `end_turn` answer, or a later rung's `end_turn` answer with text, ends the
+  ladder, and a thinking wrapper is stripped from its text only after that,
+  so an answer that strips to empty takes this exit whichever rung gave it.
+  After the canonical stage's, a recall variant's or split-stitch's, the
+  canonical's plain-prose retry is asked once, and the family exhausts if it
+  ends without a summary too. After source-only-final's or a tool-prose
+  hoist's, the family exhausts at once.
+
+A rung ends without a summary when it refuses, answers incompletely or with
+no persistable text, throws a request-attributable provider error or one its
+failures decided, or, for a hoist or a variant, is rejected by admission. A
+transient failure ends no rung by itself: it interrupts the ladder, which
+resumes at that rung later, and `COMPRESSION_PERSISTENT_FAILURES` of them on
+one rung, counted as rule 10 says, decide it. An abort, the caller's signal
+or a host's withdrawal, ends no rung and counts no failure: nothing is
+recorded, and the family stays open.
+
+When a family exhausts:
 
 - leave the chunk raw;
 - do not store an empty summary;
