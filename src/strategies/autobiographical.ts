@@ -6389,13 +6389,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Background-drain loop: keeps calling tick() while there's queued work,
    * subject to the preflight hook, and to the speculation cap through tick's
-   * L1 step (speculativeCapHolds). Recurses via
-   * `queueMicrotask` so one chunk's compression doesn't block the
-   * scheduling of the next.
+   * L1 step (speculativeCapHolds). Each next tick runs from a timer
+   * (`setTimeout` 0), so one chunk's compression doesn't block the
+   * scheduling of the next. No caller awaits that tick, so nothing it throws
+   * leaves the timer: a tick that comes due on a closed store doesn't run,
+   * and whatever a tick throws is logged. A tick already running when the
+   * store closes ends in the drain's own `.catch`, which logs it.
    *
-   * Stops if a tick fails to make progress (queue size unchanged) — guards
-   * against runaway recursion when tick is a no-op (e.g. no membrane
-   * configured, or a subclass override that doesn't process the queue).
+   * Stops if a tick fails to make progress (no queue item consumed, by
+   * `_drainProgress`) — guards against runaway recursion when tick is a
+   * no-op (e.g. no membrane configured, or a subclass override that doesn't
+   * process the queue).
    */
   protected driveSpeculativeDrain(ctx: StrategyContext): void {
     this.requireLoadedBranch('driveSpeculativeDrain');
@@ -6440,7 +6444,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // turn start while a post-restart drain ground ~10 compiles). A
         // macrotask hop lets pending sockets/timers run between ticks,
         // capping the added wake latency at ~one tick's compile.
-        setTimeout(() => this.driveSpeculativeDrain(ctx), 0);
+        setTimeout(() => {
+          // No caller awaits this tick, so nothing it throws may leave the
+          // timer: an uncaught exception ends the host's process. A tick that
+          // comes due on a store the host has closed, as its stop() closes
+          // one, doesn't run, and the drain ends quietly, as on a withdrawal.
+          // Whatever the tick throws is logged, as below.
+          try {
+            if (this.store?.isClosed()) return;
+            this.driveSpeculativeDrain(ctx);
+          } catch (err) {
+            console.error(`AutobiographicalStrategy: speculative-drain error: ${describeCompressionFailure(err)}`);
+          }
+        }, 0);
       })
       .catch((err) => {
         // A host's withdrawal stops the drain quietly: the host asked for it.
