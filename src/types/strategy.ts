@@ -1357,11 +1357,19 @@ export interface AutobiographicalConfig {
   toolUseInputMaxTokens?: number;
 
   /**
-   * Cap on the number of speculative L1 summaries the strategy will hold
-   * (queued + unmerged). When `count(unmerged L1s) + count(queued chunks)`
-   * exceeds this cap, `onNewMessage`'s auto-tick is held back. Chunks
-   * still form and queue, but compression is deferred until a manual
-   * `tick()` or `compile()` triggers it.
+   * Cap on the number of produced, unmerged L1 summaries. Past it, while an
+   * L1→L2 merge is queued and `hierarchical` is on, `tick` takes no chunk
+   * to compress into an L1, whether the background drain or a manual
+   * `tick()` calls it, and runs the merge, which brings the count back down.
+   * Production waits for that merge as long as the merge waits, such as on
+   * a compression hold over its sources. Chunks still form and queue, and
+   * queued chunks don't count toward the cap.
+   *
+   * With no L1 merge queued, the cap holds nothing. No merge forms below
+   * `mergeThreshold` unmerged L1s, so a cap below `mergeThreshold - 1` lets
+   * them rise to the threshold. Unmerged L1s that can never merge count
+   * toward the cap without holding production. Under `hierarchical: false`
+   * tick runs no merge, so the cap holds nothing.
    *
    * Default: undefined (no cap; compression fires eagerly on every
    * new message when `autoTickOnNewMessage` is true).
