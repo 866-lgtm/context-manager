@@ -14758,10 +14758,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * As-of perspective pin: true when the chunk's messages are all strictly
    * before the agent's first own turn (witnessedBeforeSequence) — inherited
-   * record, not lived experience. Drives the L1 instruction, the identity
-   * reminder of the L1 request and of each split-rung piece, and the
-   * `witnessed` stamp on the minted summary or quiet-stretch stub (which
-   * merge consolidation honors and propagates upward).
+   * record, not lived experience. Drives the L1 instruction (not reading
+   * mode's, which has no witnessed variant), the identity reminder of the L1
+   * request and of each split-rung piece, and the `witnessed` stamp on the
+   * minted summary or quiet-stretch stub (which merge consolidation honors
+   * and propagates upward).
    */
   protected chunkIsWitnessed(chunk: Chunk): boolean {
     const pin = this.config.witnessedBeforeSequence;

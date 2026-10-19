@@ -866,7 +866,8 @@ export interface AutobiographicalConfig {
    * the boundary use the standard instruction — the agent's own turns are
    * present in them. Reading mode (a portion of a much larger message, or a
    * merge of portions of one) keeps its own instructions, which have no
-   * witnessed variant.
+   * witnessed variant, except that the split rung's pieces and a merge
+   * retried after a refusal take the witnessed one.
    */
   witnessedBeforeSequence?: number;
   /**
