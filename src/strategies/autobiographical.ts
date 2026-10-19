@@ -13186,21 +13186,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     },
     // 4: a tool result the per-tool limit replaces, or a tool_use input over
     // the input cap, under the host's config: both were priced whole before.
-    // So, before, were the results of a tool whose limit in a map isn't a
-    // number: such a limit was read by arithmetic (a null as 0, a "2" as 2,
-    // true as 1), replacing results the plan priced whole. Now it sets none.
-    // A store with an answered call of such a tool discards, as the count
-    // pairs calls (answeredToolCalls). A value that replaced nothing before,
-    // such as a non-numeric string, or a limit the results never passed,
-    // discards too, at the cost of one compile at 1.
+    // So were the results a per-tool limit in a map that isn't a number
+    // replaced before, when it was read by arithmetic (a null as 0, a "2" as
+    // 2, true as 1); now it sets no limit. A store discards where a tool's
+    // limit, read the same way, is below the number of its calls answered, as
+    // the count pairs them (answeredToolCalls); for a number, that's where
+    // the count replaces. A value that reads as no number, such as undefined,
+    // a non-numeric string, or the function a tool named like an Object member
+    // finds, replaced nothing, and keeps.
     4: (messages, strategy, store) => {
       const pruning = strategy.toolPruning(store);
       if (pruning.replaced.size > 0) return true;
       const limits = strategy.config.toolResultMaxLastN as Record<string, unknown> | number | null | undefined;
       if (typeof limits === 'object' && limits !== null) {
-        for (const toolName of answeredToolCalls(messages).keys()) {
+        for (const [toolName, answered] of answeredToolCalls(messages)) {
           const limit = limits[toolName];
-          if (limit !== undefined && typeof limit !== 'number') return true;
+          // A symbol threw at that arithmetic, as Number() would here.
+          const read = typeof limit === 'symbol' ? NaN : Number(limit);
+          if (read >= 0 && read < answered.length) return true;
         }
       }
       if (!(pruning.inputCap > 0)) return false;

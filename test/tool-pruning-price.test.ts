@@ -211,6 +211,8 @@ describe('tool pruning, priced as sent', () => {
     ['null for the tool', { lookup: null }],
     ['a negative number', -1],
     ['a negative number for the tool', { lookup: -1 }],
+    ['a string for the tool, read as a number before', { lookup: '1' }],
+    ['true for the tool, read as 1 before', { lookup: true }],
   ] as const) {
     it(`sets no limit for ${label}`, async () => {
       const { cm } = await open({ adaptiveResolution: true, toolResultMaxLastN: limit });
@@ -609,6 +611,14 @@ describe('tool pruning, priced as sent', () => {
       assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: undefined } }), view(two)), false, 'a limit left undefined, which set none before either');
       assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: 5 } }), view(two)), false, 'a number the results never pass');
       assert.equal(reprices(two, at({ toolResultMaxLastN: null }), view(two)), false, 'a null for every tool, which threw before, so learned nothing');
+      // A value that isn't a number discards only where main's arithmetic
+      // read it as a limit below the tool's answered calls.
+      assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: '2' } }), view(two)), false, 'a string limit the results never passed');
+      assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: 'abc' } }), view(two)), false, 'a string that reads as no number, which replaced nothing');
+      assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: '-1' } }), view(two)), false, 'a string that reads as a negative number, which set no limit');
+      assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: Symbol('limit') } }), view(two)), false, 'a symbol, which threw before');
+      const member = [msg('u', text('go')), msg('a', [call('k1', 'constructor')]), msg('u', [result('k1', 'r')])];
+      assert.equal(reprices(member, at({ toolResultMaxLastN: { other: 2 } }), view(member)), false, 'a tool named like an Object member, whose lookup finds a function');
       // Only an answered call counts, paired as the count pairs them.
       const unanswered = [msg('u', text('go')), msg('a', [call('n1', 'lookup')]), msg('u', text('never mind')),
         msg('a', [call('o1', 'other')]), msg('u', [result('o1', 'r')])];
