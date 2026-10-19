@@ -56,7 +56,7 @@ import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.j
 import type { StoreBranchGeneration } from './branch-generation.js';
 import { randomUUID } from 'node:crypto';
 import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
-import { FoldJournal, branchRefOf } from './fold-journal.js';
+import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
 import type { FoldQuery, FoldQueryResult, FoldReceipt, Presentation, ReceiptSource, RoundUsage } from './fold-journal.js';
 import type {
@@ -235,6 +235,10 @@ export class ContextManager {
   private ownsStore: boolean;
   /** close() has run: the strategy is detached, and the manager refuses its operations (requireOpen). */
   private closed = false;
+  /** Writes running (write()): their listeners can call close(). */
+  private writeDepth = 0;
+  /** A close() came from inside a write: the owned store closes when that write returns. */
+  private storeCloseAfterWrite = false;
   private debugLogContext: boolean;
   /** Namespace passed to strategies for scoping their persistent state slots. */
   private strategyNamespace: string;
@@ -505,6 +509,9 @@ export class ContextManager {
     causedBy?: MessageId[],
     options?: AddMessageOptions
   ): MessageId {
+    // A closed manager refuses the add by name, before its content or hold
+    // options are read.
+    this.requireOpen('addMessage');
     // First, so a message refused here changes nothing: no hold expires, no
     // hold is placed, and the strategy's ingress chunking never reads it.
     // What a write mends is mended here, so the strategy chunks what is
@@ -512,26 +519,28 @@ export class ContextManager {
     // later (appendMessage), once expired holds have been released, as at
     // any add.
     content = contentForWrite(content, 'Message refused');
-    this.expireCompressionHolds();
-    if (!options?.holdCompression) {
-      return this.appendMessage(participant, content, metadata, causedBy);
-    }
-    const holdOptions = options.holdCompression === true ? {} : options.holdCompression;
-    this.validateHoldOptions(holdOptions);
-    const held: MessageId[] = [];
-    this.holdingAdds = held;
-    this.holdingAddOptions = holdOptions;
-    // One clock read per add: every shard shares heldAt and expiresAt.
-    this.holdingAddAt = this.now();
-    let id: MessageId;
-    try {
-      id = this.appendMessage(participant, content, metadata, causedBy);
-    } finally {
-      this.holdingAdds = null;
-      this.holdingAddOptions = undefined;
-    }
-    if (held.length > 1) this.compressionHoldGroups.set(id, held);
-    return id;
+    return this.write(() => {
+      this.expireCompressionHolds();
+      if (!options?.holdCompression) {
+        return this.appendMessage(participant, content, metadata, causedBy);
+      }
+      const holdOptions = options.holdCompression === true ? {} : options.holdCompression;
+      this.validateHoldOptions(holdOptions);
+      const held: MessageId[] = [];
+      this.holdingAdds = held;
+      this.holdingAddOptions = holdOptions;
+      // One clock read per add: every shard shares heldAt and expiresAt.
+      this.holdingAddAt = this.now();
+      let id: MessageId;
+      try {
+        id = this.appendMessage(participant, content, metadata, causedBy);
+      } finally {
+        this.holdingAdds = null;
+        this.holdingAddOptions = undefined;
+      }
+      if (held.length > 1) this.compressionHoldGroups.set(id, held);
+      return id;
+    });
   }
 
   private appendMessage(
@@ -641,7 +650,7 @@ export class ContextManager {
    */
   editMessage(messageId: MessageId, content: ContentBlock[]): void {
     this.requireInitialized('editMessage');
-    this.messageStore.edit(messageId, content);
+    this.write(() => this.messageStore.edit(messageId, content));
     // Propagation handled by event listener
   }
 
@@ -813,7 +822,7 @@ export class ContextManager {
    */
   removeMessage(messageId: MessageId): void {
     this.requireInitialized('removeMessage');
-    this.messageStore.remove(messageId);
+    this.write(() => this.messageStore.remove(messageId));
     // Propagation handled by event listener
   }
 
@@ -822,7 +831,7 @@ export class ContextManager {
    */
   removeMessages(fromId: MessageId, toId: MessageId): void {
     this.requireInitialized('removeMessages');
-    this.messageStore.removeRange(fromId, toId);
+    this.write(() => this.messageStore.removeRange(fromId, toId));
     // Propagation handled by event listener
   }
 
@@ -874,8 +883,9 @@ export class ContextManager {
    * would land between a body's shards and split the body (body-runs.ts).
    * Add it after the call returns (a microtask or later) instead. A listener
    * that throws is logged, naming the message it missed, and the write it
-   * heard stands: the throw doesn't reach the caller. Each call registers
-   * its own listener and returns its own unsubscribe, so a function
+   * heard stands: the throw doesn't reach the caller. A listener that calls
+   * close() lets the write that ran it finish (see close()). Each call
+   * registers its own listener and returns its own unsubscribe, so a function
    * registered twice hears each event twice.
    */
   onMessage(listener: MessageStoreListener): () => void {
@@ -1389,7 +1399,7 @@ export class ContextManager {
     presentation?: Presentation;
   }): FoldReceipt | null {
     this.requireOpen('acceptRound');
-    return this.foldJournal.accept(args.provenance, args.acceptedAt ?? Date.now(), args.usage, args.presentation);
+    return this.write(() => this.foldJournal.accept(args.provenance, args.acceptedAt ?? Date.now(), args.usage, args.presentation));
   }
 
   /**
@@ -1408,7 +1418,9 @@ export class ContextManager {
    * (one whose write reported a failure, one another manager on the store
    * wrote, or one from before a reopen). So a listener can hear a receipt
    * again, and needn't hear every receipt: key on `receipt.id`, and read
-   * `listFoldReceipts` for the whole record. Returns a detacher.
+   * `listFoldReceipts` for the whole record. A listener that calls close()
+   * lets the acceptance that announced to it commit its receipt (see
+   * close()). Returns a detacher.
    */
   onFoldReceipt(listener: (receipt: FoldReceipt) => void): () => void {
     return this.foldJournal.onReceipt(listener);
@@ -1419,8 +1431,18 @@ export class ContextManager {
     this.foldJournal.setSource(source);
   }
 
-  /** The store's id, minted once per store on first use. */
+  /**
+   * The store's id, minted once per store on first use. After close() it is
+   * never minted, since minting writes the store's identity record: it is
+   * answered when it was read before, or, while the store is open, read from
+   * that record. Otherwise it refuses by name: on a store that has none, and
+   * on a closed store with none read before.
+   */
   getStoreId(): string {
+    if (this.closed) {
+      const id = this.store.isClosed() ? cachedStoreIdentity(this.store) : existingStoreIdentity(this.store);
+      return id ?? this.refuseAfterClose('getStoreId');
+    }
     return this.foldJournal.storeId();
   }
 
@@ -1597,6 +1619,7 @@ export class ContextManager {
    * `compressionRecallBudgetTokens`). Returns the new pin id.
    */
   pinAtLevel(firstMessageId: MessageId, lastMessageId: MessageId, level: number, opts?: { name?: string }): string {
+    this.requireOpen('pinAtLevel');
     return this.pinRange(firstMessageId, lastMessageId, { name: opts?.name, level });
   }
 
@@ -1705,7 +1728,9 @@ export class ContextManager {
    * If transitionText is provided, it's used as the transition summary.
    * If omitted, an LLM call auto-generates a transition summary.
    *
-   * Returns the transition summary text used.
+   * Returns the transition summary text used. A close() from a listener of
+   * the transition message's add lets the add finish, and the call then
+   * rejects, naming the stored message, without resetting the head window.
    */
   async resetHeadWindow(transitionText?: string): Promise<string> {
     const attempt = this.requireInitialized('resetHeadWindow');
@@ -1723,6 +1748,17 @@ export class ContextManager {
     const msgId = this.addMessage('Context Manager', [
       { type: 'text', text: `[Topic Transition]\n\n${summary}` },
     ]);
+    // A listener of that add may have closed the manager, set a strategy or
+    // moved the store's branch. The add stands and the strategy isn't told,
+    // and the refusal says the message is stored.
+    try {
+      this.requireInitialized('resetHeadWindow', attempt);
+    } catch (error) {
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)} ` +
+          `(during the transition add: message ${msgId} is stored, and the head window wasn't reset)`,
+      );
+    }
 
     // Reset head window to start from this message
     this.strategy.resetHeadWindow(msgId);
@@ -1800,7 +1836,11 @@ export class ContextManager {
 
   /** Refuse an operation on a closed manager, naming it. */
   private requireOpen(operation: string): void {
-    if (this.closed) throw new Error(`ContextManager.${operation} after close()`);
+    if (this.closed) this.refuseAfterClose(operation);
+  }
+
+  private refuseAfterClose(operation: string): never {
+    throw new Error(`ContextManager.${operation} after close()`);
   }
 
   /** Fence failed/pending attempts; optionally pin a manager-owned operation across an await. */
@@ -1924,8 +1964,10 @@ export class ContextManager {
       this.holdingAdds.push(message.id);
       this.placeHold(message.id, this.holdingAddOptions, this.holdingAddAt);
     }
-    // Notify strategy of new message
-    if (this.strategy.onNewMessage) {
+    // Notify strategy of new message. After close() nothing reaches the
+    // strategy: a close() from a listener lets the write it interrupted
+    // finish, and that write's remaining shards are stored unheard.
+    if (this.strategy.onNewMessage && !this.closed) {
       // Fire and forget - don't block on strategy processing
       this.strategy.onNewMessage(message, this.createStrategyContext()).catch((err) => {
         console.error('Strategy onNewMessage failed:', err);
@@ -2028,7 +2070,12 @@ export class ContextManager {
    * setSystemPrompt(), still answer, and releaseCompression() still doesn't
    * throw. close() throws the store's own error when closing a store the
    * manager owns fails at its final sync; the store is closed all the same.
-   * A second close() does nothing.
+   * A second close() does nothing. A close() from inside a listener (onMessage,
+   * onFoldReceipt) lets the write it interrupted finish and starts nothing
+   * new: the write's remaining shards are stored and its receipt committed,
+   * nothing after the close() reaches the strategy, and a store the manager
+   * owns closes once that write returns, a failure of that close logged
+   * rather than thrown.
    * If the manager owns the store (created via path config), this closes the store.
    * If the app owns the store (passed via store config), the store stays open;
    * the app is responsible for closing it when done.
@@ -2038,7 +2085,38 @@ export class ContextManager {
     this.closed = true;
     this.detachStrategy(this.strategy);
     if (this.ownsStore) {
-      this.store.close();
+      // From a listener inside a write: the write finishes on the open
+      // store, and write() closes it when the write returns.
+      if (this.writeDepth > 0) this.storeCloseAfterWrite = true;
+      else this.store.close();
+    }
+  }
+
+  /**
+   * Run one write that calls a host's listeners: an add, whose shards' events
+   * each run them, a round's acceptance, which announces a branch's earlier
+   * receipt before it commits its own, or an edit or a removal, whose one
+   * event runs them once its change is stored. A close() from one of those
+   * listeners lets the write finish, since a write is the unit the store
+   * stays whole in, and a store the manager owns closes when the outermost
+   * write returns, so the listeners after the one that closed still find it
+   * open. A failure of that close is logged: the close() that asked for it
+   * has returned, and the write it followed stands.
+   */
+  private write<T>(run: () => T): T {
+    this.writeDepth++;
+    try {
+      return run();
+    } finally {
+      this.writeDepth--;
+      if (this.writeDepth === 0 && this.storeCloseAfterWrite) {
+        this.storeCloseAfterWrite = false;
+        try {
+          this.store.close();
+        } catch (error) {
+          logThrown('[context-manager] closing the store after a close() from a listener failed; the store is closed all the same:', error);
+        }
+      }
     }
   }
 

@@ -2207,12 +2207,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Take up what another instance sharing the store has written since this
+   * one loaded: the persisted summaries, counter and pending merges, as
+   * loadPersistedState reads them, with this instance's kv-unified
+   * presentation in flight kept as it is (#166). Called by a compression that
+   * waited on another instance's in-flight compression of its family, by the
+   * live lookup when the store holds an L1 this instance doesn't
+   * (findExactL1), and by a merge whose sources the store holds as parented
+   * and this instance doesn't (parentedMergeSources). The store's queue of
+   * merges replaces this instance's, and may have been written by an
+   * instance that hadn't seen this one's later merges, so the threshold pass
+   * then queues again whatever the summaries make eligible. Each caller has
+   * found its branch current.
+   */
+  private takeUpStoreState(): void {
+    this.loadPersistedState({ keepKvUnifiedPresentation: true });
+    this.checkMergeThreshold();
+  }
+
+  /**
    * Load summaries, counter, and pending merges from chronicle into the
    * in-memory mirrors. Called on every (re)initialize so branch switches
-   * pick up the new branch's state, by a compression that waited on another
-   * instance's in-flight compression of its family, to take up that result
-   * (compressChunkHierarchical), and by the live lookup when the store holds
-   * an L1 this instance doesn't (findExactL1). Those two reloads pass
+   * pick up the new branch's state, and by takeUpStoreState(), which passes
    * `keepKvUnifiedPresentation`: a kv-unified strategy then keeps its own
    * receipt chain, whose pending submission is never persisted, rather than
    * replacing it from the store, and keeps its draft and pending layout (with
@@ -2378,17 +2394,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // above L1 covers the messages of each summary it lists, so a summary two
     // kept summaries list has its messages covered twice, and hierarchical
     // mode, which shows summaries that have no parent, renders both. Two
-    // instances on one store can merge the same run, since compression
-    // coalesces across instances and merges don't: the run's pointers name
-    // the merge written last, and the other is dropped. Where a crash split
-    // the pointers between the two, each lists a source whose parent is the
-    // other, so both are dropped. A summary that two list and whose pointers
-    // name neither has no parent, so both are dropped and it merges again.
-    // Each summary's parent is chosen before any of these drops, so what is
-    // dropped doesn't depend on which summary the pass reaches first. The
-    // cost: when the pass drops a summary's chosen parent for listing another
-    // summary, the summary's other listers go too, though one of them could
-    // have been its parent, and the summary merges again.
+    // instances on one store each write a merge of the same run where neither
+    // sees the other's pointers when it checks, as before merges read the
+    // store's summaries, or where a merge stopped between its summary and its
+    // pointers: the run's pointers name the merge written last, and the other
+    // is dropped. Where a crash split the pointers between the two, each
+    // lists a source whose parent is the other, so both are dropped. A
+    // summary that two list and whose pointers name neither has no parent, so
+    // both are dropped and it merges again. Each summary's parent is chosen
+    // before any of these drops, so what is dropped doesn't depend on which
+    // summary the pass reaches first. The cost: when the pass drops a
+    // summary's chosen parent for listing another summary, the summary's
+    // other listers go too, though one of them could have been its parent,
+    // and the summary merges again.
     const reparentedIds: string[] = [];
     const clearedIds: string[] = [];
     const notParentIds: string[] = [];
@@ -3044,7 +3062,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       (summary) => summary?.level === 1 && isIdList(summary.sourceIds) && summary.sourceIds.join(':') === chunkIdKey,
     );
     if (!written) return undefined;
-    this.loadPersistedState({ keepKvUnifiedPresentation: true });
+    this.takeUpStoreState();
     return this.heldExactL1(chunkIdKey);
   }
 
@@ -5329,10 +5347,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       const table = this.chunks;
       this.pendingCompressionWork = { chunk };
-      this.pendingCompression = this.compressChunkHierarchical(chunk, ctx);
+      const work = this.compressChunkHierarchical(chunk, ctx);
+      this.pendingCompression = work;
 
       try {
-        await this.pendingCompression;
+        await work;
       } catch (error) {
         // Withdrawn by the host: the chunk goes back to the head of the
         // queue, for the next tick after the host lets calls through. A
@@ -5357,8 +5376,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
         throw error;
       } finally {
-        this.pendingCompression = null;
-        this.pendingCompressionWork = null;
+        this.clearPendingCompression(work);
       }
       return;
     }
@@ -5381,15 +5399,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._drainProgress++; // executing a merge is real work, even if a
       // follow-on merge gets enqueued and the queue length nets out unchanged
       this.pendingCompressionWork = { sourceIds: [...merge.sourceIds] };
-      this.pendingCompression = this.executeMerge(merge.level, merge.sourceIds, ctx);
+      const work = this.executeMerge(merge.level, merge.sourceIds, ctx);
+      this.pendingCompression = work;
 
       try {
-        await this.pendingCompression;
+        await work;
         if (!this.isCompressionBranchCurrent(sourceBranch)) return;
-        // Success: drop from head and persist the shorter queue. We
-        // re-check that head is still our merge in case some future code
-        // path mutates the queue mid-await (today no other site does,
-        // but the assertion makes that invariant explicit).
+        // Success: drop from head and persist the shorter queue, if the
+        // head is still our merge: a merge that took up another
+        // instance's state (parentedMergeSources) has replaced the queue
+        // with the store's while it ran.
         if (this.mergeQueue[0] === merge) {
           this.dequeueMerge();
         }
@@ -5469,10 +5488,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
         throw error;
       } finally {
-        this.pendingCompression = null;
-        this.pendingCompressionWork = null;
+        this.clearPendingCompression(work);
       }
     }
+  }
+
+  /**
+   * The ids of `sources` a merge may no longer parent: each this instance
+   * holds as parented, or the store's summary list does. A parent only the
+   * store holds means the store has changed since this instance loaded, as
+   * another instance's merge changes it: this instance then takes up the
+   * store's state, as a compression that waited on another instance's does,
+   * so that afterwards its threshold pass and its count of unmerged
+   * summaries see that merge rather than choosing the run again.
+   */
+  private parentedMergeSources(sources: readonly SummaryEntry[]): string[] {
+    const parented = new Set(sources.filter((source) => getSummaryParentId(source)).map((source) => source.id));
+    const held = parented.size;
+    const stored = this.store?.getStateJson(this.summariesStateId);
+    if (Array.isArray(stored)) {
+      const ids = new Set(sources.map((source) => source.id));
+      for (const item of stored as Array<SummaryEntry | null>) {
+        if (!item || typeof item.id !== 'string' || !ids.has(item.id)) continue;
+        const parent = getSummaryParentId(item);
+        if (typeof parent === 'string' && parent) parented.add(item.id);
+      }
+    }
+    if (parented.size > held) this.takeUpStoreState();
+    return [...parented];
+  }
+
+  /**
+   * Clear the single-flight marker a tick set for its work, if it's still
+   * that work's. An instance set again while this tick's call was out has
+   * cleared it in initialize(), and the new generation's tick may have set it
+   * for work of its own: clearing that would let the next tick start a second
+   * compression beside it, or a second merge of the same sources.
+   */
+  private clearPendingCompression(work: Promise<void>): void {
+    if (this.pendingCompression !== work) return;
+    this.pendingCompression = null;
+    this.pendingCompressionWork = null;
   }
 
   /**
@@ -7248,7 +7304,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // an exhausted waiter gets the quarantine projection rather than merely
       // returning after somebody else's work. This instance's kv-unified
       // presentation in flight stays as it is (#166).
-      this.loadPersistedState({ keepKvUnifiedPresentation: true });
+      this.takeUpStoreState();
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       const coalescedSummary = this.findExactL1(chunkIdKey);
       if (coalescedSummary) {
@@ -8685,12 +8741,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // state rewrites the authored child graph and creates crossed lineages
     // (Fable's L2-37/L2-43 scar). Any parented source invalidates this queue
     // item; the remaining orphans will be regrouped by the next threshold
-    // pass. Never mutate an already-authored parent edge.
-    const alreadyParented = sources.filter((source) => getSummaryParentId(source));
+    // pass. Never mutate an already-authored parent edge. The store's
+    // summaries are read too, so a merge another instance sharing the store
+    // has written is taken up here, before any call.
+    const alreadyParented = this.parentedMergeSources(sources);
     if (alreadyParented.length > 0) {
       console.warn(
         `executeMerge: ${alreadyParented.length}/${sources.length} source(s) already parented ` +
-          `(${alreadyParented.map((source) => source.id).join(', ')}); skipping stale queue entry`,
+          `(${alreadyParented.join(', ')}); skipping stale queue entry`,
       );
       return;
     }
@@ -9216,6 +9274,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the accepted request known.
       const requestHash = sha256Json(acceptedRequest);
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
+
+      // A summary has one parent, so the check at entry is made again here,
+      // after the call: while the call was out, another merge of these
+      // sources may have been written, by another instance sharing the store
+      // (taken up here, as at entry) or by any other path that brings two
+      // merges of one group together. This one writes nothing, and its queue
+      // entry goes as a finished merge's does. Where this instance took up
+      // the store's state, the store's queue has replaced its own, and an
+      // entry for these sources still in it goes when a later tick reaches
+      // it and the entry check finds them parented. Nothing below awaits
+      // before the writes.
+      const parentedSince = this.parentedMergeSources(sources);
+      if (parentedSince.length > 0) {
+        console.warn(
+          `executeMerge: ${parentedSince.length}/${sources.length} source(s) parented while the L${targetLevel} ` +
+            `merge's call was out (${parentedSince.join(', ')}); its summary is not written`,
+        );
+        return;
+      }
 
       // Terminal-disposition gate (2026-08-01): a consolidation may become
       // canonical only after a COMPLETE accepted disposition — `end_turn` +

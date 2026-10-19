@@ -19,6 +19,7 @@ import { ContextManager, AutobiographicalStrategy, PassthroughStrategy } from '.
 
 const TEST_STORE_PATH = './test-strategy-detach';
 const SUMMARIES = 'default/autobio:summaries';
+const MERGE_QUEUE = 'default/autobio:mergeQueue';
 const CHUNKS = 'default/autobio:chunks';
 
 function cleanup() {
@@ -960,7 +961,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         }
 
         // Each operation's name and arguments; the refusal comes first, so
-        // the arguments needn't be valid. pinAtLevel() refuses as pinRange().
+        // the arguments needn't be valid.
         const operations: Array<[string, unknown[], string?]> = [
           ['addMessage', ['User', [{ type: 'text', text: 'after close' }]]],
           ['editMessage', [id, [{ type: 'text', text: 'after close' }]]],
@@ -978,7 +979,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
           ['updateHotContextSettings', [{}]],
           ['previewContext', [{}]],
           ['pinRange', [id, id]],
-          ['pinAtLevel', [id, id, 1], 'pinRange'],
+          ['pinAtLevel', [id, id, 1]],
           ['markDocument', [id]],
           ['unpin', ['pin']],
           ['listPins', []],
@@ -1160,13 +1161,16 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const store = manager.getStore() as unknown as { close: () => void };
     const realClose = store.close.bind(store);
     let closes = 0;
+    // As Chronicle 0.4.0's does when its final sync fails: the store is
+    // closed, and then the sync's error is thrown.
     store.close = () => {
       closes++;
-      if (closes === 1) throw new Error('sync failed');
       realClose();
+      if (closes === 1) throw new Error('sync failed');
     };
     try {
       assert.throws(() => manager.close(), /sync failed/);
+      assert.ok(manager.getStore().isClosed(), 'the failed close closed the store');
       manager.close();
       assert.strictEqual(closes, 1, "the second close() called the store's close() again");
     } finally {
@@ -1388,8 +1392,10 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         const clearing = new Promise<void>((resolve) => { openClear = resolve; });
         const cleared: string[] = [];
         internals.clearCompressionRefusalQuarantine = async (key) => { cleared.push(String(key)); await clearing; };
+        let ended = { outcome: 'pending' };
         const logged = await logsDuring(async () => {
           const clearingChunk = internals.clearQuarantineForCompressedChunk(chunk);
+          ended = outcomeOf(clearingChunk);
           assert.ok(await reaches(() => cleared.length === 1), 'the first clear began');
           if (move === 'swap') await manager.setStrategy(new PassthroughStrategy());
           else await manager.fork();
@@ -1398,10 +1404,500 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         });
         assert.deepStrictEqual(cleared, ['debt-1'], 'the clear made no further clear');
         assert.deepStrictEqual(logged.filter((line) => line.includes('[compression-quarantine]')), [], 'no clear and no failure logged');
+        assert.strictEqual(ended.outcome, 'resolved', 'the clear ended quietly');
       } finally {
         manager.close();
         store.close();
       }
     });
   }
+
+  // An instance set again while its detached tick's call is out: the new
+  // generation's tick holds the single-flight marker, and the detached tick
+  // settling must leave it, or the next tick starts work beside the new
+  // tick's. Both ways an instance is set again: a new manager on the same
+  // app-owned store after close(), and setStrategy() on the same manager.
+  for (const reuse of ['reopen', 'setStrategy'] as const) {
+    it(`an instance set again (${reuse}) while its detached compression's call is out starts no work beside the new generation's when that call settles`, async () => {
+      const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+      const { calls, membrane } = heldMembrane();
+      const strategy = newStrategy();
+      const work = watchWork(strategy);
+      const first = await ContextManager.open({ store, strategy, membrane: membrane as never });
+      let manager = first;
+      try {
+        seed(first, 24);
+        await first.compile();
+        const detachedTick = first.tick();
+        await waitFor(() => calls.length === 1);
+        if (reuse === 'reopen') {
+          first.close();
+          manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+        } else {
+          await first.setStrategy(new PassthroughStrategy());
+          await first.setStrategy(strategy);
+        }
+        await manager.compile();
+        const newTick = manager.tick();
+        // The new generation's compression has started, and its tick holds
+        // the marker, before the detached call returns.
+        await waitFor(() => work.compressions === 2);
+        calls[0].release();
+        await detachedTick;
+        await waitFor(() => calls.length === 2);
+        assert.ok((strategy as unknown as { pendingCompressionWork: unknown }).pendingCompressionWork, "the new generation's record of its work stands");
+        const next = manager.tick();
+        await Promise.race([next, waitFor(() => calls.length === 3)]);
+        assert.strictEqual(calls.length, 2, 'a tick started a compression beside the new generation\'s, still out');
+        calls[1].release();
+        await newTick;
+        await next;
+      } finally {
+        for (const call of calls) call.release();
+        manager.close();
+        first.close();
+        store.close();
+      }
+    });
+  }
+
+  it('an instance set again while its detached merge\'s call is out writes one merge of its sources', async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = heldMembrane();
+    // Two L1s are a merge, and with two unmerged a tick merges before it
+    // compresses another chunk.
+    const strategy = newStrategy(false, { mergeThreshold: 2, maxSpeculativeL1s: 1 });
+    const work = watchWork(strategy);
+    const first = await ContextManager.open({ store, strategy, membrane: membrane as never });
+    let second: ContextManager | undefined;
+    try {
+      seed(first, 24);
+      await first.compile();
+      for (let n = 1; n <= 2; n++) {
+        const tick = first.tick();
+        await waitFor(() => calls.length === n);
+        calls[n - 1].release();
+        await tick;
+      }
+      const detachedTick = first.tick();
+      await waitFor(() => calls.length === 3);
+      assert.strictEqual(work.merges, 1, 'the third call is the merge');
+      first.close();
+      second = await ContextManager.open({ store, strategy, membrane: membrane as never });
+      const newTick = second.tick();
+      await waitFor(() => calls.length === 4);
+      assert.strictEqual(work.merges, 2, 'the fourth call is the new generation\'s merge of the same sources');
+      calls[2].release();
+      await detachedTick;
+      assert.ok((strategy as unknown as { pendingCompressionWork: unknown }).pendingCompressionWork, "the new generation's record of its merge stands");
+      const next = second.tick();
+      await Promise.race([next, waitFor(() => calls.length === 5)]);
+      assert.strictEqual(calls.length, 4, 'a tick started a call beside the new generation\'s merge, still out');
+      calls[3].release();
+      await newTick;
+      await next;
+      const merges = (persisted(store, SUMMARIES) as Array<{ level: number; sourceIds: string[] }>).filter((s) => s.level === 2);
+      assert.deepStrictEqual(merges.map((s) => s.sourceIds), [['L1-0', 'L1-1']], 'one L2 over the two L1s');
+    } finally {
+      for (const call of calls) call.release();
+      second?.close();
+      first.close();
+      store.close();
+    }
+  });
+
+  // A summary has one parent: a merge whose sources were parented in this
+  // instance's own summaries while its call was out writes nothing.
+  it('a merge whose sources were parented in its own instance while its call was out writes no summary', async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = heldMembrane();
+    const strategy = newStrategy(false, { mergeThreshold: 2, maxSpeculativeL1s: 1 });
+    const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+    try {
+      seed(manager, 24);
+      await manager.compile();
+      for (let n = 1; n <= 2; n++) {
+        const tick = manager.tick();
+        await waitFor(() => calls.length === n);
+        calls[n - 1].release();
+        await tick;
+      }
+      const merging = manager.tick();
+      await waitFor(() => calls.length === 3);
+      const held = (strategy as unknown as { summaries: Array<{ id: string; mergedInto?: string }> }).summaries;
+      held.find((s) => s.id === 'L1-0')!.mergedInto = 'L2-elsewhere';
+      const logged = await logsDuring(async () => {
+        calls[2].release();
+        await merging;
+      });
+      const written = persisted(store, SUMMARIES) as Array<{ level: number }>;
+      assert.strictEqual(written.filter((s) => s.level === 2).length, 0, 'the merge wrote no summary');
+      assert.ok(logged.some((line) => line.includes("parented while the L2 merge's call was out (L1-0)")), `the skip is said: ${JSON.stringify(logged)}`);
+      assert.deepStrictEqual((strategy as unknown as { mergeQueue: unknown[] }).mergeQueue, [], 'the merge left the queue');
+    } finally {
+      for (const call of calls) call.release();
+      manager.close();
+      store.close();
+    }
+  });
+
+  // Another instance sharing the store merges the same run: this one writes
+  // nothing and takes that merge up, whether it finds it after its own call
+  // or before making one, so it doesn't choose the run again.
+  for (const found of ['after its call', 'before its call'] as const) {
+    it(`a merge that finds another instance's merge of its sources ${found} writes nothing and takes that merge up`, async () => {
+      const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+      const { calls, membrane } = heldMembrane();
+      // Two L1s are a merge, and with two unmerged an instance is at its
+      // speculative cap, so a tick merges before it compresses another chunk.
+      const config = { mergeThreshold: 2, maxSpeculativeL1s: 1 };
+      const strategy = newStrategy(false, config);
+      const work = watchWork(strategy);
+      const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+      let other: ContextManager | undefined;
+      try {
+        seed(manager, 24);
+        await manager.compile();
+        for (let n = 1; n <= 2; n++) {
+          const tick = manager.tick();
+          await waitFor(() => calls.length === n);
+          calls[n - 1].release();
+          await tick;
+        }
+        // Another manager and instance on the store merge the same two L1s.
+        const otherMerges = async () => {
+          other = await ContextManager.open({ store, strategy: newStrategy(false, config), membrane: membrane as never });
+          await other.compile();
+          const before = calls.length;
+          const otherTick = other.tick();
+          await waitFor(() => calls.length === before + 1);
+          calls[before].release();
+          await otherTick;
+        };
+        let logged: string[];
+        if (found === 'after its call') {
+          const merging = manager.tick();
+          await waitFor(() => calls.length === 3);
+          await otherMerges();
+          logged = await logsDuring(async () => {
+            calls[2].release();
+            await merging;
+          });
+          assert.ok(logged.some((line) => line.includes("parented while the L2 merge's call was out (L1-0, L1-1)")), `the skip is said: ${JSON.stringify(logged)}`);
+        } else {
+          await otherMerges();
+          logged = await logsDuring(async () => {
+            await Promise.race([manager.tick(), waitFor(() => calls.length === 4)]);
+          });
+          assert.strictEqual(calls.length, 3, 'this instance made no call for the merge');
+          assert.ok(logged.some((line) => line.includes('already parented (L1-0, L1-1)')), `the skip is said: ${JSON.stringify(logged)}`);
+        }
+        const merges = (persisted(store, SUMMARIES) as Array<{ id: string; level: number }>).filter((s) => s.level === 2);
+        assert.strictEqual(merges.length, 1, "only the other instance's merge was written");
+        const held = (strategy as unknown as { summaries: Array<{ id: string; mergedInto?: string }> }).summaries;
+        assert.ok(held.some((s) => s.id === merges[0]!.id), "this instance holds the other instance's merge");
+        assert.deepStrictEqual(
+          held.filter((s) => s.id === 'L1-0' || s.id === 'L1-1').map((s) => s.mergedInto),
+          [merges[0]!.id, merges[0]!.id],
+          'and holds its sources as merged into it',
+        );
+        // Off its speculative cap, it compresses the next chunk rather than
+        // choosing the run again.
+        const { compressions, merges: merged } = work;
+        const next = manager.tick();
+        await waitFor(() => work.compressions > compressions);
+        assert.strictEqual(work.merges, merged, 'it chose no merge');
+        calls.at(-1)!.release();
+        await next;
+      } finally {
+        for (const call of calls) call.release();
+        other?.close();
+        manager.close();
+        store.close();
+      }
+    });
+  }
+
+  it("a merge that takes up another instance's queue queues again a merge that queue lacks", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = heldMembrane();
+    // Past three unmerged L1s this instance merges, so it compresses four
+    // chunks first, queueing a merge for each two.
+    const strategy = newStrategy(false, { mergeThreshold: 2, maxSpeculativeL1s: 3 });
+    const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+    const queued = () => (strategy as unknown as { mergeQueue: Array<{ sourceIds: string[] }> }).mergeQueue.map((m) => m.sourceIds.join('+'));
+    let other: ContextManager | undefined;
+    try {
+      seed(manager, 24);
+      await manager.compile();
+      const compress = async () => {
+        const before = calls.length;
+        const tick = manager.tick();
+        await waitFor(() => calls.length === before + 1);
+        calls[before].release();
+        await tick;
+      };
+      await compress();
+      await compress();
+      // Another instance loads the store while it queues L1-0+L1-1 alone. At
+      // its own cap, it merges before it compresses.
+      other = await ContextManager.open({ store, strategy: newStrategy(false, { mergeThreshold: 2, maxSpeculativeL1s: 1 }), membrane: membrane as never });
+      await other.compile();
+      await compress();
+      await compress();
+      assert.deepStrictEqual(queued(), ['L1-0+L1-1', 'L1-2+L1-3'], 'this instance queued both merges');
+      const merging = manager.tick();
+      await waitFor(() => calls.length === 5);
+      // The other instance merges L1-0 and L1-1 first, and writes its queue,
+      // which never held L1-2+L1-3.
+      const otherTick = other.tick();
+      await waitFor(() => calls.length === 6);
+      calls[5].release();
+      await otherTick;
+      calls[4].release();
+      await merging;
+      const merges = (persisted(store, SUMMARIES) as Array<{ level: number }>).filter((s) => s.level === 2);
+      assert.strictEqual(merges.length, 1, "this instance took up the other's merge rather than writing its own");
+      assert.deepStrictEqual(queued(), ['L1-2+L1-3'], "the merge the other instance's queue lacked is queued again");
+      assert.deepStrictEqual(
+        (persisted(store, MERGE_QUEUE) as Array<{ sourceIds: string[] }>).map((m) => m.sourceIds.join('+')),
+        ['L1-2+L1-3'],
+        "and the store's queue holds it",
+      );
+    } finally {
+      for (const call of calls) call.release();
+      other?.close();
+      manager.close();
+      store.close();
+    }
+  });
+
+  it("a close() from a listener during resetHeadWindow()'s transition add refuses the reset by name, and the transition message stands", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const strategy = newStrategy();
+    const manager = await ContextManager.open({ store, strategy });
+    const resets: string[] = [];
+    const resettable = strategy as unknown as { resetHeadWindow: (id: string) => void };
+    const reset = resettable.resetHeadWindow.bind(strategy);
+    resettable.resetHeadWindow = (id) => {
+      resets.push(id);
+      reset(id);
+    };
+    try {
+      seed(manager, 2);
+      let transition: string | undefined;
+      manager.onMessage((event) => {
+        if (event.type === 'add' && event.message.participant === 'Context Manager') {
+          transition = event.message.id;
+          manager.close();
+        }
+      });
+      await assert.rejects(manager.resetHeadWindow('moving on'), (error: Error) => {
+        assert.match(error.message, /^ContextManager\.resetHeadWindow after close\(\)/);
+        assert.ok(transition && error.message.includes(`message ${transition} is stored`), `the refusal names the stored message: ${error.message}`);
+        return true;
+      });
+      assert.deepStrictEqual(resets, [], "the strategy's head window wasn't reset");
+      assert.ok(transition && manager.getMessage(transition), 'the transition message was stored');
+    } finally {
+      manager.close();
+      store.close();
+    }
+  });
+
+  // A listener of the transition add that sets a strategy, or moves the
+  // store's branch, refuses the reset: it would reach a strategy or branch
+  // the call didn't start on.
+  for (const move of ['setStrategy', 'branch'] as const) {
+    it(`a ${move === 'setStrategy' ? 'strategy set' : "store's branch moved"} by a listener during resetHeadWindow()'s transition add refuses the reset, and no strategy is reset`, async () => {
+      const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+      const strategy = newStrategy();
+      const replacement = newStrategy();
+      const manager = await ContextManager.open({ store, strategy });
+      const resets: string[] = [];
+      for (const s of [strategy, replacement]) {
+        const resettable = s as unknown as { resetHeadWindow: (id: string) => void };
+        const reset = resettable.resetHeadWindow.bind(s);
+        resettable.resetHeadWindow = (id) => {
+          resets.push(id);
+          reset(id);
+        };
+      }
+      let setting: Promise<void> | undefined;
+      let transition: string | undefined;
+      try {
+        seed(manager, 2);
+        manager.onMessage((event) => {
+          if (event.type !== 'add' || event.message.participant !== 'Context Manager') return;
+          transition = event.message.id;
+          if (move === 'setStrategy') setting = manager.setStrategy(replacement);
+          else {
+            store.createBranch('elsewhere');
+            store.switchBranch('elsewhere');
+          }
+        });
+        await assert.rejects(manager.resetHeadWindow('moving on'), (error: Error) => {
+          assert.match(
+            error.message,
+            move === 'setStrategy'
+              ? /^ContextManager\.resetHeadWindow requires successful strategy initialization/
+              : /^Branch or strategy changed during ContextManager\.resetHeadWindow/,
+          );
+          assert.ok(transition && error.message.includes(`message ${transition} is stored`), `the refusal names the stored message: ${error.message}`);
+          return true;
+        });
+        assert.deepStrictEqual(resets, [], 'no head window was reset');
+        await setting;
+      } finally {
+        manager.close();
+        store.close();
+      }
+    });
+  }
+
+  for (const change of ['edit', 'remove', 'removeRange'] as const) {
+    const named = change === 'edit' ? 'an edit' : change === 'remove' ? 'a removal' : 'a range removal';
+    it(`a close() from a listener of ${named} leaves the owned store open to the listeners after it, and closes it when the call returns`, async () => {
+      const path = `${TEST_STORE_PATH}-owned`;
+      rmSync(path, { recursive: true, force: true });
+      const manager = await ContextManager.open({ path, strategy: new PassthroughStrategy() });
+      try {
+        const [first, second] = ['one', 'two', 'three'].map((text) => manager.addMessage('User', [{ type: 'text', text }]));
+        let openToLater: boolean | undefined;
+        manager.onMessage((event) => {
+          if (event.type !== 'add') manager.close();
+        });
+        manager.onMessage((event) => {
+          if (event.type !== 'add') openToLater = !manager.getStore().isClosed();
+        });
+        if (change === 'edit') manager.editMessage(first!, [{ type: 'text', text: 'edited' }]);
+        else if (change === 'remove') manager.removeMessage(first!);
+        else manager.removeMessages(first!, second!);
+        assert.strictEqual(openToLater, true, 'the listener after the one that closed found the store open');
+        assert.ok(manager.getStore().isClosed(), 'and the store closed when the call returned');
+      } finally {
+        if (!manager.getStore().isClosed()) manager.getStore().close();
+        rmSync(path, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("a close() from a listener during a sharded add lets the add finish: every shard is stored, the strategy hears none after it, and the owned store closes when the add returns", async () => {
+    const path = `${TEST_STORE_PATH}-owned`;
+    rmSync(path, { recursive: true, force: true });
+    class ShardingStrategy extends PassthroughStrategy {
+      heard: string[] = [];
+      chunkIngressMessage() {
+        return { bodyGroupId: 'group', shards: [0, 1, 2].map((i) => ({ content: [{ type: 'text' as const, text: `shard ${i}` }], shardIndex: i })) };
+      }
+      async onNewMessage(message: { content: Array<{ type: string; text?: string }> }): Promise<void> {
+        this.heard.push(message.content.map((b) => b.text ?? '').join(''));
+      }
+    }
+    const strategy = new ShardingStrategy();
+    const manager = await ContextManager.open({ path, strategy });
+    try {
+      const added: string[] = [];
+      let storeOpenAtClose: boolean | undefined;
+      manager.onMessage((event) => {
+        if (event.type !== 'add') return;
+        added.push(event.message.id);
+        if (added.length === 1) {
+          manager.close();
+          storeOpenAtClose = !manager.getStore().isClosed();
+        }
+      });
+      manager.addMessage('User', [{ type: 'text', text: 'one body' }]);
+      assert.strictEqual(added.length, 3, 'each shard was stored, and the listener heard it');
+      assert.deepStrictEqual(strategy.heard, ['shard 0'], 'the strategy heard only the shard stored before the close()');
+      assert.strictEqual(storeOpenAtClose, true, 'the owned store stayed open while the add ran');
+      assert.ok(manager.getStore().isClosed(), 'and closed when the add returned');
+      const reopened = await ContextManager.open({ path, strategy: new PassthroughStrategy() });
+      try {
+        assert.deepStrictEqual(
+          reopened.getAllMessages().map((m) => m.content.map((b) => (b.type === 'text' ? b.text : '')).join('')),
+          ['shard 0', 'shard 1', 'shard 2'],
+          'every shard is stored',
+        );
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it("a close() from a listener whose owned store then fails to close is logged, and the add it followed returns", async () => {
+    const path = `${TEST_STORE_PATH}-owned`;
+    rmSync(path, { recursive: true, force: true });
+    class ShardingStrategy extends PassthroughStrategy {
+      chunkIngressMessage() {
+        return { bodyGroupId: 'group', shards: [0, 1].map((i) => ({ content: [{ type: 'text' as const, text: `shard ${i}` }], shardIndex: i })) };
+      }
+    }
+    const manager = await ContextManager.open({ path, strategy: new ShardingStrategy() });
+    try {
+      const store = manager.getStore();
+      const closeStore = store.close.bind(store);
+      store.close = () => { closeStore(); throw new Error('the final sync failed'); };
+      manager.onMessage((event) => { if (event.type === 'add') manager.close(); });
+      const logged = await logsDuring(async () => {
+        manager.addMessage('User', [{ type: 'text', text: 'one body' }]);
+      });
+      assert.ok(store.isClosed(), 'the store is closed');
+      assert.ok(
+        logged.some((line) => line.includes('closing the store after a close() from a listener failed') && line.includes('the final sync failed')),
+        `the failure is logged: ${JSON.stringify(logged)}`,
+      );
+    } finally {
+      manager.close();
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('after close(), an add refuses by name before reading its content, pinAtLevel() names itself, and getStoreId() reads an id but mints none', async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const strategy = newStrategy();
+    const manager = await ContextManager.open({ store, strategy });
+    manager.close();
+    try {
+      assert.throws(() => manager.addMessage('User', [{ type: 'text' } as never]), /ContextManager\.addMessage after close\(\)/);
+      assert.throws(
+        () => manager.addMessage('User', [{ type: 'text', text: 'held' }], undefined, undefined, { holdCompression: { timeoutMs: -1 } }),
+        /ContextManager\.addMessage after close\(\)/,
+      );
+      assert.throws(() => manager.pinAtLevel('a', 'b', 1), /ContextManager\.pinAtLevel after close\(\)/);
+      const records = store.getRecordIdsByType('context-manager/store-identity').length;
+      assert.throws(() => manager.getStoreId(), /ContextManager\.getStoreId after close\(\)/, 'a store with no id gets none minted');
+      assert.strictEqual(store.getRecordIdsByType('context-manager/store-identity').length, records, 'no identity record was written');
+      const open = await ContextManager.open({ store, strategy: new PassthroughStrategy() });
+      const id = open.getStoreId();
+      open.close();
+      assert.strictEqual(manager.getStoreId(), id, 'a store with an id answers it after close()');
+      // Opened anew, the store's id isn't held in memory, so a closed manager
+      // reads it from the store's identity record.
+      store.close();
+      const reopened = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+      try {
+        const closedOnIt = await ContextManager.open({ store: reopened, strategy: new PassthroughStrategy() });
+        closedOnIt.close();
+        assert.strictEqual(closedOnIt.getStoreId(), id, "a closed manager reads the store's id from its record");
+      } finally {
+        reopened.close();
+      }
+      // A store the manager owned is closed with it: the id is answered only
+      // if it was read before, and otherwise refused by name, the closed
+      // store unread.
+      for (const readBefore of [false, true]) {
+        const owning = await ContextManager.open({ path: TEST_STORE_PATH, strategy: new PassthroughStrategy() });
+        const known = readBefore ? owning.getStoreId() : undefined;
+        owning.close();
+        if (readBefore) assert.strictEqual(owning.getStoreId(), known, 'an owned store answers the id read before close()');
+        else assert.throws(() => owning.getStoreId(), /ContextManager\.getStoreId after close\(\)/, 'an owned store closed with no id read refuses by name');
+      }
+    } finally {
+      store.close();
+    }
+  });
 });
