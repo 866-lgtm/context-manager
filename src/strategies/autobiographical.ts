@@ -11026,9 +11026,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // its request shows inherited and lived material together, with no
       // label saying which is which. The sources' witnessed stamps decide
       // this predicate and the new summary's stamp, and the request never
-      // shows them. They choose the merge instruction too, except in reading
-      // mode, whose instruction has no witnessed variant, and in an override
-      // that doesn't read them, such as KnowledgeStrategy's.
+      // shows them. Outside a refusal fallback they choose the merge
+      // instruction only through getMergeInstruction: reading mode's
+      // instruction has no witnessed variant, and an override that doesn't
+      // read them, such as KnowledgeStrategy's, keeps its own. A refusal
+      // fallback calls the base formatters directly, so there they choose it
+      // whatever the mode or the override.
       sources.length > 0 && sources.every((s) => s.witnessed),
     );
     if (mergeSourceOnly) {

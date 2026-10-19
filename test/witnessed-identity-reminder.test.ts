@@ -31,6 +31,7 @@ const LIVE = 'LIVE-REMINDER: first person only for your own actions and experien
 const L1_WITNESSED_MARK = 'predates your own first turn';
 const MERGE_WITNESSED_MARK = 'witnessed through the record you carry';
 const READING_MARK = 'You have just been reading a substantial body of text';
+const READING_MERGE_MARK = 'You have just re-experienced the portions of text you read above';
 const PIN = 30;
 
 const t = (text: string): ContentBlock => ({ type: 'text', text });
@@ -123,6 +124,7 @@ class Probe extends AutobiographicalStrategy {
   compress(chunk: Chunk, ctx: StrategyContext): Promise<void> { return this.compressChunkHierarchical(chunk, ctx); }
   seed(entry: SummaryEntry): void { this.pushSummary(entry); }
   queueMerge(level: number, sourceIds: string[]): void { this.enqueueMerge({ level, sourceIds }); }
+  merge(level: number, sourceIds: string[], ctx: StrategyContext): Promise<boolean> { return this.executeMerge(level as never, sourceIds, ctx); }
   entries(): SummaryEntry[] { return this.summaries; }
 }
 const contextOf = (manager: ContextManager): StrategyContext =>
@@ -237,6 +239,43 @@ async function readingRun(inherited: boolean) {
   return { calls, shards: shards.length, grouped: shards.every((s) => s.bodyGroupId !== undefined && s.bodyGroupId === shards[0]!.bodyGroupId) };
 }
 
+/**
+ * An L2 merge of two seeded L1s over shards 0..1 and 2..3 of one sharded
+ * message, so the merge takes the reading-mode merge instruction. The L1s are
+ * stamped as an L1 mint stamps them against the pin, which `inherited` puts
+ * after every shard, or at the first.
+ */
+async function readingMergeRun(inherited: boolean) {
+  cleanup();
+  const calls: NormalizedRequest[] = [];
+  const membrane = {
+    complete: async (request: NormalizedRequest) => {
+      calls.push(request);
+      return { content: [t('a reflection across the reading')], stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 20 } };
+    },
+  };
+  const strategy = new Probe({
+    ...PROBE_OPTIONS, hierarchical: true, targetChunkTokens: 100, minChunkCharsForLLM: 0, mergeThreshold: 99, adaptiveResolution: true,
+  } as never);
+  const manager = await ContextManager.open({ path: PROBE_STORE, strategy, membrane: membrane as never });
+  manager.addMessage('User', [t('a shared document of many substantive paragraphs. '.repeat(100))]);
+  const ctx = contextOf(manager);
+  const shards = ctx.messageStore.getAll();
+  strategy.pinBefore(inherited ? shards[shards.length - 1]!.sequence + 1 : shards[0]!.sequence);
+  const l1 = (id: string, a: number, b: number): SummaryEntry => ({
+    id, level: 1, content: `authored ${id}`, tokens: 20, sourceLevel: 0,
+    sourceIds: [shards[a]!.id, shards[b]!.id], sourceRange: { first: shards[a]!.id, last: shards[b]!.id }, created: 1,
+    ...(inherited ? { witnessed: true } : {}),
+  });
+  strategy.seed(l1('L1-100', 0, 1));
+  strategy.seed(l1('L1-101', 2, 3));
+  await strategy.merge(2, ['L1-100', 'L1-101'], ctx);
+  const merged = strategy.entries().filter((s) => s.level === 2).length;
+  await manager.close();
+  cleanup();
+  return { calls, merged, shards: shards.length };
+}
+
 describe('witnessedIdentityReminder', () => {
   before(cleanup);
   after(cleanup);
@@ -293,7 +332,7 @@ describe('witnessedIdentityReminder', () => {
     assert.ok(inherited > 0, 'the run reached a wholly inherited target');
   });
 
-  it('the split L1 rung gives every piece the whole chunk\'s reminder, as it gives its instruction', async () => {
+  it('the split L1 rung gives every piece the whole chunk\'s reminder and compression instruction', async () => {
     const inherited = await splitRun(4);
     assert.equal(inherited.targetsOf(inherited.calls[0]!).length, 4, 'the first request is the whole chunk, from the L1 site');
     assert.equal(inherited.pieces.length, 4, 'the chunk was folded one message at a time');
@@ -348,5 +387,20 @@ describe('witnessedIdentityReminder', () => {
     assert.equal(lived.calls.length, 1);
     assert.ok(instruction(lived.calls[0]!).startsWith(READING_MARK));
     assertCarries(lived.calls[0]!, false, 'lived shard');
+  });
+
+  it('a reading-mode merge of wholly inherited sources gets the witnessed reminder after the reading merge instruction', async () => {
+    const inherited = await readingMergeRun(true);
+    assert.ok(inherited.shards >= 4, `the message was sharded (${inherited.shards} shards)`);
+    assert.equal(inherited.calls.length, 1, 'one merge request');
+    assert.equal(inherited.merged, 1, 'the merge installed an L2');
+    assert.ok(instruction(inherited.calls[0]!).startsWith(READING_MERGE_MARK), 'the reading merge instruction, which has no witnessed variant');
+    assertCarries(inherited.calls[0]!, true, 'merge of inherited shards');
+
+    const lived = await readingMergeRun(false);
+    assert.equal(lived.calls.length, 1, 'one merge request');
+    assert.equal(lived.merged, 1, 'the merge installed an L2');
+    assert.ok(instruction(lived.calls[0]!).startsWith(READING_MERGE_MARK));
+    assertCarries(lived.calls[0]!, false, 'merge of lived shards');
   });
 });

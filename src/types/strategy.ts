@@ -917,9 +917,10 @@ export interface AutobiographicalConfig {
    * and reminder, with no label saying which is which, so the live reminder
    * (after a rename, the new name's) reaches the inherited material there.
    * When the split rung (`compressionSplitFallback`) folds a chunk in
-   * pieces, every piece takes its chunk's instruction and reminder, so a
-   * piece of a mixed chunk takes the live ones even when its own messages
-   * all predate the pin.
+   * pieces, every piece takes its chunk's reminder and its chunk's
+   * compression instruction (`getCompressionInstruction`, never the reading
+   * one), so a piece of a mixed chunk takes the live ones even when its own
+   * messages all predate the pin.
    *
    * The protection is opt-in. With only `identityReminder` set, it is
    * appended, current name included, to wholly inherited targets too, so an
@@ -936,10 +937,15 @@ export interface AutobiographicalConfig {
    * merge retried after a refusal take the witnessed instruction instead of
    * the reading one.
    *
-   * The reminder follows the target whatever instruction it gets: a
-   * subclass override that doesn't read the pin, such as KnowledgeStrategy's
-   * phase prompts and merge instruction, keeps its own instruction, and a
-   * wholly inherited target still takes this reminder.
+   * The reminder follows the target whatever instruction it gets. An
+   * override of `getCompressionInstruction` or `getMergeInstruction` that
+   * doesn't read the pin, such as KnowledgeStrategy's phase prompts and
+   * merge instruction, gives a wholly inherited target its own instruction
+   * with this reminder. It doesn't reach a reading-mode chunk or merge,
+   * which takes `getReadingChunkInstruction` or `getReadingMergeInstruction`
+   * (though the split rung's pieces take `getCompressionInstruction`), or a
+   * merge retried after a refusal, which takes the base merge instruction,
+   * the witnessed one when every source is witnessed.
    *
    * Unset: every target uses `identityReminder` (unchanged behavior).
    */
