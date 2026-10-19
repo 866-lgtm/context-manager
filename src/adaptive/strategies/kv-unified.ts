@@ -16,6 +16,7 @@ import {
 import { normalizeContinuityMultiplier, normalizePolicy, policyScore } from '../kv-unified-policy.js';
 
 import type { KvUnifiedReuse } from '../kv-unified-reuse.js';
+import type { SubtreeSolveStats } from '../kv-unified-subtree.js';
 export type { KvUnifiedReuse } from '../kv-unified-reuse.js';
 
 export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> {
@@ -37,6 +38,9 @@ export interface KvUnifiedTimings {
   readonly baseSolveMs: number;
   readonly demandMs: number;
   readonly demandSolves: number;
+  /** Delta sets the base solve computed and reused, when the subtree
+   * engine ran it (see kv-unified-subtree.ts). */
+  readonly subtree?: SubtreeSolveStats;
 }
 
 export interface LatentDemandEvaluation {
@@ -101,7 +105,10 @@ export class KvUnifiedStrategy implements FoldingSolver {
     this.demandEvaluations = [];
     this.requests = [];
     this.demandSolves = 0;
-    this.timings = { forestMs: t1 - t0, forestDerived: forest.derived, certificateMs: solver.lastCertificateMs, baseSolveMs: t2 - t1, demandMs: 0, demandSolves: 0 };
+    this.timings = {
+      forestMs: t1 - t0, forestDerived: forest.derived, certificateMs: solver.lastCertificateMs, baseSolveMs: t2 - t1,
+      demandMs: 0, demandSolves: 0, ...(solver.lastSubtreeStats ? { subtree: solver.lastSubtreeStats } : {}),
+    };
     if (!result.feasible) {
       if (result.feasibility.frontier) {
         return {
@@ -447,8 +454,23 @@ function solveWithLatentCandidate(
   // from last compile's what-if when only leaves were appended since. The
   // first what-if borrows unchanged nodes from the live certificate graph.
   const key = `${candidate.id}\0${recallTokens}`;
-  const holder: KvUnifiedReuse = whatIf.kept?.get(key) ?? whatIf.carried?.get(key) ??
-    { certificate: whatIf.live?.certificate };
+  // The what-if starts from a copy of the live memo: it reads the live
+  // subtrees' sets and keeps its own candidate's, and its copy goes with
+  // the holder when the candidate is gone, instead of leaving every merge
+  // ever considered in the live map.
+  const kept = whatIf.kept?.get(key);
+  const carried = kept ?? whatIf.carried?.get(key);
+  const holder: KvUnifiedReuse = carried ??
+    { certificate: whatIf.live?.certificate, subtree: whatIf.live?.subtree && new Map(whatIf.live.subtree) };
+  if (carried && !kept && whatIf.live?.subtree) {
+    // A holder from last compile still points at the entries the live map
+    // has since replaced; those would fail validation and be computed again
+    // inside the what-if. It starts from the live map as it is now and keeps
+    // only its own ids (the candidate's).
+    const seeded = new Map(whatIf.live.subtree);
+    if (holder.subtree) for (const [id, entry] of holder.subtree) if (!seeded.has(id)) seeded.set(id, entry);
+    holder.subtree = seeded;
+  }
   whatIf.kept?.set(key, holder);
   const forest = (holder.forest ? CanonicalSummaryForest.derive(holder.forest, candidateInputs, forestOptions) : null) ??
     CanonicalSummaryForest.derive(whatIf.base, candidateInputs, forestOptions) ??

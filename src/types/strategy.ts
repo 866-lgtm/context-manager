@@ -837,6 +837,13 @@ export interface KvUnifiedConfig {
    * built from a recipe fills in `true`.
    */
   hysteresisCertificate?: boolean;
+  /**
+   * Which propagation engine solves the forest (see
+   * `docs/kv-unified-subtree-memo.md`). `auto` (absent): the
+   * subtree-memoized engine, run again on the packed DAG engine once if the
+   * subtree engine exceeds the label ceiling. `subtree` and `dag` pin one.
+   */
+  engine?: 'auto' | 'subtree' | 'dag';
 }
 
 export interface AutobiographicalConfig {

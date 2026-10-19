@@ -1581,6 +1581,34 @@ test('latent demand runs each expected-cost solve once when a certified what-if 
   assert.equal(strategy.lastTimings?.demandSolves, 5);
 });
 
+test('a what-if holder carried to the next compile reads the live memo as it is now', () => {
+  // The holder's copy of the subtree memo is taken when the holder is made;
+  // on the next compile the live solve has replaced the entries an append
+  // touched, and a copy still pointing at the old ones would compute those
+  // subtrees again inside every what-if. A carried holder starts from the
+  // live map and keeps only its own ids.
+  const base = {
+    raw: [50, 50, 200, 100, 100, 200, 50, 200], salience: [0.2, 0.5, 1, 1, 0.5, 1, 0.5, 1],
+    pairTokens: 150, seenL2: [10, 20, 30, 40], covered: 2, budget: 800, adoptEpsilon: 200, hysteresisCertificate: false,
+  };
+  const reuse: KvUnifiedReuse = {};
+  for (const appended of [0, 1, 2]) {
+    certifiedWhatIfFixture({ ...base, appended, reuse });
+    assert.ok(reuse.subtree && reuse.subtree.size > 0 && reuse.whatIf && reuse.whatIf.size > 0, `appended=${appended}`);
+    for (const [key, holder] of reuse.whatIf) {
+      assert.ok(holder.subtree, key);
+      // The candidate's sources read their leaves' allowed levels, which the
+      // candidate changes, so their sets are the what-if's own.
+      const sources = new Set(key.split('\0')[0].split(':').at(-1)!.split('+'));
+      for (const [id, entry] of reuse.subtree) {
+        if (sources.has(id)) continue;
+        assert.equal(holder.subtree.get(id), entry, `appended=${appended}: ${key} shares the live entry for ${id}`);
+      }
+      assert.ok([...holder.subtree.keys()].some((id) => !reuse.subtree!.has(id)), `${key} keeps its own candidate's entry`);
+    }
+  }
+});
+
 test('latent demand what-if solves reuse their own forests across compiles without changing the ranking', () => {
   const base = {
     raw: [50, 50, 200, 100, 100, 200, 50, 200], salience: [0.2, 0.5, 1, 1, 0.5, 1, 0.5, 1],
