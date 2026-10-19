@@ -5144,8 +5144,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.rebuildChunks(ctx.messageStore);
 
     // Auto-tick: fire speculative compression in the background. After
-    // each tick completes, if the queue still has work AND we're under
-    // the speculation cap AND preflight allows, schedule another tick.
+    // each tick completes, if the queue still has work AND preflight
+    // allows, schedule another tick; tick itself skips L1 compression
+    // while the speculation cap holds it (speculativeCapHolds).
     // This drains the queue ahead of need rather than one-chunk-per-
     // user-turn (reactive). Combined with ContextManager.compile not
     // awaiting pendingCompression, the agent's response and background
@@ -5157,7 +5158,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Background-drain loop: keeps calling tick() while there's queued work,
-   * subject to the speculation cap and preflight hook. Recurses via
+   * subject to the preflight hook, and to the speculation cap through tick's
+   * L1 step (speculativeCapHolds). Recurses via
    * `queueMicrotask` so one chunk's compression doesn't block the
    * scheduling of the next.
    *
@@ -5177,9 +5179,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const hasMerges = this.config.hierarchical === true && this.mergeQueue.length > 0;
     const hasCompression = this.compressionQueue.length > 0;
     if (!hasCompression && !hasMerges) return;
-    // Only bail when the *sole* available work is L1 compression that the cap
-    // or preflight currently forbids. Merge work always proceeds.
-    if (!hasMerges && (this.isAtSpeculativeCap() || !this.shouldCompressPreflight())) return;
+    // Only bail when the *sole* available work is L1 compression that the
+    // preflight currently forbids. Merge work always proceeds. Here no merge
+    // is queued, or `hierarchical` is off, and the cap holds nothing either
+    // way (speculativeCapHolds), so it can't be what stops the drain. With a
+    // merge queued and `hierarchical` on, tick's L1 step comes first and takes
+    // a chunk unless the queue is empty or the cap holds, and the merge runs
+    // otherwise.
+    if (!hasMerges && !this.shouldCompressPreflight()) return;
 
     const progressBefore = this._drainProgress;
 
@@ -5190,8 +5197,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // wrong signal: a productive merge tick can also enqueue a follow-on
         // merge, leaving the length unchanged — which the old check misread as
         // "no progress" and halted the drain mid-backlog. A genuine no-op tick
-        // (empty queues, at-cap with no merges, no membrane) doesn't advance
-        // the counter, so this still stops cleanly (no runaway recursion).
+        // (empty queues, the cap holding production while a hold blocks the
+        // head merge, no membrane) doesn't advance the counter, so this still
+        // stops cleanly (no runaway recursion).
         if (this._drainProgress === progressBefore) return;
         // Recurse to drain more — via the MACROTASK queue (setTimeout 0),
         // never queueMicrotask. Microtasks run before the event loop returns
@@ -5212,7 +5220,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Whether the count of *produced, unmerged* L1 summaries has reached the cap
+   * Whether the count of *produced, unmerged* L1 summaries is past the cap
    * configured by `maxSpeculativeL1s`. If no cap is set, always false.
    *
    * The cap bounds how many L1 summaries may sit un-consolidated before the
@@ -5221,14 +5229,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the backlog of work to be *drained*, not produced summaries. Counting it
    * here would let a large backlog permanently trip the cap and block the very
    * compression that would clear it — a deadlock (merges relieve the cap, but
-   * compression of the backlog never resumes). The throttle is on produced L1s;
-   * the queue drains freely, with merges keeping the unmerged count under the cap.
+   * compression of the backlog never resumes). The throttle is on produced L1s.
+   * Being past the cap holds production only while an L1 merge is queued to
+   * bring the count back down (speculativeCapHolds).
    */
   protected isAtSpeculativeCap(): boolean {
     const cap = this.config.maxSpeculativeL1s;
     if (cap === undefined || cap < 0) return false;
     const unmergedL1s = this.summaries.filter(s => s.level === 1 && !s.mergedInto).length;
     return unmergedL1s > cap;
+  }
+
+  /**
+   * Whether the speculative cap holds L1 production now: past the cap, while
+   * an L1→L2 merge is queued and `hierarchical` is on, so that tick will run
+   * it and bring the count of unmerged L1s back down. Production waits for
+   * that merge however long the merge waits: behind another merge at the
+   * head, on a hold over its sources, or through calls that fail and retry.
+   *
+   * With no L1 merge queued, no merge the cap could wait for is coming, so it
+   * holds nothing (issue #240). No merge forms below `mergeThreshold`
+   * unmerged L1s, which a cap below `mergeThreshold - 1` stopped short of.
+   * L1s that can never merge count toward the cap: a pruned source, the
+   * wide-span quarantine, a lone interior summary, or the sources of a merge
+   * in the merge quarantine, which contiguousMergeCandidates offers again
+   * while its run is the oldest that qualifies, so enqueueMerge refuses it
+   * and no later L1 merge forms. And under `hierarchical: false` tick runs no
+   * merge, though checkMergeThreshold can still queue one.
+   */
+  protected speculativeCapHolds(): boolean {
+    if (!this.isAtSpeculativeCap()) return false;
+    // Read `hierarchical` as tick's merge step reads it: this predicts that step.
+    return Boolean(this.config.hierarchical) && this.mergeQueue.some((m) => m.level === 2);
   }
 
   /**
@@ -5258,11 +5290,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
 
-    // Priority 1: Compress raw chunks → L1. Skipped while at the speculative
-    // cap (maxSpeculativeL1s) so we don't pile up more unmerged L1s; the merge
-    // priority below still runs to consolidate existing L1s and relieve the cap.
-    // No cap configured → isAtSpeculativeCap() is always false → unchanged.
-    if (this.compressionQueue.length > 0 && !this.isAtSpeculativeCap()) {
+    // Priority 1: Compress raw chunks → L1. Skipped while the speculative cap
+    // (maxSpeculativeL1s) holds production, so we don't pile up more unmerged
+    // L1s: past the cap with an L1 merge queued, which the merge priority below
+    // runs to consolidate existing L1s and relieve the cap (speculativeCapHolds).
+    // No cap configured → it never holds → unchanged.
+    if (this.compressionQueue.length > 0 && !this.speculativeCapHolds()) {
       const chunkIndex = this.compressionQueue.shift()!;
       this._drainProgress++; // consumed a queue item (real work or stale-cleanup)
       const chunk = this.chunks[chunkIndex];
@@ -9319,8 +9352,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * compression hold blocks (tick runs no merge from there until the
    * release, though it takes queued chunks first; merges can queue with
    * `hierarchical` off, but tick runs none then); or a queued chunk tick
-   * would compress while it runs chunks at all (below
-   * the speculative cap). Each counts only when its summary would fold a
+   * would compress while it runs chunks at all (while the speculative cap
+   * holds nothing). Each counts only when its summary would fold a
    * message the selection can fold now (below). Tick takes the merges in
    * order, the head each call: it runs a head that folds nothing (a model
    * call, or a drop with none when it's stale) and takes the next once that
@@ -9357,15 +9390,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * so the next rebuild brings it back, and it refuses one partly covered, so
    * neither counts on either path. shouldCompressPreflight isn't consulted:
    * it gates only the speculative drain, and a host's tick (as a refusal's
-   * recovery runs it) takes a queued chunk whatever it says. At the cap, tick
-   * runs only merges, and a merge is what relieves the cap. The count reads
-   * the cap once, as it stands when it's asked: an L1 tick makes for a chunk
-   * the walk goes past can bring the drain to the cap first, and tick then
-   * merges before it takes the chunk that counts, reaching it once merges
-   * relieve the cap, or never at a cap no merge relieves. Following the cap
-   * through the walk would take the merges tick queues on the way, which the
-   * count can't know. So at the cap no queued chunk counts, though a merge
-   * that folds nothing may relieve the cap when it lands. A held
+   * recovery runs it) takes a queued chunk whatever it says. While the cap
+   * holds production (past it, with an L1 merge queued), tick runs only
+   * merges, and the L1 merge is what relieves it. The count reads the cap
+   * once, as it stands when it's asked: an L1 tick makes for a chunk the walk
+   * goes past can take the drain past the cap and queue a merge first, and
+   * tick then merges before it takes the chunk that counts, reaching it once
+   * that merge has run. Following the cap through the walk would take the
+   * merges tick queues on the way, which the count can't know. So while the
+   * cap holds, no queued chunk counts, though the merge that holds it may
+   * fold nothing and release the cap when it lands. A held
    * chunk
    * can be queued: select's rebuild leaves one out, but a produce op queues
    * the chunks it demands, held or not. Tick drops a held one from the queue
@@ -9491,10 +9525,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Without a compression model no merge counts: tick drops a stale head
     // merge without a model call, and throws at the first merge it would make
     // (executeMerge needs the model). It reaches a merge only once it has
-    // taken every queued chunk, or at the cap. With a model, tick takes the
-    // merges in order, the head each call: it runs a head that folds nothing
-    // (a model call, or a drop with none when it's stale) and takes the next
-    // once that call lands or drops it, and returns at a head a hold blocks.
+    // taken every queued chunk, or while the cap holds production. With a
+    // model, tick takes the merges in order, the head each call: it runs a
+    // head that folds nothing (a model call, or a drop with none when it's
+    // stale) and takes the next once that call lands or drops it, and
+    // returns at a head a hold blocks.
     // A call that fails, is refused or is withdrawn leaves the merge at the
     // head, so work behind it waits for a later call, which the count can't
     // foresee. So the walk goes past a merge that folds nothing and ends at
@@ -9513,7 +9548,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
     }
-    if (this.compressionQueue.length === 0 || this.isAtSpeculativeCap()) return mergeCounts;
+    if (this.compressionQueue.length === 0 || this.speculativeCapHolds()) return mergeCounts;
     const adoptionShrinks = path === 'hierarchical' && this.chunkPersistenceEnabled;
     const coveredByL1 = new Set<string>();
     const exactL1 = new Set<string>();

@@ -22,7 +22,7 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   useRealPicker = false;
   /** When set, the fixture solver asks for an L1 over the middle, as a plan with summaries still to produce does. */
   produce = false;
-  /** Holds the drain at the speculative cap, as unmerged L1s past maxSpeculativeL1s do. */
+  /** Puts the unmerged L1s past maxSpeculativeL1s, so the cap holds L1 production while an L1 merge is queued. */
   atCap = false;
   /** Blocks every queued merge, as a hold on a message its sources cover does. */
   holdBlocksMerges = false;
@@ -2271,8 +2271,19 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
-  for (const merge of [false, true]) {
-    it(`names ${merge ? 'compression' : 'nothing'} for queued chunks the speculative cap holds ${merge ? 'when a merge is queued to relieve it' : 'with no merge queued'}`, async () => {
+  // Past the speculative cap, the cap holds the queued chunks only while an
+  // L1 merge is queued to relieve it (speculativeCapHolds, #240). With none
+  // queued, nothing the cap waits for can come, so the chunks count. With one
+  // queued, they wait for it: the merge counts, or nothing does while a hold
+  // blocks it.
+  for (const merge of ['none', 'queued', 'blocked'] as const) {
+    const named = merge === 'blocked' ? 'nothing' : 'compression';
+    const when = {
+      none: 'with no merge queued, since the cap holds nothing then',
+      queued: 'when a merge is queued to relieve it',
+      blocked: 'while the merge queued to relieve it is blocked',
+    }[merge];
+    it(`names ${named} for queued chunks past the speculative cap ${when}`, async () => {
       const strategy = new DiagnosticStrategy({
         adaptiveResolution: false,
         hierarchical: true,
@@ -2284,10 +2295,11 @@ describe('OverBudgetError.clearedBy', () => {
         speculativeProduction: false,
       });
       strategy.atCap = true;
+      strategy.holdBlocksMerges = merge === 'blocked';
       await withManager(strategy, async (manager) => {
         const ids = Array.from({ length: 12 }, (_, i) =>
           manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
-        if (merge) {
+        if (merge !== 'none') {
           // A merge whose sources in memory cover messages the compile can fold.
           strategy.seedL1('L1-a', [ids[0]!]);
           strategy.seedL1('L1-b', [ids[1]!]);
@@ -2296,7 +2308,7 @@ describe('OverBudgetError.clearedBy', () => {
         assert.equal(strategy.checkReadiness().ready, false, 'chunks are queued');
         const error = await refusal(manager);
         assert.match(error.message, /^Hierarchical emission overran the budget/);
-        assert.deepEqual(error.clearedBy, merge ? ['compression'] : []);
+        assert.deepEqual(error.clearedBy, merge === 'blocked' ? [] : ['compression']);
       });
     });
   }
@@ -2540,8 +2552,11 @@ describe('OverBudgetError.clearedBy', () => {
         const ticking = manager.tick().then(() => undefined, (error: unknown) => error);
         await Promise.race([model.called, ticking]);
         assert.equal(model.calls.n, 1, 'premise: tick asked the model for the first chunk, and waits');
-        // At the cap the walk takes no queued chunk, so only the work in flight can count.
+        // Past the cap with an L1 merge queued, one that covers no message and
+        // so counts nothing, the cap holds and the walk takes no queued chunk:
+        // only the work in flight can count.
         strategy.atCap = true;
+        strategy.queueMerge();
         assert.deepEqual((await refusal(manager)).clearedBy, pinned ? [] : ['compression']);
         model.release();
         assert.match(String(await ticking), /released by the test/);

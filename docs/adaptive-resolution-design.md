@@ -399,8 +399,9 @@ L_k summaries for `k > 1` come from two complementary paths in V1:
   default-on under `adaptiveResolution`): when a new L_k lands, if N
   siblings now share a (would-be) L_{k+1} parent, the pre-producer
   enqueues the L_{k+1} merge immediately. Walks all levels recursively so
-  the chain climbs as far as the source counts justify. Bounded by
-  `maxSpeculativeL1s` to keep cost-sensitive deployments honest.
+  the chain climbs as far as the source counts justify. Past
+  `maxSpeculativeL1s` unmerged L1s, L1 production ahead of it waits while
+  an L1 merge is queued, to keep cost-sensitive deployments honest.
 - **Reactive on `produce` op** (§3.8): if the picker requests an L_n the
   pre-producer hasn't reached yet (either because the deployment opted
   out, or because the speculation cap held it back), `handleProducedOps`
