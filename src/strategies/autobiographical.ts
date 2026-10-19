@@ -4012,7 +4012,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         visiting.delete(summary.id);
         return null;
       }
-      leaves.push(...childLeaves);
+      // One by one: a large child's leaves overflow a spread's argument limit.
+      for (const id of childLeaves) leaves.push(id);
     }
     visiting.delete(summary.id);
     if (new Set(leaves).size !== leaves.length) return null;
@@ -5972,7 +5973,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         out = [];
         for (const childId of s.sourceIds) {
           const child = byId.get(childId);
-          if (child) out.push(...collect(child, trail));
+          // One by one: a large child's leaves overflow a spread's argument limit.
+          if (child) for (const id of collect(child, trail)) out.push(id);
         }
       }
       trail.delete(s.id);
@@ -7344,7 +7346,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const mints = this.summaries
         .map((s) => s.created)
         .filter((t): t is number => typeof t === 'number');
-      const lastMintAt = mints.length ? toMs(Math.max(...mints)) : null;
+      // Folded, not spread: Math.max(...array) overflows the call stack past
+      // about 125,000 entries, and the catch below would report it healthy.
+      const lastMintAt = mints.length ? toMs(mints.reduce((max, t) => Math.max(max, t))) : null;
 
       let state: 'healthy' | 'degraded' | 'critical' = 'healthy';
       const stale = oldestPendingAgeMs !== null && oldestPendingAgeMs > DEGRADED_AFTER_MS;
@@ -7364,7 +7368,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         pendingChunks: pending.length,
         oldestPendingAgeMs,
         mergeQueueDepth: this.mergeQueue.length,
-        mergeQueueMaxAttempts: Math.max(0, ...this.mergeQueue.map((m) => m.attempts ?? 0)),
+        mergeQueueMaxAttempts: this.mergeQueue.reduce((max, m) => Math.max(max, m.attempts ?? 0), 0),
         mergeQuarantineCount,
         mergeQuarantineKeys: [...this.mergeQuarantine.keys()],
         mergeHeldIds: [...(this.config.mergeHoldSummaryIds ?? [])],

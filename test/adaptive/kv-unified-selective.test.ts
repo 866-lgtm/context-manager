@@ -126,6 +126,9 @@ test('exact scoring takes more candidates than a call takes as spread arguments'
   // Each floor is unique, non-zero and away from the first candidate, so a
   // floor that never moved from its start, or read another field, fails.
   const values = Array.from({ length: 200_000 }, (_, index) => row(index, index, 200_000 - index, Math.abs(index - 123_456) + 3));
+  // A failure of this premise means the runtime takes more spread arguments,
+  // as with a larger stack (`node --stack-size`) or a newer V8, not that the
+  // scorer changed: raise the count until the old spread throws again.
   assert.throws(() => Math.min(...values.map((value) => value.continuityLoss)), RangeError,
     'premise: this runtime takes fewer spread arguments than there are candidates');
   const result = new ExactKvUnifiedPolicySolver(inputs).scorePreparedCandidates(values, { maxTokens: 200 }, stats, true);
