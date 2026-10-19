@@ -22,6 +22,9 @@ class Probe extends AutobiographicalStrategy {
   seedSummary(entry: SummaryEntry): void {
     (this as unknown as { summaries: SummaryEntry[] }).summaries.push(entry);
   }
+  setMergeQueue(entries: Array<{ attempts?: number }>): void {
+    (this as unknown as { mergeQueue: Array<{ attempts?: number }> }).mergeQueue = entries;
+  }
   setMergeQuarantine(keys: string[]): void {
     const m = (this as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine;
     m.clear();
@@ -54,6 +57,7 @@ describe('getCompressionDebt', () => {
     assert.equal(d.state, 'healthy');
     assert.equal(d.pendingChunks, 0);
     assert.equal(d.oldestPendingAgeMs, null);
+    assert.equal(d.mergeQueueMaxAttempts, 0);
   });
 
   it('the open frontier chunk is life, not debt', () => {
@@ -118,6 +122,34 @@ describe('getCompressionDebt', () => {
     const d = s.getCompressionDebt(NOW);
     assert.equal(d.state, 'degraded');
     assert.ok((d.oldestPendingAgeMs ?? 0) < 3 * HOUR, 'µs value read as ms would be absurdly old');
+  });
+
+  it('reports a store with more summaries and merge groups than a call takes as spread arguments (#258)', () => {
+    // A call takes about 125,000 spread arguments on node 22 and 24, so the
+    // newest mint and the most merge attempts are folded, not spread; a spread
+    // here would throw, and the method's catch would report the empty, healthy
+    // state. A failure of this premise means the runtime takes more spread
+    // arguments, as with a larger stack (`node --stack-size`) or a newer V8, not
+    // that the method changed: raise the count until a spread throws again.
+    const count = 200_000;
+    assert.throws(() => Math.max(...new Array<number>(count).fill(0)), RangeError,
+      'premise: this runtime takes fewer spread arguments than there are summaries');
+    const s = fresh();
+    // The newest mint and the most attempts sit in the middle, so a fold that
+    // kept the first or the last entry fails.
+    for (let i = 0; i < count; i++) {
+      s.seedSummary({
+        id: `L1-${i}`, level: 1, content: 'x', tokens: 5, sourceLevel: 0,
+        sourceIds: [], sourceRange: { first: 'a', last: 'b' }, created: NOW - HOUR - Math.abs(i - 123_456),
+      } as SummaryEntry);
+    }
+    // Every fifth entry has never been tried, so it carries no attempts.
+    s.setMergeQueue(Array.from({ length: count }, (_, i) => (i === 77_777 ? { attempts: 9 } : i % 5 === 0 ? {} : { attempts: i % 5 })));
+    const d = s.getCompressionDebt(NOW);
+    assert.equal(d.unmergedFrontier.l1, count, 'the report is the store\'s, not the empty one');
+    assert.equal(d.lastMintAt, NOW - HOUR);
+    assert.equal(d.mergeQueueDepth, count);
+    assert.equal(d.mergeQueueMaxAttempts, 9);
   });
 
   it('lastMintAt reflects the newest summary', () => {

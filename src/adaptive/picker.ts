@@ -18,6 +18,7 @@
  * See `docs/adaptive-resolution-design.md` §5.
  */
 
+import type { Diagnostics } from '../diagnostics.js';
 import type {
   FoldingSolver,
   FoldingBudget,
@@ -65,9 +66,10 @@ export interface OverBudgetDiagnostics {
  *   running or queued, as `tick` would take it: a compression in flight;
  *   the queued chunks, in `tick`'s order, while the speculative cap lets it
  *   take one, the cap read as it stands when the count is asked (an L1
- *   `tick` makes on the way can bring the drain to the cap before it reaches
- *   a chunk that counts, and a merge that folds nothing can relieve the cap
- *   when it lands); and after them, with `hierarchical` merging on and a
+ *   `tick` makes on the way can take the drain past the cap and queue a
+ *   merge before it reaches a chunk that counts, and the merge that holds
+ *   the cap may fold nothing and release it when it lands); and after
+ *   them, with `hierarchical` merging on and a
  *   compression model, the queued merges, in `tick`'s order up to one a
  *   compression hold blocks, where `tick` stops. Each counts only when the
  *   compile can fold now one of the messages its summary would cover: one
@@ -441,7 +443,11 @@ export function accountFrontier(
 }
 
 export class Picker {
-  constructor(private readonly solver: FoldingSolver) {}
+  constructor(
+    private readonly solver: FoldingSolver,
+    /** Where its lines go: a strategy's diagnostics, which name its namespace (#239). */
+    private readonly log: Diagnostics = console,
+  ) {}
 
   /** Name of the solver this picker runs — surfaced so every compile can be
    *  attributed to the policy that actually planned it (solver observability:
@@ -487,14 +493,14 @@ export class Picker {
     // plan/render divergence.
     const { tokens, unrealizable } = accountFrontier(inputs, levelOf);
     if (unrealizable.length > 0) {
-      console.error(
+      this.log.error(
         `[picker-unrealizable] solver=${this.solver.name}: ${unrealizable.length} chunk(s) target ` +
           `a level whose summary does not exist (first: ${unrealizable.slice(0, 3).join(', ')}). ` +
           `Accounted as raw. This is a solver bug — the frontier must be realizable by contract.`,
       );
     }
     if (deadFrontierIds > 0) {
-      console.error(
+      this.log.error(
         `[picker-dead-ids] solver=${this.solver.name}: dropped ${deadFrontierIds} frontier ` +
           `entr${deadFrontierIds === 1 ? 'y' : 'ies'} referencing no live chunk (store surgery residue).`,
       );

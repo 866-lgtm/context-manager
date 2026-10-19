@@ -85,8 +85,10 @@ const passthroughKeys = [
   'compressionSplitMaxCallsPerChunk',
   'compressionSplitMaxCallsPer10Min',
   'compressionRecallBudgetTokens',
+  'mergeHoldSummaryIds',
   'summaryTargetTokens',
   'identityReminder',
+  'witnessedIdentityReminder',
   'witnessedBeforeSequence',
   'witnessedInstruction',
 ] as const;

@@ -492,6 +492,49 @@ describe("content that doesn't match ContentBlock", () => {
     });
   });
 
+  // #239: a read's line names the namespace whose state it read. An isolated message slot is its
+  // manager's; the shared message slot is no one namespace's.
+  it('a read\'s line names the namespace of an isolated message slot, and none for the shared slot', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-malformed-ns-'));
+    const path = join(dir, 'store');
+    try {
+      const raw = JsStore.create({ path });
+      MessageStore.register(raw, 'agents/tern');
+      MessageStore.register(raw);
+      raw.appendToStateJsonWithIdentity('agents/tern/messages', { participant: 'User', content: [t('own'), null], timestamp: Date.now() }, 'id', 'sequence');
+      raw.appendToStateJsonWithIdentity('messages', { participant: 'User', content: [t('shared'), null], timestamp: Date.now() }, 'id', 'sequence');
+      raw.close();
+      const lines = (await errorLines(async () => {
+        const own = await ContextManager.open({ path, namespace: 'agents/tern', isolate: true });
+        own.getAllMessages();
+        own.close();
+        const shared = await ContextManager.open({ path, namespace: 'agents/wren' });
+        shared.getAllMessages();
+        shared.close();
+      })).filter((line) => line.startsWith('[context-manager]'));
+      assert.equal(lines.length, 2, lines.join('\n'));
+      assert.match(lines[0]!, /^\[context-manager\] message .*the store keeps it as written ns=agents\/tern$/);
+      assert.match(lines[1]!, /^\[context-manager\] message .*the store keeps it as written$/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // #239: a context log of one namespace names it on its lines; the log with no namespace names
+  // none, as the next test's line shows.
+  it('a context log\'s line names its namespace', async () => {
+    await withStore(async (store) => {
+      ContextLog.register(store, 'agents/tern');
+      store.appendToStateJson('agents/tern/context', { index: 0, participant: 'User', content: [t('x'), null] });
+      const log = new ContextLog(store, { namespace: 'agents/tern' });
+      const lines = (await errorLines(() => {
+        log.getAll();
+      })).filter((line) => line.startsWith('[context-manager]'));
+      assert.equal(lines.length, 1, lines.join('\n'));
+      assert.match(lines[0]!, /^\[context-manager\] context entry 0: .* ns=agents\/tern$/);
+    });
+  });
+
   it('a context entry holding it is read without it, with one line', async () => {
     await withStore(async (store) => {
       ContextLog.register(store);

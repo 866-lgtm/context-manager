@@ -6,18 +6,20 @@
  * results only, at four characters a token, so a capped message's images,
  * tool calls and thinking go out whole, and its kept text is priced at the
  * store's own rate. Where no image is stripped, that sum is the store's
- * estimate of what's sent, except where the strategy joins a body's cut
- * shards back into one text block, which the store estimates once (the
- * shard tests). The hierarchical selection prices an image the strip
- * replaces at full weight, uncapped messages included, so the strip's case
- * is tested in the adaptive selection, whose base is post-strip.
+ * estimate of what's sent, except where the strategy joins a body's shards
+ * back into one text block: it counts each shard on its own, and the store
+ * would estimate the joined block once (the shard tests). The hierarchical
+ * selection prices an image the strip replaces at full weight, uncapped
+ * messages included, so the strip's case is tested in the adaptive
+ * selection, whose base is post-strip.
  *
  * The rule it replaced charged a capped message no more than the cap plus
  * 50: too little for an image, a tool call or thinking the cap keeps whole,
- * and for the text it keeps at large caps, and too much for the few
- * characters it keeps at small ones. So the cases here cut both ways, and one
- * is a message the cap leaves whole, which the old rule charged the cap plus
- * 50 too. Between them they pin each place a raw message is priced but one:
+ * and, at the multiplier of 1 these cases run at, for the text it keeps at
+ * large caps, and too much for the few characters it keeps at small ones.
+ * So the cases here cut both ways, and one is a message the cap leaves
+ * whole, which the old rule charged the cap plus 50 too. Between them they
+ * pin each place a raw message is priced but one:
  * the head window, the middle (positioned and combined recall pairs, a plan
  * whose level has no summary, and a body's raw shards, which the adaptive
  * middle sends uncut and the head and recent windows cut), the recent
@@ -315,6 +317,89 @@ describe("an override of truncateContent is the cut a raw message is priced and 
       }
     });
   }
+
+  // An override that rewrites a message and passes the rewrite on to this
+  // class's cut, with the estimate it was given: the cut decides from the
+  // rewrite's estimate, not the stored message's, whether the rewrite adds a
+  // block or keeps the message's count of them.
+  class AddsNote extends AutobiographicalStrategy {
+    protected override truncateContent(
+      content: ContentBlock[],
+      maxTokens: number,
+      estimate?: (content: ContentBlock[]) => number,
+    ): ContentBlock[] {
+      return super.truncateContent([...content, { type: 'text', text: 'n'.repeat(4000) }], maxTokens, estimate);
+    }
+  }
+  class ReplacesText extends AutobiographicalStrategy {
+    protected override truncateContent(
+      content: ContentBlock[],
+      maxTokens: number,
+      estimate?: (content: ContentBlock[]) => number,
+    ): ContentBlock[] {
+      const rewritten = content.map((block) => (block.type === 'text' ? { type: 'text', text: 'n'.repeat(4000) } as ContentBlock : block));
+      return super.truncateContent(rewritten, maxTokens, estimate);
+    }
+  }
+  const rewrites: Array<[string, typeof AutobiographicalStrategy]> = [
+    ['that adds a block', AddsNote],
+    ['that keeps the block count', ReplacesText],
+  ];
+  for (const [how, Rewrites] of rewrites) for (const [mode, config] of SELECTIONS) {
+    it(`autobiographical, ${mode}: a rewrite ${how}, passed on to the cut, is cut by its own estimate, and the render stats count it`, async () => {
+      // 'hello' alone is 2 tokens to the cut's estimate, under a cap of 100,
+      // and with the override's 4,000 characters it is past 1,000.
+      const strategy = new Rewrites({ maxMessageTokens: 100, overBudgetGraceRatio: 0, ...config });
+      const { manager, rendered, attempt, close } = await open(strategy, [['u', [{ type: 'text', text: 'hello' }]]]);
+      try {
+        const compiled = await manager.compile(BIG);
+        const texts = compiled.messages.flatMap((m) => m.content.map((block) => (block as { text?: string }).text ?? ''));
+        assert.ok(texts.some((text) => text.includes('[truncated — original was 1000 tokens]')),
+          `the rewrite is cut: ${JSON.stringify(texts.map((text) => text.slice(0, 60)))}`);
+        assert.ok(!texts.some((text) => text.includes('n'.repeat(4000))), 'nothing sends the rewrite whole');
+        const sent = rendered(compiled);
+        assertStatsMatch(manager, sent, config.adaptiveResolution === true);
+        assert.equal(await attempt(sent), sent, `a budget of ${sent} sends all of it`);
+      } finally {
+        await close();
+      }
+    });
+  }
+});
+
+describe("the cut asks about a stored message's own content through the message's cached estimate", () => {
+  // The text-only estimate is cached on the stored message object, so a site
+  // that gives the cut that message's content reads its estimate from the
+  // cache, where any other object, a copy of the message included, is
+  // estimated afresh.
+  class RecordsEstimates extends AutobiographicalStrategy {
+    asked: StoredMessage[] = [];
+    protected override estimateTextOnlyTokens(msg: StoredMessage): number {
+      this.asked.push(msg);
+      return super.estimateTextOnlyTokens(msg);
+    }
+  }
+  for (const [mode, config] of SELECTIONS) {
+    it(`autobiographical, ${mode}: a compile of raw messages under a cap estimates only the stored messages themselves`, async () => {
+      const strategy = new RecordsEstimates({ maxMessageTokens: 100, ...config });
+      const { manager, close } = await open(strategy, [
+        ['u', [{ type: 'text', text: 'r'.repeat(2000) }]],
+        ['a', [{ type: 'text', text: 'ok' }]],
+      ]);
+      try {
+        const compiled = await manager.compile(BIG);
+        const texts = compiled.messages.flatMap((m) => m.content.map((block) => (block as { text?: string }).text ?? ''));
+        assert.ok(texts.some((text) => text.includes('[truncated')), 'premise: the cap cuts the first message');
+        const store = (manager as unknown as { messageStore: { getAll(): StoredMessage[] } }).messageStore;
+        const stored = new Map(store.getAll().map((m) => [m.id, m]));
+        assert.ok(strategy.asked.length > 0, 'premise: the cut asked for estimates');
+        const apart = strategy.asked.filter((m) => stored.get(m.id) !== m);
+        assert.equal(apart.length, 0, `estimated apart from the stored messages: ${apart.length} of ${strategy.asked.length}`);
+      } finally {
+        await close();
+      }
+    });
+  }
 });
 
 describe("a body's raw shards go out uncut in the adaptive middle and cut in the head and recent windows, each priced as it's sent", () => {
@@ -337,29 +422,26 @@ describe("a body's raw shards go out uncut in the adaptive middle and cut in the
     compiled.messages.map(textOf).join('').split('[truncated').length - 1;
   type Sent = { messages: Array<{ content: ContentBlock[] }> };
   type Stats = { head: { messages: number }; tail: { messages: number } };
-  // The third field is how far over the request the render stats may run,
-  // and the fourth how far over the emitter's count the plan may. A text
-  // block's estimate is its characters over a rate the store picks from its
-  // first 2,000 characters, rounded up. This body's shards all share one
-  // rate, and the strategy priced each shard's block on its own, so where a
-  // count sums the shards and the request joins them into one block, the
-  // count comes to between 0 and 6 tokens over: the stats in the head and
-  // recent windows, and the plan in the middle, whose shard path prices the
-  // joined block itself for the stats. (Shards of different densities would
-  // put the joined block at its first shard's rate, as on `main`.)
-  const windows: Array<[string, Record<string, unknown>, number, number, (compiled: Sent, stats: Stats) => void]> = [
-    ['in the middle, uncut', { headWindowTokens: 0, recentWindowTokens: 2000 }, 0, 6, (compiled) =>
+  // A text block's estimate is its characters over a rate the store picks
+  // from its first 2,000 characters, rounded up. The strategy counts each
+  // shard on its own, in the head and recent windows and in the middle's
+  // joined run alike, so where the request joins the shards into one block,
+  // the render stats come to between 0 and 6 tokens over the store's
+  // estimate of what's sent, and the plan is what the emitter counted.
+  // Shards of different densities are body-run-price's cases.
+  const windows: Array<[string, Record<string, unknown>, (compiled: Sent, stats: Stats) => void]> = [
+    ['in the middle, uncut', { headWindowTokens: 0, recentWindowTokens: 2000 }, (compiled) =>
       assert.equal(textOf(compiled.messages[0]).length, 80_000, 'premise: the middle sends the body uncut, its shards joined')],
-    ['in the recent window, cut', { headWindowTokens: 0 }, 6, 0, (compiled, stats) => {
+    ['in the recent window, cut', { headWindowTokens: 0 }, (compiled, stats) => {
       assert.ok(stats.tail.messages >= 7, `premise: the tail holds the seven shards: ${stats.tail.messages} messages`);
       assert.equal(cutShards(compiled), 7, 'premise: the recent window sends each shard cut');
     }],
-    ['in the head window, cut', { headWindowTokens: 40_000 }, 6, 0, (compiled, stats) => {
+    ['in the head window, cut', { headWindowTokens: 40_000 }, (compiled, stats) => {
       assert.ok(stats.head.messages >= 7, `premise: the head holds the seven shards: ${stats.head.messages} messages`);
       assert.equal(cutShards(compiled), 7, 'premise: the head sends each shard cut');
     }],
   ];
-  for (const [where, config, rounding, planRounding, premise] of windows) {
+  for (const [where, config, premise] of windows) {
     it(`autobiographical, adaptive selection, a cap of 1,000 tokens under shards of 12,000 characters: ${where}`, async () => {
       const strategy = autobiographical(1000, { adaptiveResolution: true, ...config });
       const { manager, rendered, attempt, close } = await open(strategy, body);
@@ -369,15 +451,12 @@ describe("a body's raw shards go out uncut in the adaptive middle and cut in the
         premise(compiled, stats);
         const sent = rendered(compiled);
         const price = stats.total.tokens;
-        assert.ok(price - sent >= 0 && price - sent <= rounding, `render stats ${price}, sent ${sent}`);
+        assert.ok(price - sent >= 0 && price - sent <= 6, `render stats ${price}, sent ${sent}`);
         const { planned, actual } = stats.planVsActual!;
-        assert.ok(planned - actual >= 0 && planned - actual <= planRounding, `planned ${planned}, emitted ${actual}`);
-        // A compile must fit both its plan and what it emits, so the budget
-        // that sends all of it is the larger of the two.
-        const counted = Math.max(price, planned);
-        assert.equal(await attempt(counted), sent, `a budget of ${counted} sends all of it`);
-        const under = await attempt(counted - 1);
-        if (under !== 'refused') assert.ok(under < sent, `a budget of ${counted - 1} sent ${under}`);
+        assert.equal(planned, actual, `planned ${planned}, emitted ${actual}`);
+        assert.equal(await attempt(price), sent, `a budget of ${price} sends all of it`);
+        const under = await attempt(price - 1);
+        if (under !== 'refused') assert.ok(under < sent, `a budget of ${price - 1} sent ${under}`);
       } finally {
         await close();
       }

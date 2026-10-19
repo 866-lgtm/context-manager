@@ -258,10 +258,14 @@ async function errorsDuring(fn: () => Promise<void>): Promise<unknown[][]> {
   return errors;
 }
 
-/** A provider's refusal of the reasoning carriers in a request. */
+/**
+ * A provider's refusal of the reasoning carriers in a request, typed as
+ * membrane types a 400: an untyped error is transient, which interrupts the
+ * ladder instead of taking the carrier fallback.
+ */
 const carrierRejection = () => Object.assign(
   new Error('invalid_request_error: thinking blocks in this request cannot be accepted'),
-  { httpStatus: 400 },
+  { type: 'invalid_request', httpStatus: 400, retryable: false },
 );
 
 describe('a manager detaches the strategy it lets go of (#209)', () => {
@@ -846,7 +850,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       await settlesWithin(producing.catch(() => {}));
       await settlesWithin(waiting);
 
-      assert.strictEqual(waiterWork.compressions, 2, 'the waiter took the chunk over with a fresh compression');
+      assert.strictEqual(waiterWork.compressions, 1, "the waiter found the chunk's quarantine in the ledger and compressed nothing more");
       assert.strictEqual(calls.length, answered, `the waiter made ${calls.length - answered} call(s) for a quarantined chunk`);
       assert.strictEqual(waited.outcome, 'resolved', "the waiter's tick ended quietly");
       assert.deepStrictEqual(persisted(store, SUMMARIES), [], 'no summary written');

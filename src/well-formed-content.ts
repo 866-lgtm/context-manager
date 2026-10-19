@@ -67,6 +67,7 @@
  * through a `tool_result`'s content, always does, and JSON can't produce it.
  */
 
+import type { Diagnostics } from './diagnostics.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredContentBlock } from './types/index.js';
 import { releaseEditedRawForms } from './raw-forms.js';
@@ -434,6 +435,8 @@ export function wellFormedContent(
   content: StoredContentBlock[],
   where: string,
   logged: Set<string>,
+  /** Where the line goes: a namespace's diagnostics, for a record of its own state (#239). */
+  log: Diagnostics = console,
 ): StoredContentBlock[] {
   const array = Array.isArray(content);
   if (array && allWellFormed(content, 'read')) return content;
@@ -441,7 +444,7 @@ export function wellFormedContent(
   const key = `${where}\u0000${places}`;
   if (!logged.has(key)) {
     logged.add(key);
-    console.error(
+    log.error(
       `[context-manager] ${where}: reads leave out or mend what doesn't match ContentBlock (${places}); ` +
         'the store keeps it as written',
     );

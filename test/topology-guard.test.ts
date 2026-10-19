@@ -212,6 +212,29 @@ describe('load-time topology audit', () => {
     assert.deepEqual(p.audit(ids(0, 40)), []);
   });
 
+  test('a summary whose child covers more messages than a call takes as spread arguments is audited (#258)', () => {
+    // A call takes about 125,000 spread arguments on node 22 and 24. The
+    // audit collects each summary's messages from its children's, so an L3
+    // over an L2 of 199,990 messages took them in one spread, which threw at
+    // load. A failure of this premise means the runtime takes more spread
+    // arguments, as with a larger stack (`node --stack-size`) or a newer V8,
+    // not that the audit changed: raise the count until a spread throws again.
+    const count = 200_000;
+    assert.throws(() => Math.max(...new Array<number>(count).fill(0)), RangeError,
+      'premise: this runtime takes fewer spread arguments than the L2 has messages');
+    const p = probe();
+    const groups = Array.from({ length: count / 10 }, (_, k) => ids(10 * k, 10 * k + 9));
+    p.setChunks(groups);
+    const l1s = groups.map((_, k) => l1(`a${k}`, 10 * k, 10 * k + 9));
+    // One L1 left out of the L2 leaves a 10-message hole in the L2 and the L3
+    // over it, which the audit reports only if it collected all their messages.
+    const l2 = { ...l1('L2', 0, count - 1, 2), sourceIds: l1s.filter((_, k) => k !== 10_000).map((s) => s.id) } as SummaryEntry;
+    const l3 = { ...l1('L3', 0, count - 1, 3), sourceIds: ['L2'] } as SummaryEntry;
+    p.setSummaries([...l1s, l2, l3]);
+    const found = p.audit(ids(0, count - 1)).map((v) => [v.id, v.leafCount, v.holes]);
+    assert.deepEqual(found, [['L2', count - 10, 10], ['L3', count - 10, 10]]);
+  });
+
   test("never-chunked messages inside a span are not holes", () => {
     const p = probe();
     // m-10 is unowned (e.g. a message the chunker skipped): it occupies no position.

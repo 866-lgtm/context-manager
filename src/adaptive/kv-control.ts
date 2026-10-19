@@ -30,6 +30,7 @@
  * Pure and deterministic.
  */
 
+import type { Diagnostics } from '../diagnostics.js';
 import type { ChunkId, SummaryId } from './folding-strategy.js';
 import type { PickerInputs, PickerChunk } from './picker.js';
 import type { SummaryEntry } from '../types/strategy.js';
@@ -279,6 +280,7 @@ function relevanceCut(
   target: number,
   windowTokens: number,
   maxFoldLevel: number,
+  log: Diagnostics,
 ): { F: Map<ChunkId, number>; tokens: number } {
   const F = new Map(base);
   const byId = new Map(ordered.map((c) => [c.id, c] as const));
@@ -309,7 +311,7 @@ function relevanceCut(
   // Incremental accounting: O(group) per move instead of O(n) renderLayout.
   const _tl = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
   let ledger = new TokenLedger(tree, inputs, ordered, F);
-  if (_tl) console.error(`[kv-timing] ledger-init ${Date.now() - _tl}ms tokens=${ledger.tokens}`);
+  if (_tl) log.error(`[kv-timing] ledger-init ${Date.now() - _tl}ms tokens=${ledger.tokens}`);
 
   // Eligibility memo, keyed (node, level, phase). The verdict is a pure
   // function of static inputs (caps / pinCaps) shared by every member chunk
@@ -523,7 +525,7 @@ function relevanceCut(
 
   const _tp = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
   projectToValidCut(F, tree, ordered, frozen, fixedLevels, projectionExempt);
-  if (_tp) console.error(`[kv-timing] cut-projection ${Date.now() - _tp}ms`);
+  if (_tp) log.error(`[kv-timing] cut-projection ${Date.now() - _tp}ms`);
   // One authoritative render at the end (the ledger tracks it exactly, but the
   // projection may have moved leaves — recompute once, not per move).
   const tokens = renderLayout(inputs, tree, F).totalTokens;
@@ -778,7 +780,12 @@ const EMPTY_LEVEL_MAP: ReadonlyMap<ChunkId, number> = new Map();
 /** KV_DIAG_GROUP=<summaryId>: log that group's leaf-level histogram at each
  *  solve stage + the branch taken — for diagnosing cut-through-group targets. */
 const DIAG_GROUP = typeof process !== 'undefined' ? process.env?.KV_DIAG_GROUP : undefined;
-function diagHist(label: string, F: ReadonlyMap<ChunkId, number>, tree: SummaryTree): void {
+function diagHist(
+  label: string,
+  F: ReadonlyMap<ChunkId, number>,
+  tree: SummaryTree,
+  log: Diagnostics,
+): void {
   if (!DIAG_GROUP) return;
   const node = tree.summary(DIAG_GROUP);
   if (!node) return;
@@ -787,15 +794,21 @@ function diagHist(label: string, F: ReadonlyMap<ChunkId, number>, tree: SummaryT
     const l = F.get(id) ?? 0;
     hist.set(l, (hist.get(l) ?? 0) + 1);
   }
-  console.error(`[kv-diag] ${label}: levels ${JSON.stringify([...hist.entries()].sort((a, b) => a[0] - b[0]))}`);
+  log.error(`[kv-diag] ${label}: levels ${JSON.stringify([...hist.entries()].sort((a, b) => a[0] - b[0]))}`);
 }
-function diagBranch(label: string): void {
-  if (DIAG_GROUP) console.error(`[kv-diag] branch: ${label}`);
+function diagBranch(label: string, log: Diagnostics): void {
+  if (DIAG_GROUP) log.error(`[kv-diag] branch: ${label}`);
 }
 
 export interface ControlPlanParams {
   /** Carried frontier (F_prev). */
   previous: ReadonlyMap<ChunkId, number>;
+  /**
+   * Where the planner's `[kv-timing]` and `[kv-diag]` lines go: a strategy's
+   * diagnostics, which name its namespace (#239). A replay of one agent's
+   * turns gives none, and they go to the console as they are.
+   */
+  diagnostics?: Diagnostics;
   /** Fold (deepen) when rendered tokens exceed this (high-watermark). */
   foldAtTokens: number;
   /** Un-fold (raise toward raw) when rendered tokens are below this
@@ -962,11 +975,15 @@ function findOverlap(
  * AutobiographicalStrategy calls this with its compile's own plan, beside
  * `[kv-escalation]`, and replayControlled with each turn's. The planner
  * doesn't, since kv-stable's shadow production pick plans the same way and
- * renders nothing.
+ * renders nothing. The strategy gives its diagnostics, whose line names its
+ * namespace (#239); a replay of one agent's turns gives none.
  */
-export function reportOverlap(overlap: ControlPlan['overlap']): void {
+export function reportOverlap(
+  overlap: ControlPlan['overlap'],
+  log: Diagnostics = console,
+): void {
   if (overlap.length === 0) return;
-  console.error(
+  log.error(
     `[kv-overlap] ⚠️ non-nested summary tree: ${overlap.length} leaf(s) with ` +
       `conflicting lineage tolerated this compile (double-representation in window). ` +
       `Store needs nesting repair. sample=${overlap.slice(0, 5).join(',')}`,
@@ -978,6 +995,7 @@ function planUnreported(
   tree: SummaryTree,
   p: ControlPlanParams,
 ): Omit<ControlPlan, 'overlap'> {
+  const log = p.diagnostics ?? console;
   const ordered = [...inputs.chunks].sort((a, b) => a.sequence - b.sequence);
   const frozen = p.frozen ?? EMPTY_SET;
   const fixedLevels = p.fixedLevels ?? EMPTY_LEVEL_MAP;
@@ -1044,7 +1062,7 @@ function planUnreported(
   for (const v of p.previous.values()) {
     if (v !== 0) { carriedNonEmpty = true; break; }
   }
-  diagHist('carried(pre-projection)', carried, tree);
+  diagHist('carried(pre-projection)', carried, tree, log);
   // Hard-protected set for boundary-cut tolerance: raw-zone and immovable
   // leaves render at their held level beside their group's recall (raw for the
   // raw zone) and are exempt from group-unanimity everywhere. A leaf whose
@@ -1056,7 +1074,7 @@ function planUnreported(
     if (p.rawZone.has(c.id) || immovable.has(c.id)) boundaryExempt.add(c.id);
   }
   projectToValidCut(carried, tree, ordered, frozen, fixedLevels, boundaryExempt);
-  diagHist('carried(projected)', carried, tree);
+  diagHist('carried(projected)', carried, tree, log);
   const carriedLayout = renderLayout(inputs, tree, carried);
   const carriedTokens = carriedLayout.totalTokens;
 
@@ -1080,10 +1098,10 @@ function planUnreported(
   const _t0 = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
   const ideal = relevanceCut(
     inputs, tree, ordered, base, caps, pinCaps, p.rawZone, immovable, frozen, fixedLevels,
-    p.targetTokens, p.windowTokens, maxFoldLevel,
+    p.targetTokens, p.windowTokens, maxFoldLevel, log,
   );
-  if (_t0) console.error(`[kv-timing] relevanceCut ${Date.now() - _t0}ms idealTokens=${ideal.tokens}`);
-  diagHist('ideal', ideal.F, tree);
+  if (_t0) log.error(`[kv-timing] relevanceCut ${Date.now() - _t0}ms idealTokens=${ideal.tokens}`);
+  diagHist('ideal', ideal.F, tree, log);
   const idealLayout = renderLayout(inputs, tree, ideal.F);
   const idealLoss = relevanceLoss(ideal.F, ordered, p.rawZone, caps);
   const gapCeiling = (strictReach ? Number.POSITIVE_INFINITY : gapRatio) * Math.max(1, idealLoss);
@@ -1114,14 +1132,14 @@ function planUnreported(
   });
 
   // 2. Bootstrap: nothing carried → nothing to preserve; pure relevance solve.
-  if (!carriedNonEmpty && p.previous.size === 0) { diagBranch('bootstrap'); return adoptIdeal('bootstrap'); }
+  if (!carriedNonEmpty && p.previous.size === 0) { diagBranch('bootstrap', log); return adoptIdeal('bootstrap'); }
 
   // 3. Dead band with self-heal: hold the carried frontier only when it is
   //    feasible, in band, AND not certifiably misallocated.
   const carriedLoss = relevanceLoss(carried, ordered, p.rawZone, caps);
   const inBand = carriedTokens <= p.foldAtTokens && carriedTokens >= expandAt;
   if (inBand && carriedTokens <= p.windowTokens && carriedLoss - idealLoss <= gapCeiling) {
-    diagBranch(`hold (carried=${carriedTokens} band=[${expandAt},${p.foldAtTokens}])`);
+    diagBranch(`hold (carried=${carriedTokens} band=[${expandAt},${p.foldAtTokens}])`, log);
     return {
       resolutions: carried,
       tokens: carriedTokens,
@@ -1133,7 +1151,7 @@ function planUnreported(
 
   // 4. Within the trust region → adopt the ideal outright.
   const idealPert = kvCost(carriedLayout, idealLayout);
-  if (idealPert <= P) { diagBranch(`adopt-ideal (pert=${idealPert} <= P=${P})`); return adoptIdeal(); }
+  if (idealPert <= P) { diagBranch(`adopt-ideal (pert=${idealPert} <= P=${P})`, log); return adoptIdeal(); }
 
   // 5. Suffix adoption: the ideal's newest changes only, within P.
   const partial = suffixAdopt(
@@ -1149,8 +1167,8 @@ function planUnreported(
   const madeProgress =
     !mustShed || partial.tokens <= p.foldAtTokens || partial.perturbation > 0;
   if (partial.tokens <= p.windowTokens && partialLoss - idealLoss <= gapCeiling && madeProgress) {
-    diagBranch(`suffix-adopt (pert=${partial.perturbation} tokens=${partial.tokens})`);
-    diagHist('partial', partial.F, tree);
+    diagBranch(`suffix-adopt (pert=${partial.perturbation} tokens=${partial.tokens})`, log);
+    diagHist('partial', partial.F, tree, log);
     return {
       resolutions: partial.F,
       tokens: partial.tokens,
@@ -1172,7 +1190,7 @@ function planUnreported(
   }
 
   // Trust region priced out: feasibility or quality demands the ideal.
-  diagBranch(partial.tokens > p.windowTokens ? 'override:infeasible' : 'override:quality-gap');
+  diagBranch(partial.tokens > p.windowTokens ? 'override:infeasible' : 'override:quality-gap', log);
   return adoptIdeal(partial.tokens > p.windowTokens ? 'infeasible' : 'quality-gap');
 }
 

@@ -700,6 +700,32 @@ export interface RenderStats {
      *  'flat-profile'). Surfaces the policy actually in force — a config
      *  clobber that silently downgrades the solver is invisible without it. */
     solver?: string;
+    /** Messages in the strategy's view of the branch this compile read (after
+     *  the view filter, auxiliary slots included), before any folding. Logged
+     *  as `messages=`, so a compile time can be read against the history size
+     *  it covered. The new fields here are optional so a custom strategy's
+     *  stats still type-check. */
+    messages?: number;
+    /** Time in the base `AutobiographicalStrategy.select()` up to the
+     *  `[plan-vs-actual]` line, in whole ms: chunk rebuild, planning (the fold
+     *  solver) and emission. It excludes a subclass's own `select()` override
+     *  and the `ContextManager` work around the call; a host that wants the
+     *  whole compile times `compile()` itself. It includes a
+     *  `productionBudgetTokens` shadow pick, whose solve `solveMs` leaves out,
+     *  and after a provisional-calibration retry the refused first attempt.
+     *  Logged as `compileMs=`. */
+    compileMs?: number;
+    /** Under `foldingStrategy: 'kv-unified'` only: the forest build, solve and
+     *  latent-demand ranking of the compile's final pick inside `compileMs`,
+     *  in whole ms (`solveMs=`). */
+    solveMs?: number;
+    /** Set on a dry run or preview (`dryRun: true`, `previewContext`), which
+     *  skips work a live compile does; logged as `dryRun=true`. Absent on a
+     *  live compile. A caller reads a dry pass's stats only from
+     *  `previewContext(..., { render: true })`'s `stats`: `compile()` returns
+     *  no stats, and a dry pass leaves `getRenderStats()` describing the last
+     *  live compile. */
+    dryRun?: true;
     /** Which chunks moved between which levels, and where this request's
      *  entries first differ from those of the last request the strategy
      *  returned, past which no cached prefix reaches. Present only when a
@@ -732,8 +758,60 @@ export function isRenderStatsCapable(s: ContextStrategy): s is RenderStatsCapabl
  * Public quarantine status shape (health surfaces + the repeating alarm).
  */
 export interface CompressionQuarantineStatus {
+  /** Quarantine records: one per request shape a span exhausted, so a span can hold several. */
   count: number;
+  /** The records' keys, as `clearCompressionRefusalQuarantine()` takes them. */
   keys: string[];
+  /** The quarantined spans, each once however many records it holds, the longest waiting first. */
+  spans: CompressionQuarantineSpan[];
+  /**
+   * Present when the quarantine couldn't be read, such as when the store
+   * failed to return its ledger. `count`, `keys` and `spans` are then empty
+   * and say nothing about what's quarantined, and the alarm neither sounds
+   * its all-clear nor calls its handler until a read succeeds.
+   */
+  unreadable?: true;
+}
+
+/** One quarantined span: a chunk's messages, which stay raw while it's quarantined. */
+export interface CompressionQuarantineSpan {
+  /** The span's identity: the hash of its chunk's message ids. */
+  chunkSourceHash: string;
+  /** Its first and last message ids; null when no current chunk has this span. */
+  firstMessageId: string | null;
+  lastMessageId: string | null;
+  /**
+   * How long since its chunk closed, from the newest of its messages'
+   * timestamps: how long it has stayed raw. Null when unknown.
+   */
+  closedAgeMs: number | null;
+  /**
+   * When its earliest record was made (ms since the epoch): how long it has
+   * been refused, where `closedAgeMs` is how long it has stayed raw. The
+   * alarm line shows it as "refusing since". A re-cut chunk's records start
+   * over.
+   */
+  quarantinedAt: number;
+  /** Its quarantine records, one per request shape it exhausted. */
+  records: number;
+  /**
+   * Requests a provider answered for those records, none giving a summary:
+   * the canonical request and its no-tools and tools-less retries, and each
+   * fallback after them. A recall variant planned over the compression's
+   * context budget, recorded as `admission_rejected` and never sent, isn't
+   * counted, and neither is a rung its failures decided
+   * (`provider_error:persistent-<class>`), which no provider gave as an answer.
+   * A record an earlier version wrote holds one outcome for the whole
+   * canonical stage, so it counts that stage once.
+   */
+  answeredAttempts: number;
+  /**
+   * The newest record's last outcome, with its error type after a colon when
+   * it carries one (`refusal`, `incomplete`, `provider_error:invalid_request`,
+   * `admission_rejected`, or `provider_error:persistent-<class>` for a rung its
+   * failures decided); null when that record holds none.
+   */
+  latestOutcome: string | null;
 }
 
 /** Delimiter convention applied to recall answer content. See `recallEnvelope`. */
@@ -759,6 +837,19 @@ export interface KvUnifiedConfig {
     continuityRecencyFloor: number;
     continuityStableHalfLife: number;
     continuityStableFloor: number;
+    /**
+     * Bands per doubling the solver reads ages at (fidelity age in
+     * sequences, continuity recency in tokens, stability in turns): an age
+     * is priced at the lower edge of its band, so a leaf's weight changes
+     * only when it crosses a band edge instead of on every append. 4 unless
+     * set (a band is a factor of 2^(1/4) ≈ 1.19 wide; at most 64); 0 prices exact ages,
+     * which is what the solver itself does when the key is absent. Two
+     * continuity readings differ from the plain band rule whenever banding
+     * is on, whatever the count: recency is at its floor from eight
+     * half-lives out, and stability is 1 for the first half of a half-life
+     * after a move and then read at whole doublings of the turns since.
+     */
+    ageBandSteps?: number;
   };
   tokenBucketSize: number;
   continuityBucketSize: number;
@@ -776,6 +867,24 @@ export interface KvUnifiedConfig {
    * built from a recipe fills in `true`.
    */
   hysteresisCertificate?: boolean;
+  /**
+   * Which propagation engine solves the forest (see
+   * `docs/kv-unified-subtree-memo.md`). `auto` (absent): the
+   * subtree-memoized engine, run again on the packed DAG engine once if the
+   * subtree engine exceeds the label ceiling. `subtree` and `dag` pin one.
+   */
+  engine?: 'auto' | 'subtree' | 'dag';
+  /**
+   * How producible merges are measured against the live cut (see
+   * `KvUnifiedOptions.latentDemand.mode`). `joint` unless set to
+   * `individual`: one what-if solve with every candidate present, instead of
+   * two solves per candidate. The gain gating a demand is then the set's,
+   * measured once, and a compile with a merge backlog pays one extra solve.
+   * In either mode a merge in the merge quarantine is not a candidate: its
+   * request would be refused, and a joint cut that used it would hide the
+   * merge it would otherwise demand.
+   */
+  latentDemandMode?: 'individual' | 'joint';
 }
 
 export interface AutobiographicalConfig {
@@ -816,7 +925,10 @@ export interface AutobiographicalConfig {
    * memories (observed 2026-07-26: an inheriting resident's L1s
    * first-personing scenes from before his arrival). Chunks that straddle
    * the boundary use the standard instruction — the agent's own turns are
-   * present in them.
+   * present in them. Reading mode (a portion of a much larger message, or a
+   * merge of portions of one) keeps its own instructions, which have no
+   * witnessed variant, except that the split rung's pieces and a merge
+   * retried after a refusal take the witnessed one.
    */
   witnessedBeforeSequence?: number;
   /**
@@ -826,7 +938,7 @@ export interface AutobiographicalConfig {
    */
   witnessedInstruction?: string;
   /**
-   * Identity reminder appended to every compression and merge instruction
+   * Identity reminder appended to compression and merge instructions
    * (L1 chunk, reading-mode, and all merge variants). Whether a compression
    * request carries a system prompt is the HOST's call: with none declared
    * (StrategyContext.systemPrompt unset) it carries none and identity is
@@ -845,8 +957,60 @@ export interface AutobiographicalConfig {
    * <name>. Speak in the first person only for what you yourself said,
    * did, and felt; attribute other participants' words and experiences to
    * them by name."
+   *
+   * A wholly inherited target (see `witnessedBeforeSequence`) takes
+   * `witnessedIdentityReminder` instead, when that is set.
+   *
+   * For guidance the memory should follow without quoting it, end the
+   * reminder by asking for that, e.g. "Apply this guidance silently. Do not
+   * quote, restate, or recite it in the memory. Begin with the substantive
+   * record."
    */
   identityReminder?: string;
+  /**
+   * Identity reminder for WHOLLY inherited targets: an L1 chunk entirely
+   * before `witnessedBeforeSequence`, or a merge whose every source is
+   * witnessed. When set (a blank value counts as unset), those targets use
+   * it instead of `identityReminder`. Every other target keeps
+   * `identityReminder`, including a mixed one: a chunk that spans the pin,
+   * or a merge of inherited and lived sources. A mixed target's request
+   * shows inherited and lived material together under the live instruction
+   * and reminder, with no label saying which is which, so the live reminder
+   * (after a rename, the new name's) reaches the inherited material there.
+   * When the split rung (`compressionSplitFallback`) folds a chunk in
+   * pieces, every piece takes its chunk's reminder and its chunk's
+   * compression instruction (`getCompressionInstruction`, never the reading
+   * one), so a piece of a mixed chunk takes the live ones even when its own
+   * messages all predate the pin.
+   *
+   * The protection is opt-in. With only `identityReminder` set, it is
+   * appended, current name included, to wholly inherited targets too, so an
+   * inherited-history migration should set this explicitly.
+   *
+   * For residents whose Chronicle begins with reviewed inherited history,
+   * the inherited reminder can stay frozen (it was reviewed with the import)
+   * while the live one stays neutral and revisable by the resident.
+   *
+   * A wholly inherited reading-mode target (a portion of a much larger
+   * message, or a merge of portions of one) gets this reminder after the
+   * reading instruction, which has no witnessed variant: it asks the agent
+   * to speak in its own voice as the reader. The split rung's pieces and a
+   * merge retried after a refusal take the witnessed instruction instead of
+   * the reading one.
+   *
+   * The reminder follows the target whatever instruction it gets. An
+   * override of `getCompressionInstruction` or `getMergeInstruction` that
+   * doesn't read the pin, such as KnowledgeStrategy's phase prompts and
+   * merge instruction, gives a wholly inherited target its own instruction
+   * with this reminder. It doesn't reach a reading-mode chunk or merge,
+   * which takes `getReadingChunkInstruction` or `getReadingMergeInstruction`
+   * (though the split rung's pieces take `getCompressionInstruction`), or a
+   * merge retried after a refusal, which takes the base merge instruction,
+   * the witnessed one when every source is witnessed.
+   *
+   * Unset: every target uses `identityReminder` (unchanged behavior).
+   */
+  witnessedIdentityReminder?: string;
   /** Label shown before summaries in compiled context */
   summaryContextLabel?: string;
 
@@ -1072,6 +1236,23 @@ export interface AutobiographicalConfig {
    * (never silently retried in a loop, never canonized). Default: 5.
    */
   mergeAttemptLimit?: number;
+  /**
+   * Operator merge holds: summary ids that are never offered as merge
+   * sources (a held summary that hasn't merged stays on the frontier, and
+   * no summary above it forms). Held ids split the frontier into runs like
+   * a hole, so later history still merges around them. They still count as
+   * unmerged summaries: a held L1 toward `maxSpeculativeL1s`, and every
+   * held summary toward its level's `mergeThreshold`. The run of
+   * same-level summaries just before a held one can't grow past it, so it
+   * merges as a run between two summaries does, which can be at two, below
+   * `mergeThreshold`. Lifting a hold doesn't undo
+   * the merges formed around the summary: it can then
+   * merge only with an unmerged summary of its level beside it, and one
+   * with none beside it stays at its level. Sources of a merge quarantined
+   * after provider failures are held the same way while its group could be
+   * retried as it stands. Use for summaries awaiting review.
+   */
+  mergeHoldSummaryIds?: string[];
   /**
    * Store-topology policy. On every load the summary archive is audited for
    * crossed ownership: a summary whose leaves are not contiguous among the
@@ -1380,11 +1561,19 @@ export interface AutobiographicalConfig {
   toolUseInputMaxTokens?: number;
 
   /**
-   * Cap on the number of speculative L1 summaries the strategy will hold
-   * (queued + unmerged). When `count(unmerged L1s) + count(queued chunks)`
-   * exceeds this cap, `onNewMessage`'s auto-tick is held back. Chunks
-   * still form and queue, but compression is deferred until a manual
-   * `tick()` or `compile()` triggers it.
+   * Cap on the number of produced, unmerged L1 summaries. Past it, while an
+   * L1→L2 merge is queued and `hierarchical` is on, `tick` takes no chunk
+   * to compress into an L1, whether the background drain or a manual
+   * `tick()` calls it, and runs the merge, which brings the count back down.
+   * Production waits for that merge as long as the merge waits, such as on
+   * a compression hold over its sources. Chunks still form and queue, and
+   * queued chunks don't count toward the cap.
+   *
+   * With no L1 merge queued, the cap holds nothing. No merge forms below
+   * `mergeThreshold` unmerged L1s, so a cap below `mergeThreshold - 1` lets
+   * them rise to the threshold. Unmerged L1s that can never merge count
+   * toward the cap without holding production. Under `hierarchical: false`
+   * tick runs no merge, so the cap holds nothing.
    *
    * Default: undefined (no cap; compression fires eagerly on every
    * new message when `autoTickOnNewMessage` is true).

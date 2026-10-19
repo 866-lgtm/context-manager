@@ -1124,10 +1124,20 @@ describe('fold journal size', () => {
   });
 
   it('a delta rebuilds the next layout exactly, for random edits of members and units', () => {
+    // mulberry32. A linear congruential step computed in a double loses its
+    // low bits past 2^53, and `seed % n` then repeats a few values.
     let seed = 12345;
-    const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2 ** 31; return seed % n; };
+    const rand = (n: number) => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return Math.floor((((t ^ (t >>> 14)) >>> 0) / 4294967296) * n);
+    };
+    const distinct = new Set<string>();
+    const kinds = [0, 0, 0];
     const unit = (): LayoutUnit => {
       const k = rand(3);
+      kinds[k] = (kinds[k] ?? 0) + 1;
       if (k === 0) return { k: 'r', t: rand(4) };
       if (k === 1) return { k: 's', n: 1 + rand(4), sm: [[`s${rand(3)}`, 1, 'm', 0, rand(5)]] };
       return { k: 'o', n: 1 + rand(4) };
@@ -1139,17 +1149,30 @@ describe('fold journal size', () => {
       return { members, units };
     };
     let asserted = 0;
+    let spliced = 0;
     for (let round = 0; round < 2000; round++) {
       const prevUnits = Array.from({ length: rand(8) + 1 }, unit);
-      const nextUnits = rand(2) === 0 ? [...prevUnits.slice(0, rand(prevUnits.length + 1)), ...Array.from({ length: rand(4) }, unit), ...prevUnits.slice(rand(prevUnits.length))] : Array.from({ length: rand(8) + 1 }, unit);
+      const splice = rand(2) === 0;
+      if (splice) spliced++;
+      const nextUnits = splice ? [...prevUnits.slice(0, rand(prevUnits.length + 1)), ...Array.from({ length: rand(4) }, unit), ...prevUnits.slice(rand(prevUnits.length))] : Array.from({ length: rand(8) + 1 }, unit);
       const pool = Array.from({ length: 60 }, () => rand(200));
       const unique = [...new Set(pool)];
       const prev = layout(prevUnits, unique.filter(() => rand(4) > 0));
       const next = layout(nextUnits, unique.filter(() => rand(4) > 0));
       assert.deepEqual(applyLayoutDelta(prev, layoutDelta(prev, next)), next, `round ${round}`);
       asserted++;
+      distinct.add(JSON.stringify([prev, next]));
     }
     assert.equal(asserted, 2000, 'every pair of layouts has a delta');
+    assert.ok(distinct.size >= 1900, `${distinct.size} distinct pairs of layouts in 2000 rounds`);
+    // Each unit kind, and each way of building the next layout, has to come up
+    // a fair share of the time: distinct pairs alone would pass a generator
+    // that never drew one of them, since the member pools keep pairs apart.
+    const drawn = kinds[0]! + kinds[1]! + kinds[2]!;
+    for (const [i, kind] of ['r', 's', 'o'].entries()) {
+      assert.ok(kinds[i]! * 4 >= drawn, `${kinds[i]} of ${drawn} units are '${kind}'`);
+    }
+    assert.ok(spliced >= 800 && spliced <= 1200, `${spliced} of 2000 next layouts edit the previous one`);
 
     // A chain rebuilt in one pass equals the same deltas applied one at a time,
     // across chains that remove and re-add the same sequences.
@@ -1662,7 +1685,8 @@ describe('fold journal durability and index', () => {
         ({ cm } = await open(strategy));
         const receipt = await acceptCompile(cm);
         assert.equal(receipt?.kind, 'baseline', `${what}: a baseline`);
-        assert.ok(errors.some((e) => e.includes('is unreadable')), `${what}: and it is reported`);
+        // As this journal's branch's, naming its namespace (#239).
+        assert.ok(errors.some((e) => e.includes('is unreadable') && e.endsWith(' ns=agents/tester')), `${what}: and it is reported: ${errors.join('\n')}`);
         errors.length = 0;
       }
     } finally {
@@ -1730,7 +1754,8 @@ describe('fold journal durability and index', () => {
     console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
     try {
       assert.equal((await acceptCompile(cm))?.kind, 'baseline');
-      assert.ok(errors.some((e) => e.includes("its layout doesn't rebuild: null")), `reported: ${errors.join('\n')}`);
+      // About this journal's branch, so it names the journal's namespace (#239).
+      assert.ok(errors.some((e) => e.includes("its layout doesn't rebuild: null") && e.endsWith(' ns=agents/tester')), `reported: ${errors.join('\n')}`);
     } finally {
       console.error = error;
       cm.close();
@@ -1784,7 +1809,8 @@ describe('fold journal durability and index', () => {
     }
     assert.equal(receipt?.kind, 'baseline', 'the acceptance stands');
     assert.equal(layoutRecords(cm.getStore()).length, 1);
-    assert.ok(written.some((w) => w.includes('receipt listener failed: [object Object]')), `reported: ${written.join('')}`);
+    // Its line names the journal's namespace (#239).
+    assert.ok(written.some((w) => w.includes('receipt listener failed: [object Object] ns=agents/tester')), `reported: ${written.join('')}`);
     cm.close();
   });
 
@@ -1908,6 +1934,8 @@ describe('fold journal durability and index', () => {
         ({ cm } = await open(strategy));
         assert.equal((await acceptCompile(cm))?.kind, 'baseline', `${what}: a baseline`);
         assert.ok(errors.some((e) => /unreadable|treating the branch as unrecorded/.test(e)), `${what}: reported`);
+        // The fallback that treats this journal's branch as unrecorded names its namespace (#239).
+        assert.ok(errors.some((e) => e.includes('unrecorded') && e.endsWith(' ns=agents/tester')), `${what}: ${errors.join('\n')}`);
         errors.length = 0;
         // Another round compares with the baseline just written, and the
         // record that couldn't be read lends the branch no receipts.

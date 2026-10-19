@@ -64,6 +64,7 @@ import { randomUUID } from 'node:crypto';
 import type { JsStore } from '@animalabs/chronicle';
 import type { BranchRef, CompileProvenance, JournalMark, LayoutUnit, RenderedLayout } from './types/index.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
+import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
 
 export const STORE_IDENTITY_RECORD = 'context-manager/store-identity';
 export const ACCEPTED_LAYOUT_RECORD = 'context-manager/accepted-layout';
@@ -514,19 +515,23 @@ function readHead(store: JsStore, index: StoreIndex, id: string): RecordHead | n
   return head;
 }
 
-function warnUnreadable(index: StoreIndex, id: string, why: string): void {
-  warnRecord(index, id, `is unreadable (${why})`);
+function warnUnreadable(index: StoreIndex, id: string, why: string, log: Diagnostics = console): void {
+  warnRecord(index, id, `is unreadable (${why})`, log);
 }
 
-function warnRecord(index: StoreIndex, id: string, problem: string): void {
-  warnOnce(index, id, `[fold-journal] accepted-layout record ${id} ${problem}`);
+function warnRecord(index: StoreIndex, id: string, problem: string, log: Diagnostics = console): void {
+  warnOnce(index, id, `[fold-journal] accepted-layout record ${id} ${problem}`, log);
 }
 
-/** Report something once per store object, by key (a record's id, or a situation's). */
-function warnOnce(index: StoreIndex, key: string, message: string): void {
+/**
+ * Report something once per store object, by key (a record's id, or a
+ * situation's): through the journal's diagnostics when it's about one
+ * namespace's branch, and as it is when it's about the store's records (#239).
+ */
+function warnOnce(index: StoreIndex, key: string, message: string, log: Diagnostics = console): void {
   if (index.warned.has(key)) return;
   index.warned.add(key);
-  console.error(message);
+  log.error(message);
 }
 
 /** A record now the newest of its branch: its envelope says what came before. */
@@ -607,11 +612,15 @@ export class FoldJournal {
    *  that is ever asked, so this holds one id a branch, however long the
    *  history. An older receipt a retry finds may be heard again. */
   private readonly announced = new Map<string, string>();
+  /** stderr lines about this journal's namespace's receipts, each naming it (#239). */
+  private readonly diag: Diagnostics;
 
   constructor(
     private readonly store: JsStore,
     private readonly namespace: string,
-  ) {}
+  ) {
+    this.diag = namespaceDiagnostics(() => namespace);
+  }
 
   /**
    * Where the journal stands, for a compile to carry (see JournalMark).
@@ -829,7 +838,7 @@ export class FoldJournal {
       try {
         listener(receipt);
       } catch (err) {
-        logThrown('[fold-journal] receipt listener failed:', err);
+        logThrown('[fold-journal] receipt listener failed:', err, this.diag);
       }
     }
   }
@@ -1127,7 +1136,7 @@ export class FoldJournal {
     const cached = this.latest.get(key);
     if (cached && cached.recordId === id) return cached;
     if (!branch.newest.readable) {
-      warnUnreadable(index, id, `it is of another format; branch ${branch.ref.name} is treated as unrecorded`);
+      warnUnreadable(index, id, `it is of another format; branch ${branch.ref.name} is treated as unrecorded`, this.diag);
       return null;
     }
     if (branch.shadowedBy) {
@@ -1135,7 +1144,7 @@ export class FoldJournal {
       // branch's newest, so don't diff against what came before it.
       // Reported once, though each acceptance until its baseline lands
       // (one whose write fails, say) comes here again.
-      warnOnce(index, `shadowed ${id} ${branch.shadowedBy}`, `[fold-journal] branch ${branch.ref.name}'s newest readable record, ${id}, is older than unreadable record ${branch.shadowedBy}; treating the branch as unrecorded`);
+      warnOnce(index, `shadowed ${id} ${branch.shadowedBy}`, `[fold-journal] branch ${branch.ref.name}'s newest readable record, ${id}, is older than unreadable record ${branch.shadowedBy}; treating the branch as unrecorded`, this.diag);
       return null;
     }
     const record = readRecord<AcceptedLayoutRecord>(this.store, id);
@@ -1144,7 +1153,7 @@ export class FoldJournal {
       if (!isLayoutRecord(record)) throw new Error('it no longer reads as one');
       layout = this.reconstruct(record);
     } catch (err) {
-      warnUnreadable(index, id, `its layout doesn't rebuild: ${describeThrown(err)}; branch ${branch.ref.name} is treated as unrecorded`);
+      warnUnreadable(index, id, `its layout doesn't rebuild: ${describeThrown(err)}; branch ${branch.ref.name} is treated as unrecorded`, this.diag);
       return null;
     }
     const latest: LatestLayout = {
