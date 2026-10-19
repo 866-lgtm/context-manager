@@ -435,14 +435,20 @@ export class KvUnifiedStrategy implements FoldingSolver {
       }
       return score;
     };
-    const frame = (base: Feasible, pool: Feasible): [number, number] =>
-      [Math.min(base.cacheFloor, pool.cacheFloor), Math.min(base.continuityFloor, pool.continuityFloor)];
-    const gainOf = (base: Feasible, pool: Feasible): number => {
-      const [cacheFloor, continuityFloor] = frame(base, pool);
-      return best(base, cacheFloor, continuityFloor) - best(pool, cacheFloor, continuityFloor);
+    // One frame for the whole ranking, as the individual ranking has: the
+    // lowest floors any pool reached. A certified pool's floors are zero,
+    // and a frame that rose when such a pool was replaced would score the
+    // remaining pools from higher floors and report a smaller gain than the
+    // one the replacement was decided on.
+    let cacheFloor = Math.min(baseline.cacheFloor, joint.cacheFloor);
+    let continuityFloor = Math.min(baseline.continuityFloor, joint.continuityFloor);
+    const widen = (pool: Feasible): void => {
+      cacheFloor = Math.min(cacheFloor, pool.cacheFloor);
+      continuityFloor = Math.min(continuityFloor, pool.continuityFloor);
     };
     let base = baseline;
-    let gain = gainOf(base, joint);
+    const gainOf = (): number => best(base, cacheFloor, continuityFloor) - best(joint, cacheFloor, continuityFloor);
+    let gain = gainOf();
     // A certified what-if understates the gain by up to its maxImprovement.
     // When that interval spans the gate, solve again without the certificate
     // and keep the better pool (the certified pool is a real layout, so its
@@ -452,15 +458,12 @@ export class KvUnifiedStrategy implements FoldingSolver {
       if (joint.certificate && gain <= epsilon && gain + slack > epsilon) {
         const full = solveJoint({ ...this.options, hysteresisCertificate: false });
         if (full.feasible) {
-          // The two pools are compared in one frame, the lowest floors any of
-          // the three reached: a gain measured in each pool's own frame is
-          // not comparable, since the penalties are quadratic in the excess
-          // over the floor and a certified pool's floors are zero.
-          const cacheFloor = Math.min(base.cacheFloor, joint.cacheFloor, full.cacheFloor);
-          const continuityFloor = Math.min(base.continuityFloor, joint.continuityFloor, full.continuityFloor);
+          // The two pools are compared in the shared frame, which the new
+          // pool may lower; the frame never rises again.
+          widen(full);
           if (best(full, cacheFloor, continuityFloor) <= best(joint, cacheFloor, continuityFloor)) joint = full;
         }
-        gain = gainOf(base, joint);
+        gain = gainOf();
       }
     };
     settle();
@@ -475,8 +478,9 @@ export class KvUnifiedStrategy implements FoldingSolver {
       this.demandSolves++;
       const unrestricted = solver.solve({ ...this.options, maxTokens: budget.totalBudget, hysteresisCertificate: false });
       if (unrestricted.feasible) {
+        widen(unrestricted);
         base = unrestricted;
-        gain = gainOf(base, joint);
+        gain = gainOf();
       }
     }
     // The merges demanded are the ones the cut that supplies the gain uses:
@@ -486,7 +490,6 @@ export class KvUnifiedStrategy implements FoldingSolver {
     // forest, so a cut uses it exactly when it renders some leaf of its
     // sources at that level (a pinned or locked leaf under it is a hole the
     // cut renders through the children).
-    const [cacheFloor, continuityFloor] = frame(base, joint);
     const leafIds = inputs.chunks.map((chunk) => chunk.id);
     const frontier = (joint.bestUnder
       ? joint.bestUnder(cacheFloor, continuityFloor)
