@@ -94,3 +94,20 @@ test('a candidate whose lower bound equals the best upper bound is still evaluat
   assert.equal(result.selected.frontier.get('x'), 0);
   assert.deepEqual(result.selected, reference.selected);
 });
+
+test('exact scoring takes more candidates than a call takes as spread arguments', () => {
+  // A full terminal evaluation scores every terminal label, which only the
+  // label ceiling bounds: the forest from #231's regression test (52 L1 pairs
+  // under an L2 with a pinned hole, no buckets) leaves 205,320 of them. A call
+  // takes about 125,000 spread arguments on node 22 and 24, so the scorer's
+  // floors are taken in a loop (#255).
+  // Each floor is unique, non-zero and away from the first candidate, so a
+  // floor that never moved from its start, or read another field, fails.
+  const values = Array.from({ length: 200_000 }, (_, index) => row(index, index, 200_000 - index, Math.abs(index - 123_456) + 3));
+  assert.throws(() => Math.min(...values.map((value) => value.continuityLoss)), RangeError,
+    'premise: this runtime takes fewer spread arguments than there are candidates');
+  const result = new ExactKvUnifiedPolicySolver(inputs).scorePreparedCandidates(values, { maxTokens: 200 }, stats, true);
+  assert.equal(result.candidates.length, 200_000);
+  assert.equal(result.continuityFloor, 1);
+  assert.equal(result.cacheFloor, 3);
+});

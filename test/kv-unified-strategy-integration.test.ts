@@ -54,6 +54,30 @@ function receipts(strategy: AutobiographicalStrategy): KvUnifiedReceiptChain {
   return (strategy as unknown as { kvUnifiedReceipts: KvUnifiedReceiptChain }).kvUnifiedReceipts;
 }
 
+// #239: a superseded submission's line names the namespace it was logged for, after its fields, so
+// one process's strategies' lines can be told apart.
+test('a submission superseded before it settled is logged with its namespace', async (t) => {
+  const logged: string[] = [];
+  const original = console.error.bind(console);
+  t.mock.method(console, 'error', (...args: unknown[]) => {
+    const line = args.map(String).join(' ');
+    if (line.startsWith('[kv-unified]')) logged.push(line);
+    else original(...args);
+  });
+  const first = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: first, namespace: 'agents/wren' });
+  manager.addMessage('user', [{ type: 'text', text: 'hello continuity' }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  first.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  first.beginKvUnifiedSubmission({ submissionId: 's2', requestHash: 'wire2', layoutHash: 'layout1' });
+  assert.deepEqual(logged, [
+    '[kv-unified] submission s1 was never settled (no usage event before the next provider call); ' +
+      'superseded by s2 ns=agents/wren',
+  ]);
+  manager.close();
+});
+
 test('kv-unified presentation commits only after acceptance and survives restart', async () => {
   const first = strategy();
   const manager = await ContextManager.open({ path: STORE, strategy: first });
@@ -753,7 +777,8 @@ test('the plan-vs-actual line keeps its old prefix, and marks dry runs', async (
   assert.match(lines[0], shape);
   assert.doesNotMatch(lines[0], /dryRun/);
   assert.match(lines[1], shape);
-  assert.match(lines[1], / dryRun=true$/);
+  // Its namespace follows its fields (#239).
+  assert.match(lines[1], / dryRun=true ns=default$/);
   manager.close();
 });
 
@@ -796,8 +821,11 @@ async function planVsActualLines(fn: () => Promise<void>, quiet: string[] = []):
 const PVA_OPENING =
   String.raw`^\[plan-vs-actual\] planned=\d+ actual=\d+ delta=[+-]\d+ \([+-]\d+\.\d%\) budgetMet=(true|false) exhausted=(true|false)` +
   String.raw` moves=\d+`;
-/** The note that ends the line when the emitter overruns the plan. */
-const PVA_OVERRUN = String.raw`( \u2014 emitter overran the plan; .*)?$`;
+/**
+ * The note that ends the line's message when the emitter overruns the plan, then the namespace
+ * the line names, which follows its fields and the note (#239).
+ */
+const PVA_OVERRUN = String.raw`( \u2014 emitter overran the plan; .*)? ns=default$`;
 
 test('a kv-stable compile after a preview that solved with kv-unified logs no solveMs', async () => {
   // buildPicker's kv-stable branch leaves _lastKvUnified as the preview's pick

@@ -10,6 +10,7 @@
  * mock membrane; everything after picker.run is the production path.
  */
 
+import { withNamespace } from '../../src/diagnostics.js';
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, existsSync } from 'node:fs';
@@ -184,7 +185,7 @@ describe('AutobiographicalStrategy — [fold-diff] wiring', () => {
     const diff = stats(manager)?.planVsActual?.foldDiff;
     assert.ok(diff, 'foldDiff attached to planVsActual');
     assert.ok(diff.moves > 0 && diff.deepened === diff.moves, 'the fold plan deepened chunks');
-    assert.equal(formatFoldDiff(diff), lines[0], 'the attached record is the one logged');
+    assert.equal(withNamespace(formatFoldDiff(diff), 'default'), lines[0], 'the attached record is the one logged, naming its namespace (#239)');
     // The strategy's first compile has nothing earlier to compare with.
     assert.equal(diff.divergenceOffset, null);
     assert.equal(diff.suffixTokens, null);

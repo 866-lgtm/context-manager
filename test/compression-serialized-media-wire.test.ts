@@ -613,7 +613,7 @@ describe('transition request preparation', () => {
     // text: not the tool_result's, which the head's text never carries, nor
     // the third message's, past the cap.
     assert.deepEqual(lines.filter((l) => l.includes('[transition]')),
-      ['[autobiographical] compression prompt: replaced 3 serialized data URL(s) with markers [transition]']);
+      ['[autobiographical] compression prompt: replaced 3 serialized data URL(s) with markers [transition] ns=default']);
     const sent = requests.at(-1)!;
     for (const payload of ['T', 'V', 'U', 'R', 'W']) assert.ok(!sent.includes(payload.repeat(200)), `no ${payload} payload in the request`);
     cm.close();

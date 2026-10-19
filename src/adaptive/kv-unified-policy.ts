@@ -238,8 +238,15 @@ export class ExactKvUnifiedPolicySolver {
       // The exact feasibility witness must always survive the exact enumerator.
       throw new Error('kv-unified exact oracle produced no candidate under a feasible hard wall');
     }
-    const cacheFloor = Math.min(...unscored.map((candidate) => candidate.cacheChurn));
-    const continuityFloor = Math.min(...unscored.map((candidate) => candidate.continuityLoss));
+    // A loop, not a spread: a full terminal evaluation passes every terminal
+    // label, which only the label ceiling bounds, and a call takes about
+    // 125,000 spread arguments (#255).
+    let cacheFloor = Infinity;
+    let continuityFloor = Infinity;
+    for (const candidate of unscored) {
+      cacheFloor = Math.min(cacheFloor, candidate.cacheChurn);
+      continuityFloor = Math.min(continuityFloor, candidate.continuityLoss);
+    }
     const continuityMultiplier = normalizeContinuityMultiplier(options.continuityMultiplier);
     const matching = new Map<ExactPolicyCandidate, boolean | undefined>();
     const candidates: ExactPolicyCandidate[] = unscored.map((candidate) => {
