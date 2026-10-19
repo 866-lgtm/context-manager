@@ -21,6 +21,15 @@ import { KvUnifiedStrategy, type KvUnifiedReuse } from '../../src/adaptive/strat
 import { Picker } from '../../src/adaptive/picker.js';
 import { buildChronicleWithChain, MockChronicle } from './harness.js';
 
+/** Each engine that solves on a grid: the subtree engine `auto` runs, the
+ * packed DAG engine `auto` falls back to and `engine: 'dag'` pins, and the
+ * object DAG engine, the diagnostic reference (`storage: 'objects'`). */
+const GRID_ENGINES = [
+  { name: 'subtree', options: { engine: 'subtree' } },
+  { name: 'packed', options: { engine: 'dag' } },
+  { name: 'objects', options: { storage: 'objects' } },
+] as const;
+
 function fixture(): { chronicle: MockChronicle; inputs: PickerInputs } {
   const chronicle = buildChronicleWithChain({
     chunkCount: 4,
@@ -550,19 +559,63 @@ test('kv-unified a-posteriori bound covers exact welfare regret on varied small 
       },
     } as const;
     const exact = new ExactKvUnifiedPolicySolver(inputs).solve(options);
-    const approximate = new ParetoKvUnifiedPolicySolver(inputs).solve({
-      ...options,
-      tokenBucketSize: 80,
-      continuityBucketSize: 100,
-      fidelityBucketSize: 100,
-    });
     assert.equal(exact.feasible, true, `exact case ${caseIndex}`);
-    assert.equal(approximate.feasible, true, `approximate case ${caseIndex}`);
-    if (!exact.feasible || !approximate.feasible) continue;
-    const regret = approximate.selected.score - exact.selected.score;
-    const bound = approximate.propagation?.approximationScoreErrorBound ?? -1;
-    assert.ok(regret <= bound + 1e-9, `case ${caseIndex}: regret ${regret} > bound ${bound}`);
+    if (!exact.feasible) continue;
+    for (const engine of GRID_ENGINES) {
+      const approximate = new ParetoKvUnifiedPolicySolver(inputs).solve({
+        ...options,
+        ...engine.options,
+        tokenBucketSize: 80,
+        continuityBucketSize: 100,
+        fidelityBucketSize: 100,
+      });
+      assert.equal(approximate.feasible, true, `approximate case ${caseIndex} (${engine.name})`);
+      if (!approximate.feasible) continue;
+      const regret = approximate.selected.score - exact.selected.score;
+      const bound = approximate.propagation?.approximationScoreErrorBound ?? -1;
+      assert.ok(regret <= bound + 1e-9, `case ${caseIndex} (${engine.name}): regret ${regret} > bound ${bound}`);
+    }
   }
+});
+
+test('the DAG engines charge a dropped cut only to a representative with no more tokens (#254)', () => {
+  // Four 30-token leaves, two 55-token L1s and a 100-token L2, then an
+  // ownerless 100-token leaf, under a 210-token wall on a coarse grid. After
+  // the first four leaves the raw (120), L1 (110) and L2 (100) cuts share a
+  // bucket, where the raw cut is the best-fidelity representative and the L1
+  // cut is cheapest to stand in for by it. The last leaf takes the raw cut
+  // over the wall (220) where the L1 cut fits (210). Charged to the raw cut,
+  // the L1 cut's error left with it, and the surviving L2 cut carried none,
+  // so the bound read 0 beside the worse cut. The oracle's answer is the L1
+  // cut, and every engine's reported bound has to cover it.
+  const chronicle = new MockChronicle({ recallPairTokens: 55 });
+  for (let i = 0; i < 4; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 30 });
+  const a = chronicle.produceL1(['c0', 'c1']);
+  const b = chronicle.produceL1(['c2', 'c3']);
+  const parent = chronicle.produceUpper(2, [a.id, b.id]);
+  chronicle.recallPairTokens.set(parent.id, 100);
+  chronicle.addChunk({ id: 'last', rawTokens: 100 });
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const forest = new CanonicalSummaryForest(inputs);
+  const options = {
+    maxTokens: 210, tokenBucketSize: 200, continuityBucketSize: 100, fidelityBucketSize: 1000, labelCeiling: 100_000,
+    policy: { continuityLambda: 0, cacheLambda: 0, budgetUnderLambda: 0, budgetOverLambda: 0 },
+  };
+  const oracle = new ExactKvUnifiedPolicySolver(inputs, forest).solve(options);
+  assert.ok(oracle.feasible);
+  assert.equal(oracle.selected.frontier.get('c0'), 1, 'the oracle takes the L1 cut');
+  assert.equal(oracle.selected.renderedTokens, 210, 'which fits the wall exactly');
+  const over = GRID_ENGINES.flatMap((engine) => {
+    const result = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, ...engine.options });
+    assert.ok(result.feasible, engine.name);
+    const bound = result.propagation!.approximationScoreErrorBound;
+    return result.selected.score <= oracle.selected.score + bound + 1e-6 ? []
+      : [`${engine.name}: ${result.selected.score} vs oracle ${oracle.selected.score} + bound ${bound}`];
+  });
+  assert.deepEqual(over, [], 'every engine selects within its reported bound of the oracle');
 });
 
 test('kv-unified grid mode retains cache and continuity floor witnesses', () => {
