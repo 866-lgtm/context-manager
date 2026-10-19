@@ -1412,9 +1412,8 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
-  it('past the speculative cap, the run before a hole a retry will fill merges at two as a last resort, and tick takes no chunk there, the retry among them', async () => {
-    const mock = scripted([OK('unused')]);
-    const fx = await queued(mock.membrane);
+  it('past the speculative cap, the run before a hole a retry will fill still waits, and the cap holds no L1 production while no L1 merge is queued, so the retry comes', async () => {
+    const fx = await queued(scripted([OK('unused')]).membrane);
     for (let i = 8; i < 10; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
     const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
     const hole = fx.strategy.chunksView().find((chunk) => !chunk.compressed && chunk.messages[0]!.id === ids[4]);
@@ -1429,18 +1428,13 @@ describe('compression lane: failures are evidence only by the company they keep'
     (fx.strategy as unknown as { compressionFailureRuns: Map<string, { run: typeof run; chunkKey: string }> }).compressionFailureRuns
       .set('zz-subject', { run, chunkKey: hole!.messages.map((m) => m.id).join(':') });
     assert.equal(fx.strategy.mergeCandidates(unmerged, 4), null, 'premise: below the cap, the run waits for the retry');
-    const lane = fx.strategy as unknown as { config: { maxSpeculativeL1s?: number }; summaries: SummaryEntry[]; isAtSpeculativeCap(): boolean };
+    const lane = fx.strategy as unknown as {
+      config: { maxSpeculativeL1s?: number }; summaries: SummaryEntry[]; isAtSpeculativeCap(): boolean; speculativeCapHolds(): boolean;
+    };
     lane.config.maxSpeculativeL1s = lane.summaries.filter((s) => s.level === 1 && !s.mergedInto).length - 1;
     assert.ok(lane.isAtSpeculativeCap(), 'premise: the unmerged L1s are past the cap');
-    assert.deepEqual(fx.strategy.mergeCandidates(unmerged, 4)?.map((s) => s.id), ['L1-a', 'L1-b'],
-      'past the cap, with no other run eligible, the interior run merges, so the count can fall back under the cap and the retry run');
-    const queueBefore = fx.strategy.compressionQueueView();
-    assert.ok(queueBefore.length > 0, 'premise: chunks are queued');
-    await fx.strategy.tick(managerContext(fx.manager));
-    assert.deepEqual(fx.strategy.compressionQueueView(), queueBefore, 'tick took no chunk past the cap');
-    assert.equal(mock.calls.length, 0, 'and asked the model nothing');
-    assert.ok(fx.strategy.chunksView().some((chunk) => !chunk.compressed && chunk.messages[0]!.id === ids[4]),
-      'the chunk over the hole is still pending');
+    assert.equal(fx.strategy.mergeCandidates(unmerged, 4), null, 'past the cap, the run still waits for the retry rather than merging lopsided before it');
+    assert.equal(lane.speculativeCapHolds(), false, 'and with no L1 merge queued the cap holds no L1 production, so the retry comes');
     fx.manager.close();
   });
 
@@ -1464,11 +1458,11 @@ describe('compression lane: failures are evidence only by the company they keep'
     lane.config.maxSpeculativeL1s = lane.summaries.filter((s) => s.level === 1 && !s.mergedInto).length - 1;
     assert.ok(lane.isAtSpeculativeCap(), 'premise: the unmerged L1s are past the cap');
     assert.deepEqual(fx.strategy.mergeCandidates(unmerged, 4)?.map((s) => s.id), ['L1-c', 'L1-d', 'L1-e', 'L1-f'],
-      'the run at the threshold merges first; the waiting pair is only a last resort');
+      'the run at the threshold merges, and the pair before the hole waits for the retry');
     fx.manager.close();
   });
 
-  it('past the speculative cap, a waiting run above L1 keeps waiting, since the cap counts L1s alone', async () => {
+  it('past the speculative cap, a waiting run above L1 keeps waiting, as below it', async () => {
     const fx = await queued(scripted([OK('unused')]).membrane);
     for (let i = 8; i < 10; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
     const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
@@ -1494,7 +1488,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     const lane = fx.strategy as unknown as { config: { maxSpeculativeL1s?: number }; summaries: SummaryEntry[]; isAtSpeculativeCap(): boolean };
     lane.config.maxSpeculativeL1s = lane.summaries.filter((s) => s.level === 1 && !s.mergedInto).length - 1;
     assert.ok(lane.isAtSpeculativeCap(), 'premise: the unmerged L1s are past the cap');
-    assert.equal(fx.strategy.mergeCandidates(level2, 4), null, 'past the cap the L2 run still waits, since merging it relieves nothing');
+    assert.equal(fx.strategy.mergeCandidates(level2, 4), null, 'past the cap the L2 run still waits');
     fx.manager.close();
   });
 

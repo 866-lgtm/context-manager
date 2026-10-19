@@ -10320,27 +10320,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // waits too, rather than merging lopsided before the summary lands. Once
     // that work is decided (minted, or exhausted into quarantine), its hole
     // is filled or stranded for good, and the rule above applies. Past the
-    // speculative cap (more unmerged L1s than maxSpeculativeL1s) tick takes
-    // no chunk, the retry that would fill the hole among them, so only a
-    // merge can bring the count back under the cap. There a waiting L1 run
-    // merges at two as a last resort, when no run is eligible without that,
-    // so a run at the threshold after it still merges first. The cap counts
-    // L1s alone, so a waiting run of a higher level keeps waiting. Past the
-    // cap no L1 merge forms where fewer L1s outside a queued merge than the
-    // threshold remain, or where no L1 run before the newest holds two and
-    // the newest holds fewer than the threshold: compression then stops for
-    // good, unless something outside tick changes the count or the cap.
-    const pick = (lastResort: boolean): SummaryEntry[] | null => {
-      for (let i = 0; i < runs.length; i++) {
-        const r = runs[i]!;
-        const isNewest = i === runs.length - 1;
-        if (r.length >= threshold) return r.slice(0, threshold).map((x) => x.s);
-        const mayMerge = !waiting[i] || (lastResort && r[0]!.s.level === 1);
-        if (!isNewest && mayMerge && r.length >= 2) return r.slice(0, threshold).map((x) => x.s);
-      }
-      return null;
-    };
-    return pick(false) ?? (this.isAtSpeculativeCap() ? pick(true) : null);
+    // speculative cap the run waits as below it: the cap holds L1 production
+    // only while an L1 merge is queued to bring the count back down
+    // (speculativeCapHolds), so the retry that fills the hole comes once the
+    // count is back under the cap or no L1 merge is left queued.
+    for (let i = 0; i < runs.length; i++) {
+      const r = runs[i]!;
+      const isNewest = i === runs.length - 1;
+      if (r.length >= threshold) return r.slice(0, threshold).map((x) => x.s);
+      if (!isNewest && !waiting[i] && r.length >= 2) return r.slice(0, threshold).map((x) => x.s);
+    }
+    return null;
   }
 
   protected checkMergeThreshold(): void {
