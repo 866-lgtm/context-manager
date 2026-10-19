@@ -65,6 +65,12 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     return work !== null && 'chunk' in work ? work.chunk.messages.map((m) => m.id) : undefined;
   }
 
+  /** Whether the call for the chunk in flight has skipped it for the quarantine, or undefined when no chunk is in flight. */
+  chunkInFlightSkipped(): boolean | undefined {
+    const work = this.pendingCompressionWork;
+    return work !== null && 'chunk' in work ? work.skipped === true : undefined;
+  }
+
   /** Whether the chunk tick is compressing has landed its result (its compressed flag), or undefined when no chunk is in flight. */
   chunkInFlightCompressed(): boolean | undefined {
     const work = this.pendingCompressionWork;
@@ -131,6 +137,11 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
     this.config.minChunkCharsForLLM = chars;
   }
 
+  /** Sets compressionContextBudgetTokens, as a host restarted with another configuration does. */
+  setContextBudget(tokens: number): void {
+    this.config.compressionContextBudgetTokens = tokens;
+  }
+
   /** Sets the head window's size, as a host restarted with another configuration does. */
   setHeadWindowTokens(tokens: number): void {
     this.config.headWindowTokens = tokens;
@@ -168,6 +179,15 @@ class DiagnosticStrategy extends AutobiographicalStrategy {
   protected compressionWorkQueued(...args: Parameters<AutobiographicalStrategy['compressionWorkQueued']>): boolean {
     this.countedView = args[0];
     return super.compressionWorkQueued(...args);
+  }
+
+  /** Run the moment a call skips its chunk for the quarantine, before the call yields and tick's finally runs. */
+  onQuarantineSkipProbe: (() => void) | undefined;
+
+  protected override compressChunkHierarchical(...args: Parameters<AutobiographicalStrategy['compressChunkHierarchical']>): Promise<void> {
+    const [chunk, ctx, onSkip] = args;
+    const probe = this.onQuarantineSkipProbe;
+    return super.compressChunkHierarchical(chunk, ctx, probe ? () => { onSkip?.(); probe(); } : onSkip);
   }
 
   /** Whether a hierarchical refusal's count would name compression now, over the store view the last refusal read. */
@@ -1197,6 +1217,65 @@ describe('OverBudgetError.clearedBy', () => {
     return { strategy, calls, membrane, drive };
   };
 
+  it("names nothing for a quarantined chunk while tick's call yields after skipping it", async () => {
+    const { strategy, membrane, drive } = quarantining();
+    await withManager(strategy, async (manager) => {
+      const queued = await drive(manager);
+      // The count while tick's call yields after skipping the chunk, before tick's finally clears the
+      // work in flight: a timer set at the skip fires ahead of the hop, which tick schedules only once
+      // the call returns.
+      const seen: Array<{ inFlight: readonly string[] | undefined; skipped: boolean | undefined; counts: boolean }> = [];
+      strategy.onQuarantineSkipProbe = () => {
+        setTimeout(() => {
+          seen.push({ inFlight: strategy.chunkInFlight(), skipped: strategy.chunkInFlightSkipped(), counts: strategy.countsCompressionWork() });
+        }, 0);
+      };
+      await manager.tick();
+      strategy.onQuarantineSkipProbe = undefined;
+      assert.ok(seen.length >= 1, 'premise: tick took a chunk, which the quarantine skipped');
+      assert.deepEqual(seen[0]!.inFlight, queued[0], 'premise: the first chunk queued');
+      for (const [i, at] of seen.entries()) {
+        assert.deepEqual({ skipped: at.skipped, counts: at.counts }, { skipped: true, counts: false }, `skip ${i}: a chunk its call skipped frees no room while the call yields`);
+      }
+      assert.equal(strategy.chunkInFlight(), undefined, 'premise: the call has ended');
+      assert.equal(strategy.countsCompressionWork(), false, 'premise: with nothing in flight, the quarantined chunks queued count nothing');
+    }, { membrane });
+  });
+
+  it("names compression for a quarantined chunk whose call goes out, a new request family's fresh attempt, while the call runs", async () => {
+    const { strategy, drive } = quarantining();
+    // Refuses at once, as quarantining's membrane does, until `held` is set; then holds the call open.
+    let held: { reached: () => void; release?: () => void } | undefined;
+    const membrane = {
+      complete: async () => {
+        const at = held;
+        if (at) {
+          at.reached();
+          await new Promise<void>((resolve) => { at.release = resolve; });
+        }
+        return { content: [], stopReason: 'refusal', usage: { inputTokens: 100, outputTokens: 0 }, raw: { response: { stop_details: { category: 'reasoning_extraction' } } } };
+      },
+    } as unknown as Membrane;
+    await withManager(strategy, async (manager) => {
+      const queued = await drive(manager);
+      // A new context budget is a new request family, and the chunk's one quarantine record is under the shape
+      // cap, so tick's gate gives the chunk a fresh call, though the quarantine holds its source hash.
+      strategy.setContextBudget(123_456);
+      let reached!: () => void;
+      const out = new Promise<void>((resolve) => { reached = resolve; });
+      const hold: { reached: () => void; release?: () => void } = { reached };
+      held = hold;
+      const ticking = manager.tick();
+      await out;
+      assert.deepEqual(strategy.chunkInFlight(), queued[0], 'premise: tick took the quarantined chunk, and its call is out');
+      assert.equal(strategy.chunkInFlightSkipped(), false, "premise: its call wasn't skipped");
+      assert.equal(strategy.countsCompressionWork(), true, 'its call counts while it runs');
+      held = undefined;
+      hold.release!();
+      await ticking;
+    }, { membrane });
+  });
+
   for (const settle of ['adopts', 'stubs'] as const) {
     it(`names compression for quarantined chunks tick ${settle === 'adopts' ? 'adopts an exact L1 for' : 'stubs'} without a model call, before it reads the quarantine`, async () => {
       const { strategy, calls, membrane, drive } = quarantining();
@@ -1302,7 +1381,8 @@ describe('OverBudgetError.clearedBy', () => {
         // The premise: the host's loop ends at the first chunk, and tick never reaches the last.
         const summaries = strategy.summaryIds().length;
         await assert.rejects(hostTicks(manager, strategy), cause === 'no model' ? /compressionModel is NOT configured/ : /the quarantine ledger cannot be read/);
-        assert.deepEqual(strategy.queuedChunkIds(), queued.slice(1), 'tick took the first chunk only');
+        // A failure that didn't decide the chunk puts it back, behind the work that hasn't failed.
+        assert.deepEqual(strategy.queuedChunkIds(), [...queued.slice(1), queued[0]], 'tick took the first chunk only, and put it back behind the others');
         assert.equal(strategy.summaryIds().length, summaries, 'tick adopted nothing');
         assert.equal(calls.n, 0, 'no model call');
       }, { membrane: countingMembrane(calls) });
@@ -2491,7 +2571,8 @@ describe('OverBudgetError.clearedBy', () => {
       assert.deepEqual(strategy.queuedChunkIds(), queued, 'the compile queued the same chunks, in the same order');
       // The premise: tick takes the pinned chunk first, and the host's loop ends there.
       await assert.rejects(hostTicks(manager, strategy), /compressionModel is NOT configured/);
-      assert.deepEqual(strategy.queuedChunkIds(), queued.slice(1), 'tick took the first chunk only');
+      // A failure that didn't decide the chunk puts it back, behind the work that hasn't failed.
+      assert.deepEqual(strategy.queuedChunkIds(), [...queued.slice(1), queued[0]], 'tick took the first chunk only, and put it back behind the others');
       assert.equal(calls.n, 0, 'no model call');
     }, { membrane: countingMembrane(calls) });
   });
@@ -2740,7 +2821,7 @@ describe('OverBudgetError.clearedBy', () => {
   // model has answered. The chunk's landing is main's G1 test (compression-hold.test.ts).
   for (const hold of [false, true]) {
     it(hold
-      ? 'discards a merge\'s answer when a hold placed during its call reaches it: tick rejects, writes no L2 and keeps the merge at the head, and its next call makes no model call'
+      ? 'discards a merge\'s answer when a hold placed during its call reaches it: tick writes no L2 and keeps the merge at the head, and its next call makes no model call'
       : 'lands a merge whose call no hold reaches, writing its L2 and leaving the queue (the control)', async () => {
       const strategy = mergeOfTwo();
       let manager!: ContextManager;
@@ -2754,9 +2835,17 @@ describe('OverBudgetError.clearedBy', () => {
         strategy.queueMergeOf(['L1-c', 'L1-d']);
         const summaries = strategy.summaryIds().length;
         if (hold) {
-          await assert.rejects(manager.tick(), /discarded: a compression hold was placed on its span mid-request/);
+          // Nothing failed: tick keeps the answer out and returns, the merge still queued.
+          await manager.tick();
+          assert.equal(calls.n, 1, 'premise: tick asked the model once, and the hold reached its answer');
           assert.equal(strategy.summaryIds().length, summaries, 'no L2 is written');
           assert.equal(strategy.queuedMergeCount(), 1, 'the merge stays at the head');
+          const lane = strategy as unknown as { mergeFailureOrder: Map<string, number>; mergeFailureRuns: Map<string, unknown>; compressionPause: unknown };
+          assert.deepEqual(
+            { order: lane.mergeFailureOrder.size, runs: lane.mergeFailureRuns.size, pause: lane.compressionPause },
+            { order: 0, runs: 0, pause: null },
+            'and the discard counts no failure: no failure order, no failure run, no pause',
+          );
           await manager.tick();
           assert.equal(calls.n, 1, 'the next tick returns at the held head without a model call');
           manager.releaseCompression([ids[3]!]);

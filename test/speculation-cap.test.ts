@@ -235,12 +235,13 @@ describe('AutobiographicalStrategy — speculation cap does not deadlock (regres
 
     // Isolate the drain/cap gating from executeMerge's message-store coupling:
     // simulate a successful merge by marking the sources merged.
-    protected override async executeMerge(_level: any, sourceIds: string[]): Promise<void> {
+    protected override async executeMerge(_level: any, sourceIds: string[]): Promise<boolean> {
       this.mergeRuns++;
       for (const id of sourceIds) {
         const s = (this as any).summaries.find((x: SummaryEntry) => x.id === id);
         if (s) (s as any).mergedInto = 'L2-test';
       }
+      return true;
     }
   }
 
@@ -544,7 +545,7 @@ describe('AutobiographicalStrategy — drain progresses past flat-length ticks (
 
     // Each merge consolidates its sources AND (for the first few) enqueues a
     // follow-on merge — so the queue length nets out unchanged that tick.
-    protected override async executeMerge(_level: any, sourceIds: string[]): Promise<void> {
+    protected override async executeMerge(_level: any, sourceIds: string[]): Promise<boolean> {
       this.mergeRuns++;
       for (const id of sourceIds) {
         const s = (this as any).summaries.find((x: SummaryEntry) => x.id === id);
@@ -557,6 +558,7 @@ describe('AutobiographicalStrategy — drain progresses past flat-length ticks (
           .slice(0, 6).map((s: SummaryEntry) => s.id);
         if (fresh.length >= 2) this.qMerge(fresh);
       }
+      return true;
     }
   }
 
