@@ -1,7 +1,8 @@
 - kv-unified latent demand measures the producible merges jointly by
   default: one what-if solve with every candidate present at its
-  conservative recall cost, demanding the merges the selected cut uses when
-  that cut beats the live one by more than `adoptEpsilon`. A compile with a
+  conservative recall cost, demanding the merges the pool's best cut in the
+  frame it shares with the live solve uses, when that cut beats the live
+  one by more than `adoptEpsilon`. A compile with a
   merge backlog paid two full solves per candidate (up to 16 candidates,
   the multi-second compiles of #131); it now pays one extra solve, and the
   gain gating a demand is the set's, measured once, instead of per-candidate

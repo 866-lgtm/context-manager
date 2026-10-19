@@ -13,7 +13,7 @@ import {
   type ParetoPolicySolveResult,
   type ParetoSolveOptions,
 } from '../kv-unified-pareto.js';
-import { normalizeContinuityMultiplier, normalizePolicy, policyScore, type KvUnifiedWelfarePolicy } from '../kv-unified-policy.js';
+import { frontierSignature, normalizeContinuityMultiplier, normalizePolicy, policyScore, type KvUnifiedWelfarePolicy } from '../kv-unified-policy.js';
 
 import type { KvUnifiedReuse } from '../kv-unified-reuse.js';
 import type { SubtreeSolveStats } from '../kv-unified-subtree.js';
@@ -33,9 +33,11 @@ export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> 
      * each gain measured on its own, plus an expected-cost solve to order
      * the demanded ones (the v1 marginal rule of `unified-solve-design.md`
      * §8). `joint`: one what-if solve with every candidate present at its
-     * conservative cost; the merges the selected cut uses are demanded when
-     * that cut beats the live one by more than `adoptEpsilon`, in the order
-     * of their estimated token reduction. A compile with a merge backlog
+     * conservative cost; the merges the pool's best cut in the shared frame
+     * uses are demanded when that cut beats the live one by more than
+     * `adoptEpsilon`, in the order of their estimated token reduction (the
+     * hysteresis selection may be the carried layout kept within epsilon of
+     * that cut, and is not the cut read). A compile with a merge backlog
      * then pays one extra solve instead of two per candidate, and the gain
      * is the set's, measured once, instead of per-candidate differences at
      * the approximation's noise floor. The strategy built from a recipe
@@ -360,7 +362,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
 
   /** `latentDemand.mode: 'joint'`: every candidate enters one what-if forest
    * at its conservative cost, and one solve measures the set. The candidates
-   * the selected cut uses are demanded when that cut beats the live one by
+   * the pool's best cut in the shared frame uses are demanded when that cut beats the live one by
    * more than epsilon. The gain is scored in the frame both pools share, as
    * the individual ranking does, and the same certificate rules apply: a
    * certified what-if that cannot decide the gate is solved again without
@@ -384,6 +386,16 @@ export class KvUnifiedStrategy implements FoldingSolver {
       this.demandSolves++;
       return solveWithLatentCandidates(inputs, whatIf, conservative, options, budget.totalBudget);
     };
+    // A joint forest that exceeded the ceiling last compile, with the same
+    // candidate set and ceiling, would exceed it again: its holder says so,
+    // and is kept so that it still says so next compile.
+    const key = whatIfKey(conservative);
+    const ceiling = this.options.labelCeiling ?? Number.POSITIVE_INFINITY;
+    const remembered = whatIf.carried?.get(key);
+    if (remembered?.jointCeiling === ceiling) {
+      whatIf.kept?.set(key, remembered);
+      return this.rankIndividualLatentDemand(inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier);
+    }
     try {
       return this.rankJointPool(inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier, solveJoint);
     } catch (error) {
@@ -392,6 +404,8 @@ export class KvUnifiedStrategy implements FoldingSolver {
       // optional, so the compile goes on with the candidates one at a time
       // rather than failing on its account.
       if (!(error instanceof SparseLabelCeilingError)) throw error;
+      const holder = whatIf.kept?.get(key);
+      if (holder) holder.jointCeiling = ceiling;
       return this.rankIndividualLatentDemand(inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier);
     }
   }
@@ -433,26 +447,36 @@ export class KvUnifiedStrategy implements FoldingSolver {
     // When that interval spans the gate, solve again without the certificate
     // and keep the better pool (the certified pool is a real layout, so its
     // gain is a floor; the uncertified solve prunes and can come back worse).
-    // The gate moves when the base is replaced below, so this is asked again.
     const settle = (): void => {
       const slack = joint.certificate?.maxImprovement ?? 0;
       if (joint.certificate && gain <= epsilon && gain + slack > epsilon) {
         const full = solveJoint({ ...this.options, hysteresisCertificate: false });
-        if (full.feasible && gainOf(base, full) >= gain) joint = full;
+        if (full.feasible) {
+          // The two pools are compared in one frame, the lowest floors any of
+          // the three reached: a gain measured in each pool's own frame is
+          // not comparable, since the penalties are quadratic in the excess
+          // over the floor and a certified pool's floors are zero.
+          const cacheFloor = Math.min(base.cacheFloor, joint.cacheFloor, full.cacheFloor);
+          const continuityFloor = Math.min(base.continuityFloor, joint.continuityFloor, full.continuityFloor);
+          if (best(full, cacheFloor, continuityFloor) <= best(joint, cacheFloor, continuityFloor)) joint = full;
+        }
         gain = gainOf(base, joint);
       }
     };
     settle();
     // A certified base exposes only the carried layout and its extensions,
     // scored up to epsilon above the best cut; a passing gain is decided
-    // against the unrestricted base instead.
+    // against the unrestricted base instead. The joint pool is not
+    // certified here: a certified pool's best is within its slack (at most
+    // epsilon) of the carried layout, which the certified base scores the
+    // same, so its gain cannot have passed the gate. Nothing is left to
+    // settle after the base moves.
     if (gain > epsilon && baseline.certificate) {
       this.demandSolves++;
       const unrestricted = solver.solve({ ...this.options, maxTokens: budget.totalBudget, hysteresisCertificate: false });
       if (unrestricted.feasible) {
         base = unrestricted;
         gain = gainOf(base, joint);
-        settle();
       }
     }
     // The merges demanded are the ones the cut that supplies the gain uses:
@@ -463,11 +487,18 @@ export class KvUnifiedStrategy implements FoldingSolver {
     // sources at that level (a pinned or locked leaf under it is a hole the
     // cut renders through the children).
     const [cacheFloor, continuityFloor] = frame(base, joint);
+    const leafIds = inputs.chunks.map((chunk) => chunk.id);
     const frontier = (joint.bestUnder
       ? joint.bestUnder(cacheFloor, continuityFloor)
       : joint.candidates.reduce((winner, c) => {
           const value = policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss, cacheFloor, continuityFloor, policy, multiplier);
-          return value < winner.score ? { score: value, candidate: c } : winner;
+          if (value > winner.score) return winner;
+          if (value < winner.score) return { score: value, candidate: c };
+          // A tie breaks as the selection breaks one: tokens, then signature.
+          const tokens = c.renderedTokens - winner.candidate.renderedTokens;
+          const after = tokens > 0 || (tokens === 0 &&
+            frontierSignature(c.frontier, leafIds).localeCompare(frontierSignature(winner.candidate.frontier, leafIds)) >= 0);
+          return after ? winner : { score: value, candidate: c };
         }, { score: Infinity, candidate: joint.selected }).candidate
     ).frontier;
     const used = new Set(candidates.filter((candidate) => candidate.sourceIds.some((sourceId) =>
@@ -576,6 +607,11 @@ function latentHigherLevelCandidates(
     );
 }
 
+/** The holder key of a what-if over these candidates at these costs. */
+function whatIfKey(candidates: readonly { candidate: LatentCandidate; recallTokens: number }[]): string {
+  return candidates.map(({ candidate, recallTokens }) => `${candidate.id}\0${recallTokens}`).join('\n');
+}
+
 /** What a what-if solve may reuse: the live forest it extends, the holders
  * last compile's what-ifs left (`carried`) and the ones this compile keeps. */
 interface WhatIfReuse {
@@ -642,7 +678,7 @@ function solveWithLatentCandidates(
   // derived from last compile's what-if when only leaves were appended
   // since. The first what-if borrows unchanged nodes from the live
   // certificate graph.
-  const key = candidates.map(({ candidate, recallTokens }) => `${candidate.id}\0${recallTokens}`).join('\n');
+  const key = whatIfKey(candidates);
   // The what-if starts from a copy of the live memo: it reads the live
   // subtrees' sets and keeps its own candidates', and its copy goes with
   // the holder when the candidates are gone, instead of leaving every merge

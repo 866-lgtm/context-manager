@@ -983,7 +983,13 @@ Demand therefore has an explicit **latent-candidate layer**:
    occupancy band, welfare policy, and approximation configuration, evaluated with **the same bounded Pareto
    solver used for cut selection** (not a separate "exact" solve). v1
    marginal values are individual (one candidate at a time), not conditional
-   on a production set — a documented approximation. Each evaluation reports:
+   on a production set — a documented approximation. Since 2026-10 the
+   recipe default is the *joint* measurement (`latentDemandMode`, #229):
+   one what-if solve holds every candidate at its conservative cost, and
+   the merges demanded are the ones the pool's best cut, scored in the
+   frame it shares with the live solve, uses, when that cut beats the live
+   one by more than `adoptEpsilon`; `'individual'` restores the
+   per-candidate rule below. Each evaluation reports:
    exact vs approximate mode; bucket parameters; the estimated recall-cost
    distribution; the improvement at the point estimate; and a **conservative
    improvement used for ranking** — v1 rule: cost at an upper quantile

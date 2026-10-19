@@ -35,6 +35,28 @@ test('selective scoring refines the winner and carried contender, preserving the
   assert.ok(result.candidates.includes(result.selected));
 });
 
+test('bestUnder breaks a tie in the caller\'s frame on tokens then signature, not on the pool-frame score', () => {
+  // A = (fidelity 300, continuity 10, 100 tokens), B = (0, 20, 200 tokens),
+  // continuity lambda and scale 1. The pool's continuity floor is 10, so in
+  // the pool's frame B scores 100 to A's 300; under a caller's floor of 0
+  // both score 400, and the tie goes to A, the smaller cut, as the
+  // selection would break it.
+  const a: UnscoredCandidate = { ...row(0, 300, 10), renderedTokens: 100 };
+  const b: UnscoredCandidate = { ...row(1, 0, 20), renderedTokens: 200 };
+  const options: ExactPolicySolveOptions = { maxTokens: 400, policy: { continuityScale: 1, continuityLambda: 1, cacheLambda: 0 } };
+  for (const order of [[a, b], [b, a]]) {
+    const result = scoreBoundedCandidates(order.map((value) => bounds(value, new Set())), options, stats, false, ['x']);
+    assert.equal(result.continuityFloor, 10);
+    assert.equal(result.selected, result.candidates.find((c) => c.renderedTokens === 200), 'premise: B wins in the pool frame');
+    assert.ok(result.bestUnder, 'the hooks are present');
+    assert.equal(result.bestScoreUnder(0, 0), 400);
+    assert.equal(result.bestUnder(0, 0).renderedTokens, 100, 'the tie goes to the smaller cut');
+    const reference = new ExactKvUnifiedPolicySolver(inputs).scorePreparedCandidates(order, options, stats, false);
+    assert.equal(reference.bestUnder!(0, 0).renderedTokens, 100, 'the exact scorer agrees');
+    assert.equal(reference.bestScoreUnder!(0, 0), 400);
+  }
+});
+
 test('a welfare loser still establishes an exact normalization floor', () => {
   const values = [row(0, 10, 10, 5), row(1, 12, 4, 8), row(2, 10000, 2, 0)];
   const refined = new Set<UnscoredCandidate>();

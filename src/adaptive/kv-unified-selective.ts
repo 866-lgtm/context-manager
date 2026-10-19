@@ -1,7 +1,7 @@
 import type { ChunkId } from './folding-strategy.js';
 import type { ExactCutEnumerationStats } from './kv-unified.js';
 import {
-  comparePolicyCandidates, normalizeContinuityMultiplier, normalizePolicy, policyScore,
+  comparePolicyCandidates, frontierSignature, normalizeContinuityMultiplier, normalizePolicy, policyScore,
   type ExactPolicyCandidate, type ExactPolicySolveOptions, type ExactPolicySolveResult, type UnscoredCandidate, withBestScoreUnder } from './kv-unified-policy.js';
 
 export interface MetricInterval { readonly lower: number; readonly upper: number }
@@ -131,9 +131,18 @@ export function scoreBoundedCandidates(source: readonly BoundedPolicyCandidate[]
       policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss, kf, cf, policy, multiplier);
     let best = -1;
     let bestScore = Infinity;
+    // A tie in the caller's frame breaks as the selection breaks one: fewer
+    // rendered tokens, then the frontier signature. (The pool-frame score
+    // the candidates carry is not a tie-breaker here: it can order two
+    // caller-frame ties the other way.)
+    const beats = (i: number, j: number): boolean => {
+      const a = refine(i), b = refine(j);
+      return a.renderedTokens < b.renderedTokens || (a.renderedTokens === b.renderedTokens &&
+        frontierSignature(a.frontier, leafIds).localeCompare(frontierSignature(b.frontier, leafIds)) < 0);
+    };
     const consider = (i: number): void => {
       const value = exactScore(refine(i));
-      if (value < bestScore || (value === bestScore && best >= 0 && comparePolicyCandidates(score(i), score(best), leafIds) < 0)) {
+      if (value < bestScore || (value === bestScore && best >= 0 && beats(i, best))) {
         best = i; bestScore = value;
       }
     };
