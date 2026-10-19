@@ -652,7 +652,9 @@ function jointFailureSignature(inputs: PickerInputs, options: KvUnifiedOptions, 
   }
   for (const summary of inputs.summaries.values()) {
     str(summary.id); num(summary.level); num(summary.tokens); num(inputs.recallPairTokens?.get(summary.id));
-    str(getSummaryParentId(summary)); str(summary.sourceRange.first); str(summary.sourceRange.last); num(summary.sourceIds.length);
+    str(getSummaryParentId(summary)); str(summary.sourceRange.first); str(summary.sourceRange.last); num(summary.sourceLevel);
+    num(summary.sourceIds.length);
+    for (const sourceId of summary.sourceIds) str(sourceId);
   }
   const presentation = options.presentation;
   num(presentation ? 1 : 0);
