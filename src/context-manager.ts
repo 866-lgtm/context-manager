@@ -4,6 +4,9 @@ import type {
   MessageId,
   Sequence,
   MessageMetadata,
+  AddMessageOptions,
+  CompressionHoldOptions,
+  CompressionHoldInfo,
   StoredMessage,
   ContextEntry,
   TokenBudget,
@@ -41,14 +44,31 @@ import {
   isRenderStatsCapable,
   isHotConfigurableStrategy,
 } from './types/index.js';
+import { isStateExistsFor } from './state-registration.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
+import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
 import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.js';
 import type { StoreBranchGeneration } from './branch-generation.js';
+import { randomUUID } from 'node:crypto';
+import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
+import { FoldJournal, branchRefOf } from './fold-journal.js';
+import { describeThrown, logThrown } from './describe-thrown.js';
+import type { FoldQuery, FoldQueryResult, FoldReceipt, Presentation, ReceiptSource, RoundUsage } from './fold-journal.js';
+import type {
+  BranchRef,
+  CompiledMessageSources,
+  CompileProvenance,
+  MessageStoreView,
+  RenderedLayout,
+  RenderedSummaryInfo,
+} from './types/index.js';
+
+type InitializationStamp = StoreBranchGeneration & { id: string; attempt: number };
 
 /**
  * Base configuration for ContextManager.
@@ -77,6 +97,11 @@ interface ContextManagerBaseConfig {
    * When true, log the compiled context to stderr for debugging.
    */
   debugLogContext?: boolean;
+  /**
+   * Clock for compression-hold timeouts (ms). Defaults to Date.now; tests
+   * inject a fake clock.
+   */
+  now?: () => number;
   /**
    * Strategy-facing exclusion predicate: return true to keep a message
    * visible. When set, the view handed to the strategy — for compile,
@@ -148,10 +173,55 @@ interface ContextManagerStoreConfig extends ContextManagerBaseConfig {
 export type ContextManagerConfig = ContextManagerPathConfig | ContextManagerStoreConfig;
 
 /**
+ * Rejection of a strategy initialization that a newer one superseded.
+ *
+ * From switchBranch() or fork(), the call's branch selection, and a fork's
+ * branch creation, had already happened: `branch` names the branch, and
+ * `created` says whether this call created it. A caller never needs to retry
+ * a fork to learn whether it happened. From setStrategy(), `branch` is
+ * undefined.
+ */
+export class InitializationSupersededError extends Error {
+  readonly branch: string | undefined;
+  readonly created: boolean;
+
+  constructor(selection?: { branch: string; created: boolean }) {
+    super(
+      selection
+        ? `ContextManager.${selection.created ? 'fork created and selected' : 'switchBranch selected'} ` +
+          `branch "${selection.branch}", but its strategy initialization was superseded by a newer initialization`
+        : 'Strategy initialization was superseded by a newer initialization',
+    );
+    this.name = 'InitializationSupersededError';
+    this.branch = selection?.branch;
+    this.created = selection?.created ?? false;
+  }
+}
+
+/**
  * Context Manager - the main interface for managing conversation context.
  *
  * Sits between the application/agent layer and Membrane, managing what goes
  * into the context window. Uses Chronicle for persistent storage.
+ *
+ * Mutations and strategy operations require a completed initialization attempt.
+ * Pending or failed attempts refuse that work. They also refuse the
+ * strategy-state queries, whose answers could then belong to another branch or
+ * be partial: isReady, getPendingWork, getHotContextSettings, previewContext,
+ * listPins, searchSummaries, getSummary, getSummariesInRange,
+ * getMaxSummaryLevel and getRenderStats. Raw message reads and branch
+ * inspection remain available for recovery with switchBranch() or
+ * setStrategy(). So do compression holds (holdCompression,
+ * releaseCompression) and request settings (setToolDefinitions,
+ * setSystemPrompt): they live in memory, and the strategy hears of a released
+ * hold only once an attempt succeeds.
+ *
+ * The fence governs operations that start while an attempt is pending or
+ * failed. Work already in flight when a transition begins, and a superseded
+ * initializer's own writes before it returns, are the strategy's to guard;
+ * transitions do not roll back earlier writes. Direct Chronicle switches retain
+ * their existing strategy-specific semantics; this fence does not pin a manager
+ * to a branch.
  */
 export class ContextManager {
   private store: JsStore;
@@ -159,7 +229,8 @@ export class ContextManager {
   private contextLog: ContextLog;
   private strategy: ContextStrategy;
   private membrane?: Membrane;
-  private initialized = false;
+  private initializationAttempt = 0;
+  private initializedAttempt: number | null = null;
   /** Whether we own the store (created it) vs app owns it (passed in) */
   private ownsStore: boolean;
   private debugLogContext: boolean;
@@ -167,8 +238,27 @@ export class ContextManager {
   private strategyNamespace: string;
   /** Strategy-facing exclusion predicate (see ContextManagerBaseConfig.viewFilter). */
   private viewFilter?: (message: StoredMessage) => boolean;
+  /**
+   * Compression holds (see holdCompression). Transient by design: never
+   * persisted, so a restart can never leave compression permanently stalled.
+   */
+  private compressionHolds = new Set<MessageId>();
+  /** Summaries the strategy rendered but couldn't describe, already reported. */
+  private undescribedSummariesReported = new Set<string>();
+  /** Sharded adds held on ingress: first-shard id -> every shard id. */
+  private compressionHoldGroups = new Map<MessageId, MessageId[]>();
+  /** heldAt / expiresAt per held id (expiresAt absent = no timeout). */
+  private compressionHoldInfo = new Map<MessageId, CompressionHoldInfo>();
+  private now: () => number = Date.now;
+  /** Hold options + shared heldAt for the addMessage currently appending. */
+  private holdingAddOptions: CompressionHoldOptions | undefined;
+  private holdingAddAt = 0;
+  /** Set while addMessage(..., { holdCompression: true }) appends. */
+  private holdingAdds: MessageId[] | null = null;
   /** Read-only auxiliary stores merged into the strategy-facing view. */
   private auxiliaryStores: MessageStore[];
+  /** Fold receipts for this manager's namespace (see fold-journal.ts). */
+  private foldJournal: FoldJournal;
 
   private constructor(
     store: JsStore,
@@ -192,6 +282,7 @@ export class ContextManager {
     this.debugLogContext = debugLogContext;
     this.viewFilter = viewFilter;
     this.auxiliaryStores = auxiliaryStores;
+    this.foldJournal = new FoldJournal(store, strategyNamespace);
 
     // Set up edit propagation
     this.messageStore.addListener((event) => this.handleMessageStoreEvent(event));
@@ -205,14 +296,24 @@ export class ContextManager {
    * filter sees (and can exclude from) the merged world.
    */
   private strategyMessageView() {
-    let view = mergeMessageStoreViews(
-      this.messageStore.createView(),
-      this.auxiliaryStores.map((s) => s.createView()),
-    );
+    let view = this.mergedMessageView();
     if (this.viewFilter) {
       view = filterMessageStoreView(view, this.viewFilter);
     }
+    // Live predicate (strategies capture views across long drains). Every
+    // view built above is a fresh object, so this never leaks into a store.
+    const holds = this.compressionHolds;
+    view.isCompressionHeld = (id: MessageId) => holds.has(id);
+    view.hasCompressionHolds = () => holds.size > 0;
     return view;
+  }
+
+  /** This manager's messages merged with its auxiliary slots, before the view filter. */
+  private mergedMessageView(): MessageStoreView {
+    return mergeMessageStoreViews(
+      this.messageStore.createView(),
+      this.auxiliaryStores.map((s) => s.createView()),
+    );
   }
 
   /**
@@ -244,16 +345,37 @@ export class ContextManager {
       throw new Error('ContextManagerConfig must have either "path" or "store"');
     }
 
+    // Opening can fail from here on: a registration Chronicle refuses, a
+    // configuration error, or a strategy that refuses the store (e.g.
+    // StoreTopologyError). A store we opened must not stay locked behind a
+    // rejected promise: release it, then rethrow.
+    try {
+      return await ContextManager.openOn(store, ownsStore, config);
+    } catch (error) {
+      if (ownsStore) {
+        try { store.close(); } catch { /* the open error is the one to report */ }
+      }
+      throw error;
+    }
+  }
+
+  private static async openOn(
+    store: JsStore,
+    ownsStore: boolean,
+    config: ContextManagerConfig,
+  ): Promise<ContextManager> {
     // Namespace for messages: only when `isolate` is true
     if (config.isolate && !config.namespace) {
       throw new Error('ContextManagerConfig: "isolate" requires "namespace" to be set');
     }
     const messageNamespace = config.isolate ? config.namespace : undefined;
 
-    // Register states if needed (idempotent)
+    // Register states if needed. A slot that already exists is kept; any
+    // other registration failure propagates (see isStateExistsFor).
     try {
       MessageStore.register(store, messageNamespace);
-    } catch {
+    } catch (error) {
+      if (!isStateExistsFor(error, MessageStore.registrationFor(messageNamespace).id)) throw error;
       // State already registered. Registrations persist in the store, so
       // on existing stores the snapshot cadence stays pinned to whatever
       // the FIRST registration said — retune it to the current constants
@@ -282,8 +404,8 @@ export class ContextManager {
 
     try {
       ContextLog.register(store, config.namespace);
-    } catch {
-      // State already registered
+    } catch (error) {
+      if (!isStateExistsFor(error, ContextLog.stateIdFor(config.namespace))) throw error;
     }
 
     const messageStore = new MessageStore(store, {
@@ -318,8 +440,8 @@ export class ContextManager {
       seenAuxSlots.add(slotId);
       try {
         MessageStore.register(store, aux.namespace);
-      } catch {
-        /* already registered */
+      } catch (error) {
+        if (!isStateExistsFor(error, slotId)) throw error;
       }
       return [new MessageStore(store, {
         estimator: config.tokenEstimator,
@@ -344,12 +466,9 @@ export class ContextManager {
       config.viewFilter,
       auxiliaryStores,
     );
+    if (config.now) manager.now = config.now;
 
-    // Initialize strategy
-    const openingBranch = observeStoreBranch(store);
-    await manager.initializeStrategy(openingBranch);
-    manager.initialized = true;
-
+    await manager.initializeStrategy();
     return manager;
   }
 
@@ -364,13 +483,55 @@ export class ContextManager {
    * a non-null sharding decision, the message is stored as multiple records
    * sharing a `bodyGroupId` (per the adaptive-resolution design §3.6). The
    * returned MessageId is the first shard's id.
+   *
+   * `options.holdCompression` places a compression hold (see
+   * holdCompression) on the new message BEFORE the strategy's onNewMessage
+   * fires, so not even the ingress chunk rebuild can fold it. Release it
+   * with releaseCompression([returnedId]) (releases every shard).
    */
   addMessage(
     participant: string,
     content: ContentBlock[],
     metadata?: MessageMetadata,
+    causedBy?: MessageId[],
+    options?: AddMessageOptions
+  ): MessageId {
+    // First, so a message refused here changes nothing: no hold expires, no
+    // hold is placed, and the strategy's ingress chunking never reads it.
+    // What a write mends is mended here, so the strategy chunks what is
+    // stored (well-formed-content.ts). A shard of that chunking is checked
+    // later (appendMessage), once expired holds have been released, as at
+    // any add.
+    content = contentForWrite(content, 'Message refused');
+    this.expireCompressionHolds();
+    if (!options?.holdCompression) {
+      return this.appendMessage(participant, content, metadata, causedBy);
+    }
+    const holdOptions = options.holdCompression === true ? {} : options.holdCompression;
+    this.validateHoldOptions(holdOptions);
+    const held: MessageId[] = [];
+    this.holdingAdds = held;
+    this.holdingAddOptions = holdOptions;
+    // One clock read per add: every shard shares heldAt and expiresAt.
+    this.holdingAddAt = this.now();
+    let id: MessageId;
+    try {
+      id = this.appendMessage(participant, content, metadata, causedBy);
+    } finally {
+      this.holdingAdds = null;
+      this.holdingAddOptions = undefined;
+    }
+    if (held.length > 1) this.compressionHoldGroups.set(id, held);
+    return id;
+  }
+
+  private appendMessage(
+    participant: string,
+    content: ContentBlock[],
+    metadata?: MessageMetadata,
     causedBy?: MessageId[]
   ): MessageId {
+    this.requireInitialized('addMessage');
     // Optional strategy-driven ingestion-time chunking
     const strategyAny = this.strategy as unknown as {
       chunkIngressMessage?: (
@@ -381,19 +542,78 @@ export class ContextManager {
     if (typeof strategyAny.chunkIngressMessage === 'function') {
       const decision = strategyAny.chunkIngressMessage(participant, content);
       if (decision && decision.shards.length > 1) {
-        let firstId: MessageId | null = null;
-        for (const shard of decision.shards) {
-          const message = this.messageStore.append(
-            participant,
-            shard.content,
-            metadata,
-            causedBy,
-            {
-              bodyGroupId: decision.bodyGroupId,
-              shardIndex: shard.shardIndex,
-            }
+        // Every shard declares its group's size, so a group an interrupted
+        // write left short reads as partial, not whole (compile provenance).
+        // That needs indices exactly 0..n-1: refuse anything else before
+        // writing a shard.
+        const shardCount = decision.shards.length;
+        const indices = new Set(decision.shards.map((s) => s.shardIndex));
+        if (indices.size !== shardCount || ![...indices].every((i) => Number.isInteger(i) && i >= 0 && i < shardCount)) {
+          throw new Error(
+            `chunkIngressMessage returned shard indices ${JSON.stringify(decision.shards.map((s) => s.shardIndex))}; ` +
+              `a group of ${shardCount} shards needs each index 0..${shardCount - 1} exactly once`,
           );
-          if (firstId === null) firstId = message.id;
+        }
+        // Shards are written in index order, so the id returned (the first
+        // written) is shard 0's: the body's identity in compile provenance.
+        const ordered = [...decision.shards].sort((a, b) => a.shardIndex - b.shardIndex);
+        // A shard that doesn't match is refused before any shard is stored,
+        // as the message was: the store's own refusal would meet it only once
+        // the shards before it were stored. The error names the shard, since
+        // the message as given was refused by nothing.
+        for (const shard of decision.shards) {
+          const places = malformedContentPlaces(shard.content);
+          if (places.length > 0) {
+            throw new MalformedContentError(`Shard ${shard.shardIndex} of the message, as the strategy chunked it, refused`, places);
+          }
+        }
+        let firstId: MessageId | null = null;
+        const lengthBefore = this.messageStore.length();
+        // These appends must stay synchronous: one body's shards in one loop, in
+        // shard order, with no await between them. The body-runs rule (body-runs.ts)
+        // reads a body as consecutive messages of one group id whose shard indices
+        // rise, so a body's shards must land together: a message appended between
+        // them would split the body. Nothing in context-manager appends a message
+        // anywhere but here and below, so nothing of its own can. A host's
+        // onMessage listener runs inside each append, and its contract rules out
+        // adding a message from there synchronously.
+        try {
+          for (const shard of ordered) {
+            const message = this.messageStore.append(
+              participant,
+              shard.content,
+              metadata,
+              causedBy,
+              {
+                bodyGroupId: decision.bodyGroupId,
+                shardIndex: shard.shardIndex,
+                shardCount,
+              }
+            );
+            if (firstId === null) firstId = message.id;
+          }
+        } catch (err) {
+          // A write that fails partway leaves no part of the body in the
+          // store: remove what it wrote (the failing shard too, if it
+          // landed), so a retry writes one body. If that fails as well, the
+          // shards may stay, and shardCount marks the body short. The first
+          // shard's own append can throw after it landed: then it's the
+          // store's last. Nothing here replaces the write's own error.
+          let landed = firstId;
+          try {
+            if (landed === null && this.messageStore.length() > lengthBefore) {
+              const last = this.messageStore.getTail(1)[0];
+              if (last?.bodyGroupId === decision.bodyGroupId) landed = last.id;
+            }
+            if (landed !== null) this.messageStore.removeBodyGroup(landed);
+          } catch (removal) {
+            console.error(
+              `[context-manager] a sharded addMessage failed partway, and removing what it wrote threw, so body group ` +
+                `${decision.bodyGroupId}${landed !== null ? ` (first shard ${landed})` : ''} may be left short: ` +
+                describeThrown(removal),
+            );
+          }
+          throw err;
         }
         return firstId!;
       }
@@ -404,16 +624,186 @@ export class ContextManager {
 
   /**
    * Edit a message in the store. Propagates to context log based on source relation.
+   *
+   * Edits do not reach `derived` entries and do not notify the strategy: a
+   * summary already built from the old content keeps it. To replace content
+   * that must reach compressed memory, hold the message (holdCompression /
+   * addMessage `holdCompression`) until after the edit.
    */
   editMessage(messageId: MessageId, content: ContentBlock[]): void {
+    this.requireInitialized('editMessage');
     this.messageStore.edit(messageId, content);
     // Propagation handled by event listener
+  }
+
+  // ==========================================================================
+  // Compression holds
+  // ==========================================================================
+
+  /**
+   * Keep messages out of compression until released.
+   *
+   * While any message is held, strategies that compress (Autobiographical and
+   * subclasses) treat the earliest held message as the start of the protected
+   * recent window: it, everything after it, and the tool_use it answers stay
+   * raw and are never cut into a compressible chunk. History before it
+   * compresses normally. Rendering is unaffected apart from that longer raw
+   * tail.
+   *
+   * Intended for content that is provisional and will be replaced with
+   * editMessage (e.g. a tool_result staged with a placeholder): edits never
+   * reach `derived` context entries or summaries, so an edit is only safe
+   * while the message is held — edit first, then release.
+   *
+   * Holds are in-memory only and are not persisted; a reopened manager starts
+   * with none. Unknown ids are ignored. Removing a message drops its hold.
+   * A hold that is never released stalls compression of everything after it,
+   * so callers must release on every settle path — or pass `timeoutMs`.
+   *
+   * `options.timeoutMs`: the hold is released automatically once it has been
+   * in place that long (checked lazily on tick(), compile() and hold queries;
+   * no timer is armed). Expiry releases exactly like releaseCompression —
+   * the strategy is notified — and logs a warning naming the ids and how
+   * long they were held. Without `timeoutMs` a hold never expires.
+   *
+   * Deadlines are per message id. One call (or one sharded addMessage) reads
+   * the clock once, so every id it holds shares one deadline; expiry releases
+   * only the ids whose own deadline passed (it never expands to a shard
+   * group, unlike an explicit releaseCompression of the add's id).
+   *
+   * Re-holding an already-held id REPLACES its hold: `heldAt` resets to now
+   * and the new options apply — a timeout restarts (refresh/extend/shorten),
+   * and re-holding without `timeoutMs` makes it indefinite.
+   */
+  holdCompression(messageIds: Iterable<MessageId>, options?: CompressionHoldOptions): void {
+    this.validateHoldOptions(options);
+    const heldAt = this.now(); // one deadline per call
+    for (const id of messageIds) {
+      if (this.messageStore.get(id)) this.placeHold(id, options, heldAt);
+    }
+  }
+
+  private validateHoldOptions(options?: CompressionHoldOptions): void {
+    const t = options?.timeoutMs;
+    if (t !== undefined && !(Number.isFinite(t) && t > 0)) {
+      throw new Error(`holdCompression: timeoutMs must be a positive finite number (got ${t})`);
+    }
+  }
+
+  private placeHold(id: MessageId, options: CompressionHoldOptions | undefined, heldAt: number): void {
+    this.compressionHolds.add(id);
+    this.compressionHoldInfo.set(id, options?.timeoutMs !== undefined
+      ? { heldAt, expiresAt: heldAt + options.timeoutMs }
+      : { heldAt });
+  }
+
+  /**
+   * Release holds whose timeout has passed (lazy; called from tick, compile
+   * and hold queries). Also drops bookkeeping for holds removed elsewhere.
+   */
+  private expireCompressionHolds(): void {
+    if (this.compressionHoldInfo.size === 0) return;
+    const now = this.now();
+    const expired: Array<{ id: MessageId; heldFor: number }> = [];
+    for (const [id, info] of this.compressionHoldInfo) {
+      if (!this.compressionHolds.has(id)) { this.compressionHoldInfo.delete(id); continue; }
+      if (info.expiresAt !== undefined && now >= info.expiresAt) {
+        expired.push({ id, heldFor: now - info.heldAt });
+      }
+    }
+    if (expired.length === 0) return;
+    console.warn(
+      `[context-manager] compression hold timeout: releasing ${expired.length} hold(s) — ` +
+        expired.map((e) => `${e.id} (held ${e.heldFor}ms)`).join(', '),
+    );
+    // Per-id deadlines: release exactly the expired ids. Unlike an explicit
+    // releaseCompression of a sharded add's id, this does NOT expand to the
+    // whole shard group — a shard whose hold was re-placed (extended) keeps
+    // it. Shards of one add share a deadline, so they expire together.
+    for (const { id } of expired) {
+      this.compressionHolds.delete(id);
+      this.compressionHoldInfo.delete(id);
+    }
+    for (const [key, members] of [...this.compressionHoldGroups]) {
+      if (!members.some((mid) => this.compressionHolds.has(mid))) this.compressionHoldGroups.delete(key);
+    }
+    this.notifyHoldsReleased();
+  }
+
+  /**
+   * Release compression holds. Idempotent; unknown ids are ignored. Releasing
+   * the id returned by a sharded addMessage releases every shard. Releasing
+   * notifies the strategy (onCompressionHoldsReleased), which re-queues the
+   * deferred chunks so the next tick — or the auto-tick drain — compresses
+   * the now-final content.
+   */
+  releaseCompression(messageIds: Iterable<MessageId>): void {
+    const before = this.compressionHolds.size;
+    for (const id of messageIds) {
+      const group = this.compressionHoldGroups.get(id);
+      if (group) {
+        for (const member of group) {
+          this.compressionHolds.delete(member);
+          this.compressionHoldInfo.delete(member);
+        }
+        this.compressionHoldGroups.delete(id);
+      }
+      this.compressionHolds.delete(id);
+      this.compressionHoldInfo.delete(id);
+    }
+    if (this.compressionHolds.size !== before) this.notifyHoldsReleased();
+  }
+
+  /** Set when a hold went away while the strategy was (re)initializing. */
+  private holdReleaseNotifyPending = false;
+
+  /**
+   * Tell the strategy holds went away (release or removal) so it re-queues
+   * deferred work. Never throws into the caller (a settle path); while the
+   * strategy is initializing, the notification is deferred until it is
+   * ready rather than dropped.
+   */
+  private notifyHoldsReleased(): void {
+    if (!this.strategy.onCompressionHoldsReleased) return;
+    if (this.initializedAttempt !== this.initializationAttempt) {
+      this.holdReleaseNotifyPending = true;
+      return;
+    }
+    this.holdReleaseNotifyPending = false;
+    try {
+      this.strategy.onCompressionHoldsReleased(this.createStrategyContext());
+    } catch (err) {
+      // Holds are already gone; the strategy's next rebuild (addMessage,
+      // compile) re-queues the work.
+      console.error('Strategy onCompressionHoldsReleased failed:', err);
+    }
+  }
+
+  /** Currently held message ids (snapshot; expired timed holds released first). */
+  getCompressionHolds(): ReadonlySet<MessageId> {
+    this.expireCompressionHolds();
+    return new Set(this.compressionHolds);
+  }
+
+  /**
+   * Currently held message ids with `heldAt` and, for timed holds,
+   * `expiresAt` (snapshot; expired timed holds released first).
+   */
+  getCompressionHoldDetails(): ReadonlyMap<MessageId, CompressionHoldInfo> {
+    this.expireCompressionHolds();
+    const out = new Map<MessageId, CompressionHoldInfo>();
+    for (const id of this.compressionHolds) {
+      const info = this.compressionHoldInfo.get(id);
+      out.set(id, info ? { ...info } : { heldAt: 0 });
+    }
+    return out;
   }
 
   /**
    * Remove a message from the store. Propagates to context log.
    */
   removeMessage(messageId: MessageId): void {
+    this.requireInitialized('removeMessage');
     this.messageStore.remove(messageId);
     // Propagation handled by event listener
   }
@@ -422,6 +812,7 @@ export class ContextManager {
    * Remove a range of messages from the store.
    */
   removeMessages(fromId: MessageId, toId: MessageId): void {
+    this.requireInitialized('removeMessages');
     this.messageStore.removeRange(fromId, toId);
     // Propagation handled by event listener
   }
@@ -467,9 +858,28 @@ export class ContextManager {
    * Subscribe to message-store mutations (add/edit/remove/removeRange).
    * Returns a detacher. Unlike trace events, this fires for ALL stored
    * messages including assistant turns and tool results.
+   *
+   * A listener runs synchronously inside the write that emitted its event,
+   * so it can run while a sharded addMessage is still storing that body's
+   * remaining shards. It must not add a message synchronously: one added there
+   * would land between a body's shards and split the body (body-runs.ts).
+   * Add it after the call returns (a microtask or later) instead. A listener
+   * that throws is logged, naming the message it missed, and the write it
+   * heard stands: the throw doesn't reach the caller. Each call registers
+   * its own listener and returns its own unsubscribe, so a function
+   * registered twice hears each event twice.
    */
   onMessage(listener: MessageStoreListener): () => void {
-    return this.messageStore.addListener(listener);
+    // A host's listener observes; its throw isn't the write's failure. The
+    // manager's own listener (the context log's propagation) stays outside
+    // this, so a failure there still fails the write as before.
+    return this.messageStore.addListener((event) => {
+      try {
+        listener(event);
+      } catch (err) {
+        logThrown(`[context-manager] an onMessage listener threw on a '${event.type}' event for ${describeStoreEvent(event)}; the write stands:`, err);
+      }
+    });
   }
 
   /**
@@ -565,6 +975,7 @@ export class ContextManager {
    * on JsBranch is an internal identifier and isn't accepted by switchBranch.)
    */
   branchAt(messageId: MessageId, name?: string): string {
+    this.requireInitialized('branchAt');
     const message = this.messageStore.get(messageId);
     if (!message) {
       throw new Error(`Message not found: ${messageId}`);
@@ -589,11 +1000,22 @@ export class ContextManager {
    * stored on Chronicle is reloaded. Strategies that hold derived in-memory
    * caches (e.g. AutobiographicalStrategy.summaries) need this to avoid
    * showing the previous branch's state on the new branch.
+   *
+   * Transitions are nontransactional: if initialization rejects, the selected
+   * branch and any initialization writes remain. Inspect currentBranch();
+   * mutations and strategy operations stay blocked until a successful
+   * switchBranch() or setStrategy(). Inspection and close remain available.
+   * If a newer initialization supersedes this one, the call rejects with
+   * InitializationSupersededError naming the branch it selected.
    */
   async switchBranch(branchId: string): Promise<void> {
-    this.store.switchBranch(branchId);
+    await this.selectBranch(branchId, false);
+  }
+
+  private async selectBranch(name: string, created: boolean): Promise<void> {
+    this.store.switchBranch(name);
     const requested = markStoreBranchSwitch(this.store);
-    await this.initializeStrategy(requested);
+    await this.initializeStrategy(requested, { branch: requested.name, created });
   }
 
   /**
@@ -608,14 +1030,20 @@ export class ContextManager {
    * `branchAt(messageId, name?)` instead, then `switchBranch(name)`.
    *
    * Returns the new branch's name. The strategy is re-initialized on the
-   * new branch so it picks up the forked state.
+   * new branch so it picks up the forked state. If initialization rejects,
+   * the new branch remains present and selected unless another operation
+   * switches it. The same recovery contract as switchBranch() applies. If a
+   * newer initialization supersedes this one, the call rejects with
+   * InitializationSupersededError naming the branch it created, so a caller
+   * never retries a fork to learn whether it happened.
    */
   async fork(name?: string): Promise<string> {
+    this.requireInitialized('fork');
     const branchName = name ?? `fork-${Date.now()}`;
     const currentBranch = this.store.currentBranch();
     const currentSeq = this.store.currentSequence();
     const branch = this.store.createBranchAt(branchName, currentBranch.name, currentSeq);
-    await this.switchBranch(branch.name);
+    await this.selectBranch(branch.name, true);
     return branch.name;
   }
 
@@ -656,6 +1084,7 @@ export class ContextManager {
    * Check if compile() will block waiting for background work.
    */
   isReady(): boolean {
+    this.requireInitialized('isReady');
     return this.strategy.checkReadiness().ready;
   }
 
@@ -663,6 +1092,7 @@ export class ContextManager {
    * Get info about pending background work.
    */
   getPendingWork(): PendingWork | null {
+    this.requireInitialized('getPendingWork');
     const state = this.strategy.checkReadiness();
     if (state.ready) {
       return null;
@@ -680,8 +1110,10 @@ export class ContextManager {
    * Accepts optional context injections (e.g., from MCPL servers) and merges
    * them into the compiled output by position:
    * - "system": returned separately in `systemInjections` (caller appends to system prompt)
-   * - "beforeUser": inserted before the last user message
-   * - "afterUser": inserted after the last user message
+   * - "beforeUser": inserted before the last user message, or, when the
+   *   messages hold none, at the end, ahead of any "afterUser" injections
+   * - "afterUser": inserted after the last user message, or at the end when
+   *   the messages hold none
    *
    * May block if strategy has pending work.
    */
@@ -690,6 +1122,8 @@ export class ContextManager {
     injections?: ContextInjection[],
     opts?: SelectOptions
   ): Promise<CompileResult> {
+    this.requireInitialized('compile');
+    this.expireCompressionHolds();
     // Don't block the agent's turn on speculative compression — let it
     // run in the background. The strategy renders whatever's available
     // now; the next compile picks up the freshly-formed L1.
@@ -709,14 +1143,29 @@ export class ContextManager {
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     const _t0 = _diag ? Date.now() : 0;
 
+    // The branch and view this compile reads; provenance binds to both.
+    const branch = branchRefOf(this.store);
+    const view = this.strategyMessageView();
+
     // Get selected entries from strategy
     const entries = this.strategy.select(
-      this.strategyMessageView(),
+      view,
       this.contextLog.createView(),
       effectiveBudget,
       opts
     );
+    const selectionCause = this.strategy.takeSelectionCause?.();
     if (_diag) console.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
+
+    const viewMessages = view.getAll();
+    // Raw bodies are judged as stored: the view filter can hide a shard of a
+    // body from the strategy, but the body's identity (shard 0, the id
+    // addMessage returned) and its membership are the stored group's. The
+    // layout stays on the filtered view the strategy rendered. Attribution
+    // reads only around the messages the raw entries name.
+    const storedView = this.viewFilter ? this.mergedMessageView() : view;
+    const storedMessages = this.viewFilter ? storedView.getAll() : viewMessages;
+    const attribution = attributeEntries(entries, storedMessages, (id) => storedView.get(id)?.sequence);
 
     // Convert to NormalizedMessage[]. We split each entry individually
     // so we know the output-count per input and can re-attach cache
@@ -727,8 +1176,11 @@ export class ContextManager {
     // non-user message containing `tool_result` blocks becomes a sequence
     // of agent/user/agent turns so the API accepts it. Already-API-shape
     // messages pass through untouched. See `src/normalize-tool-messages.ts`.
+    // Every part of a split entry carries that entry's sources.
     const messages: NormalizedMessage[] = [];
-    for (const entry of entries) {
+    const messageSources: CompiledMessageSources[] = [];
+    for (let e = 0; e < entries.length; e++) {
+      const entry = entries[e]!;
       const splitParts = splitMixedToolMessages([
         { participant: entry.participant, content: entry.content },
       ]);
@@ -740,14 +1192,30 @@ export class ContextManager {
           content: part.content,
           ...(entry.cacheMarker && isLast ? { cacheBreakpoint: true } : {}),
         });
+        messageSources.push(attribution.sources[e]!);
       }
     }
 
-    // If no injections, log and return early
-    if (!injections || injections.length === 0) {
-      const result: CompileResult = { messages, systemInjections: [] };
+    const finish = (result: CompileResult, injected: ContentBlock[][]): CompileResult => {
+      result.rawBodies = rawBodiesOf(attribution);
+      const layout = this.renderedLayoutFor(viewMessages, entries, attribution.rawComplete, injected, selectionCause);
+      result.provenance = {
+        compileId: randomUUID(),
+        namespace: this.strategyNamespace,
+        branch,
+        messages: messageSources,
+        layout,
+        strategy: this.strategy.name,
+        // Only a layout is ever accepted, so only then ask where the journal stands.
+        ...(layout ? { journalMark: this.foldJournal.mark() } : {}),
+      };
       if (this.debugLogContext) this.logCompiledContext(result);
       return result;
+    };
+
+    // If no injections, log and return early
+    if (!injections || injections.length === 0) {
+      return finish({ messages, systemInjections: [] }, []);
     }
 
     // Separate injections by position
@@ -778,18 +1246,28 @@ export class ContextManager {
       }
     }
 
-    // Insert beforeUser injections before last user message
-    if (beforeUser.length > 0 && lastUserIdx >= 0) {
+    const injectedContent: ContentBlock[][] = [];
+    const injectionSources = (list: ContextInjection[]): CompiledMessageSources[] =>
+      list.map((inj) => ({ kind: 'injection', namespace: inj.namespace }));
+
+    // Insert beforeUser injections before the last user message. Messages
+    // with none take them at the end, as afterUser's fallback below does, so
+    // afterUser's land after them.
+    if (beforeUser.length > 0) {
+      const insertIdx = lastUserIdx >= 0 ? lastUserIdx : messages.length;
       const injectedMessages: NormalizedMessage[] = beforeUser.map((inj) => ({
         participant: `system_context:${inj.namespace}`,
         content: inj.content,
       }));
-      messages.splice(lastUserIdx, 0, ...injectedMessages);
+      messages.splice(insertIdx, 0, ...injectedMessages);
+      messageSources.splice(insertIdx, 0, ...injectionSources(beforeUser));
+      injectedContent.push(...beforeUser.map((inj) => inj.content));
       // Adjust lastUserIdx to account for inserted messages
-      lastUserIdx += injectedMessages.length;
+      if (lastUserIdx >= 0) lastUserIdx += injectedMessages.length;
     }
 
-    // Insert afterUser injections after last user message
+    // Insert afterUser injections after the last user message. Messages with
+    // none take them at the end, after the beforeUser injections placed there.
     if (afterUser.length > 0) {
       const insertIdx = lastUserIdx >= 0 ? lastUserIdx + 1 : messages.length;
       const injectedMessages: NormalizedMessage[] = afterUser.map((inj) => ({
@@ -797,11 +1275,156 @@ export class ContextManager {
         content: inj.content,
       }));
       messages.splice(insertIdx, 0, ...injectedMessages);
+      messageSources.splice(insertIdx, 0, ...injectionSources(afterUser));
+      injectedContent.push(...afterUser.map((inj) => inj.content));
     }
 
-    const result: CompileResult = { messages, systemInjections };
-    if (this.debugLogContext) this.logCompiledContext(result);
-    return result;
+    return finish({ messages, systemInjections }, injectedContent);
+  }
+
+  /**
+   * The rendered layout of one compile, or null when the strategy does not
+   * report its layout, or names a summary it cannot describe (a layout that
+   * would read covered history as omitted is worse than none).
+   */
+  private renderedLayoutFor(
+    viewMessages: StoredMessage[],
+    entries: ContextEntry[],
+    rawComplete: ReadonlyMap<MessageId, boolean>,
+    injected: ContentBlock[][],
+    cause: string | undefined,
+  ): RenderedLayout | null {
+    if (!this.strategy.renderedForms) return null;
+    const summaryIds = new Set<string>();
+    for (const entry of entries) for (const s of entry.summaries ?? []) summaryIds.add(s.id);
+    const summaryInfo = summaryIds.size > 0
+      ? this.strategy.describeRenderedSummaries?.([...summaryIds]) ?? new Map<string, RenderedSummaryInfo>()
+      : new Map<string, RenderedSummaryInfo>();
+    const undescribed = [...summaryIds].filter((id) => !summaryInfo.has(id));
+    if (undescribed.length > 0) {
+      const fresh = undescribed.filter((id) => !this.undescribedSummariesReported.has(id));
+      if (fresh.length > 0) {
+        for (const id of fresh) this.undescribedSummariesReported.add(id);
+        console.warn(
+          `[context-manager] ${this.strategy.name} rendered summaries it cannot describe ` +
+          `(${fresh.slice(0, 5).join(', ')}${fresh.length > 5 ? ', …' : ''}); ` +
+          'no rendered layout is reported for a compile that renders them',
+        );
+      }
+      return null;
+    }
+    // Estimators are store-level: the strategy view's estimates and its
+    // calibration are this store's (auxiliary slots delegate to it). Layouts
+    // keep base estimates, taken before the calibration multiplier and its
+    // per-block rounding, so identical content costs the same in every
+    // compile whatever the calibration was.
+    const calibration = this.messageStore.getTokenCalibration();
+    const factor = Number.isFinite(calibration) && calibration > 0 ? calibration : 1;
+    const estimateBase = (content: ContentBlock[]): number => this.messageStore.estimateBaseTokens(content);
+    let extraTokens = 0;
+    for (const content of injected) extraTokens += estimateBase(content);
+    return buildRenderedLayout({
+      view: viewMessages,
+      entries,
+      rawComplete,
+      summaryInfo,
+      estimateBase,
+      extraTokens,
+      calibration: factor,
+      cause,
+    });
+  }
+
+  // ==========================================================================
+  // Accepted rounds and fold receipts
+  // ==========================================================================
+
+  /**
+   * Accept a compile whose provider round succeeded. Call once a round that
+   * carried `provenance`'s messages has stood. A compile is accepted once:
+   * repeat calls (later rounds of the same compile, or a retry after an
+   * uncertain failure, from this manager or another of its namespace on the
+   * store, before or after a reopen) are no-ops. Compares the compile's
+   * rendered layout with the last layout accepted on the compile's own branch
+   * in its namespace, by any manager of it on the store — even when another
+   * branch is selected by now — and appends a fold receipt when any message
+   * changed form, or a baseline when that branch has no record it can read.
+   * `usage` is the confirming round's own usage as the provider reported it;
+   * leave a field undefined when it was not reported. `presentation` is how
+   * that round carried the compile, as its producer reported (`verbatim`,
+   * `altered`, or `unknown`, the default); receipts record it beside the
+   * layout, which is the compile's.
+   *
+   * Returns the receipt, or null: no change, or a compile with no layout to
+   * record (`provenance.layout` is null): a strategy that doesn't report its
+   * layout, or one that rendered a summary it can't describe, reported once
+   * per summary. Nothing is recorded for such a compile, so the next one
+   * accepted is compared with the last layout recorded before it, and its
+   * receipt carries the changes of both rounds. A compile accepted before
+   * returns what that acceptance returned, its receipt or null, so a retry
+   * after an uncertain failure learns the outcome, and a receipt can come
+   * back again (key on its id and compileId: a receipt lost to Chronicle's
+   * rot exception can have its id go to a later receipt). A provenance of
+   * another namespace is refused with an error, and so is one whose branch
+   * this store doesn't know, live or recorded in this namespace, such as
+   * another store's: accept a compile on the manager that compiled it. So is
+   * a layout whose shape changed after compile returned it: members out of
+   * order, unit counts that aren't positive whole numbers adding up to the
+   * members, or not one id for each member.
+   */
+  acceptRound(args: {
+    provenance: CompileProvenance;
+    acceptedAt?: number;
+    usage?: RoundUsage;
+    presentation?: Presentation;
+  }): FoldReceipt | null {
+    return this.foldJournal.accept(args.provenance, args.acceptedAt ?? Date.now(), args.usage, args.presentation);
+  }
+
+  /**
+   * Fold receipts of one branch (default: the selected one): newest first,
+   * or, with `afterId`, oldest first from just after it, so a reader can page
+   * forward; `more` says whether the query matched more than it returned.
+   */
+  listFoldReceipts(query?: FoldQuery): FoldQueryResult {
+    return this.foldJournal.query(query);
+  }
+
+  /**
+   * Be told of fold receipts, each once it is durable: every receipt this
+   * manager's `acceptRound` returns, and, at its next acceptance on a
+   * branch, that branch's newest receipt if this manager hasn't announced it
+   * (one whose write reported a failure, one another manager on the store
+   * wrote, or one from before a reopen). So a listener can hear a receipt
+   * again, and needn't hear every receipt: key on `receipt.id`, and read
+   * `listFoldReceipts` for the whole record. Returns a detacher.
+   */
+  onFoldReceipt(listener: (receipt: FoldReceipt) => void): () => void {
+    return this.foldJournal.onReceipt(listener);
+  }
+
+  /** Deployment facts recorded in every receipt from now on. */
+  setReceiptSource(source: ReceiptSource): void {
+    this.foldJournal.setSource(source);
+  }
+
+  /** The store's id, minted once per store on first use. */
+  getStoreId(): string {
+    return this.foldJournal.storeId();
+  }
+
+  /** The selected branch as receipts name it (id, name, creation time). */
+  currentBranchRef(): BranchRef {
+    return branchRefOf(this.store);
+  }
+
+  /**
+   * How the active strategy can render history, for an honest answer when
+   * there are no receipts: which forms it uses, or null when it does not
+   * report its rendered layout at all.
+   */
+  describeRenderedForms(): { strategy: string; forms: ReadonlyArray<'raw' | 'summary' | 'omitted'> | null } {
+    return { strategy: this.strategy.name, forms: this.strategy.renderedForms ?? null };
   }
 
   /**
@@ -840,7 +1463,9 @@ export class ContextManager {
   // ==========================================================================
 
   /**
-   * Set the context management strategy.
+   * Set the context management strategy and initialize it on the selected branch.
+   * Also recovers a manager after failed initialization. A failure leaves work
+   * fenced until another successful initialization; it does not restore the old strategy.
    */
   async setStrategy(strategy: ContextStrategy): Promise<void> {
     this.strategy = strategy;
@@ -856,12 +1481,14 @@ export class ContextManager {
 
   /** Read the active strategy's allowlisted live settings, if supported. */
   getHotContextSettings(): HotContextSettingsStatus | null {
+    this.requireInitialized('getHotContextSettings');
     if (!isHotConfigurableStrategy(this.strategy)) return null;
     return this.strategy.getHotContextSettings();
   }
 
   /** Update only settings the active strategy explicitly declares hot-safe. */
   updateHotContextSettings(update: HotContextSettingsUpdate): HotContextSettingsStatus {
+    this.requireInitialized('updateHotContextSettings');
     if (!isHotConfigurableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support live context settings');
     }
@@ -878,6 +1505,7 @@ export class ContextManager {
     overrides?: Record<string, unknown>,
     opts?: { render?: boolean },
   ): PreviewResult | null {
+    this.requireInitialized('previewContext');
     const s = this.strategy as unknown as {
       previewContext?: (
         store: ReturnType<MessageStore['createView']>,
@@ -902,12 +1530,22 @@ export class ContextManager {
   // ==========================================================================
 
   /**
-   * Pin a range of messages so they aren't compressed and render raw at
-   * their original chronological position. Returns the new pin id.
+   * Pin a range of messages. A pin's bound is its `level`, or without one
+   * its `maxLevel`. A raw pin, with no bound or a bound of 0, keeps the
+   * messages out of compression and renders them raw at their original
+   * chronological position. A bound above 0 is read only under
+   * `foldingStrategy: 'kv-stable'` and `'kv-unified'` with
+   * `adaptiveResolution`: there the range is still compressed, since only a
+   * summary can supply its level, and is held at `level`, or no deeper than
+   * `maxLevel`, as `ProtectedRange` describes. Anywhere else the range is
+   * raw. Where bounds are read and pins overlap at a message, the bound
+   * `ProtectedRange` names holds it, which can compress a message a raw pin
+   * covers. Returns the new pin id.
    *
    * Throws if the active strategy doesn't support pins.
    */
   pinRange(firstMessageId: MessageId, lastMessageId: MessageId, opts?: PinLevelOptions): string {
+    this.requireInitialized('pinRange');
     if (!isPinnableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support pins');
     }
@@ -915,10 +1553,15 @@ export class ContextManager {
   }
 
   /**
-   * V2 dynamic pin-at-level-k: fix a range to render at EXACTLY fold level
-   * `level` (0 = raw) — the frontier cut passes through that L_k node. Honored
-   * only by `foldingStrategy: 'kv-stable'`; other strategies fall back to
-   * treating the range as raw. Returns the new pin id.
+   * V2 dynamic pin-at-level-k: fix a range to render at fold level `level`
+   * (0 = raw) — the frontier cut passes through that L_k node. Under
+   * kv-stable, a chunk whose summaries stop below `level` renders at the
+   * deepest it has, and one whose own-lineage summary at `level` doesn't list
+   * it renders where one does, or raw (`ProtectedRange.level`). Honored
+   * by `foldingStrategy: 'kv-stable'` and `'kv-unified'` with adaptive
+   * resolution; under any other selector the range is raw, in the live view
+   * and in the canonical L1 compression prompt where its budgets allow (see
+   * `compressionRecallBudgetTokens`). Returns the new pin id.
    */
   pinAtLevel(firstMessageId: MessageId, lastMessageId: MessageId, level: number, opts?: { name?: string }): string {
     return this.pinRange(firstMessageId, lastMessageId, { name: opts?.name, level });
@@ -926,10 +1569,15 @@ export class ContextManager {
 
   /**
    * Mark a single message as a "document" (semantically a body of
-   * information to retain in full). Same effect as a single-message pin
-   * with `kind: 'document'`. Returns the new pin id.
+   * information to keep). Same effect as a single-message pin with
+   * `kind: 'document'`, levels included (see `pinRange`): without a `level`
+   * or `maxLevel` the message is kept raw, while
+   * `markDocument(id, { maxLevel })` lets it fold no deeper than that level
+   * where the selector reads level bounds.
+   * Returns the new pin id.
    */
   markDocument(messageId: MessageId, opts?: PinLevelOptions): string {
+    this.requireInitialized('markDocument');
     if (!isPinnableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support documents');
     }
@@ -938,6 +1586,7 @@ export class ContextManager {
 
   /** Remove a pin or document mark. Returns true if removed. */
   unpin(pinId: string): boolean {
+    this.requireInitialized('unpin');
     if (!isPinnableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support pins');
     }
@@ -946,6 +1595,7 @@ export class ContextManager {
 
   /** List all current pins. Returns empty array if strategy is not pinnable. */
   listPins(): ReadonlyArray<ProtectedRange> {
+    this.requireInitialized('listPins');
     if (!isPinnableStrategy(this.strategy)) return [];
     return this.strategy.listPins();
   }
@@ -962,12 +1612,14 @@ export class ContextManager {
    * — see e.g. agent-framework's MCPL host integration.
    */
   searchSummaries(query: SearchQuery): SearchResult[] {
+    this.requireInitialized('searchSummaries');
     if (!isSearchableStrategy(this.strategy)) return [];
     return this.strategy.searchSummaries(query);
   }
 
   /** Look up a single summary by id. Returns null if not found / unsupported. */
   getSummary(id: string): SummaryEntry | null {
+    this.requireInitialized('getSummary');
     if (!isSearchableStrategy(this.strategy)) return null;
     return this.strategy.getSummary(id);
   }
@@ -985,6 +1637,7 @@ export class ContextManager {
    * see e.g. agent-framework's MCPL host integration.
    */
   getSummariesInRange(opts: { fromMs?: number; toMs?: number; level?: number }): TimeRangeSummaryEntry[] {
+    this.requireInitialized('getSummariesInRange');
     if (!isSummaryOverviewStrategy(this.strategy)) return [];
     return this.strategy.listSummariesInRange(this.strategyMessageView(), opts);
   }
@@ -994,6 +1647,7 @@ export class ContextManager {
    * doesn't support the summary table-of-contents, or none exist yet.
    */
   getMaxSummaryLevel(): number {
+    this.requireInitialized('getMaxSummaryLevel');
     return isSummaryOverviewStrategy(this.strategy) ? this.strategy.getMaxSummaryLevel() : 0;
   }
 
@@ -1006,6 +1660,7 @@ export class ContextManager {
    * agent's context is folded vs raw" at a glance.
    */
   getRenderStats(): RenderStats | null {
+    this.requireInitialized('getRenderStats');
     if (!isRenderStatsCapable(this.strategy)) return null;
     return this.strategy.getRenderStats(this.strategyMessageView());
   }
@@ -1020,6 +1675,7 @@ export class ContextManager {
    * Returns the transition summary text used.
    */
   async resetHeadWindow(transitionText?: string): Promise<string> {
+    const attempt = this.requireInitialized('resetHeadWindow');
     if (!isResettableStrategy(this.strategy)) {
       throw new Error('Active strategy does not support head window reset');
     }
@@ -1028,6 +1684,7 @@ export class ContextManager {
 
     // Generate transition summary if not provided
     const summary = transitionText ?? await this.strategy.generateTransitionSummary(ctx);
+    this.requireInitialized('resetHeadWindow', attempt);
 
     // Inject transition message
     const msgId = this.addMessage('Context Manager', [
@@ -1045,6 +1702,8 @@ export class ContextManager {
    * Call this periodically to allow strategies to do compression, etc.
    */
   async tick(): Promise<void> {
+    this.requireInitialized('tick');
+    this.expireCompressionHolds();
     if (this.strategy.tick) {
       await this.strategy.tick(this.createStrategyContext());
     }
@@ -1055,25 +1714,58 @@ export class ContextManager {
   // ==========================================================================
 
   private async initializeStrategy(
-    expectedBranch: StoreBranchGeneration = observeStoreBranch(this.store),
+    expectedBranch?: StoreBranchGeneration,
+    selection?: { branch: string; created: boolean },
   ): Promise<void> {
-    this.initialized = false;
-    if (this.strategy.initialize) {
-      await this.strategy.initialize(this.createStrategyContext());
+    const attempt = ++this.initializationAttempt;
+    this.initializedAttempt = null;
+    const strategy = this.strategy;
+    expectedBranch ??= observeStoreBranch(this.store);
+    const branchId = this.store.currentBranch().id;
+    if (strategy.initialize) {
+      await strategy.initialize(this.createStrategyContext());
+    }
+    if (attempt !== this.initializationAttempt || strategy !== this.strategy) {
+      throw new InitializationSupersededError(selection);
     }
     const current = observeStoreBranch(this.store);
+    const currentBranchId = this.store.currentBranch().id;
     if (
       current.name !== expectedBranch.name ||
       current.generation !== expectedBranch.generation ||
-      this.store.currentBranch().name !== expectedBranch.name
+      currentBranchId !== branchId
     ) {
       throw new Error(
         `Branch changed during strategy initialization: requested ${expectedBranch.name} ` +
-        `(generation ${expectedBranch.generation}), now ${current.name} ` +
-        `(generation ${current.generation})`,
+        `(id ${branchId}, generation ${expectedBranch.generation}), now ${current.name} ` +
+        `(id ${currentBranchId}, generation ${current.generation})`,
       );
     }
-    this.initialized = true;
+    this.initializedAttempt = attempt;
+    if (this.holdReleaseNotifyPending) this.notifyHoldsReleased();
+  }
+
+  /** Fence failed/pending attempts; optionally pin a manager-owned operation across an await. */
+  private requireInitialized(operation: string, expected?: InitializationStamp): InitializationStamp {
+    const current: InitializationStamp = {
+      ...observeStoreBranch(this.store),
+      id: this.store.currentBranch().id,
+      attempt: this.initializationAttempt,
+    };
+    if (this.initializedAttempt !== current.attempt) {
+      throw new Error(
+        `ContextManager.${operation} requires successful strategy initialization (selected branch ${current.name}). ` +
+        'Inspect currentBranch() and recover with switchBranch() or setStrategy().',
+      );
+    }
+    if (expected && (
+      expected.attempt !== current.attempt ||
+      expected.name !== current.name || expected.generation !== current.generation ||
+      expected.id !== current.id
+    )) {
+      throw new Error(`Branch or strategy changed during ContextManager.${operation}; retry on the intended branch.`);
+    }
+    return current;
   }
 
   /**
@@ -1150,6 +1842,18 @@ export class ContextManager {
         this.handleMessageRemove(event.messageId);
         break;
       case 'removeRange':
+        // Ids of the removed span aren't in the event; prune holds whose
+        // message no longer exists.
+        {
+          const before = this.compressionHolds.size;
+          for (const id of [...this.compressionHolds]) {
+            if (!this.messageStore.get(id)) this.compressionHolds.delete(id);
+          }
+          for (const [key, members] of [...this.compressionHoldGroups]) {
+            if (!members.some((m) => this.compressionHolds.has(m))) this.compressionHoldGroups.delete(key);
+          }
+          if (this.compressionHolds.size !== before) this.notifyHoldsReleased();
+        }
         // For range removes, we need to check all affected messages
         // This is a simplification - in practice we'd need to track the IDs
         break;
@@ -1157,6 +1861,10 @@ export class ContextManager {
   }
 
   private handleMessageAdd(message: StoredMessage): void {
+    if (this.holdingAdds) {
+      this.holdingAdds.push(message.id);
+      this.placeHold(message.id, this.holdingAddOptions, this.holdingAddAt);
+    }
     // Notify strategy of new message
     if (this.strategy.onNewMessage) {
       // Fire and forget - don't block on strategy processing
@@ -1193,6 +1901,12 @@ export class ContextManager {
   }
 
   private handleMessageRemove(messageId: MessageId): void {
+    if (this.compressionHolds.delete(messageId)) {
+      for (const [key, members] of [...this.compressionHoldGroups]) {
+        if (!members.some((m) => this.compressionHolds.has(m))) this.compressionHoldGroups.delete(key);
+      }
+      this.notifyHoldsReleased();
+    }
     // Find context entries that reference this message
     const entries = this.contextLog.findBySource(messageId);
 
@@ -1272,5 +1986,18 @@ export class ContextManager {
       contextEntryCount: this.contextLog.length(),
       branches: this.listBranches().length,
     };
+  }
+}
+
+/** What a store event was about, for a log line: its message (and body group), or its span. */
+function describeStoreEvent(event: MessageStoreEvent): string {
+  switch (event.type) {
+    case 'add':
+      return `message ${event.message.id}${event.message.bodyGroupId ? ` (body group ${event.message.bodyGroupId})` : ''}`;
+    case 'edit':
+    case 'remove':
+      return `message ${event.messageId}`;
+    case 'removeRange':
+      return `messages ${event.fromId} to ${event.toId}`;
   }
 }

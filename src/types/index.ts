@@ -4,6 +4,9 @@ export type {
   Sequence,
   BranchId,
   MessageMetadata,
+  AddMessageOptions,
+  CompressionHoldOptions,
+  CompressionHoldInfo,
   StoredMessage,
   BlobReference,
   StoredContentBlock,
@@ -30,6 +33,13 @@ export type {
   BranchInfo,
   ContextInjection,
   CompileResult,
+  BranchRef,
+  RawBodySource,
+  CompiledMessageSources,
+  CompileProvenance,
+  JournalMark,
+  RenderedLayout,
+  LayoutUnit,
 } from './context.js';
 
 // Strategy types
@@ -48,6 +58,7 @@ export type {
   AutobiographicalConfig,
   AutobiographicalOptions,
   CompressionQuarantineStatus,
+  CompressionQuarantineSpan,
   RecallEnvelopeMode,
   CarrierPolicy,
   SummaryLevel,
@@ -65,7 +76,9 @@ export type {
   TimeRangeSummaryEntry,
   SummaryOverviewStrategy,
   RenderStats,
+  CalibrationReset,
   RenderStatsCapableStrategy,
+  RenderedSummaryInfo,
 } from './strategy.js';
 
 export {

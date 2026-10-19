@@ -92,6 +92,14 @@ export {
   type PresentationReceipt,
   type ReceiptChainSnapshot,
   type SerializedReceiptChain,
+  type SerializedReceiptChainV1,
+  type SerializedReceiptChainV2,
+  type SerializedReceiptHead,
+  type LeafRun,
+  type RawLeafRun,
+  MAX_DECODED_LEAVES,
+  encodeLeafRuns,
+  decodeLeafRuns,
   type ObservedCacheWireReceipt,
 } from './kv-unified-receipts.js';
 export {
@@ -123,6 +131,7 @@ export {
 export {
   replayControlled,
   planControlledFrontier,
+  reportOverlap,
   foldDepthCap,
   PRICE,
   MAX_FOLD_LEVEL,
@@ -139,6 +148,7 @@ export {
   OverBudgetError,
   UncoveredDropError,
   accountFrontier,
+  type OverBudgetClearedBy,
   type OverBudgetDiagnostics,
   type PickerInputs,
   type PickerResult,

@@ -10,11 +10,13 @@ import type {
   SelectOptions,
   Sequence,
 } from '../types/index.js';
+import { registerStateIfAbsent } from '../state-registration.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { JsStore } from '@animalabs/chronicle';
 import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
+import { capContent, cappedPriceExtra } from './message-cap.js';
 
 /**
  * Options for {@link WindowedPassthroughStrategy}.
@@ -39,14 +41,21 @@ export interface WindowedPassthroughOptions {
   anchorStateId?: string;
   /**
    * Per-message token ceiling. Applied HERE to text blocks and string
-   * tool-result content (the autobiographical strategy's idiom, same
-   * `[truncated — original was N tokens]` marker), and surfaced as
+   * tool-result content by the truncator the autobiographical strategy uses
+   * (`capContent`): a `[truncated — original was N tokens]` marker on the
+   * block it cuts, and one `[content omitted: this message reached its token
+   * limit]` block where the first text block it drops that held anything
+   * was. A text block that holds nothing (empty or only whitespace) stays as
+   * it is before the cap, and is left out across or past it, and a message
+   * of such blocks alone, one of which the cap leaves out, carries the
+   * omission block alone. It's surfaced as
    * `ContextStrategy.maxMessageTokens` so the framework's storage-time
    * tool-result clamp mirrors it. Side-process agents should mirror their
    * principal's value so the two see the same truncation policy. Images are
    * not subject to this cap; they are governed by the live-image policy
-   * below. Unset = no truncation, in which case a single message larger
-   * than the usable budget is refused (see {@link OverBudgetError}).
+   * below. Unset, or any value that isn't a positive number, = no
+   * truncation, in which case a single message larger than the usable
+   * budget is refused (see {@link OverBudgetError}).
    */
   maxMessageTokens?: number;
   /**
@@ -68,7 +77,7 @@ export interface WindowedPassthroughOptions {
 /** Text substituted for an image block once it leaves the live-image window
  *  (identical to the autobiographical strategy's placeholder, so a merged
  *  timeline reads the same in both agents' windows). */
-const IMAGE_PLACEHOLDER = '[image dropped from live context]';
+const IMAGE_PLACEHOLDER = '[image not shown: this context keeps only some images]';
 /** Mirrors `AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES` (protected there). */
 const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
 
@@ -114,6 +123,8 @@ const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
 export class WindowedPassthroughStrategy implements ContextStrategy {
   readonly name = 'windowed-passthrough';
   readonly maxMessageTokens?: number;
+  /** Renders the window raw; history before the anchor is not rendered. */
+  readonly renderedForms = ['raw', 'omitted'] as const;
 
   private readonly reAnchorFraction: number;
   private readonly anchorStateIdOverride?: string;
@@ -128,6 +139,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   private loadedBranch: StoreBranchGeneration | null = null;
   /** Content identity of the previous committed compile's entries. */
   private prevCacheKeys: string[] | null = null;
+  /** Set when a committed select moved the anchor (see takeSelectionCause). */
+  private pendingCause: string | undefined;
 
   constructor(options: WindowedPassthroughOptions = {}) {
     const fraction = options.reAnchorFraction ?? 0.5;
@@ -146,11 +159,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   async initialize(ctx: StrategyContext): Promise<void> {
     this.store = ctx.store;
     this.stateId = this.anchorStateIdOverride ?? `${ctx.namespace}/windowed:anchor`;
-    try {
-      this.store.registerState({ id: this.stateId, strategy: 'snapshot' });
-    } catch {
-      /* already registered */
-    }
+    registerStateIfAbsent(this.store, { id: this.stateId, strategy: 'snapshot' });
     this.loadBranchState();
     this.loadedBranch = observeStoreBranch(this.store);
   }
@@ -253,8 +262,20 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     }
 
     // Per-message shaping BEFORE pricing, so the window is sized on what
-    // will actually be sent. Truncation follows the autobiographical
-    // strategy: a capped message is priced at the cap plus its marker.
+    // will actually be sent. A message the cap cuts is priced as it renders,
+    // as the autobiographical strategy prices one: its estimate, plus what
+    // the cut adds to it as the store estimates the content sent
+    // (cappedPriceExtra). The cut changes text and string results alone, and
+    // the store prices the text the cap keeps at its own rates, so the
+    // difference holds the kept text, the suffix, the omission notices and
+    // the marker, and the message's other blocks keep their price. A message
+    // the truncator leaves whole renders whole and is priced at its
+    // estimate, even past the cap. The two estimates differ: the store's
+    // counts every block, thinking included, and the truncator's counts text
+    // and string results alone, rounding each block up, so either can pass
+    // the cap with nothing cut. The image strip's depth (applyImageStripping)
+    // is still measured by the store's estimate of each stored message,
+    // before the cap, as the autobiographical strategy measures its own.
     const cap = this.maxMessageTokens ?? 0;
     const shaped = new Map<number, ContentBlock[]>();
     const priced = (i: number): number => {
@@ -264,7 +285,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       const content = truncateContent(msg.content, cap);
       if (content === msg.content) return estimate;
       shaped.set(i, content);
-      return Math.min(estimate, cap + 50);
+      return estimate + cappedPriceExtra(store, msg, content);
     };
 
     let total = 0;
@@ -297,6 +318,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         if (newAnchor !== this.anchor) {
           this.anchor = newAnchor;
           this.persistAnchor();
+          this.pendingCause = 'window';
         }
       }
     }
@@ -311,6 +333,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         budget: maxTokens,
         actual: total,
         stage: 'Windowed passthrough: the newest message alone',
+        // No compression here: the window moves past this message once a
+        // newer one that fits arrives (the progress clause above).
+        clearedBy: ['newer-message'],
         diagnostics: {
           headTokens: 0,
           tailTokens: total,
@@ -336,6 +361,13 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     this.applyImageStripping(entries, messages, store);
     if (!opts?.dryRun) this.placeCacheMarkers(entries);
     return entries;
+  }
+
+  /** 'window' when the last committed select moved the window's start. */
+  takeSelectionCause(): string | undefined {
+    const cause = this.pendingCause;
+    this.pendingCause = undefined;
+    return cause;
   }
 
   // --------------------------------------------------------------------------
@@ -443,71 +475,14 @@ function estimateTextOnlyTokens(content: ContentBlock[]): number {
 }
 
 /**
- * Surrogate-safe string slice. Avoids cutting between a UTF-16 surrogate pair
- * which would produce invalid JSON ("no low surrogate in string" API errors).
- */
-function safeSlice(str: string, start: number, end: number): string {
-  if (end >= str.length) return str.slice(start);
-  const code = str.charCodeAt(end);
-  if (code >= 0xDC00 && code <= 0xDFFF) {
-    return str.slice(start, end - 1);
-  }
-  return str.slice(start, end);
-}
-
-/**
- * Truncate a message's text / string tool-result content to fit within
- * `maxTokens` — the autobiographical strategy's `truncateContent`, verbatim
- * in behavior: text blocks are cut with a `[truncated — original was N
- * tokens]` marker; tool_result blocks are always kept (the API requires a
- * result for every tool_use), with their content cut or replaced by an
- * omission notice; every other block passes through. Returns the original
- * array when nothing needed cutting.
+ * Cut a message's text and string tool-result content to `maxTokens`, with
+ * the truncator the autobiographical strategy uses (`capContent`). This
+ * strategy's estimate counts text and string tool results alone, where the
+ * autobiographical one also counts thinking and tool calls. The estimate
+ * only decides whether the truncator looks: it cuts by the characters of
+ * text and string results, and returns the content itself when nothing
+ * needs cutting, so the two strategies cap a message alike.
  */
 function truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
-  if (maxTokens <= 0) return content;
-  if (estimateTextOnlyTokens(content) <= maxTokens) return content;
-
-  const maxChars = maxTokens * 4;
-  const result: ContentBlock[] = [];
-  let remaining = maxChars;
-
-  for (const block of content) {
-    if (block.type === 'text') {
-      if (remaining <= 0) continue;
-      if (block.text.length <= remaining) {
-        result.push(block);
-        remaining -= block.text.length;
-      } else {
-        result.push({
-          type: 'text',
-          text: safeSlice(block.text, 0, remaining) + '\n\n[truncated — original was ' +
-            Math.ceil(block.text.length / 4) + ' tokens]',
-        });
-        remaining = 0;
-      }
-    } else if (block.type === 'tool_result') {
-      if (typeof block.content === 'string') {
-        const text = block.content;
-        if (remaining <= 0) {
-          result.push({ ...block, content: '[content omitted — context budget exceeded]' });
-        } else if (text.length > remaining) {
-          result.push({
-            ...block,
-            content: safeSlice(text, 0, remaining) + '\n\n[truncated — original was ' +
-              Math.ceil(text.length / 4) + ' tokens]',
-          });
-          remaining = 0;
-        } else {
-          result.push(block);
-          remaining -= text.length;
-        }
-      } else {
-        result.push(block);
-      }
-    } else {
-      result.push(block);
-    }
-  }
-  return result;
+  return capContent(content, maxTokens, estimateTextOnlyTokens);
 }

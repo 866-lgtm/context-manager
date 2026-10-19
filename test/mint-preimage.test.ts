@@ -23,6 +23,7 @@ import { existsSync, rmSync } from 'node:fs';
 import {
   ContextManager,
   AutobiographicalStrategy,
+  CompressionWithdrawn,
   getMintRequestByHash,
   getMintRequestPreimageBytes,
   MintPreimageMaterializationError,
@@ -330,9 +331,11 @@ function scriptedMintMembrane(script: ScriptedAttemptOutcome[]) {
         const outcome = script[attempts.length] ?? 'accept';
         attempts.push({ request: structuredClone(request), outcome });
         if (outcome === 'carrier_reject') {
+          // As the Anthropic adapter classifies a 400 (membrane 0.5.69+):
+          // typed invalid_request, so the ladder knows it is about the request.
           throw Object.assign(
             new Error('invalid_request: thinking blocks cannot be modified'),
-            { httpStatus: 400 },
+            { httpStatus: 400, type: 'invalid_request', retryable: false },
           );
         }
         return {
@@ -407,6 +410,45 @@ const acceptedRequestCases: Array<{ label: string; script: ScriptedAttemptOutcom
   { label: 'tool_use rejection then the no-tools retry', script: ['tool_use', 'accept'] },
   { label: 'carrier-400 rejection then the stripped retry', script: ['carrier_reject', 'accept'] },
 ];
+
+describe("a host's withdrawal of an L1 call shaped like a carrier rejection (CompressionWithdrawn)", () => {
+  after(cleanup);
+
+  // A 400 invalid_request carries its type, which makes it a request-attributable rejection: the stripped retry's
+  // other precondition.
+  const carrierShape = { httpStatus: 400, type: 'invalid_request', message: 'invalid_request: thinking blocks cannot be modified' };
+  const carriesReasoning = (request: NormalizedRequest): boolean =>
+    request.messages.some((message) => message.content.some((block) => block.type === 'thinking'));
+
+  it('rethrows a withdrawal without the stripped retry that the same shape gets unbranded', async () => {
+    // The premise: without the brand, this shape is a transport rejection of the request's carriers.
+    const controlRequests: NormalizedRequest[] = [];
+    const control = await acceptedRequestFixture({
+      complete: async (request: NormalizedRequest) => {
+        controlRequests.push(structuredClone(request));
+        if (controlRequests.length === 1) throw Object.assign(new Error(), carrierShape);
+        return { stopReason: 'end_turn', content: [t('zz-l1-memory-2')], usage: { inputTokens: 100, outputTokens: 20 } };
+      },
+    });
+    await control.strategy.run(control.target, ctx(control.manager));
+    assert.equal(controlRequests.length, 2, 'the premise: unbranded, this shape gets the stripped retry');
+    assert.ok(carriesReasoning(controlRequests[0]!) && !carriesReasoning(controlRequests[1]!), 'the premise: the retry is the request stripped of its reasoning');
+    await control.manager.close();
+
+    const withdrawn = Object.assign(new CompressionWithdrawn(), carrierShape);
+    const requests: NormalizedRequest[] = [];
+    const fx = await acceptedRequestFixture({
+      complete: async (request: NormalizedRequest) => {
+        requests.push(structuredClone(request));
+        throw withdrawn;
+      },
+    });
+    await assert.rejects(fx.strategy.run(fx.target, ctx(fx.manager)), (error) => error === withdrawn);
+    assert.ok(carriesReasoning(requests[0]!), 'setup: the request carries reasoning blocks (the carrier path needs them)');
+    assert.equal(requests.length, 1, 'no stripped retry: a withdrawal is never a transport rejection');
+    await fx.manager.close();
+  });
+});
 
 describe('Mint preimages follow the accepted request', () => {
   after(cleanup);
@@ -921,5 +963,32 @@ describe('Preimage persistence never blocks the mint', () => {
       'an unindexed envelope reads as absent, not as a throw',
     );
     await fx.manager.close();
+  });
+});
+
+describe('Mint preimage envelope registration', () => {
+  after(cleanup);
+
+  it('reports a registration failure itself, rather than swallowing it', (tc) => {
+    const store = JsStore.create({ path: freshPath() });
+    const failure = new Error('IO failure registering mint-preimage-envelopes');
+    const register = store.registerState.bind(store);
+    tc.mock.method(store, 'registerState', (registration: { id: string }) => {
+      if (registration.id === 'mint-preimage-envelopes') throw failure;
+      return register(registration as Parameters<JsStore['registerState']>[0]);
+    });
+    const reports: unknown[][] = [];
+    tc.mock.method(console, 'error', (...args: unknown[]) => { reports.push(args); });
+    const request: NormalizedRequest = {
+      messages: [{ participant: 'zz-user', content: [t('look'), zzImageBlock(zzImageBase64(7))] }],
+      config: { model: ZZ_MINT_MODEL, maxTokens: 1 },
+    };
+    const requestHash = sha256(Buffer.from(JSON.stringify(request), 'utf8'));
+    assert.doesNotThrow(() => persistMintRequestPreimage(store, request, requestHash), 'persistence never throws');
+    assert.ok(
+      reports.some(args => args.includes(failure)),
+      `the report carries the registration failure: ${JSON.stringify(reports.map(args => String(args[0])))}`,
+    );
+    store.close();
   });
 });

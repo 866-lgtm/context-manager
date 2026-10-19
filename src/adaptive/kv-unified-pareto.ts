@@ -1,5 +1,6 @@
 import type { ChunkId } from './folding-strategy.js';
 import type { PickerInputs } from './picker.js';
+import { tailUnits } from './render-offsets.js';
 import { certifyCarriedLayout, type HysteresisCertificate } from './kv-unified-certificate.js';
 import { TerminalPolicyEvaluator } from './kv-unified-terminal.js';
 import { PackedDagSolver } from './kv-unified-packed.js';
@@ -7,6 +8,7 @@ import {
   CanonicalSummaryForest,
   SparseLabelCeilingError,
   type ExactCutCandidate,
+  orderedChunks,
 } from './kv-unified.js';
 import {
   ExactKvUnifiedPolicySolver,
@@ -120,33 +122,44 @@ export class ParetoKvUnifiedPolicySolver {
   readonly forest: CanonicalSummaryForest;
 
   private readonly leaves: ReturnType<CanonicalSummaryForest['orderedLeaves']>;
-  private readonly chunksById: ReadonlyMap<ChunkId, PickerInputs['chunks'][number]>;
-  private readonly indexById: ReadonlyMap<ChunkId, number>;
-  private readonly midpointAge = new Map<ChunkId, number>();
+  private readonly chunks: readonly PickerInputs['chunks'][number][];
+  private readonly midpointAge: Float64Array;
   private summaryMetricCache = new WeakMap<readonly ChunkId[], { continuity: number; fidelity: number }>();
   private readonly newestSequence: number;
   private bufferGapEmissions = false;
+  /** Wall time of the last certificate attempt, succeeded or not. */
+  lastCertificateMs = 0;
 
   constructor(private readonly inputs: PickerInputs, forest?: CanonicalSummaryForest) {
     this.forest = forest ?? new CanonicalSummaryForest(inputs);
     this.leaves = this.forest.orderedLeaves();
-    this.chunksById = new Map(inputs.chunks.map((chunk) => [chunk.id, chunk]));
-    this.indexById = new Map(this.leaves.map((leaf, index) => [leaf.id, index]));
+    // A forest built from these inputs already holds this sort of them; any
+    // other forest prices with the caller's current chunks (same as the exact
+    // scorer and the terminal evaluator).
+    this.chunks = this.forest.builtFrom(inputs) ? this.forest.orderedChunks() : orderedChunks(inputs.chunks);
+    this.midpointAge = new Float64Array(this.leaves.length);
     this.newestSequence = inputs.chunks.reduce((newest, chunk) => Math.max(newest, chunk.sequence), 0);
     let age = 0;
     for (let i = this.leaves.length - 1; i >= 0; i--) {
       const leaf = this.leaves[i];
-      this.midpointAge.set(leaf.id, age + leaf.rawTokens / 2);
+      this.midpointAge[i] = age + leaf.rawTokens / 2;
       age += leaf.rawTokens;
     }
   }
 
   solve(options: ParetoSolveOptions): ParetoPolicySolveResult {
+    // The options object is the scope of the per-solve caches (the accepted
+    // presentation read per leaf position, shared by the certificate and the
+    // evaluators). A caller reusing one object across solves, with its
+    // presentation map edited in between, must not be served the old read.
+    options = { ...options };
     this.summaryMetricCache = new WeakMap();
-    const internalHoles = this.hasInternalProtectedHoles();
+    const internalHoles = this.forest.hasInternalProtectedHoles();
     const gapBearingOwnership = this.forest.gapBearingSummaryIds.length > 0;
     if (options.hysteresisCertificate) {
+      const started = performance.now();
       const certified = certifyCarriedLayout(this.inputs, this.forest, options);
+      this.lastCertificateMs = performance.now() - started;
       if (certified) return certified;
     }
     if (options.engine !== 'leaf') {
@@ -245,10 +258,7 @@ export class ParetoKvUnifiedPolicySolver {
       const label = stack.pop()!;
       if (!label.active) continue;
       if (label.remaining === 0n) {
-        let finished = label;
-        if (this.inputs.tailTokens > 0) {
-          finished = this.emit(label, 'tail', 'tail', this.inputs.tailTokens, false, options, markerByUnit);
-        }
+        const finished = this.emitTail(label, options, markerByUnit);
         if (finished.renderedTokens <= options.maxTokens) {
           terminal.push({ frontier: reconstructFrontier(finished.trace), renderedTokens: finished.renderedTokens });
         }
@@ -268,7 +278,7 @@ export class ParetoKvUnifiedPolicySolver {
         let mask = 0n;
         let overlap = false;
         for (const id of summary.leafIds) {
-          const index = this.indexById.get(id)!;
+          const index = this.forest.leaf(id)!.index;
           const candidateBit = bit(index);
           const allowed = this.forest.leaf(id)!.allowedLevels.includes(summary.level);
           if ((label.remaining & candidateBit) === 0n && allowed) { overlap = true; break; }
@@ -373,7 +383,7 @@ export class ParetoKvUnifiedPolicySolver {
         const previousLevel = options.presentation?.leaves.get(leaf.id)?.level ?? 0;
         maxContinuity += leaf.rawTokens * Math.max(1, previousLevel, Math.abs(maxLevel - previousLevel));
         if (!leaf.externallyAccounted) maxFidelity += fidelityLeafLoss(
-          this.chunksById.get(leaf.id)!, maxLevel, this.newestSequence, policy,
+          this.chunks[leaf.index], maxLevel, this.newestSequence, policy,
         );
       }
       continuityBins = Math.ceil(maxContinuity / continuityBucketSize) + 2;
@@ -583,17 +593,7 @@ export class ParetoKvUnifiedPolicySolver {
         options,
         markerByUnit,
       );
-      if (this.inputs.tailTokens > 0) {
-        finished = this.emit(
-          finished,
-          'tail',
-          'tail',
-          this.inputs.tailTokens,
-          false,
-          options,
-          markerByUnit,
-        );
-      }
+      finished = this.emitTail(finished, options, markerByUnit);
       if (finished.renderedTokens <= options.maxTokens) {
         terminal.push(evaluator.candidate(finished.trace, finished.renderedTokens));
       }
@@ -647,15 +647,6 @@ export class ParetoKvUnifiedPolicySolver {
         approximationCacheErrorBound: approximation.cache,
       },
     };
-  }
-
-  private hasInternalProtectedHoles(): boolean {
-    for (const summary of this.forest.allSummaries()) {
-      const live = summary.leafIds.filter((id) => !this.forest.leaf(id)!.externallyAccounted);
-      const allowed = live.filter((id) => this.forest.leaf(id)!.allowedLevels.includes(summary.level));
-      if (allowed.length > 0 && allowed.length < live.length) return true;
-    }
-    return false;
   }
 
   private approximationBound(
@@ -715,8 +706,8 @@ export class ParetoKvUnifiedPolicySolver {
     let fidelityLoss = label.fidelityLoss;
     const presentation = options.presentation;
     for (const id of ids) {
-      remaining &= ~(1n << BigInt(this.indexById.get(id)!));
-      const chunk = this.chunksById.get(id)!;
+      remaining &= ~(1n << BigInt(this.forest.leaf(id)!.index));
+      const chunk = this.chunks[this.forest.leaf(id)!.index];
       fidelityLoss += fidelityLeafLoss(chunk, level, this.newestSequence, policy);
       const previous = presentation?.leaves.get(id);
       continuityLoss += continuityLeafLoss(
@@ -725,7 +716,7 @@ export class ParetoKvUnifiedPolicySolver {
         level === 0 ? `raw:${id}` : `summary:${this.forest.leaf(id)!.summaryIds.find((sid) => this.forest.summary(sid)!.level === level)!}`,
         previous,
         presentation?.currentSeq ?? 0,
-        this.midpointAge.get(id)!,
+        this.midpointAge[this.forest.leaf(id)!.index],
         policy,
       );
     }
@@ -764,7 +755,7 @@ export class ParetoKvUnifiedPolicySolver {
       let continuity = 0;
       let fidelity = 0;
       for (const id of ids) {
-        const chunk = this.chunksById.get(id)!;
+        const chunk = this.chunks[this.forest.leaf(id)!.index];
         fidelity += fidelityLeafLoss(chunk, level, this.newestSequence, policy);
         const previous = options.presentation?.leaves.get(id);
         const repHash = `summary:${summaryId}`;
@@ -774,7 +765,7 @@ export class ParetoKvUnifiedPolicySolver {
           repHash,
           previous,
           options.presentation?.currentSeq ?? 0,
-          this.midpointAge.get(id)!,
+          this.midpointAge[this.forest.leaf(id)!.index],
           policy,
         );
       }
@@ -849,6 +840,22 @@ export class ParetoKvUnifiedPolicySolver {
     };
   }
 
+  /** Emit the raw tail as per-message units (see `tailUnits`), then flush so
+   * gap-buffered emissions never strand behind the tail. */
+  private emitTail(
+    label: ParetoLabel,
+    options: ExactPolicySolveOptions,
+    markerByUnit: ReadonlyMap<number, number>,
+  ): ParetoLabel {
+    let finished = label;
+    for (const unit of tailUnits(this.inputs)) {
+      finished = unit.kind === 'raw'
+        ? this.emit(finished, 'raw', unit.key, unit.tokens, this.isExtension([unit.key], options), options, markerByUnit, this.forest.leaf(unit.key)?.sequence ?? Number.POSITIVE_INFINITY)
+        : this.emit(finished, 'tail', unit.key, unit.tokens, false, options, markerByUnit);
+    }
+    return this.flushPendingEmissions(finished, Number.POSITIVE_INFINITY, options, markerByUnit);
+  }
+
   private isExtension(ids: readonly ChunkId[], options: ExactPolicySolveOptions): boolean {
     return options.presentation !== undefined && ids.length > 0 && ids.every((id) => !options.presentation!.leaves.has(id));
   }
@@ -865,14 +872,14 @@ export class ParetoKvUnifiedPolicySolver {
     if (knownContinuity !== undefined) continuityLoss += knownContinuity;
     else if (options.presentation) {
       for (const id of ids) {
-        const chunk = this.chunksById.get(id)!;
+        const chunk = this.chunks[this.forest.leaf(id)!.index];
         continuityLoss += continuityLeafLoss(
           chunk,
           0,
           `raw:${id}`,
           options.presentation.leaves.get(id),
           options.presentation.currentSeq,
-          this.midpointAge.get(id)!,
+          this.midpointAge[this.forest.leaf(id)!.index],
           policy,
         );
       }
@@ -929,12 +936,12 @@ export class ParetoKvUnifiedPolicySolver {
     let extensionTokens = 0;
     let continuity = 0;
     for (const id of ids) {
-      const chunk = this.chunksById.get(id)!;
+      const chunk = this.chunks[this.forest.leaf(id)!.index];
       tokens += chunk.rawTokens;
       const previous = options.presentation?.leaves.get(id);
       if (options.presentation && !previous) extensionTokens += chunk.rawTokens;
       continuity += continuityLeafLoss(chunk, 0, `raw:${id}`, previous,
-        options.presentation?.currentSeq ?? 0, this.midpointAge.get(id)!, policy);
+        options.presentation?.currentSeq ?? 0, this.midpointAge[this.forest.leaf(id)!.index], policy);
     }
     return { tokens, extensionTokens, continuity };
   }

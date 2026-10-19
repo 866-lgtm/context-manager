@@ -1,5 +1,5 @@
 // Main class
-export { ContextManager } from './context-manager.js';
+export { ContextManager, InitializationSupersededError } from './context-manager.js';
 export type { ContextManagerConfig } from './context-manager.js';
 
 // Phase channel (liveness-watchdog observability hook)
@@ -9,8 +9,10 @@ export { phaseChannel, enterPhase, withPhase, withPhaseAsync } from './phase-cha
 export { MessageStore, defaultTokenEstimator, jsonTokenEstimator } from './message-store.js';
 export type { MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 export { concatBodyGroups } from './adaptive/render.js';
+export { continuesBody, bodyStart, bodyEnd, bodyBounds, bodyBoundsIn, type BodyShard } from './body-runs.js';
 export { ContextLog } from './context-log.js';
-export { BlobManager } from './blob-manager.js';
+export { BlobManager, blockAsStored } from './blob-manager.js';
+export { MalformedContentError, malformedContentPlaces } from './well-formed-content.js';
 export {
   persistMintRequestPreimage,
   getMintRequestPreimageBytes,
@@ -36,6 +38,10 @@ export type { ConfigLayer, ConfigResolutionSemantics, EffectiveConfigReport } fr
 // classifyInferenceError); exporting them from the root gives consumers a
 // real `instanceof` instead of stringly-typed `err.name` matching.
 export { OverBudgetError, UncoveredDropError } from './adaptive/picker.js';
+export type { OverBudgetClearedBy } from './adaptive/picker.js';
+export { CompressionWithdrawn } from './compression-withdrawn.js';
+export { StoreTopologyError, type TopologyViolation } from './strategies/autobiographical.js';
+export { planTopologyRepair, type RepairPlan, type RepairInputs, type RepairOptions } from './repair/topology.js';
 export type { OverBudgetDiagnostics } from './adaptive/picker.js';
 
 // Types
@@ -66,6 +72,13 @@ export type {
   BranchInfo,
   ContextInjection,
   CompileResult,
+  BranchRef,
+  RawBodySource,
+  CompiledMessageSources,
+  CompileProvenance,
+  JournalMark,
+  RenderedLayout,
+  LayoutUnit,
   // Strategy types
   MessageStoreView,
   ContextLogView,
@@ -88,7 +101,33 @@ export type {
   ResettableStrategy,
   TimeRangeSummaryEntry,
   SummaryOverviewStrategy,
+  AddMessageOptions,
+  CompressionHoldOptions,
+  CompressionHoldInfo,
+  RenderedSummaryInfo,
 } from './types/index.js';
+
+// Accepted rounds and fold receipts
+export {
+  FOLD_QUERY_DEFAULT_LIMIT,
+  FOLD_QUERY_MAX_LIMIT,
+  ACCEPTED_LAYOUT_RECORD,
+  STORE_IDENTITY_RECORD,
+  storeIdentity,
+} from './fold-journal.js';
+export type {
+  FoldReceipt,
+  FoldReceiptSource,
+  FoldChange,
+  FoldForm,
+  FoldLayoutRun,
+  FoldSpanBound,
+  FoldQuery,
+  FoldQueryResult,
+  RoundUsage,
+  ReceiptSource,
+  Presentation,
+} from './fold-journal.js';
 
 export {
   DEFAULT_AUTOBIOGRAPHICAL_CONFIG,
