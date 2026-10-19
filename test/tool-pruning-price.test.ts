@@ -617,6 +617,7 @@ describe('tool pruning, priced as sent', () => {
       assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: 'abc' } }), view(two)), false, 'a string that reads as no number, which replaced nothing');
       assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: '-1' } }), view(two)), false, 'a string that reads as a negative number, which set no limit');
       assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: Symbol('limit') } }), view(two)), false, 'a symbol, which threw before');
+      assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: Object.create(null) } }), view(two)), false, 'an object with no way to a primitive, which threw before');
       const member = [msg('u', text('go')), msg('a', [call('k1', 'constructor')]), msg('u', [result('k1', 'r')])];
       assert.equal(reprices(member, at({ toolResultMaxLastN: { other: 2 } }), view(member)), false, 'a tool named like an Object member, whose lookup finds a function');
       // Only an answered call counts, paired as the count pairs them.

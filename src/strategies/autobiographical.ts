@@ -13189,10 +13189,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // So were the results a per-tool limit in a map that isn't a number
     // replaced before, when it was read by arithmetic (a null as 0, a "2" as
     // 2, true as 1); now it sets no limit. A store discards where a tool's
-    // limit, read the same way, is below the number of its calls answered, as
-    // the count pairs them (answeredToolCalls); for a number, that's where
-    // the count replaces. A value that reads as no number, such as undefined,
-    // a non-numeric string, or the function a tool named like an Object member
+    // limit, read the same way, is a number of 0 or more (a negative one was
+    // skipped) below the number of its calls answered, as the count pairs
+    // them (answeredToolCalls); for a number, that's where the count
+    // replaces. A value that reads as no number, such as undefined, a
+    // non-numeric string, or the function a tool named like an Object member
     // finds, replaced nothing, and keeps.
     4: (messages, strategy, store) => {
       const pruning = strategy.toolPruning(store);
@@ -13201,8 +13202,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (typeof limits === 'object' && limits !== null) {
         for (const [toolName, answered] of answeredToolCalls(messages)) {
           const limit = limits[toolName];
-          // A symbol threw at that arithmetic, as Number() would here.
-          const read = typeof limit === 'symbol' ? NaN : Number(limit);
+          // A value Number() can't read, such as a symbol or an object with
+          // no way to a primitive, threw at that arithmetic too.
+          let read = NaN;
+          try { read = Number(limit); } catch { /* read stays NaN, and keeps */ }
           if (read >= 0 && read < answered.length) return true;
         }
       }
