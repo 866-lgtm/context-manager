@@ -739,13 +739,18 @@ describe('estimator calibration band', () => {
   it("epoch 3's predicate: a positive cap, and a message the cut's test puts past it or one whose estimate could have passed the cap plus 50", () => {
     // A stored message whose price the cap plus 50 limited, uncut, was
     // repriced too, and how far its estimate ran depended on the multiplier
-    // then, so the predicate reads the estimate at 1 and asks whether the
-    // clamp's ceiling could have taken it past the cap plus 50.
+    // then, so the predicate bounds the estimate at the clamp's ceiling from
+    // the one at the applied multiplier and asks whether it could have passed
+    // the cap plus 50.
     const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[3]!;
-    const text = (chars: number) => ({ content: [{ type: 'text', text: 'r'.repeat(chars) }] }) as unknown as StoredMessage;
-    /** A store pricing text at 2.9 characters a token, at the multiplier given. */
+    const blocks = (count: number, chars: number) =>
+      ({ content: Array.from({ length: count }, () => ({ type: 'text', text: 'r'.repeat(chars) })) }) as unknown as StoredMessage;
+    const text = (chars: number) => blocks(1, chars);
+    /** A store pricing text at 2.9 characters a token, at the multiplier given,
+     *  each block rounded on its own, as MessageStore rounds them. */
     const storeAt = (multiplier: number) => ({
-      estimateTokens: (m: StoredMessage) => Math.round(Math.ceil(((m.content[0] as { text: string }).text.length) / 2.9) * multiplier),
+      estimateTokens: (m: StoredMessage) => m.content.reduce(
+        (sum, block) => sum + Math.round(Math.ceil((block as { text: string }).text.length / 2.9) * multiplier), 0),
       getTokenCalibration: () => multiplier,
     }) as unknown as MessageStoreView;
     const at = (cap: number | undefined) => new AutobiographicalStrategy({ maxMessageTokens: cap as number });
@@ -755,12 +760,86 @@ describe('estimator calibration band', () => {
     // Uncut, but 20,000 characters estimate at 6,897, and 1.8 times that
     // passes 10,050, while the cut's estimate, 5,000, is under the cap.
     assert.equal(reprices([text(20_000)], at(10_000), storeAt(1)), true, 'a message the old price could have limited');
-    // The same at an applied multiplier of 0.6: read at 1, not at 0.6.
-    assert.equal(reprices([text(20_000)], at(10_000), storeAt(0.6)), true, 'the estimate is read at a multiplier of 1');
-    // 10,000 characters: 3,449 at 1.8 is 6,208, under 10,050, and uncut.
+    // The same at an applied multiplier of 0.6, which the estimate is read
+    // back from, not taken at.
+    assert.equal(reprices([text(20_000)], at(10_000), storeAt(0.6)), true, 'the estimate is read back from the applied multiplier');
+    // 10,000 characters: 3,449 at 1, which bounds the estimate at 1.8 by
+    // 6,209.6, under 10,050, and uncut.
     assert.equal(reprices([text(10_000)], at(10_000), storeAt(1)), false, 'nothing near the cap');
+    // 83 one-character blocks, under a cap of 100 to the cut's estimate,
+    // estimate at 83 at a multiplier of 1, and 83 times 1.8 is 149.4, under
+    // 150. But each block rounds to 2 at 1.75, so the store estimated the
+    // message at 166, which the cap plus 50 limited.
+    assert.equal(reprices([blocks(83, 1)], at(100), storeAt(1)), true, "a message of small blocks, each rounded on its own");
+    // 39 blocks of four characters, 39 tokens to the cut's estimate, are 2
+    // tokens each to the store at 1: 2.4 at 1.2 rounds to 2, so it estimates
+    // 78, and 3.6 at the ceiling rounds to 4, 156 in all, past 150. Read back
+    // from 1.2 without either block's rounding, the bound is 117; with the
+    // reading's rounding alone, 146.25; with the ceiling's too, 165.75.
+    assert.equal(reprices([blocks(39, 4)], at(100), storeAt(1.2)), true, "each block's rounding, read back and at the ceiling");
     for (const cap of [0, -1, Number.NaN, undefined]) {
       assert.equal(reprices([text(80_000)], at(cap), storeAt(1)), false, `no cap: ${cap}`);
+    }
+  });
+
+  it("epoch 3's bound, over messages of equal text blocks, counts each whose estimate at the clamp's ceiling passes the cap plus 50, and none under it by 1 + 1.8/F tokens a block, at applied multipliers from 0.6 to 1.8 in steps of 0.05", () => {
+    // The old price limited a message wherever the store's estimate passed
+    // the cap plus 50 at the multiplier then, which the clamp kept at 1.8 or
+    // under, and a block's rounded estimate only grows with the multiplier,
+    // so the estimate at 1.8 is the largest the old price could have met.
+    // The bound over-counts by less than 1 + 1.8/F tokens a block. Equal
+    // blocks all round the same way at a given multiplier, so their errors
+    // add up, the case the bound is tightest for. Only messages the cut's own
+    // test leaves are swept, so the bound decides each.
+    const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[3]!;
+    const rawOf = (chars: number) => Math.ceil(chars / 2.9);
+    let counted = 0;
+    let left = 0;
+    for (let step = 0; step <= 24; step++) {
+      const multiplier = (60 + 5 * step) / 100;
+      const store = {
+        estimateTokens: (m: StoredMessage) => m.content.reduce(
+          (sum, block) => sum + Math.round(rawOf((block as { text: string }).text.length) * multiplier), 0),
+        getTokenCalibration: () => multiplier,
+      } as unknown as MessageStoreView;
+      for (const cap of [50, 100]) {
+        const strategy = new AutobiographicalStrategy({ maxMessageTokens: cap });
+        for (let chars = 1; chars <= 12; chars++) {
+          for (let count = 1; count <= 80; count++) {
+            if (count * Math.ceil(chars / 4) > cap) continue;
+            const atCeiling = count * Math.round(rawOf(chars) * 1.8);
+            const message = { content: Array.from({ length: count }, () => ({ type: 'text', text: 'r'.repeat(chars) })) } as unknown as StoredMessage;
+            const where = `${count} blocks of ${chars} characters at ${multiplier}, cap ${cap}: ${atCeiling} at the ceiling`;
+            if (atCeiling > cap + 50) {
+              assert.equal(reprices([message], strategy, store), true, where);
+              counted++;
+            } else if (atCeiling + count * (1 + 1.8 / multiplier) <= cap + 50) {
+              assert.equal(reprices([message], strategy, store), false, where);
+              left++;
+            }
+          }
+        }
+      }
+    }
+    assert.ok(counted > 0 && left > 0, `premise: the sweep reaches both sides: ${counted} counted, ${left} left`);
+  });
+
+  it("epoch 3's bound reads a multiplier the view doesn't report as a positive finite number at the clamp's floor, 0.6", () => {
+    // 26 blocks of three characters, under a cap of 50 to the cut's
+    // estimate, estimate at 26 at 0.6 and 104 at 1.8, past 100. Read at 1,
+    // the bound would be 83.2; read at 0.6, it's 130.
+    const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[3]!;
+    const message = { content: Array.from({ length: 26 }, () => ({ type: 'text', text: 'rrr' })) } as unknown as StoredMessage;
+    const estimateTokens = (m: StoredMessage) => m.content.reduce(
+      (sum, block) => sum + Math.round(Math.ceil((block as { text: string }).text.length / 2.9) * 0.6), 0);
+    const strategy = new AutobiographicalStrategy({ maxMessageTokens: 50 });
+    const views: Array<[string, MessageStoreView]> = [
+      ['no getTokenCalibration', { estimateTokens } as unknown as MessageStoreView],
+      ...[Number.NaN, 0, -1, Number.POSITIVE_INFINITY].map((reported): [string, MessageStoreView] =>
+        [`getTokenCalibration reporting ${reported}`, { estimateTokens, getTokenCalibration: () => reported } as unknown as MessageStoreView]),
+    ];
+    for (const [what, view] of views) {
+      assert.equal(reprices([message], strategy, view), true, what);
     }
   });
 

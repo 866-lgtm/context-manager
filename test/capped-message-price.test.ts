@@ -14,10 +14,11 @@
  *
  * The rule it replaced charged a capped message no more than the cap plus
  * 50: too little for an image, a tool call or thinking the cap keeps whole,
- * and for the text it keeps at large caps, and too much for the few
- * characters it keeps at small ones. So the cases here cut both ways, and one
- * is a message the cap leaves whole, which the old rule charged the cap plus
- * 50 too. Between them they pin each place a raw message is priced but one:
+ * and, at the multiplier of 1 these cases run at, for the text it keeps at
+ * large caps, and too much for the few characters it keeps at small ones.
+ * So the cases here cut both ways, and one is a message the cap leaves
+ * whole, which the old rule charged the cap plus 50 too. Between them they
+ * pin each place a raw message is priced but one:
  * the head window, the middle (positioned and combined recall pairs, a plan
  * whose level has no summary, and a body's raw shards, which the adaptive
  * middle sends uncut and the head and recent windows cut), the recent
@@ -310,6 +311,89 @@ describe("an override of truncateContent is the cut a raw message is priced and 
         const sent = rendered(compiled);
         assertStatsMatch(manager, sent, config.adaptiveResolution === true);
         assert.equal(await attempt(sent), sent, `a budget of ${sent} sends all of it`);
+      } finally {
+        await close();
+      }
+    });
+  }
+
+  // An override that rewrites a message and passes the rewrite on to this
+  // class's cut, with the estimate it was given: the cut decides from the
+  // rewrite's estimate, not the stored message's, whether the rewrite adds a
+  // block or keeps the message's count of them.
+  class AddsNote extends AutobiographicalStrategy {
+    protected override truncateContent(
+      content: ContentBlock[],
+      maxTokens: number,
+      estimate?: (content: ContentBlock[]) => number,
+    ): ContentBlock[] {
+      return super.truncateContent([...content, { type: 'text', text: 'n'.repeat(4000) }], maxTokens, estimate);
+    }
+  }
+  class ReplacesText extends AutobiographicalStrategy {
+    protected override truncateContent(
+      content: ContentBlock[],
+      maxTokens: number,
+      estimate?: (content: ContentBlock[]) => number,
+    ): ContentBlock[] {
+      const rewritten = content.map((block) => (block.type === 'text' ? { type: 'text', text: 'n'.repeat(4000) } as ContentBlock : block));
+      return super.truncateContent(rewritten, maxTokens, estimate);
+    }
+  }
+  const rewrites: Array<[string, typeof AutobiographicalStrategy]> = [
+    ['that adds a block', AddsNote],
+    ['that keeps the block count', ReplacesText],
+  ];
+  for (const [how, Rewrites] of rewrites) for (const [mode, config] of SELECTIONS) {
+    it(`autobiographical, ${mode}: a rewrite ${how}, passed on to the cut, is cut by its own estimate, and the render stats count it`, async () => {
+      // 'hello' alone is 2 tokens to the cut's estimate, under a cap of 100,
+      // and with the override's 4,000 characters it is past 1,000.
+      const strategy = new Rewrites({ maxMessageTokens: 100, overBudgetGraceRatio: 0, ...config });
+      const { manager, rendered, attempt, close } = await open(strategy, [['u', [{ type: 'text', text: 'hello' }]]]);
+      try {
+        const compiled = await manager.compile(BIG);
+        const texts = compiled.messages.flatMap((m) => m.content.map((block) => (block as { text?: string }).text ?? ''));
+        assert.ok(texts.some((text) => text.includes('[truncated — original was 1000 tokens]')),
+          `the rewrite is cut: ${JSON.stringify(texts.map((text) => text.slice(0, 60)))}`);
+        assert.ok(!texts.some((text) => text.includes('n'.repeat(4000))), 'nothing sends the rewrite whole');
+        const sent = rendered(compiled);
+        assertStatsMatch(manager, sent, config.adaptiveResolution === true);
+        assert.equal(await attempt(sent), sent, `a budget of ${sent} sends all of it`);
+      } finally {
+        await close();
+      }
+    });
+  }
+});
+
+describe("the cut asks about a stored message's own content through the message's cached estimate", () => {
+  // The text-only estimate is cached on the stored message object, so a site
+  // that gives the cut that message's content reads its estimate from the
+  // cache, where any other object, a copy of the message included, is
+  // estimated afresh.
+  class RecordsEstimates extends AutobiographicalStrategy {
+    asked: StoredMessage[] = [];
+    protected override estimateTextOnlyTokens(msg: StoredMessage): number {
+      this.asked.push(msg);
+      return super.estimateTextOnlyTokens(msg);
+    }
+  }
+  for (const [mode, config] of SELECTIONS) {
+    it(`autobiographical, ${mode}: a compile of raw messages under a cap estimates only the stored messages themselves`, async () => {
+      const strategy = new RecordsEstimates({ maxMessageTokens: 100, ...config });
+      const { manager, close } = await open(strategy, [
+        ['u', [{ type: 'text', text: 'r'.repeat(2000) }]],
+        ['a', [{ type: 'text', text: 'ok' }]],
+      ]);
+      try {
+        const compiled = await manager.compile(BIG);
+        const texts = compiled.messages.flatMap((m) => m.content.map((block) => (block as { text?: string }).text ?? ''));
+        assert.ok(texts.some((text) => text.includes('[truncated')), 'premise: the cap cuts the first message');
+        const store = (manager as unknown as { messageStore: { getAll(): StoredMessage[] } }).messageStore;
+        const stored = new Map(store.getAll().map((m) => [m.id, m]));
+        assert.ok(strategy.asked.length > 0, 'premise: the cut asked for estimates');
+        const apart = strategy.asked.filter((m) => stored.get(m.id) !== m);
+        assert.equal(apart.length, 0, `estimated apart from the stored messages: ${apart.length} of ${strategy.asked.length}`);
       } finally {
         await close();
       }

@@ -10936,15 +10936,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the cut's own estimate passing it. Whether the old price limited a
     // message depends on the multiplier it was priced under, so this asks
     // whether its estimate could have passed the cap plus 50 at the clamp's
-    // ceiling, from the estimate at a multiplier of 1. That over-counts, and
-    // a store it counts in wrongly restarts from 1, which one sample sets.
+    // ceiling of 1.8, bounded from its estimate at the applied multiplier.
+    // The store rounds each top-level block's estimate on its own, so that
+    // estimate is within half a token a block of the applied multiplier
+    // times the blocks' unrounded sum, and at the ceiling each block's
+    // rounding adds up to half a token more. The bound covers both, so with
+    // the multiplier the store estimates at it is never under the estimate
+    // at the ceiling, and a store it counts in wrongly restarts from 1,
+    // which one sample sets. A view that doesn't report its multiplier as a
+    // positive finite number is read at the clamp's floor, 0.6, the lowest
+    // this strategy applies, so the bound stays above the estimate at the
+    // ceiling for whichever it applied. Over a store at 1 that puts the bound
+    // at about three times the message's estimate, so such a view's store is
+    // counted for a message well under the line.
     3: (messages, strategy, store) => {
       const cap = strategy.config.maxMessageTokens;
       if (!(typeof cap === 'number' && cap > 0)) return false;
-      const applied = store.getTokenCalibration?.() ?? 1;
-      const factor = Number.isFinite(applied) && applied > 0 ? applied : 1;
-      return messages.some((m) =>
-        strategy.estimateTextOnlyTokens(m) > cap || (store.estimateTokens(m) / factor) * 1.8 > cap + 50);
+      const applied = store.getTokenCalibration?.();
+      const factor = typeof applied === 'number' && Number.isFinite(applied) && applied > 0 ? applied : 0.6;
+      return messages.some((m) => {
+        if (strategy.estimateTextOnlyTokens(m) > cap) return true;
+        const rounding = 0.5 * m.content.length;
+        return (1.8 * (store.estimateTokens(m) + rounding)) / factor + rounding > cap + 50;
+      });
     },
   };
 
@@ -14923,10 +14937,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the cap both strategies share (`capContent`, message-cap.ts). Whether it
    * looks is decided by `estimateTextOnlyTokens`, which counts thinking and
    * tool input too, so a thinking block alone can make it look. `estimate`,
-   * when given, is that estimate for `content` as it stands, such as a stored
-   * message's cached one (cappedForSend). This is the strategy's one cut: raw
-   * messages and summaries alike go through it, so an override changes both,
-   * and the price of a raw message follows what the override sends.
+   * when given, is that estimate for the content it's called with, such as
+   * cappedForSend's, which gives a stored message's cached estimate for that
+   * message's own content. This is the strategy's one cut: raw messages and
+   * summaries alike go through it, so an override changes both, and the
+   * price of a raw message follows what the override sends.
    */
   protected truncateContent(
     content: ContentBlock[],
@@ -14963,8 +14978,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The default cut, capContent, reads a cap that isn't a positive number
     // as no cap, such as a caller's explicit `maxMessageTokens: undefined`,
     // which stays in the config, and returns the content itself, so the
-    // extra is 0. The estimate given is of the content cut, msg.content.
-    const content = this.truncateContent(msg.content, msgCap, () => this.estimateTextOnlyTokens(msg));
+    // extra is 0. The estimate is the message's cached one for its own
+    // content, and otherwise of the content it's given, such as an
+    // override's rewrite passed on to this class's cut.
+    const content = this.truncateContent(msg.content, msgCap, (blocks) =>
+      blocks === msg.content ? this.estimateTextOnlyTokens(msg) : this.estimateTextOnlyTokens({ content: blocks } as StoredMessage));
     return { content, extra: cappedPriceExtra(store, msg, content) };
   }
 }
