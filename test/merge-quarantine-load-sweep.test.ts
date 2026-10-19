@@ -1,8 +1,9 @@
 /**
  * A stale merge-quarantine record (its sources merged or repaired while the
- * store was closed) holds every one of its sources. It must be swept when the
- * store loads, not only when the alarm next fires; with
- * `quarantineAlarmIntervalMs: 0` the alarm never fires at all (#117 review).
+ * store was closed) holds nothing, but `getCompressionDebt()` still lists its
+ * key. It must be swept when the store loads, not only when the alarm next
+ * fires; with `quarantineAlarmIntervalMs: 0` the alarm never fires at all
+ * (#117 review).
  */
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';

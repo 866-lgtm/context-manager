@@ -962,11 +962,16 @@ class MergeDispositionRejection extends Error {
 
 /**
  * Durable record of a merge dequeued after exhausting its bounded retry
- * policy. Keyed by sha256 of the sourceIds list. While a record is live,
- * `enqueueMerge` refuses to re-enqueue the same source set — the debt is
- * surfaced by the merge-quarantine klaxon instead of being retried in a
- * loop. Cleared by operator action (`clearMergeQuarantine`) or swept
- * automatically once every source is covered by a parent or gone.
+ * policy, or refused for its topology. Keyed by sha256 of the sourceIds
+ * list. While a record whose merge the provider kept refusing or failing is
+ * live, `enqueueMerge` refuses the same source set, and the record holds its
+ * sources out of every merge while its group could be retried as it stands
+ * (mergeRecordHolds), so merges form around them — the debt is surfaced by
+ * the merge-quarantine klaxon instead of being retried in a loop. Cleared by
+ * operator action (`clearMergeQuarantine`, which retries a held group) or
+ * swept automatically once any source is covered by a parent or gone; a
+ * topology refusal's record holds nothing, and goes once its group is a
+ * valid merge again and queues (enqueueMerge).
  */
 interface MergeQuarantineRecord {
   key: string;
@@ -2439,8 +2444,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (abortIfStale()) return;
       if (this.config.hierarchical && !this.chunkRecordsOrphaned && !this.config.auditOnly) {
         // Clear quarantine records whose sources were merged or repaired while
-        // the store was closed. A stale record now holds every one of its
-        // sources, and the alarm-driven sweep may not run for a long time.
+        // the store was closed. Such a record holds nothing (mergeRecordHolds),
+        // but getCompressionDebt lists every record's key, and the alarm-driven
+        // sweep may not run for a long time.
         this.sweepPaidOffMergeQuarantine();
         this.checkMergeThreshold();
       }
@@ -5579,20 +5585,82 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Push to the merge queue and persist the new queue snapshot.
    *
-   * The single eligibility gate for every scheduler (threshold pass, adaptive
-   * produce ops, recursive speculative pass): a group containing ANY held or
-   * quarantined source (`mergeHeldSourceIds`) is refused, not only an exact
-   * quarantined set. After a merge exhausts its bounded retry policy the
-   * schedulers would otherwise re-discover the same run, or a superset of it,
-   * and re-enqueue it forever. The merge-quarantine klaxon owns visibility;
-   * this guard stays silent.
+   * Refused: a group holding a held source (mergeHeldSourceIds: an operator
+   * hold, or a source a merge-quarantine record holds out of merges), which
+   * the merge candidates already leave out, and a group with a quarantine
+   * record of its own (after a merge exhausts its bounded retry policy, it
+   * must not be re-enqueued and retried forever) unless it is a valid merge
+   * of present, unparented sources. A provider failure's record holds such a
+   * group, so only clearMergeQuarantine retries it. A topology refusal's
+   * record holds nothing, so its group queues once it is valid again, its
+   * sources adjacent once more (say after the messages between them were
+   * deleted), when the next merge check or caller offers it: the refusal no
+   * longer applies, so the record goes, with a log line. The merge-quarantine
+   * klaxon owns visibility; the refusals stay silent.
    */
   protected enqueueMerge(merge: { level: SummaryLevel; sourceIds: string[]; attempts?: number }): void {
     this.requireBranchMutation('enqueueMerge');
     const held = this.mergeHeldSourceIds();
     if (merge.sourceIds.some((id) => held.has(id))) return;
+    const key = sha256Json(merge.sourceIds);
+    const record = this.mergeQuarantine.get(key);
+    if (record) {
+      const sources = merge.sourceIds.map((id) => this.summaryById(id));
+      if (sources.some((s) => s === undefined || getSummaryParentId(s))) return;
+      if (this.mergeTopologyProblem(merge.level, sources as SummaryEntry[], this.mergePositionIndex()) !== null) return;
+      this.mergeQuarantine.delete(key);
+      this.persistMergeQuarantine();
+      console.warn(`[merge-quarantine] cleared topology record key=${key.slice(0, 12)}: its group is a valid merge again`);
+    }
     this.mergeQueue.push(merge);
     this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
+  }
+
+  /**
+   * Summaries that must not be offered as merge sources: operator holds
+   * (`mergeHoldSummaryIds`), and the sources a merge-quarantine record holds
+   * out of merges while its group could be retried as it stands
+   * (mergeRecordHolds). The merge candidates (contiguousMergeCandidates,
+   * enqueueMergeForRange) leave them out, so they split the frontier into
+   * runs like any other hole and later history merges around them, and
+   * enqueueMerge refuses a group holding one. Offered again, a quarantined
+   * group would be refused every time: one refused merge used to stop every
+   * merge that would form after it at its level, and froze a resident's whole
+   * pyramid for 16 days (322 L1s never attempted, zero merge calls).
+   * `position` is the merge position index, when the caller has one.
+   */
+  protected mergeHeldSourceIds(position?: ReadonlyMap<MessageId, number>): Set<string> {
+    const ids = new Set<string>(this.config.mergeHoldSummaryIds ?? []);
+    if (this.mergeQuarantine.size === 0) return ids;
+    const order = position ?? this.mergePositionIndex();
+    for (const record of this.mergeQuarantine.values()) {
+      if (!this.mergeRecordHolds(record, order)) continue;
+      for (const id of record.sourceIds) ids.add(id);
+    }
+    return ids;
+  }
+
+  /**
+   * Whether a merge-quarantine record holds its sources out of merges: its
+   * merge failed at the provider (refused, answered unusably or kept failing;
+   * not a topology refusal), and its group could be retried as it stands,
+   * every source present and unparented and the group still a valid merge in
+   * store order (mergeTopologyProblem). A topology refusal made no model
+   * call, so its sources merge in valid groups. Neither does a group that
+   * can't be retried as it stands hold anything: a source gone or parented
+   * (which the sweep, when it runs, deletes), its messages deleted, or a
+   * summary landed between its sources. Its remaining sources then merge in
+   * valid groups too.
+   */
+  protected mergeRecordHolds(record: MergeQuarantineRecord, position: ReadonlyMap<MessageId, number>): boolean {
+    if (record.lastOutcome === 'topology_violation') return false;
+    const sources: SummaryEntry[] = [];
+    for (const id of record.sourceIds) {
+      const s = this.summaryById(id);
+      if (s === undefined || getSummaryParentId(s)) return false;
+      sources.push(s);
+    }
+    return this.mergeTopologyProblem(record.level, sources, position) === null;
   }
 
   /**
@@ -5803,8 +5871,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return null;
   }
 
-  /** The merge is never executed: no model call, sources stay unmerged, the
-   *  entry moves into the durable merge quarantine, health goes critical. */
+  /** The merge is never executed: no model call, the group stays unmerged,
+   *  the entry moves into the durable merge quarantine, health goes critical.
+   *  The record holds nothing (mergeRecordHolds), so its sources can merge in
+   *  valid groups, and it goes once its own group queues as a valid merge
+   *  (enqueueMerge), the sweep finds a source parented or gone, or an
+   *  operator clears it. */
   protected refuseCrossedMerge(targetLevel: SummaryLevel, sourceIds: string[], reason: string): void {
     this.requireBranchMutation('refuseCrossedMerge');
     this.topologyRefusals++;
@@ -5832,6 +5904,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       operation: `merge_l${targetLevel}`,
       metadata: { ...record },
     });
+    // A topology refusal holds no source out of merges (mergeRecordHolds):
+    // offer its sources in valid groups without waiting for another L1.
+    this.checkMergeThreshold();
   }
 
   /**
@@ -5943,12 +6018,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.mergeQueue.length === 0) return;
     const position = new Map(store.getAll().map((message, index) => [message.id, index] as const));
     const byId = new Map(this.summaries.map((summary) => [summary.id, summary] as const));
-    const held = this.mergeHeldSourceIds();
     const valid = (merge: { level: SummaryLevel; sourceIds: string[] }): boolean => {
       if (merge.sourceIds.length < 2) return false;
       let previousEnd: number | null = null;
       for (const sourceId of merge.sourceIds) {
-        if (held.has(sourceId)) return false; // held or quarantined since it was queued
         const source = byId.get(sourceId);
         if (
           !source ||
@@ -6047,6 +6120,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       operation: `merge_l${merge.level}`,
       metadata: { ...record },
     });
+    // The record holds its sources out of merges from now on: offer the runs
+    // on each side of the hole without waiting for another L1 or merge.
+    this.checkMergeThreshold();
   }
 
   protected persistMergeQuarantine(): void {
@@ -6061,20 +6137,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Operator action: lift merge quarantine for one key (or all). The next
-   * `checkMergeThreshold` pass re-discovers the unmerged run and re-enqueues
-   * it with a fresh attempt budget.
+   * Operator action: lift merge quarantine for one key (or all). A group the
+   * record held out of merges is queued again as it stands, at the queue's
+   * tail with a fresh attempt budget, unless one of its sources is still held
+   * (an operator hold, or another record holding it) or already queued:
+   * threshold selection alone might not offer it (a group short of the
+   * threshold, alone at its level). Then the `checkMergeThreshold` pass
+   * offers everything else. The merges formed around the group while it was
+   * held stay: it merges into one summary, which stays below its neighbours'
+   * level when nothing beside it was left unmerged.
    */
   clearMergeQuarantine(key?: string): void {
     this.requireLoadedBranch('clearMergeQuarantine');
-    if (key !== undefined) {
-      if (!this.mergeQuarantine.delete(key)) return;
-    } else {
-      if (this.mergeQuarantine.size === 0) return;
-      this.mergeQuarantine.clear();
-    }
+    const cleared = key !== undefined
+      ? [this.mergeQuarantine.get(key)].filter((r): r is MergeQuarantineRecord => r !== undefined)
+      : [...this.mergeQuarantine.values()];
+    if (cleared.length === 0) return;
+    const position = this.mergePositionIndex();
+    const retry = cleared.filter((record) => this.mergeRecordHolds(record, position));
+    for (const record of cleared) this.mergeQuarantine.delete(record.key);
     this.persistMergeQuarantine();
     console.warn(`[merge-quarantine] cleared ${key ? `key=${key.slice(0, 12)}` : 'ALL records'} — merges eligible for re-enqueue`);
+    // A group overlapping one already queued, as two records an older version
+    // wrote over overlapping groups can, would be skipped as stale once that
+    // one merges, with no merge check for its other sources then: the merge
+    // check below offers them instead.
+    const queued = new Set(this.mergeQueue.flatMap((m) => m.sourceIds));
+    for (const record of retry) {
+      if (record.sourceIds.some((id) => queued.has(id))) continue;
+      const before = this.mergeQueue.length;
+      this.enqueueMerge({ level: record.level, sourceIds: [...record.sourceIds] });
+      if (this.mergeQueue.length > before) for (const id of record.sourceIds) queued.add(id);
+    }
     this.checkMergeThreshold();
   }
 
@@ -6088,7 +6182,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *    remaining orphans can be regrouped;
    *  - no source summary exists anymore (surgery/repair removed them) →
    *    unretryable orphan, clear;
-   *  - any source still unmerged and present → live debt, keep.
+   *  - every source still present and unparented → keep: debt while the
+   *    record holds its group (mergeRecordHolds), and otherwise, as for a
+   *    topology refusal, kept for the operator to inspect until a source is
+   *    parented, the record is cleared, or a topology refusal's group queues
+   *    as a valid merge (enqueueMerge).
    */
   protected sweepPaidOffMergeQuarantine(): void {
     if (this.mergeQuarantine.size === 0) return;
@@ -6114,9 +6212,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Repeating klaxon for merge quarantine, mirroring the chunk-quarantine
-   * klaxon: quarantined merges keep their sources unmerged, the frontier
-   * widens, and deep-level folds stall — debt, not a resting state. Uses
-   * the same interval config; `quarantineAlarmIntervalMs: 0` disables.
+   * klaxon: it sounds while any record stands, each one an unmerged group to
+   * inspect, and counts the records that hold their sources out of merges
+   * (mergeRecordHolds), whose sources no summary above spans while merges
+   * form around them — debt, not a resting state. Uses the same interval
+   * config; `quarantineAlarmIntervalMs: 0` disables.
    */
   protected soundMergeQuarantineAlarmIfNeeded(): void {
     const interval = this.config.quarantineAlarmIntervalMs ?? 15 * 60_000;
@@ -6136,10 +6236,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.mergeQuarantineAlarmActive = true;
     this.mergeQuarantineAlarmLastAt = now;
     const keys = [...this.mergeQuarantine.keys()].map((k) => k.slice(0, 12)).join(',');
+    const position = this.mergePositionIndex();
+    const holding = [...this.mergeQuarantine.values()].filter((record) => this.mergeRecordHolds(record, position)).length;
     console.error(
-      `[merge-quarantine] ⚠️ ${this.mergeQuarantine.size} merge(s) quarantined — their sources ` +
-        `stay unmerged and deep-level folding is stalled for those spans. Operator action ` +
-        `required (inspect llm-calls receipts; clearMergeQuarantine to retry). keys=${keys}`,
+      `[merge-quarantine] ⚠️ ${this.mergeQuarantine.size} merge(s) quarantined; ${holding} of them ` +
+        `hold their sources out of merges, and no summary above spans those. Operator action ` +
+        `required (inspect llm-calls receipts; clearMergeQuarantine retries a held group). keys=${keys}`,
     );
   }
 
@@ -6296,27 +6398,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return s >= lo && s <= hi;
     };
 
-    // In-range unmerged candidates in history order. Held or quarantined
-    // summaries are not sources, but they still split the range: a merge must
-    // never span one, so take the first run of >= 2 eligible neighbours.
-    const held = this.mergeHeldSourceIds();
-    const inRangeCandidates: SummaryEntry[] = [];
+    const held = this.mergeHeldSourceIds(messageOrder);
+    const sources: SummaryEntry[] = [];
     for (const s of this.summaries) {
       if (s.level !== sourceLevel) continue;
       if (getSummaryParentId(s)) continue;
       if (queuedAtLevel.has(s.id)) continue;
+      if (held.has(s.id)) continue;
       if (!inRange(s.sourceRange.first) && !inRange(s.sourceRange.last)) continue;
-      inRangeCandidates.push(s);
-    }
-    const pos = (s: SummaryEntry) => messageOrder.get(s.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
-    inRangeCandidates.sort((a, b) => pos(a) - pos(b));
-    let sources: SummaryEntry[] = [];
-    for (const s of inRangeCandidates) {
-      if (held.has(s.id)) {
-        if (sources.length >= 2) break;
-        sources = [];
-        continue;
-      }
       sources.push(s);
     }
     if (sources.length < 2) return;
@@ -6515,19 +6604,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Whether the speculative cap holds L1 production now: past the cap, while
    * an L1→L2 merge is queued and `hierarchical` is on, so that tick will run
-   * it and bring the count of unmerged L1s back down. Production waits for
+   * it and bring the count of unmerged L1s back down (or drop it as stale,
+   * as when a merge-quarantine record holds one of its sources). Production waits for
    * that merge however long the merge waits: behind another merge at the
    * head, on a hold over its sources, or through calls that fail and retry.
    *
    * With no L1 merge queued, no merge the cap could wait for is coming, so it
-   * holds nothing (issue #240). No merge forms below `mergeThreshold`
-   * unmerged L1s, which a cap below `mergeThreshold - 1` stopped short of.
-   * L1s that can never merge count toward the cap: a pruned source, the
-   * wide-span quarantine, a lone interior summary, or the sources of a merge
-   * in the merge quarantine, which contiguousMergeCandidates offers again
-   * while its run is the oldest that qualifies, so enqueueMerge refuses it
-   * and no later L1 merge forms. And under `hierarchical: false` tick runs no
-   * merge, though checkMergeThreshold can still queue one.
+   * holds nothing (issue #240). Threshold selection forms no merge below
+   * `mergeThreshold` unmerged L1s, which a cap below `mergeThreshold - 1`
+   * stopped short of.
+   * L1s that can't merge count toward the cap: a pruned source, the wide-span
+   * quarantine, a lone interior summary, or a held one (mergeHeldSourceIds: an
+   * operator hold, or a group a merge-quarantine record holds out of merges).
+   * And under `hierarchical: false` tick runs no merge, though
+   * checkMergeThreshold can still queue one.
    */
   protected speculativeCapHolds(): boolean {
     if (!this.isAtSpeculativeCap()) return false;
@@ -6787,9 +6877,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           return;
         }
         // Success, or a skipped entry: drop from head and persist the
-        // shorter queue. We re-check that head is still our merge in case
-        // some future code path mutates the queue mid-await (today no other
-        // site does, but the assertion makes that invariant explicit).
+        // shorter queue. We re-check that head is still our merge, since
+        // executeMerge drops the head itself when it refuses a crossed merge
+        // or skips an entry holding a held source: dequeuing again would
+        // drop the next entry.
         if (this.mergeQueue[0] === merge) {
           this.dequeueMerge();
         }
@@ -10411,26 +10502,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Summaries that must not be offered as merge sources: every source of a
-   * quarantined merge, plus operator holds (`mergeHoldSummaryIds`). They are
-   * removed BEFORE contiguity is computed, so they split the frontier into
-   * runs like any other hole and later history merges around them.
-   *
-   * Without this, a quarantined group that happens to be the OLDEST
-   * contiguous run is re-offered on every threshold pass, `enqueueMerge`
-   * silently declines it, and no later group is ever considered: one refused
-   * merge froze a resident's whole pyramid for 16 days (322 L1s never
-   * attempted, zero merge calls).
-   */
-  protected mergeHeldSourceIds(): Set<string> {
-    const held = new Set<string>(this.config.mergeHoldSummaryIds ?? []);
-    for (const record of this.mergeQuarantine.values()) {
-      for (const id of record.sourceIds) held.add(id);
-    }
-    return held;
-  }
-
-  /**
    * The message spans of work the lane put back after a failure and will try
    * again, each with the level of the summary its answer makes: a pending
    * chunk with a run of failures in progress (an L1), and a queued merge with
@@ -10486,13 +10557,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     unmerged: SummaryEntry[],
     threshold: number,
   ): SummaryEntry[] | null {
-    const held = this.mergeHeldSourceIds();
-    if (held.size > 0) unmerged = unmerged.filter((s) => !held.has(s.id));
-    // No total-count guard here: an interior run may consolidate at 2 members
-    // (the rule below) even when fewer than `threshold` summaries are eligible
-    // overall, which holds and quarantine make common. The run loop applies
-    // both limits.
-    if (unmerged.length === 0) return null;
+    if (unmerged.length < threshold) return null;
     // Store order, not chunk-record order: a chunk minted late over an early
     // message (issue #122's head ratchet) is adjacent to the frontier in
     // record order and to the chronicle's opening in store order.
@@ -10500,6 +10565,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const spanBase = this.config.mergeMaxSourceSpanMessages ?? 1500;
     const mergeK = this.config.mergeThreshold ?? 6;
     const withPos: Array<{ s: SummaryEntry; first: number; last: number }> = [];
+    // Held summaries (mergeHeldSourceIds: operator holds, and the sources a
+    // merge-quarantine record holds out) leave a hole: the runs split there
+    // and merge on each side, while the klaxon names a quarantined merge's
+    // record and the debt report lists operator holds. `heldEnd` is the last
+    // position a held summary reaches: a run that ends before it can't grow
+    // past the hole.
+    const held = this.mergeHeldSourceIds(messageOrder);
+    let heldEnd = -Infinity;
+    const heldFirsts: number[] = [];
     for (const s of unmerged) {
       const first = messageOrder.get(s.sourceRange.first);
       const last = messageOrder.get(s.sourceRange.last);
@@ -10510,6 +10584,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           s.id,
           `L${s.level} ${s.id}: source position unresolved (pruned source messages?) — permanently unmergeable, frontier debt`,
         );
+        continue;
+      }
+      if (held.has(s.id)) {
+        heldEnd = Math.max(heldEnd, first, last);
+        heldFirsts.push(Math.min(first, last));
         continue;
       }
       // Wide-span quarantine, scaled by level. Legitimate spans grow ~k× per
@@ -10538,11 +10617,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // positions in `messageOrder`, so this still bridges true tombstones; it
     // refuses only holes containing another live representation. A hole that
     // work put back after a failure will fill at this level (pendingRetrySpans)
-    // isn't stranded: the run before it waits, as the newest run does.
+    // isn't stranded: the run before it waits, as the newest run does. A run
+    // can grow only up to the next run or the first held summary after it,
+    // whichever comes first, so it waits only for a retry pending before that.
     let retrySpans: Array<[number, number, number]> | undefined;
     const retryPendingIn = (from: number, to: number, level: number): boolean => {
       retrySpans ??= this.pendingRetrySpans(messageOrder);
       return retrySpans.some(([first, last, filled]) => filled <= level && first <= to && last >= from);
+    };
+    heldFirsts.sort((a, b) => a - b);
+    const waitsFor = (end: number, next: number, level: number): boolean => {
+      const bound = Math.min(next, heldFirsts.find((p) => p > end) ?? Infinity) - 1;
+      return bound > end && retryPendingIn(end + 1, bound, level);
     };
     const runs: Array<typeof withPos> = [];
     const waiting: boolean[] = [];
@@ -10551,7 +10637,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const x of withPos) {
       if (run.length > 0 && x.first !== runEnd + 1) {
         runs.push(run);
-        waiting.push(retryPendingIn(runEnd + 1, x.first - 1, x.s.level ?? 1));
+        waiting.push(waitsFor(runEnd, x.first, x.s.level ?? 1));
         run = [];
         runEnd = -Infinity;
       }
@@ -10560,9 +10646,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     if (run.length > 0) {
       runs.push(run);
-      waiting.push(false);
+      // The newest run waits for no retry, unless a held summary follows it.
+      waiting.push(heldEnd > runEnd && waitsFor(runEnd, Infinity, run[0]!.s.level ?? 1));
     }
     if (runs.length === 0) return null;
+    // A run that ends before a held summary can't grow past the hole, so it
+    // isn't the newest: an empty run after it keeps it interior, and it
+    // consolidates at two as an interior run does. `runEnd` is still the last
+    // run's end.
+    if (heldEnd > runEnd) runs.push([]);
 
     // ONLY THE NEWEST RUN CAN GROW (2026-07-12 starvation fix). Summaries are
     // produced at the live end, so an INTERIOR run is stranded: it can never
@@ -10690,9 +10782,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Uses self-voice consolidation prompt.
    *
    * Resolves true when it wrote the merged parent. It resolves false, having
-   * written nothing, when it skips the entry with no call (a source missing
-   * or already parented, or a crossed merge refused) or its branch went stale
-   * during the call. tick drops a skipped entry from the queue. Any answer
+   * written nothing, when it skips the entry with no call (a source missing,
+   * already parented or held out of merges, or a crossed merge refused) or
+   * its branch went stale during the call. tick drops a skipped
+   * entry from the queue unless the skip dropped it already, as a refused
+   * crossed merge and an entry holding a held source do. Any answer
    * from the provider resumes the lane, a refusal included, but only a
    * written merge is a landing (noteCompressionLanded). A hold placed on the
    * span during the call keeps a valid answer out (MergeHoldDiscard).
@@ -10731,12 +10825,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return false;
     }
 
+    // A held source (mergeHeldSourceIds: an operator hold, or a source a
+    // merge-quarantine record holds out of merges) invalidates the entry the
+    // same way: it was queued before the hold, as a queue from an older
+    // version, one persisted before an operator hold was set, or a direct
+    // caller's overlapping group can be. A holding record's own group is
+    // retried only by clearMergeQuarantine, which deletes the record first.
+    this.refreshStoreOrder(ctx.messageStore.getAll());
+    const position = this.mergePositionIndex();
+    const held = this.mergeHeldSourceIds(position);
+    const heldSources = sources.filter((source) => held.has(source.id));
+    if (heldSources.length > 0) {
+      console.warn(
+        `executeMerge: ${heldSources.length}/${sources.length} source(s) held out of merges ` +
+          `(${heldSources.map((source) => source.id).join(', ')}); skipping stale queue entry`,
+      );
+      // The merge check left the entry's other sources out while it was
+      // queued: drop it now and offer them, as refuseCrossedMerge does.
+      const head = this.mergeQueue[0];
+      if (head && head.sourceIds === sourceIds) this.dequeueMerge();
+      this.checkMergeThreshold();
+      return false;
+    }
+
     // Last line of defence: a crossed node is never minted. Whatever enqueued
     // this group (threshold pass, demand path, a persisted queue from an older
     // grammar, an operator), the sources must be one level below the target
     // and strictly adjacent among chunk-owned messages in store order.
-    this.refreshStoreOrder(ctx.messageStore.getAll());
-    const topology = this.mergeTopologyProblem(targetLevel, sources, this.mergePositionIndex());
+    const topology = this.mergeTopologyProblem(targetLevel, sources, position);
     if (topology) {
       this.refuseCrossedMerge(targetLevel, sourceIds, topology);
       return false;
@@ -11479,8 +11595,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the head until it lands, and the walk reads it there: a hold placed since
    * ends the walk at it, since tick discards what its call returns and stops
    * at that head. A queued merge counts even when executeMerge will
-   * drop it as stale without a model call (a source not loaded or already
-   * parented, or a group its topology check refuses, which it quarantines),
+   * drop it as stale without a model call (a source not loaded, already
+   * parented or held out of merges, or a group its topology check refuses,
+   * which it quarantines),
    * when a source in memory covers such a message: tick drops one such entry
    * a call, so the count can name compression for it until tick reaches it.
    * A merge none of whose sources is in memory covers no message, and names

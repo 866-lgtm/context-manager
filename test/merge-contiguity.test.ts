@@ -196,8 +196,10 @@ test('a quarantined oldest group does not block later history from merging', () 
   // enqueueMerge declined it, and 322 newer L1s were never attempted.
   const p = new QuarantineProbe({ adaptiveResolution: true, autoTickOnNewMessage: false });
   p.setChunks(Array.from({ length: 5000 }, (_, i) => `m-${i}`));
-  const oldest = Array.from({ length: 6 }, (_, i) => summary(`q${i}`, i * 10, i * 10 + 9));
-  const later = Array.from({ length: 7 }, (_, i) => summary(`n${i}`, 60 + i * 10, 60 + i * 10 + 9));
+  // L1s, stored, so the L2 merge's record could be retried as it stands and holds its sources.
+  const oldest = Array.from({ length: 6 }, (_, i) => l1(`q${i}`, i * 10, i * 10 + 9));
+  const later = Array.from({ length: 7 }, (_, i) => l1(`n${i}`, 60 + i * 10, 60 + i * 10 + 9));
+  p.setSummaries([...oldest, ...later]);
   p.seedQuarantine(oldest.map((s) => s.id));
   const run = p.pick([...oldest, ...later], 6);
   assert.deepEqual(run?.map((s) => s.id), ['n0', 'n1', 'n2', 'n3', 'n4', 'n5']);
@@ -249,7 +251,11 @@ test('adaptive produce ops never merge a held source, nor span one', () => {
   const p = gateProbe({ mergeHoldSummaryIds: ['h2'] });
   p.setSummaries(Array.from({ length: 9 }, (_, i) => l1(`h${i}`, i * 10, i * 10 + 9)));
   p.produce(2, 'm-0', 'm-89');
-  assert.deepEqual(p.queue().map((m) => m.sourceIds), [['h0', 'h1']], 'first eligible run before the hold');
+  assert.deepEqual(
+    p.queue().map((m) => m.sourceIds),
+    [['h3', 'h4', 'h5', 'h6', 'h7', 'h8']],
+    'the longest eligible run, past the hold, as for any hole in the range',
+  );
 });
 
 test('adaptive produce ops cannot re-request a quarantined group or a superset of it', () => {
@@ -262,18 +268,6 @@ test('adaptive produce ops cannot re-request a quarantined group or a superset o
   assert.equal(p.queue().length, 0);
   p.produce(2, 'm-0', 'm-119'); // the picker asks for the whole range
   assert.deepEqual(p.queue().map((m) => m.sourceIds), [['n0', 'n1', 'n2', 'n3', 'n4', 'n5']]);
-});
-
-test('a persisted queue entry that now contains a held source is dropped on load', () => {
-  const held = gateProbe({ mergeHoldSummaryIds: ['b'] });
-  const kept = gateProbe();
-  for (const p of [held, kept]) {
-    p.setSummaries([summary('a', 0, 50), summary('b', 51, 100)]);
-    p.setMergeQueue([{ level: 3, sourceIds: ['a', 'b'] }]);
-    p.sanitizeQueue(Array.from({ length: 5000 }, (_, i) => `m-${i}`));
-  }
-  assert.equal(held.mergeQueueLength(), 0, 'held source → entry dropped');
-  assert.equal(kept.mergeQueueLength(), 1, 'control: the same contiguous entry survives without the hold');
 });
 
 test('an interior run merges at 2 even when fewer than threshold are eligible overall', () => {
