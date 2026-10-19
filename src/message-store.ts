@@ -119,7 +119,8 @@ interface NativeIndexEqOpts {
  */
 const sharedWriteVersions = new WeakMap<object, Map<string, number>>();
 
-function bumpWriteVersion(store: object, stateId: string): number {
+/** Its `[cm-cache]` line goes through `log`, the bumping store's diagnostics (#239). */
+function bumpWriteVersion(store: object, stateId: string, log: Diagnostics): number {
   let m = sharedWriteVersions.get(store);
   if (!m) {
     m = new Map();
@@ -129,7 +130,7 @@ function bumpWriteVersion(store: object, stateId: string): number {
   m.set(stateId, next);
   if (typeof process !== 'undefined' && process.env?.CM_CACHE_DIAG) {
     const site = (new Error().stack ?? '').split('\n')[2]?.trim();
-    console.error(`[cm-cache] writeVersion bump ${stateId} → ${next} at ${site}`);
+    log.error(`[cm-cache] writeVersion bump ${stateId} → ${next} at ${site}`);
   }
   return next;
 }
@@ -159,8 +160,9 @@ function currentEditVersion(store: object, stateId: string): number {
  *  full rebuild is ~20s of CPU on a large store on production hardware —
  *  a silent cache miss IS the latency incident (mythos, 2026-07-26). */
 const CACHE_DIAG = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
-function cacheDiag(msg: string): void {
-  if (CACHE_DIAG) console.error(`[cm-cache] ${msg}`);
+/** Through `log`, the store's diagnostics, so an isolated slot's lines name its namespace (#239). */
+function cacheDiag(msg: string, log: Diagnostics): void {
+  if (CACHE_DIAG) log.error(`[cm-cache] ${msg}`);
 }
 
 /**
@@ -232,9 +234,10 @@ export class MessageStore {
   private stateId: string;
 
   /**
-   * Where its stderr lines go: a slot of one namespace (an isolated
-   * manager's, or an auxiliary slot named by its namespace) names it; the
-   * shared slot is no one namespace's, and its lines name none (#239).
+   * Where its stderr lines go, its `[cm-cache]` lines included: a slot of one
+   * namespace (an isolated manager's, or an auxiliary slot named by its
+   * namespace) names it; the shared slot is no one namespace's, and its lines
+   * name none (#239).
    */
   private readonly log: Diagnostics;
 
@@ -478,7 +481,7 @@ export class MessageStore {
       this.indexBranchId === branchId &&
       this.indexWriteVersion === currentWriteVersion(this.store, this.stateId);
     const cacheWasCurrent = this.cacheIsCurrent();
-    const version = bumpWriteVersion(this.store, this.stateId);
+    const version = bumpWriteVersion(this.store, this.stateId, this.log);
     const record = this.store.appendToStateJsonWithIdentity(
       this.stateId,
       partialInternal,
@@ -533,6 +536,7 @@ export class MessageStore {
       if (this.allCache) {
         cacheDiag(
           `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : !cacheWasCurrent ? 'cache was stale before the append' : this.allCache.branchId !== this.store.currentBranch().id ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) stateId=${this.stateId} — cache dropped`,
+          this.log,
         );
       }
       this.allCache = null;
@@ -589,7 +593,7 @@ export class MessageStore {
     };
 
     const cacheWasCurrent = this.cacheIsCurrent();
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId, this.log);
     bumpEditVersion(this.store, this.stateId);
     this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
 
@@ -643,7 +647,7 @@ export class MessageStore {
     }
 
     const cacheWasCurrent = this.cacheIsCurrent();
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId, this.log);
     bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
     // Write-through the materialized cache (see append); fall back to
@@ -680,7 +684,7 @@ export class MessageStore {
     if (!target?.bodyGroupId) {
       // Not sharded — defer to normal remove path (re-look up via getInternal
       // since the normal `remove` checks bodyGroupId).
-      this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+      this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId, this.log);
       bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
       this.allCache = null; // rare path: plain invalidation
@@ -695,7 +699,7 @@ export class MessageStore {
     const { from, to } = bodyBoundsIn(all, index);
     const firstId = all[from].id;
     const lastId = all[to].id;
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId, this.log);
     bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, from, to + 1);
     this.allCache = null; // rare path: plain invalidation
@@ -738,7 +742,7 @@ export class MessageStore {
       );
     }
 
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId, this.log);
     bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, fromIndex, toIndex + 1);
     this.allCache = null; // rare path: plain invalidation
@@ -1807,7 +1811,7 @@ export class MessageStore {
     const internals =
       !state || !Array.isArray(state) ? [] : (state as StoredMessageInternal[]);
     this.allCache = { branchId, sequence, internals, writeVersion };
-    cacheDiag(`getAllInternal MISS (${missReason}) stateId=${this.stateId} rebuilt ${internals.length} in ${Date.now() - _t}ms`);
+    cacheDiag(`getAllInternal MISS (${missReason}) stateId=${this.stateId} rebuilt ${internals.length} in ${Date.now() - _t}ms`, this.log);
     return internals;
   }
 

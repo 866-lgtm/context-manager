@@ -4,7 +4,7 @@
  * can be told apart.
  */
 
-import { describe, it } from 'node:test';
+import { describe, it, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -56,31 +56,85 @@ describe('the manager\'s diagnostics', () => {
     assert.match(select[0]!, / ns=agents\/tern$/);
   });
 
-  it('names the message slot, as written, when retuning its snapshot cadence fails at open', async (t) => {
+  it('names an isolated slot\'s namespace on its cache lines, and the shared slot\'s none (CM_CACHE_DIAG)', async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'cm-cache-slot-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const prior = process.env.CM_CACHE_DIAG;
+    t.after(() => {
+      if (prior === undefined) delete process.env.CM_CACHE_DIAG;
+      else process.env.CM_CACHE_DIAG = prior;
+    });
+    const lines: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(String(args[0])); });
+    const isolated = await ContextManager.open({ path: join(dir, 'isolated'), namespace: 'agents/tern', isolate: true });
+    const shared = await ContextManager.open({ path: join(dir, 'shared'), namespace: 'agents/kite' });
+    // Read at each write, so it can be set here.
+    process.env.CM_CACHE_DIAG = '1';
+    isolated.addMessage('User', [{ type: 'text', text: 'hello' }]);
+    shared.addMessage('User', [{ type: 'text', text: 'hello' }]);
+    isolated.close();
+    shared.close();
+    const bumps = lines.filter((line) => line.startsWith('[cm-cache] writeVersion bump'));
+    assert.equal(bumps.length, 2, lines.join('\n'));
+    assert.ok(bumps[0]!.startsWith('[cm-cache] writeVersion bump agents/tern/messages ') && bumps[0]!.endsWith(' ns=agents/tern'), bumps[0]);
+    assert.ok(bumps[1]!.startsWith('[cm-cache] writeVersion bump messages ') && !bumps[1]!.includes(' ns='), bumps[1]);
+  });
+
+  /**
+   * Opens a manager twice on one store, so the second open retunes the slot the first made,
+   * through a store whose retune throws when `refuse` is set, and returns what the second
+   * printed, formatted as console formats its arguments.
+   */
+  async function retuneLines(
+    t: TestContext,
+    options: { namespace: string; isolate?: boolean; refuse?: boolean },
+  ): Promise<string[]> {
     const dir = mkdtempSync(join(tmpdir(), 'cm-retune-'));
     t.after(() => rmSync(dir, { recursive: true, force: true }));
     const path = join(dir, 'store');
-    // The slot exists before this open, so open retunes it; a % in the namespace stays as written.
-    const namespace = 'agents/100%s';
-    (await ContextManager.open({ path, namespace, isolate: true })).close();
+    const { namespace, isolate } = options;
+    (await ContextManager.open({ path, namespace, isolate })).close();
     const real = JsStore.openOrCreate({ path });
-    const refusing = new Proxy(real, {
-      get(target, prop) {
-        if (prop === 'updateStateStrategy') return () => { throw new Error('retune refused'); };
-        const value = Reflect.get(target, prop, target) as unknown;
-        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
-      },
-    }) as JsStore;
+    const store = options.refuse
+      ? (new Proxy(real, {
+          get(target, prop) {
+            if (prop === 'updateStateStrategy') return () => { throw new Error('retune refused'); };
+            const value = Reflect.get(target, prop, target) as unknown;
+            return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+          },
+        }) as JsStore)
+      : real;
     const printed: string[] = [];
-    // Formatted as console formats its arguments.
-    t.mock.method(console, 'error', (...args: unknown[]) => { printed.push(format(...args)); });
+    const error = console.error;
+    console.error = (...args: unknown[]) => { printed.push(format(...args)); };
     try {
-      (await ContextManager.open({ store: refusing, namespace, isolate: true })).close();
+      (await ContextManager.open({ store, namespace, isolate })).close();
     } finally {
+      console.error = error;
       real.close();
     }
-    const failed = printed.filter((line) => line.startsWith('[message-store] snapshot-cadence retune failed'));
-    assert.equal(failed.length, 1, printed.join('\n'));
-    assert.ok(failed[0]!.startsWith(`[message-store] snapshot-cadence retune failed for ${namespace}/messages: Error: retune refused`), failed[0]);
+    return printed.filter((line) => line.startsWith('[message-store] snapshot'));
+  }
+
+  it('names an isolated slot\'s namespace when it retunes the slot\'s snapshot cadence at open, and the shared slot\'s none', async (t) => {
+    const isolated = await retuneLines(t, { namespace: 'agents/tern', isolate: true });
+    assert.equal(isolated.length, 1, isolated.join('\n'));
+    assert.match(isolated[0]!, /^\[message-store\] snapshot cadence retuned: agents\/tern\/messages -> delta \d+ x full \d+ ns=agents\/tern$/);
+    const shared = await retuneLines(t, { namespace: 'agents/tern' });
+    assert.equal(shared.length, 1, shared.join('\n'));
+    assert.match(shared[0]!, /^\[message-store\] snapshot cadence retuned: messages -> delta \d+ x full \d+$/);
+  });
+
+  it('names the message slot, as written, when retuning its snapshot cadence fails at open', async (t) => {
+    // A % in the namespace stays as written, in the slot and in the suffix.
+    const isolated = await retuneLines(t, { namespace: 'agents/100%s', isolate: true, refuse: true });
+    assert.equal(isolated.length, 1, isolated.join('\n'));
+    assert.ok(
+      isolated[0]!.startsWith('[message-store] snapshot-cadence retune failed for agents/100%s/messages: ns=agents/100%s Error: retune refused'),
+      isolated[0],
+    );
+    const shared = await retuneLines(t, { namespace: 'agents/100%s', refuse: true });
+    assert.equal(shared.length, 1, shared.join('\n'));
+    assert.ok(shared[0]!.startsWith('[message-store] snapshot-cadence retune failed for messages: Error: retune refused'), shared[0]);
   });
 });

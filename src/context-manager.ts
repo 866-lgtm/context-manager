@@ -373,6 +373,11 @@ export class ContextManager {
     }
     const messageNamespace = config.isolate ? config.namespace : undefined;
     const messageSlot = MessageStore.registrationFor(messageNamespace).id;
+    // The slot's lines name its namespace where it has one, as the store's own
+    // do: an isolated slot is one agent's, and the shared slot no one's (#239).
+    const slotLines: Diagnostics = messageNamespace
+      ? namespaceDiagnostics(() => messageNamespace)
+      : console;
 
     // Register states if needed. A slot that already exists is kept; any
     // other registration failure propagates (see isStateExistsFor).
@@ -394,17 +399,17 @@ export class ContextManager {
           upsert.call(store, reg);
           // One line per boot — the rollout verification signal that the
           // retune actually applied to this (pre-existing) store.
-          console.error(
+          slotLines.error(
             `[message-store] snapshot cadence retuned: ${reg.id} -> ` +
             `delta ${reg.deltaSnapshotEvery} x full ${reg.fullSnapshotEvery}`,
           );
         } catch (err) {
           // Never fatal: a strategy-kind mismatch or transient store error
           // must not block opening the context manager. Like the line above,
-          // it names the slot, which is the store's (#239).
-          // The slot as written: it isn't part of the format string console reads when
-          // an argument follows, so a '%' in it prints as itself.
-          console.error('[message-store] snapshot-cadence retune failed for', `${messageSlot}:`, err);
+          // it names the slot (#239). Console reads the message as a format
+          // string when the error follows it, so a '%' in the slot is doubled
+          // to print as itself.
+          slotLines.error(`[message-store] snapshot-cadence retune failed for ${messageSlot.replaceAll('%', '%%')}:`, err);
         }
       }
     }
