@@ -1,6 +1,7 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { ContextManager, AutobiographicalStrategy, KnowledgeStrategy, OverBudgetError, PassthroughStrategy } from '../src/index.js';
 import type { ContextEntry, StoredMessage } from '../src/types/index.js';
 import type { KvUnifiedReceiptChain } from '../src/adaptive/kv-unified-receipts.js';
@@ -892,6 +893,27 @@ test('messages= counts the strategy view: auxiliary slots merged in, after the v
   assert.equal(reader.getRenderStats()!.planVsActual!.messages, 3);
   reader.close();
   main.close();
+});
+
+test('a quarantined merge is blocked for latent demand by its source-set key', async () => {
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  manager.addMessage('user', [{ type: 'text', text: 'hello' }]);
+  const sourceIds = ['L1-a', 'L1-b'];
+  const key = createHash('sha256').update(JSON.stringify(sourceIds), 'utf8').digest('hex');
+  (selected as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine.set(key, {
+    key, level: 2, sourceIds, attempts: 3, lastOutcome: 'refusal', quarantinedAt: 1,
+  });
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  const solver = (selected as unknown as {
+    _lastKvUnified: { options: { latentDemand?: { blocked?: (sourceIds: readonly string[]) => boolean } } };
+  })._lastKvUnified;
+  const blocked = solver.options.latentDemand?.blocked;
+  assert.ok(blocked, 'the recipe-built solver carries the predicate');
+  assert.equal(blocked(sourceIds), true, 'the quarantined source set, in order');
+  assert.equal(blocked([...sourceIds].reverse()), false, 'another order is another merge');
+  assert.equal(blocked(['L1-a', 'L1-c']), false);
+  manager.close();
 });
 
 test('latent demand is joint unless the recipe says individual', async () => {

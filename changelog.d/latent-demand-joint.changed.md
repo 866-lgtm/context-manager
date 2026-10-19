@@ -8,4 +8,7 @@
   differences at the approximation's noise floor. `latentDemandMode:
   'individual'` in the recipe's `kvUnified` block restores the per-candidate
   ranking; the solver-level `latentDemand.mode` treats an absent value as
-  `individual`.
+  `individual`. A merge in the strategy's merge quarantine is not a
+  candidate in either mode (`latentDemand.blocked`): its request would be
+  refused at the queue, and a joint cut that used it would hide the merge
+  it would otherwise demand.

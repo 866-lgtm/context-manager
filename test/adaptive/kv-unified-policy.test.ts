@@ -1801,6 +1801,40 @@ test('joint latent demand leaves a merge the joint cut does not use undemanded',
   assert.ok(evaluations.some((e) => e.conservativeImprovement === 0 && e.expectedImprovement === 0));
 });
 
+test('joint latent demand leaves a blocked merge out of the what-if, so the cut demands the alternative', () => {
+  // The hinge-at-150 fixture above: one merge is enough and the joint cut
+  // uses one candidate. When that merge is one the host would refuse (a
+  // quarantined source set), it never enters the what-if forest and the cut
+  // demands the other merge instead of hiding it behind a refused request.
+  const build = (blocked?: (sourceIds: readonly string[]) => boolean) => {
+    const strategy = new KvUnifiedStrategy({
+      policy: latentPolicy(0.5),
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode: 'joint', blocked },
+    });
+    const result = strategy.solve(latentFixture(), { totalBudget: 300, targetBudget: 270, slack: 0.1 });
+    return { strategy, result };
+  };
+  const open = build();
+  assert.equal(open.result.produced.length, 1, 'premise: one merge is enough');
+  const chosen = open.strategy.lastDemandEvaluations.find((e) => e.conservativeImprovement > 0)!;
+  const other = open.strategy.lastDemandEvaluations.find((e) => e.conservativeImprovement === 0)!;
+  const seen: string[][] = [];
+  const quarantined = build((sourceIds) => {
+    seen.push([...sourceIds]);
+    return sourceIds.join('+') === chosen.sourceIds.join('+');
+  });
+  assert.deepEqual(seen.map((ids) => ids.join('+')).sort(), [chosen.sourceIds.join('+'), other.sourceIds.join('+')].sort(),
+    'every candidate source set is asked');
+  assert.deepEqual(quarantined.result.produced, [other.request], 'the alternative is demanded');
+  assert.deepEqual(quarantined.strategy.lastDemandEvaluations.map((e) => e.sourceIds), [other.sourceIds],
+    'the blocked candidate is not measured');
+  assert.ok(quarantined.strategy.lastDemandEvaluations[0].conservativeImprovement > 0);
+  const none = build(() => true);
+  assert.deepEqual(none.result.produced, []);
+  assert.equal(none.strategy.lastTimings?.demandSolves, 0, 'nothing to measure, nothing solved');
+});
+
 test('joint latent demand demands nothing when the joint cut beats the live one by at most epsilon', () => {
   // Hinge at 150 and one merge worth ~35,800: an epsilon above that gain
   // keeps the merge undemanded while the evaluations still report it.

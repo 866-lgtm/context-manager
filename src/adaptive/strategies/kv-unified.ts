@@ -41,6 +41,11 @@ export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> 
      * the approximation's noise floor. The strategy built from a recipe
      * fills in `joint` unless `latentDemandMode` says otherwise. */
     mode?: 'individual' | 'joint';
+    /** Source sets whose merge the host would refuse to build (a merge in
+     * its quarantine). Such a candidate never enters a what-if forest: a
+     * cut that used it would attribute its gain to a merge that cannot be
+     * made, and in joint mode hide the alternative the cut left out. */
+    blocked?: (sourceIds: readonly string[]) => boolean;
   };
 }
 
@@ -544,6 +549,7 @@ function latentHigherLevelCandidates(
       );
       const childTokens = sources.reduce((sum, source) => sum + source.recallTokens, 0);
       const sourceIds = sources.map((source) => source.id);
+      if (config.blocked?.(sourceIds)) continue;
       const firstLeaf = forest.leaf(sources[0]!.leafIds[0]!);
       const lastLeaf = forest.leaf(sources.at(-1)!.leafIds.at(-1)!);
       if (!firstLeaf || !lastLeaf) continue;
