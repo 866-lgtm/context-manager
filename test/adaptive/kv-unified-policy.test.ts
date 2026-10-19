@@ -2016,11 +2016,13 @@ test('a remembered joint ceiling failure is forgotten when the wall changes', ()
   const carried = build(405, reuse);
   assert.equal(carried.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again at the new wall');
   assert.deepEqual(carried.result.produced, fresh.result.produced);
-  // A pin, or a head window, changes the levels a leaf may take, and so the
-  // label count, too.
-  const pinned = (budget: number, holder: KvUnifiedReuse, head = false) => {
+  // A pin, a head window, or a level bound that only touches the level a
+  // candidate would add (the live forest's allowed levels do not change)
+  // changes the label count too.
+  const pinned = (budget: number, holder: KvUnifiedReuse, how: 'pin' | 'head' | 'max' = 'pin') => {
     const inputs = fixture();
-    if (head) { inputs.headChunkIds = new Set(['latent-0']); inputs.headTokens = 90; }
+    if (how === 'head') { inputs.headChunkIds = new Set(['latent-0']); inputs.headTokens = 90; }
+    else if (how === 'max') for (const chunk of inputs.chunks) chunk.pinMaxLevel = 1;
     else inputs.chunks[1].pinned = true;
     const strategy = new KvUnifiedStrategy({
       policy: { alpha: 0.7, budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0, budgetOverLambda: 100_000, cacheLambda: 0, continuityLambda: 0 },
@@ -2039,11 +2041,18 @@ test('a remembered joint ceiling failure is forgotten when the wall changes', ()
   assert.deepEqual(carriedPinned.result.produced, freshPinned.result.produced);
   const once: KvUnifiedReuse = {};
   build(500, once);
-  const freshHead = pinned(500, {}, true);
+  const freshHead = pinned(500, {}, 'head');
   assert.equal(freshHead.strategy.lastTimings?.demandSolves, 1, 'premise: with a head leaf the joint forest fits at 500');
-  const carriedHead = pinned(500, once, true);
+  const carriedHead = pinned(500, once, 'head');
   assert.equal(carriedHead.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again after the head window');
   assert.deepEqual(carriedHead.result.produced, freshHead.result.produced);
+  const bounded: KvUnifiedReuse = {};
+  build(500, bounded);
+  const freshMax = pinned(500, {}, 'max');
+  assert.equal(freshMax.strategy.lastTimings?.demandSolves, 1, 'premise: with every leaf bounded at L1 the joint forest fits at 500');
+  const carriedMax = pinned(500, bounded, 'max');
+  assert.equal(carriedMax.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again after a bound on the proposed level');
+  assert.deepEqual(carriedMax.result.produced, freshMax.result.produced);
 });
 
 test('a root the forest treeified away from a crossed parent is not a merge candidate', () => {

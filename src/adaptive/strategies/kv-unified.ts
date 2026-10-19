@@ -619,19 +619,23 @@ function latentHigherLevelCandidates(
 /** What decides how many labels a joint what-if solve creates, besides the
  * candidate set (the holder's key): the ceiling, the wall, the grid, the
  * policy terms that enter propagation, whether a presentation exists, the
- * forest's size, and the levels each leaf may take as the live forest
- * resolved them (pins, locks, head and tail membership, constraints: every
- * input that narrows a leaf's levels ends up in that list). A remembered
+ * forest's size, the levels each leaf may take as the live forest resolved
+ * them (head and tail membership and constraints end up in that list), and
+ * the leaves' own pins and locks, which also bound the levels a candidate
+ * would add and which the live forest's lists cannot show. A remembered
  * ceiling failure is valid while these hold. */
 function jointFailureSignature(
   inputs: PickerInputs, forest: CanonicalSummaryForest, options: KvUnifiedOptions, maxTokens: number, policy: KvUnifiedWelfarePolicy,
 ): string {
   let levels = 0;
   for (let i = 0; i < inputs.chunks.length; i++) {
-    const leaf = forest.leaf(inputs.chunks[i].id);
+    const chunk = inputs.chunks[i];
+    const leaf = forest.leaf(chunk.id);
     if (!leaf) continue;
     let code = leaf.externallyAccounted ? 1 : 0;
     for (const level of leaf.allowedLevels) code = Math.imul(code, 31) + level + 1;
+    code = Math.imul(code, 31) + ((chunk.pinned ? 1 : 0) | (chunk.lockedByAgent ? 2 : 0) |
+      (((chunk.pinLevel ?? -1) + 2) << 2) | (((chunk.pinMaxLevel ?? -1) + 2) << 8));
     levels = Math.imul(levels ^ (i + 1), 0x9e3779b1) ^ code;
   }
   return [
