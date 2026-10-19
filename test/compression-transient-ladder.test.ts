@@ -9,7 +9,8 @@ import { createHash } from 'node:crypto';
 import type { Chunk } from '../src/strategies/autobiographical.js';
 import type { StrategyContext, SummaryEntry } from '../src/types/index.js';
 
-// Transient failures never spend the ladder.
+// A transient failure spends no rung by itself. Enough of them on one rung,
+// counted while other compression lands, decide it (CompressionFailureStreak).
 //
 // A provider failure that is not evidence about the request (capacity,
 // transport, credentials, anything unclassified) used to be recorded as a
@@ -53,6 +54,37 @@ function scripted(steps: Step[]) {
       },
     } as never,
   };
+}
+
+async function until(cond: () => boolean, what: string, ms = 10_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
+/**
+ * Count lookups in the compression in-flight registry that find a call
+ * already in flight: a producer joining it. The registry is module-private,
+ * so this watches Map lookups by its key's shape (five \u0000-joined parts:
+ * namespace, quarantine ledger id, branch, generation and family) that return
+ * a pending result. Restore it before anything else runs.
+ */
+function observeInFlightJoins(): { count: () => number; restore: () => void } {
+  const realGet = Map.prototype.get;
+  let joins = 0;
+  Map.prototype.get = function (this: Map<unknown, unknown>, key: unknown) {
+    const value = realGet.call(this, key);
+    if (
+      typeof key === 'string' &&
+      key.split('\u0000').length === 5 &&
+      key.split('\u0000')[1]!.endsWith('autobio:compression-refusal-quarantine-events') &&
+      value instanceof Promise
+    ) joins++;
+    return value;
+  };
+  return { count: () => joins, restore: () => { Map.prototype.get = realGet; } };
 }
 
 interface RawPause { backoffUntil: number; statedUntil: number | null; statedBy: 'provider' | 'admission' | null; failures: number; model: string | undefined; reason: string }
@@ -205,7 +237,7 @@ const isCanonical = (request: NormalizedRequest): boolean =>
 const toolNames = (request: NormalizedRequest): string =>
   [...new Set(request.messages.flatMap((m) => m.content.filter((b) => b.type === 'tool_use').map((b) => (b as { name: string }).name)))].join('+');
 
-describe('compression ladder: transient failures never spend it', () => {
+describe('compression ladder: a transient failure spends no rung by itself', () => {
   it('canonical rejection → source-only-final once; a 503 there interrupts; a restart resumes at source-only and mints, the canonical paid once', async () => {
     const path = freshPath();
     const first = scripted([{ throw: failure('context_length') }, { throw: failure('server', { httpStatus: 503 }) }]);
@@ -424,7 +456,11 @@ describe('compression ladder: transient failures never spend it', () => {
 });
 
 /** Real persisted raw chunks, queued by the strategy itself, so tick() does the work. */
-async function queued(membrane: unknown, opts: { path?: string; store?: ReturnType<ContextManager['getStore']>; config?: Record<string, unknown> } = {}) {
+async function queued(membrane: unknown, opts: {
+  path?: string; store?: ReturnType<ContextManager['getStore']>; config?: Record<string, unknown>;
+  /** A fresh store's messages, in place of the eight text messages. */
+  messages?: Array<[string, ContentBlock[]]>;
+} = {}) {
   const strategy = new ProbeStrategy({
     compressionModel: 'same-model', targetChunkTokens: 50, headWindowTokens: 0, recentWindowTokens: 0,
     autoTickOnNewMessage: false, l1HoldbackChunks: 0, minChunkCharsForLLM: 0, mergeThreshold: 99,
@@ -435,7 +471,8 @@ async function queued(membrane: unknown, opts: { path?: string; store?: ReturnTy
     ? await ContextManager.open({ store: opts.store, strategy, membrane: membrane as never })
     : await ContextManager.open({ path: opts.path ?? freshPath(), strategy, membrane: membrane as never });
   if (manager.queryMessages({}).messages.length === 0) {
-    for (let i = 0; i < 8; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
+    if (opts.messages) for (const [participant, content] of opts.messages) manager.addMessage(participant, content);
+    else for (let i = 0; i < 8; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
   }
   return { strategy, manager };
 }
@@ -972,6 +1009,20 @@ describe('every rung keeps its own identity across a resume', () => {
     b.manager.close();
   });
 
+  it('a carrier rejection ends the run of the request that carried them, since it is that request\'s answer', async () => {
+    const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
+    const mock = scripted([{ throw: failure('server', { httpStatus: 503 }) }, { throw: rejected }, OK('stripped memory')]);
+    const fx = await withCarriers(mock.membrane);
+    await assert.rejects(fx.strategy.run(fx.target(), managerContext(fx.manager)), /zz server failure/);
+    assert.deepEqual(l1RunsOf(fx.strategy).map((run) => run.key), [runKey(fx.target().messages, 'canonical', false)],
+      'premise: the 503 opened the run of the request that carries reasoning');
+    await fx.strategy.run(fx.target(), managerContext(fx.manager));
+    assert.ok(carriesThinking(mock.calls[1]!) && !carriesThinking(mock.calls[2]!), 'premise: the carrier request was rejected, and its stripped retry answered');
+    assert.ok(fx.strategy.summariesView().some((s) => s.content === 'stripped memory'), 'premise: the stripped retry minted');
+    assert.deepEqual(l1RunsOf(fx.strategy), [], "the rejection ended that request's run");
+    fx.manager.close();
+  });
+
   it("the stripped request's failures are its own: with work landing between them, the eighth ends it, the carrier request paid once", async () => {
     const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
     const first = scripted([{ throw: rejected }, { throw: failure('server', { httpStatus: 503 }) }]);
@@ -1403,6 +1454,10 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.strategy.seed(summary('L1-x', 1, 4, 5));
     fx.strategy.seed(summary('L1-y', 1, 6, 7));
     assert.deepEqual(fx.strategy.mergeCandidates(level2, 4)?.map((s) => s.id), ['L2-a', 'L2-b']);
+    // The chunk's retry holds the hole among summaries above its level too.
+    l1Runs.set('zz-subject', { run, chunkKey: hole!.messages.map((m) => m.id).join(':') });
+    assert.equal(fx.strategy.mergeCandidates(level2, 4), null, 'an L1 retry holds the interior run of the level above');
+    l1Runs.clear();
     (fx.strategy as unknown as { mergeQueue: unknown[] }).mergeQueue.push({ level: 2, sourceIds: ['L1-x', 'L1-y'] });
     (fx.strategy as unknown as { mergeFailureRuns: Map<string, typeof run> }).mergeFailureRuns.set(`2\u0000L1-x\u0000L1-y`, run);
     assert.equal(fx.strategy.mergeCandidates(level2, 4), null, 'a failing merge holds the hole its parent will fill');
@@ -1412,7 +1467,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     fx.manager.close();
   });
 
-  it('past the speculative cap, the run before a hole a retry will fill still waits, and the cap holds no L1 production while no L1 merge is queued, so the retry comes', async () => {
+  it('past the speculative cap, the run before a hole a retry will fill still waits, and with no L1 merge queued the cap holds no L1 production', async () => {
     const fx = await queued(scripted([OK('unused')]).membrane);
     for (let i = 8; i < 10; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
     const ids = fx.manager.queryMessages({}).messages.map((m) => m.id);
@@ -1434,7 +1489,7 @@ describe('compression lane: failures are evidence only by the company they keep'
     lane.config.maxSpeculativeL1s = lane.summaries.filter((s) => s.level === 1 && !s.mergedInto).length - 1;
     assert.ok(lane.isAtSpeculativeCap(), 'premise: the unmerged L1s are past the cap');
     assert.equal(fx.strategy.mergeCandidates(unmerged, 4), null, 'past the cap, the run still waits for the retry rather than merging lopsided before it');
-    assert.equal(lane.speculativeCapHolds(), false, 'and with no L1 merge queued the cap holds no L1 production, so the retry comes');
+    assert.equal(lane.speculativeCapHolds(), false, 'and with no L1 merge queued the cap holds no L1 production');
     fx.manager.close();
   });
 
@@ -1674,13 +1729,23 @@ describe('a failure is evidence only against landings on its own route and model
 /** The strategy's hash of a chunk's message ids (chunkSourceHash). */
 const idsHash = (ids: string[]): string => createHash('sha256').update(JSON.stringify(ids), 'utf8').digest('hex');
 const sha256Of = (value: unknown): string => createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
-/** An L1 run's subject: the chunk's rung, by its sources' ids and content (chunkRunKey, chunkRunSubject). */
+/** The subject an L1 chunk's run is kept under: its sources' ids and content (chunkRunSubject). */
+const runSubjectOf = (messages: ReadonlyArray<{ id: string; content: unknown }>): string =>
+  sha256Of({ chunkSourceHash: idsHash(messages.map((m) => m.id)), content: messages.map((m) => m.content) });
+/** An L1 run's key: the chunk's rung, by its sources' ids and content (chunkRunKey, chunkRunSubject). */
 const runKey = (messages: ReadonlyArray<{ id: string; content: unknown }>, curveLabel: string, stripped: boolean): string =>
-  sha256Of({
-    runSubject: sha256Of({ chunkSourceHash: idsHash(messages.map((m) => m.id)), content: messages.map((m) => m.content) }),
-    curveLabel,
-    stripped,
+  sha256Of({ runSubject: runSubjectOf(messages), curveLabel, stripped });
+/**
+ * A run of seven failures on one rung of `chunk`, under the subject and key
+ * the ladder keeps it by: as this process's own failures leave one before
+ * another ladder's answer decides that rung.
+ */
+const seedRung = (strategy: unknown, chunk: Chunk, curveLabel: string, stripped: boolean): void => {
+  laneOf(strategy).compressionFailureRuns.set(runSubjectOf(chunk.messages), {
+    run: { key: runKey(chunk.messages, curveLabel, stripped), domain: 'zz', failures: 7, atLanded: 0 },
+    chunkKey: keyOf(chunk),
   });
+};
 const families = (manager: ContextManager): string[] =>
   (progressSlot(manager) as Array<{ familyKey: string }>).map((entry) => entry.familyKey).sort();
 const PROGRESS_SLOT = 'default/autobio:compression-family-progress';
@@ -1689,6 +1754,17 @@ const l1RunsOf = (strategy: unknown): Array<{ key: string; failures: number }> =
   [...(strategy as { compressionFailureRuns: Map<string, { run: { key: string; failures: number } }> })
     .compressionFailureRuns.values()].map((entry) => entry.run);
 const DAY = 24 * 60 * 60_000;
+/** A chunk's key, as the lane keeps it: its message ids. */
+const keyOf = (chunk: Chunk): string => chunk.messages.map((m) => m.id).join(':');
+/** The lane's runs and merge queue (white-box). */
+const laneOf = (strategy: unknown) => strategy as {
+  compressionFailureRuns: Map<string, { run: unknown; chunkKey: string }>;
+  mergeQueue: Array<{ level: number; sourceIds: string[] }>;
+};
+/** A run of `chunk`'s under `name`, as an earlier rung or request shape leaves one. */
+const seedRun = (strategy: unknown, name: string, chunk: Chunk): void => {
+  laneOf(strategy).compressionFailureRuns.set(name, { run: { key: name, domain: 'zz', failures: 1, atLanded: 0 }, chunkKey: keyOf(chunk) });
+};
 
 describe('an abort is neither evidence nor a reason to pause', () => {
   for (const [label, error] of [
@@ -2107,6 +2183,461 @@ describe("a chunk no longer pending leaves its run", () => {
   });
 });
 
+describe('a chunk whose request is quarantined leaves its runs', () => {
+  it("a skip for another process's quarantine drops the chunk's run, and the summaries before its span merge as an interior run in the same tick", async () => {
+    // Four chunks: the first two land, the third fails and opens a run, and
+    // the fourth lands after it. The fifth answer is the merge's. A threshold
+    // of three, so three L1s are enough for discovery to consider them.
+    const mine = scripted([OK('first'), OK('second'), { throw: failure('server', { httpStatus: 503 }) }, OK('fourth'), OK('the pair merged')]);
+    const fx = await queued(mine.membrane, { config: { mergeThreshold: 3 } });
+    for (let i = 8; i < 16; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
+    const ctx = managerContext(fx.manager);
+    const keyOf = (chunk: Chunk) => chunk.messages.map((m) => m.id).join(':');
+    const chunks = fx.strategy.chunksView();
+    assert.equal(chunks.length, 4, 'premise: four chunks');
+    assert.equal(fx.strategy.compressionQueueView().length, 4, 'premise: all four queued');
+    await fx.strategy.tick(ctx);
+    await fx.strategy.tick(ctx);
+    await assert.rejects(fx.strategy.tick(ctx), /zz server failure/);
+    const runs = (fx.strategy as unknown as { compressionFailureRuns: Map<string, { chunkKey: string }> }).compressionFailureRuns;
+    const third = keyOf(chunks[2]!);
+    assert.deepEqual([...runs.values()].map((entry) => entry.chunkKey), [third], 'premise: the third chunk has a run');
+    fx.strategy.expirePause();
+    await fx.strategy.tick(ctx); // the fourth chunk, which hasn't failed, goes first and lands
+    assert.equal(mine.calls.length, 4, 'premise: the fourth chunk landed');
+
+    // Another process on the same store, seeing what this one's next request
+    // for the third chunk will see, meets a rejection for that request, and
+    // its family's exhaustion quarantines the chunk.
+    const theirs = scripted([{ throw: failure('context_length') }]);
+    const sibling = await queued(theirs.membrane, { store: fx.manager.getStore() });
+    const siblingChunk = sibling.strategy.chunksView().find((chunk) => keyOf(chunk) === third);
+    assert.ok(siblingChunk, 'premise: the sibling cuts the same chunk');
+    await sibling.strategy.run(siblingChunk, managerContext(sibling.manager));
+    assert.equal(theirs.calls.length, 1, 'premise: the sibling asked once');
+    assert.equal(sibling.strategy.getCompressionQuarantineStatus().count, 1, 'premise: the sibling quarantined it');
+
+    const l1s = fx.strategy.summariesView().filter((s) => s.level === 1 && !s.mergedInto);
+    const l1Of = (chunk: Chunk) => l1s.find((s) => s.sourceIds.join(':') === keyOf(chunk))?.id;
+    assert.deepEqual(l1s.map((s) => s.id), [l1Of(chunks[0]!), l1Of(chunks[1]!), l1Of(chunks[3]!)], 'premise: three L1s around the span');
+    assert.deepEqual((fx.strategy as unknown as { mergeQueue: unknown[] }).mergeQueue, [], 'premise: the run held the pair before the span');
+
+    await fx.strategy.tick(ctx); // the third is skipped for the sibling's quarantine
+    assert.deepEqual([...runs.values()], [], "the skip dropped the chunk's run");
+    const merged = fx.strategy.summariesView().filter((s) => s.level === 2);
+    assert.deepEqual(merged.map((s) => [s.sourceIds, s.content]), [[[l1Of(chunks[0]!), l1Of(chunks[1]!)], 'the pair merged']],
+      'the pair before the quarantined span merged as an interior run in the same tick, with no retry to wait for');
+    assert.equal(mine.calls.length, 5, 'the fifth call was the merge: the third chunk was never asked for again');
+    sibling.manager.close();
+    fx.manager.close();
+  });
+
+  it("a family that exhausts in this process ends every run of its chunk, on any rung, and leaves another chunk's", async () => {
+    const mine = scripted([{ throw: failure('context_length') }]);
+    const fx = await queued(mine.membrane);
+    const keyOf = (chunk: Chunk) => chunk.messages.map((m) => m.id).join(':');
+    const [first, second] = fx.strategy.chunksView();
+    assert.ok(first && second, 'premise: two chunks');
+    const runs = (fx.strategy as unknown as { compressionFailureRuns: Map<string, { run: unknown; chunkKey: string }> }).compressionFailureRuns;
+    // Runs of rungs other than the one that exhausts, as an earlier request
+    // shape's would be.
+    const run = (key: string) => ({ key, domain: 'zz', failures: 1, atLanded: 0 });
+    runs.set('zz-a', { run: run('zz-a'), chunkKey: keyOf(first) });
+    runs.set('zz-b', { run: run('zz-b'), chunkKey: keyOf(first) });
+    runs.set('zz-c', { run: run('zz-c'), chunkKey: keyOf(second) });
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mine.calls.length, 1, 'premise: one call, for the first chunk');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'premise: its family exhausted into quarantine');
+    assert.deepEqual([...runs.keys()], ['zz-c'], "the first chunk's runs end, and the second chunk's stays");
+    fx.manager.close();
+  });
+
+  it("an exhaustion after the rung's own rejection ended its run still queues the pair the run held", async () => {
+    // The third chunk fails with a 503 and opens a run on its canonical rung.
+    // Its retry meets context_length: the rejection ends that rung's run as
+    // its outcome, and with no source-only rung the family exhausts. No run
+    // is left for the exhaustion to end, and discovery runs all the same.
+    const mine = scripted([OK('first'), OK('second'), { throw: failure('server', { httpStatus: 503 }) }, OK('fourth'), { throw: failure('context_length') }]);
+    const fx = await queued(mine.membrane, { config: { mergeThreshold: 3 } });
+    for (let i = 8; i < 16; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
+    const ctx = managerContext(fx.manager);
+    const keyOf = (chunk: Chunk) => chunk.messages.map((m) => m.id).join(':');
+    const chunks = fx.strategy.chunksView();
+    assert.equal(chunks.length, 4, 'premise: four chunks');
+    const lane = fx.strategy as unknown as {
+      compressionFailureRuns: Map<string, { chunkKey: string }>;
+      mergeQueue: Array<{ level: number; sourceIds: string[] }>;
+    };
+    await fx.strategy.tick(ctx);
+    await fx.strategy.tick(ctx);
+    await assert.rejects(fx.strategy.tick(ctx), /zz server failure/);
+    assert.deepEqual([...lane.compressionFailureRuns.values()].map((entry) => entry.chunkKey), [keyOf(chunks[2]!)], 'premise: the third chunk has a run');
+    fx.strategy.expirePause();
+    await fx.strategy.tick(ctx); // the fourth chunk, which hasn't failed, goes first and lands
+    assert.equal(lane.mergeQueue.length, 0, 'premise: the run held the pair before the span');
+    await fx.strategy.tick(ctx); // the third meets context_length and its family exhausts
+    assert.equal(mine.calls.length, 5, 'premise: the third chunk was asked once more');
+    assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 1, 'premise: its family exhausted into quarantine');
+    assert.deepEqual([...lane.compressionFailureRuns.values()], [], 'premise: no run is left');
+    const l1s = fx.strategy.summariesView().filter((s) => s.level === 1 && !s.mergedInto);
+    const l1Of = (chunk: Chunk) => l1s.find((s) => s.sourceIds.join(':') === keyOf(chunk))?.id;
+    assert.deepEqual(lane.mergeQueue.map((merge) => [merge.level, merge.sourceIds]), [[2, [l1Of(chunks[0]!), l1Of(chunks[1]!)]]],
+      'the pair before the quarantined span is queued in the same tick');
+    fx.manager.close();
+  });
+
+  it('past the speculative cap, a skip that queues an L1 merge stops the scan: the merge runs in the same tick, and the chunk behind the skip waits', async () => {
+    // The skip test's first steps, under a cap of two unmerged L1s: the
+    // first two chunks land, the third fails with a 503 and opens a run, and
+    // the fourth lands, putting three L1s past the cap with no L1 merge
+    // queued. The fifth answer is the merge's.
+    const mine = scripted([OK('first'), OK('second'), { throw: failure('server', { httpStatus: 503 }) }, OK('fourth'), OK('the pair merged')]);
+    const fx = await queued(mine.membrane, { config: { mergeThreshold: 3, maxSpeculativeL1s: 2 } });
+    for (let i = 8; i < 16; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
+    const ctx = managerContext(fx.manager);
+    const chunks = fx.strategy.chunksView();
+    assert.equal(chunks.length, 4, 'premise: four chunks');
+    await fx.strategy.tick(ctx);
+    await fx.strategy.tick(ctx);
+    await assert.rejects(fx.strategy.tick(ctx), /zz server failure/);
+    fx.strategy.expirePause();
+    await fx.strategy.tick(ctx); // the fourth chunk, which hasn't failed, goes first and lands
+    const lane = fx.strategy as unknown as {
+      compressionFailureOrder: Map<string, number>; mergeQueue: Array<{ level: number; sourceIds: string[] }>;
+      isAtSpeculativeCap(): boolean; speculativeCapHolds(): boolean;
+    };
+    assert.ok(lane.isAtSpeculativeCap() && !lane.speculativeCapHolds(), 'premise: past the cap, with no L1 merge queued to hold production');
+    assert.deepEqual(lane.mergeQueue, [], 'premise: the run held the pair before the span');
+    // As a return that decided nothing leaves the chunk (tools not yet
+    // pushed, a family dropped meanwhile): no longer failing, so it takes its
+    // place in index order again, and its run stands, since a retry is coming.
+    const third = keyOf(chunks[2]!);
+    lane.compressionFailureOrder.delete(third);
+    // Another process on the same store quarantines the third chunk's request.
+    const theirs = scripted([{ throw: failure('context_length') }]);
+    const sibling = await queued(theirs.membrane, { store: fx.manager.getStore() });
+    const siblingChunk = sibling.strategy.chunksView().find((chunk) => keyOf(chunk) === third);
+    assert.ok(siblingChunk, 'premise: the sibling cuts the same chunk');
+    await sibling.strategy.run(siblingChunk, managerContext(sibling.manager));
+    assert.equal(sibling.strategy.getCompressionQuarantineStatus().count, 1, 'premise: the sibling quarantined it');
+    // A fifth chunk arrives, and the rebuild queues it behind the third.
+    for (let i = 16; i < 20; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
+    const fifth = fx.strategy.chunksView().find((chunk) => !chunk.compressed && keyOf(chunk) !== third);
+    assert.ok(fifth, 'premise: a fifth chunk is pending');
+    const queuedKeys = fx.strategy.compressionQueueView().map((index) => keyOf(fx.strategy.chunksView()[index]!));
+    assert.deepEqual(queuedKeys, [third, keyOf(fifth)], 'premise: the third chunk is queued ahead of the fifth');
+
+    await fx.strategy.tick(ctx); // the third is skipped, its run ends, and discovery queues the pair
+    const l1s = fx.strategy.summariesView().filter((s) => s.level === 1);
+    const l1Of = (chunk: Chunk) => l1s.find((s) => s.sourceIds.join(':') === keyOf(chunk))?.id;
+    const merged = fx.strategy.summariesView().filter((s) => s.level === 2);
+    assert.deepEqual(merged.map((s) => [s.sourceIds, s.content]), [[[l1Of(chunks[0]!), l1Of(chunks[1]!)], 'the pair merged']],
+      'the queued L1 merge ran in the same tick');
+    assert.equal(mine.calls.length, 5, 'one call in the tick: the merge');
+    assert.equal(l1Of(fifth), undefined, 'the fifth chunk was not compressed past the cap');
+    sibling.manager.close();
+    fx.manager.close();
+  });
+
+  it("a call that resolves without a request or a decision leaves the chunk's runs standing", async () => {
+    const fx = await queued(scripted([OK('unused')]).membrane);
+    const keyOf = (chunk: Chunk) => chunk.messages.map((m) => m.id).join(':');
+    const [first] = fx.strategy.chunksView();
+    const lane = fx.strategy as unknown as {
+      compressionFailureRuns: Map<string, { run: unknown; chunkKey: string }>;
+      compressChunkHierarchical(chunk: Chunk, ctx: StrategyContext, onSkip?: () => void): Promise<void>;
+    };
+    lane.compressionFailureRuns.set('zz-a', { run: { key: 'zz-a', domain: 'zz', failures: 1, atLanded: 0 }, chunkKey: keyOf(first!) });
+    // As the tools deferral does: no call is made and nothing is decided, so
+    // a retry is still coming.
+    const attempted: Chunk[] = [];
+    lane.compressChunkHierarchical = async (chunk) => { attempted.push(chunk); };
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(attempted.length, 1, 'premise: tick took the first chunk');
+    assert.deepEqual([...lane.compressionFailureRuns.keys()], ['zz-a'], 'the run stands');
+    fx.manager.close();
+  });
+});
+
+/**
+ * As in the skip's case above: the first two chunks land, the third fails and
+ * opens a run, and the fourth lands after it. Then another instance on the
+ * same store asks for the third chunk. Its call is held until this instance's
+ * tick has joined it, and then meets `answer`; `during` runs while it's held.
+ * The gate opens from here, not from either instance, so neither waits on the
+ * other.
+ */
+async function joinedTick(answer: Step, during: (sibling: Awaited<ReturnType<typeof queued>>, chunk: Chunk) => void = () => {}) {
+  const mine = scripted([OK('first'), OK('second'), { throw: failure('server', { httpStatus: 503 }) }, OK('fourth'), OK('unused')]);
+  const fx = await queued(mine.membrane, { config: { mergeThreshold: 3 } });
+  for (let i = 8; i < 16; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
+  const ctx = managerContext(fx.manager);
+  const chunks = fx.strategy.chunksView();
+  assert.equal(chunks.length, 4, 'premise: four chunks');
+  await fx.strategy.tick(ctx);
+  await fx.strategy.tick(ctx);
+  await assert.rejects(fx.strategy.tick(ctx), /zz server failure/);
+  const third = keyOf(chunks[2]!);
+  assert.deepEqual([...laneOf(fx.strategy).compressionFailureRuns.values()].map((entry) => entry.chunkKey), [third], 'premise: the third chunk has a run');
+  fx.strategy.expirePause();
+  await fx.strategy.tick(ctx); // the fourth chunk, which hasn't failed, goes first and lands
+  assert.equal(mine.calls.length, 4, 'premise: the fourth chunk landed');
+
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const theirs = scripted([{ gate, then: answer }]);
+  const sibling = await queued(theirs.membrane, { store: fx.manager.getStore() });
+  const siblingChunk = sibling.strategy.chunksView().find((chunk) => keyOf(chunk) === third);
+  assert.ok(siblingChunk, 'premise: the sibling cuts the same chunk');
+  const joins = observeInFlightJoins();
+  let producer!: Promise<void>;
+  let waiter!: Promise<void>;
+  try {
+    producer = sibling.strategy.run(siblingChunk, managerContext(sibling.manager));
+    await until(() => theirs.calls.length === 1, "the sibling's call");
+    waiter = fx.strategy.tick(ctx);
+    await until(() => joins.count() >= 1, "this instance's tick to join the sibling's call");
+    during(sibling, siblingChunk);
+  } finally {
+    joins.restore();
+    release();
+  }
+  await producer;
+  await waiter;
+  assert.equal(theirs.calls.length, 1, 'premise: the sibling asked once');
+  assert.equal(mine.calls.length, 4, 'premise: the joined tick made no call of its own');
+  const runs = [...laneOf(fx.strategy).compressionFailureRuns.values()].map((entry) => entry.chunkKey);
+  return { fx, sibling, chunks, third, runs };
+}
+
+describe("a chunk's runs end where this process won't retry its request, and stand where a retry is coming", () => {
+  it("a tick that joins another instance's call ends the chunk's runs once that call's family is quarantined, and queues the pair the run held", async () => {
+    // The sibling's call meets a rejection, so its family exhausts into quarantine.
+    const { fx, sibling, chunks, runs } = await joinedTick({ throw: failure('context_length') });
+    assert.equal(sibling.strategy.getCompressionQuarantineStatus().count, 1, "premise: the sibling's family exhausted into quarantine");
+    const l1s = fx.strategy.summariesView().filter((s) => s.level === 1 && !s.mergedInto);
+    const l1Of = (chunk: Chunk) => l1s.find((s) => s.sourceIds.join(':') === keyOf(chunk))?.id;
+    assert.deepEqual(runs, [], "the joined tick ended the chunk's run");
+    // The gate's skip of a quarantined chunk ends its runs too: this tells the
+    // two apart.
+    assert.equal(fx.strategy.warnedSkips().size, 0, 'the tick ended it by joining the call, not by a quarantine skip');
+    assert.deepEqual(laneOf(fx.strategy).mergeQueue.map((merge) => [merge.level, merge.sourceIds]), [[2, [l1Of(chunks[0]!), l1Of(chunks[1]!)]]],
+      'the pair the run held is queued in the same tick');
+    sibling.manager.close();
+    fx.manager.close();
+  });
+
+  it("a tick that joins another instance's call that lands the chunk's L1 ends the chunk's runs: the chunk is compressed", async () => {
+    const { fx, sibling, third, runs } = await joinedTick(OK('their memory'));
+    assert.ok(fx.strategy.summariesView().some((s) => s.level === 1 && s.sourceIds.join(':') === third && s.content === 'their memory'),
+      "premise: the sibling's L1 is this instance's too");
+    assert.deepEqual(runs, [], "the joined tick ended the chunk's run");
+    sibling.manager.close();
+    fx.manager.close();
+  });
+
+  it("a tick that joins another instance's call that ends with neither an L1 nor a quarantine keeps the chunk's runs: a retry is coming", async () => {
+    // A hold placed during the sibling's call discards what it answers.
+    const { fx, sibling, third, runs } = await joinedTick(OK('their memory'), (sib, chunk) => sib.manager.holdCompression([chunk.messages[0]!.id]));
+    assert.ok(!fx.strategy.summariesView().some((s) => s.level === 1 && s.sourceIds.join(':') === third), 'premise: no L1 was written');
+    assert.equal(sibling.strategy.getCompressionQuarantineStatus().count, 0, 'premise: nothing was quarantined');
+    assert.deepEqual(runs, [third], 'the run stands');
+    sibling.manager.close();
+    fx.manager.close();
+  });
+
+  it("the overlap guard ends the chunk's runs: it refuses every attempt while the overlap stands, so no retry fills the span", async () => {
+    const mock = scripted([OK('unused')]);
+    const fx = await queued(mock.membrane);
+    const [first] = fx.strategy.chunksView();
+    assert.ok(first && first.messages.length > 1, 'premise: a chunk of more than one message');
+    // An L1 over the chunk's first message alone, as store surgery can leave one.
+    const covered = first.messages[0]!.id;
+    fx.strategy.seed({ id: 'L1-surgery', level: 1, content: 'over part of it', tokens: 5, sourceLevel: 0, sourceIds: [covered], sourceRange: { first: covered, last: covered }, created: 1 });
+    seedRun(fx.strategy, 'zz-a', first);
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 0, 'premise: the guard refused the chunk, with no call');
+    assert.equal(first.compressed, false, 'premise: the chunk stays raw');
+    assert.deepEqual([...laneOf(fx.strategy).compressionFailureRuns.keys()], [], "the chunk's run ended");
+    fx.manager.close();
+  });
+
+  it('a chunk deferred until tools are pushed keeps its runs: no call was made, and a retry is coming', async () => {
+    const mock = scripted([OK('unused')]);
+    // The first chunk holds a tool call and its result, and the host has pushed no tools.
+    const fx = await queued(mock.membrane, {
+      messages: [
+        ['Claude', [use('t1', 'journal', { note: 'word '.repeat(30) })]],
+        ['User', [result('t1', 'noted ' + 'word '.repeat(30))]],
+        ...Array.from({ length: 6 }, (_, i): [string, ContentBlock[]] => [i % 2 ? 'User' : 'Claude', [text(`raw-${i + 2} ` + 'word '.repeat(30))]]),
+      ],
+    });
+    const [first] = fx.strategy.chunksView();
+    assert.ok(first?.messages.some((m) => m.content.some((b) => b.type === 'tool_use')), 'premise: the first chunk holds the tool call');
+    seedRun(fx.strategy, 'zz-a', first!);
+    await fx.strategy.tick(managerContext(fx.manager));
+    assert.equal(mock.calls.length, 0, 'premise: the chunk was deferred, with no call');
+    assert.deepEqual([...laneOf(fx.strategy).compressionFailureRuns.keys()], ['zz-a'], 'the run stands');
+    fx.manager.close();
+  });
+
+  it("a chunk that compresses ends its runs on every rung, though a rebuild during its call cut the chunk again", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const mock = scripted([{ gate, then: OK('memory') }]);
+    const fx = await queued(mock.membrane);
+    const [first] = fx.strategy.chunksView();
+    // A run on another rung of the chunk, which the mint's own rung doesn't end.
+    seedRun(fx.strategy, 'zz-a', first!);
+    let ticking!: Promise<void>;
+    try {
+      ticking = fx.strategy.tick(managerContext(fx.manager));
+      await until(() => mock.calls.length === 1, 'the call');
+      fx.manager.addMessage('User', [text('raw-8 ' + 'word '.repeat(30))]);
+      assert.notEqual(fx.strategy.chunksView()[0], first, 'premise: a rebuild during the call cut the chunk again');
+    } finally {
+      release();
+    }
+    await ticking;
+    assert.ok(fx.strategy.summariesView().some((s) => s.level === 1 && s.sourceIds.join(':') === keyOf(first!)), "premise: the chunk's L1 was written");
+    assert.deepEqual([...laneOf(fx.strategy).compressionFailureRuns.keys()], [], "the chunk's runs ended");
+    fx.manager.close();
+  });
+});
+
+describe("a rung's answer ends its runs, whether it came now or is reused from progress", () => {
+  for (const stripped of [false, true]) {
+    it(`a refusal reused from progress ends this process's run on the canonical${stripped ? ', a run of its stripped request too' : ''}`, async () => {
+      const withdrawn = new CompressionWithdrawn();
+      const mock = scripted([REFUSAL, { throw: failure('network') }, { throw: withdrawn }]);
+      const fx = await build(mock.membrane, { sourceOnlyFallback: true });
+      const ctx = managerContext(fx.manager);
+      await assert.rejects(fx.strategy.run(fx.target(), ctx), /zz network failure/);
+      assert.equal(progressSlot(fx.manager).length, 1, "premise: the canonical's refusal is kept in progress");
+      // As this process's own failures leave one, before another ladder's
+      // refusal reached the progress: on the request as sent, or on its
+      // stripped copy, as failures after a carrier rejection leave one.
+      seedRung(fx.strategy, fx.target(), 'canonical', stripped);
+      // Source-only-final's call is withdrawn, which records nothing and ends no run.
+      await assert.rejects(fx.strategy.run(fx.target(), ctx), (error) => error === withdrawn);
+      assert.equal(mock.calls.length, 3, 'premise: the canonical was not asked again');
+      assert.ok(!isCanonical(mock.calls[2]!), 'premise: the third call was source-only-final');
+      assert.deepEqual(l1RunsOf(fx.strategy), [], "the reused refusal ended the canonical's run");
+      fx.manager.close();
+    });
+  }
+
+  it("a carrier rejection reused from progress ends the run of the request that carried them", async () => {
+    const rejected = Object.assign(new Error('zz 400: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
+    const withdrawn = new CompressionWithdrawn();
+    const mock = scripted([{ throw: rejected }, { throw: failure('network') }, { throw: withdrawn }]);
+    const fx = await build(mock.membrane);
+    (fx.strategy as unknown as { summaries: SummaryEntry[] }).summaries.find((s) => s.id === 'L1-100')!.responseContent = [
+      { type: 'thinking', thinking: 'zz carried reasoning', signature: 'zz-signature' } as never,
+      text('authored L1-100'),
+    ];
+    const carries = (request: NormalizedRequest): boolean => request.messages.some((m) => m.content.some((b) => b.type === 'thinking'));
+    const ctx = managerContext(fx.manager);
+    await assert.rejects(fx.strategy.run(fx.target(), ctx), /zz network failure/);
+    assert.ok(carries(mock.calls[0]!) && !carries(mock.calls[1]!), 'premise: the carrier request was rejected, and its stripped retry failed');
+    seedRung(fx.strategy, fx.target(), 'canonical', false);
+    // The stripped request is withdrawn, which records nothing and ends no run.
+    await assert.rejects(fx.strategy.run(fx.target(), ctx), (error) => error === withdrawn);
+    assert.equal(mock.calls.length, 3, 'premise: one more call');
+    assert.ok(!carries(mock.calls[2]!), 'premise: the known-rejected carrier request was not sent again');
+    assert.deepEqual(l1RunsOf(fx.strategy), [], "the reused rejection ended the carrier request's run");
+    fx.manager.close();
+  });
+
+  it("a split-stitch that answers ends its own run, though a hold placed during its last call keeps its summary from being written", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    // The canonical and source-only-final refuse; the split rung's first piece
+    // fails, and on the next attempt both pieces answer.
+    const mock = scripted([REFUSAL, REFUSAL, { throw: failure('server', { httpStatus: 503 }) }, OK('the first half'), { gate, then: OK('the second half') }]);
+    const fx = await queued(mock.membrane, { config: { compressionSourceOnlyFallback: true, compressionSplitFallback: true } });
+    const [first] = fx.strategy.chunksView();
+    const ctx = managerContext(fx.manager);
+    await assert.rejects(fx.strategy.run(first!, ctx), /zz server failure/);
+    assert.equal(mock.calls.length, 3, 'premise: the canonical, source-only-final and the first piece');
+    assert.deepEqual(l1RunsOf(fx.strategy).map((run) => run.key), [runKey(first!.messages, 'split-stitch', false)],
+      "premise: the piece's failure opened the rung's run");
+    let running!: Promise<void>;
+    try {
+      running = fx.strategy.run(first!, ctx);
+      await until(() => mock.calls.length === 5, 'the second piece');
+      fx.manager.holdCompression([first!.messages[0]!.id]);
+    } finally {
+      release();
+    }
+    await running;
+    assert.ok(!fx.strategy.summariesView().some((s) => s.level === 1 && s.sourceIds.join(':') === keyOf(first!)),
+      'premise: the hold discarded the stitched summary');
+    assert.deepEqual(l1RunsOf(fx.strategy), [], "the stitch ended the rung's run");
+    fx.manager.close();
+  });
+
+  it("a tick whose later call throws still queues the pair a reused answer's end let go", async () => {
+    // The first two chunks land, the third's canonical fails with a 503 and
+    // opens a run, and the fourth lands. The third's retry: its canonical is
+    // refused, which progress keeps and which ends that run, and its
+    // source-only-final call fails with a 503, opening another. (The retry
+    // comes after the fourth lands, since a landing grows the canonical's
+    // recall and so changes its request.) A run is then seeded on the third
+    // chunk's canonical, as this process's own failures leave one before
+    // another ladder's refusal reaches the progress.
+    const withdrawn = new CompressionWithdrawn();
+    const mine = scripted([
+      OK('first'), OK('second'), { throw: failure('server', { httpStatus: 503 }) }, OK('fourth'),
+      REFUSAL, { throw: failure('server', { httpStatus: 503 }) }, { throw: withdrawn },
+    ]);
+    const fx = await queued(mine.membrane, { config: { mergeThreshold: 3, compressionSourceOnlyFallback: true } });
+    for (let i = 8; i < 16; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
+    const ctx = managerContext(fx.manager);
+    const chunks = fx.strategy.chunksView();
+    assert.equal(chunks.length, 4, 'premise: four chunks');
+    await fx.strategy.tick(ctx);
+    await fx.strategy.tick(ctx);
+    await assert.rejects(fx.strategy.tick(ctx), /zz server failure/);
+    fx.strategy.expirePause();
+    await fx.strategy.tick(ctx); // the fourth chunk, which hasn't failed, goes first and lands
+    await assert.rejects(fx.strategy.tick(ctx), /zz server failure/); // the third's retry
+    assert.equal(mine.calls.length, 6, "premise: the third chunk's canonical and source-only-final were asked");
+    const outcomes = (progressSlot(fx.manager) as Array<{ outcomes: Array<{ curveLabel: string; outcome: string }> }>).flatMap((entry) => entry.outcomes);
+    assert.ok(outcomes.some((o) => o.curveLabel === 'canonical' && o.outcome === 'refusal'), "premise: the canonical's refusal is kept in progress");
+    assert.deepEqual(laneOf(fx.strategy).mergeQueue, [], 'premise: the run held the pair before the span');
+    seedRung(fx.strategy, chunks[2]!, 'canonical', false);
+    fx.strategy.expirePause();
+    // The third's next attempt: the canonical's refusal is reused, which ends
+    // the run, and source-only-final's call is withdrawn, so the tick throws.
+    await assert.rejects(fx.strategy.tick(ctx), (error) => error === withdrawn);
+    assert.equal(mine.calls.length, 7, 'premise: one more call');
+    assert.equal(sha256(mine.calls[6]!), sha256(mine.calls[5]!),
+      "premise: it was source-only-final's request again, so the canonical wasn't asked again");
+    assert.deepEqual(l1RunsOf(fx.strategy), [], 'premise: the reused refusal ended the run');
+    const l1s = fx.strategy.summariesView().filter((s) => s.level === 1 && !s.mergedInto);
+    const l1Of = (chunk: Chunk) => l1s.find((s) => s.sourceIds.join(':') === keyOf(chunk))?.id;
+    assert.deepEqual(laneOf(fx.strategy).mergeQueue.map((merge) => [merge.level, merge.sourceIds]), [[2, [l1Of(chunks[0]!), l1Of(chunks[1]!)]]],
+      'the pair before the span is queued, though the tick threw');
+    fx.manager.close();
+  });
+
+  it("a merge discovery that throws after a failed attempt is logged, and the attempt's error is the one tick throws", async () => {
+    const withdrawn = new CompressionWithdrawn();
+    const fx = await queued(scripted([{ throw: withdrawn }]).membrane);
+    (fx.strategy as unknown as { checkMergeThreshold(): void }).checkMergeThreshold = () => {
+      throw new Error('zz discovery failure');
+    };
+    await warningsOf(async (warnings) => {
+      await assert.rejects(fx.strategy.tick(managerContext(fx.manager)), (error) => error === withdrawn,
+        "the withdrawal is what tick throws, not the discovery's failure");
+      assert.ok(warnings.some((line) => line.includes('merge discovery') && line.includes('zz discovery failure')),
+        "the discovery's failure is logged");
+    });
+    fx.manager.close();
+  });
+});
+
 describe("a preview keeps the lane's failure orders, runs and window waits", () => {
   it('the dry rebuild prunes them against its own cut, and the select puts them back', async () => {
     const fx = await queued(scripted([OK('unused')]).membrane);
@@ -2274,6 +2805,47 @@ describe('a family dropped while its ladder ran is not quarantined by its exhaus
     fx.manager.close();
   });
 
+  for (const surviving of [false, true]) {
+    it(surviving
+      ? 'a run an earlier rung left survives the drop, since a retry is coming, and keeps holding the pair beside its span'
+      : "after the rung's own answer ended the chunk's last run, tick still queues the pair the run held", async () => {
+      // The first two chunks land, the third's canonical fails with a 503 and
+      // opens a run, and the fourth lands. The third's retry: the canonical's
+      // refusal ends its run, and the family is dropped as source-only-final's
+      // call arrives, which is refused too.
+      let fx!: Awaited<ReturnType<typeof queued>>;
+      const mock = dropping(
+        [OK('first'), OK('second'), { throw: failure('server', { httpStatus: 503 }) }, OK('fourth'), REFUSAL as never, REFUSAL as never],
+        5, () => fx.strategy,
+      );
+      fx = await queued(mock.membrane, { config: { mergeThreshold: 3, compressionSourceOnlyFallback: true } });
+      for (let i = 8; i < 16; i++) fx.manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i} ` + 'word '.repeat(30))]);
+      const ctx = managerContext(fx.manager);
+      const chunks = fx.strategy.chunksView();
+      assert.equal(chunks.length, 4, 'premise: four chunks');
+      await fx.strategy.tick(ctx);
+      await fx.strategy.tick(ctx);
+      await assert.rejects(fx.strategy.tick(ctx), /zz server failure/);
+      fx.strategy.expirePause();
+      await fx.strategy.tick(ctx); // the fourth chunk, which hasn't failed, goes first and lands
+      if (surviving) seedRun(fx.strategy, 'zz-other', chunks[2]!);
+      await fx.strategy.tick(ctx); // the third's retry, whose family is dropped
+      assert.equal(mock.calls.length, 6, 'premise: the canonical and source-only-final were asked');
+      assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'premise: the family was dropped, not quarantined');
+      const l1s = fx.strategy.summariesView().filter((s) => s.level === 1 && !s.mergedInto);
+      const l1Of = (chunk: Chunk) => l1s.find((s) => s.sourceIds.join(':') === keyOf(chunk))?.id;
+      const queuedMerges = laneOf(fx.strategy).mergeQueue.map((merge) => [merge.level, merge.sourceIds]);
+      if (surviving) {
+        assert.deepEqual([...laneOf(fx.strategy).compressionFailureRuns.keys()], ['zz-other'], 'the earlier rung\'s run stands');
+        assert.deepEqual(queuedMerges, [], 'and still holds the pair before the span');
+      } else {
+        assert.deepEqual([...laneOf(fx.strategy).compressionFailureRuns.keys()], [], "premise: the canonical's refusal ended its run");
+        assert.deepEqual(queuedMerges, [[2, [l1Of(chunks[0]!), l1Of(chunks[1]!)]]], 'the pair the run held is queued in the same tick');
+      }
+      fx.manager.close();
+    });
+  }
+
   /** The compression log's lines while `run` runs, from a file of its own. */
   async function logged(run: () => Promise<void>): Promise<Array<{ event: string; metadata?: { outcomes?: Array<{ curveLabel: string }> } }>> {
     const log = `${freshPath()}-calls.jsonl`;
@@ -2361,8 +2933,13 @@ describe('a family dropped while its ladder ran is not quarantined by its exhaus
       await fx.strategy.clearCompressionRefusalQuarantine(String(first.key));
       assert.equal(fx.strategy.getCompressionQuarantineStatus().count, 0, 'the premise: an operator cleared it');
       const before = ledger(fx.manager).length;
-      const events = await loggedEvents(() => fx.strategy.run(fx.target(), managerContext(fx.manager)));
+      let stopped = 0;
+      const lane = fx.strategy as unknown as {
+        compressChunkHierarchical(chunk: Chunk, ctx: StrategyContext, onSkip?: () => void, onRequestStopped?: () => void): Promise<void>;
+      };
+      const events = await loggedEvents(() => lane.compressChunkHierarchical(fx.target(), managerContext(fx.manager), undefined, () => { stopped++; }));
       assert.equal(inner.calls.length, 4, 'the premise: the second ladder asked both again');
+      assert.equal(stopped, 1, "the record it found stops the request, as its own would: tick ends the chunk's runs on it");
       assert.equal(progressAtWrite, 1, "the premise: the second ladder's progress was in the slot when the other process wrote");
       assert.deepEqual(ledger(fx.manager).slice(before).map((event) => event.kind), ['exhausted', 'alert_pending', 'alert_sent'],
         "only the other process's record and its alert: this ladder appended nothing");

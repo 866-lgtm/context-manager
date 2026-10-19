@@ -19,6 +19,7 @@ export {
   getMintRequestByHash,
   MintPreimageMaterializationError,
 } from './mint-preimage.js';
+export type { Diagnostics } from './diagnostics.js';
 
 // Strategies
 export { PassthroughStrategy } from './strategies/passthrough.js';
