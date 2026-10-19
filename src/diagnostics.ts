@@ -28,8 +28,9 @@ export function withNamespace(message: string, namespace: string): string {
  * is logged, since a strategy learns its own at initialize, and so is
  * `console`, so a test's mock of console.error or console.warn sees the line.
  * Before it has one (a strategy no manager has initialized), a line names
- * none. The suffix ends the message: arguments after it, such as an error,
- * print after it, as console prints them.
+ * none. The suffix ends the message's first line, as withNamespace places it,
+ * and arguments after the message, such as an error, print after it, as
+ * console prints them.
  */
 export function namespaceDiagnostics(namespace: () => string): Diagnostics {
   const named = (message: string, rest: unknown[]) => {

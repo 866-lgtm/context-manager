@@ -1847,6 +1847,8 @@ describe('fold journal durability and index', () => {
         ({ cm } = await open(strategy));
         assert.equal((await acceptCompile(cm))?.kind, 'baseline', `${what}: a baseline`);
         assert.ok(errors.some((e) => /unreadable|treating the branch as unrecorded/.test(e)), `${what}: reported`);
+        // The fallback that treats this journal's branch as unrecorded names its namespace (#239).
+        assert.ok(errors.some((e) => e.includes('unrecorded') && e.endsWith(' ns=agents/tester')), `${what}: ${errors.join('\n')}`);
         errors.length = 0;
         // Another round compares with the baseline just written, and the
         // record that couldn't be read lends the branch no receipts.

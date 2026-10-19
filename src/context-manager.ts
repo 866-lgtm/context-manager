@@ -402,7 +402,9 @@ export class ContextManager {
           // Never fatal: a strategy-kind mismatch or transient store error
           // must not block opening the context manager. Like the line above,
           // it names the slot, which is the store's (#239).
-          console.error(`[message-store] snapshot-cadence retune failed for ${messageSlot}:`, err);
+          // The slot as written: it isn't part of the format string console reads when
+          // an argument follows, so a '%' in it prints as itself.
+          console.error('[message-store] snapshot-cadence retune failed for', `${messageSlot}:`, err);
         }
       }
     }
