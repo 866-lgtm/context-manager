@@ -619,7 +619,8 @@ function latentHigherLevelCandidates(
 /** A digest of everything a joint what-if solve reads besides the candidate
  * set (the holder's key): the leaves (sizes, salience, levels, pins, locks,
  * head and tail membership), the summaries (levels, costs, ranges, parents),
- * the presentation and receipt (layout and markers), the ceiling, the wall,
+ * the presentation and receipt (every cached unit's identity, size and
+ * offset, and the markers), the ceiling, the wall,
  * the grid, the engine, the forest options, the policy and the multiplier.
  * Any of them can change how many labels the solve
  * creates, so a remembered ceiling failure is valid only while all hold;
@@ -663,6 +664,7 @@ function jointFailureSignature(inputs: PickerInputs, options: KvUnifiedOptions, 
   num(cache ? cache.markers.length : -1); str(cache?.immutablePrefixHash); str(options.currentImmutablePrefixHash);
   if (cache) {
     num(cache.layout.units.length); num(cache.layout.totalTokens);
+    for (const unit of cache.layout.units) { str(unit.kind); str(unit.key); num(unit.tokens); num(unit.offset); }
     for (const marker of cache.markers) { num(marker.unitIndex); num(marker.offset); }
   }
   return `${(a >>> 0).toString(16)}:${(b >>> 0).toString(16)}`;
