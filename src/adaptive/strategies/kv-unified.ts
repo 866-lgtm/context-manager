@@ -619,8 +619,9 @@ function latentHigherLevelCandidates(
 /** A digest of everything a joint what-if solve reads besides the candidate
  * set (the holder's key): the leaves (sizes, salience, levels, pins, locks,
  * head and tail membership), the summaries (levels, costs, ranges, parents),
- * the presentation and receipt, the ceiling, the wall, the grid, the policy
- * and the multiplier. Any of them can change how many labels the solve
+ * the presentation and receipt (layout and markers), the ceiling, the wall,
+ * the grid, the engine, the forest options, the policy and the multiplier.
+ * Any of them can change how many labels the solve
  * creates, so a remembered ceiling failure is valid only while all hold;
  * a changed input is a new question. One pass over the inputs. */
 function jointFailureSignature(inputs: PickerInputs, options: KvUnifiedOptions, maxTokens: number, policy: KvUnifiedWelfarePolicy, multiplier: number): string {
@@ -638,6 +639,8 @@ function jointFailureSignature(inputs: PickerInputs, options: KvUnifiedOptions, 
   num(options.labelCeiling); num(maxTokens);
   num(options.tokenBucketSize); num(options.continuityBucketSize); num(options.fidelityBucketSize);
   num(options.adoptEpsilon); num(options.hysteresisCertificate ? 1 : 0); num(multiplier);
+  str(options.engine); str(options.storage); str(options.terminalEvaluation);
+  num(options.treeifyNonContiguousSummaries ? 1 : 0); num(options.preserveGapBearingSummaries ? 1 : 0);
   for (const key of Object.keys(policy).sort()) num((policy as unknown as Record<string, number>)[key]);
   num(inputs.headTokens); num(inputs.tailTokens);
   for (let i = 0; i < inputs.chunks.length; i++) {
@@ -656,7 +659,12 @@ function jointFailureSignature(inputs: PickerInputs, options: KvUnifiedOptions, 
     num(presentation.currentSeq);
     for (const [id, leaf] of presentation.leaves) { str(id); num(leaf.level); num(leaf.lastChangedSeq); str(leaf.repHash); }
   }
-  num(options.cache ? options.cache.markers.length : -1); str(options.cache?.immutablePrefixHash); str(options.currentImmutablePrefixHash);
+  const cache = options.cache;
+  num(cache ? cache.markers.length : -1); str(cache?.immutablePrefixHash); str(options.currentImmutablePrefixHash);
+  if (cache) {
+    num(cache.layout.units.length); num(cache.layout.totalTokens);
+    for (const marker of cache.markers) { num(marker.unitIndex); num(marker.offset); }
+  }
   return `${(a >>> 0).toString(16)}:${(b >>> 0).toString(16)}`;
 }
 
