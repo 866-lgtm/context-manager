@@ -72,6 +72,9 @@ test('kv-unified canonical forest rejects ownership cycles', () => {
   const l1 = chronicle.produceL1(['a']);
   const l2 = chronicle.produceUpper(2, [l1.id]);
   l2.parentId = l1.id;
+  // Ownership climbs only to a parent that lists the summary, so the cycle
+  // needs the L1 to list its L2 as well.
+  l1.sourceIds = [...l1.sourceIds, l2.id];
 
   assert.throws(
     () => new CanonicalSummaryForest(inputsOf(chronicle)),

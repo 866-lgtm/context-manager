@@ -95,14 +95,23 @@ test('derive declines ownership removals and option changes, extends re-parentin
   const l1 = (next: PickerInputs) => {
     const chunk = next.chunks.find((c) => c.id === 'c6')!;
     const entry = [...next.summaries.values()].find((s) => s.level === 1)!;
-    chunk.l1Id = entry.id; // c6 gains an owner
+    chunk.l1Id = entry.id; // c6 gains an owner, which lists it
+    entry.sourceIds = [...entry.sourceIds, chunk.id];
   };
   const cases: Array<[string, (next: PickerInputs) => void]> = [
     ['new L1 link', l1],
     ['recall cost change', (next) => { (next.recallPairTokens as Map<string, number>).set([...next.summaries.keys()][0], 1); }],
     ['summary removed', (next) => { (next.summaries as Map<string, unknown>).delete([...next.summaries.keys()][0]); }],
-    ['appended leaf with owner', (next) => { next.chunks.push({ id: 'c10', sequence: 10, rawTokens: 5, currentResolution: 0, lockedByAgent: false, pinned: false, l1Id: [...next.summaries.keys()][0] }); }],
+    ['appended leaf with owner', (next) => {
+      const owner = [...next.summaries.values()][0]!;
+      owner.sourceIds = [...owner.sourceIds, 'c10'];
+      next.chunks.push({ id: 'c10', sequence: 10, rawTokens: 5, currentResolution: 0, lockedByAgent: false, pinned: false, l1Id: owner.id });
+    }],
     ['leaf removed', (next) => { next.chunks.pop(); }],
+    ['an L1 stops listing a chunk', (next) => {
+      const entry = [...next.summaries.values()].find((s) => s.level === 1)!;
+      entry.sourceIds = entry.sourceIds.filter((id) => id !== 'c2');
+    }],
   ];
   for (const [name, mutate] of cases) {
     const next = nextCompile(fixture());
@@ -116,8 +125,126 @@ test('derive declines ownership removals and option changes, extends re-parentin
   const extended = CanonicalSummaryForest.derive(first, left, options);
   assert.ok(extended && extended.lineage, 'summary parent change extends');
   assert.deepEqual(shape(extended), shape(new CanonicalSummaryForest(left, options)));
+  // An L2 that stops listing an L1 whose pointer still names it: the L1 leaves it.
+  const unlisted = nextCompile(fixture());
+  const upper = [...unlisted.summaries.values()].find((s) => s.level === 2)!;
+  const dropped = upper.sourceIds[upper.sourceIds.length - 1]!;
+  upper.sourceIds = upper.sourceIds.slice(0, -1);
+  const fromUnlisting = CanonicalSummaryForest.derive(first, unlisted, options);
+  assert.ok(fromUnlisting && fromUnlisting.lineage, 'a parent that stops listing a child extends');
+  assert.deepEqual(shape(fromUnlisting), shape(new CanonicalSummaryForest(unlisted, options)));
+  assert.equal(fromUnlisting.summary(dropped)?.parentId, undefined, 'the unlisted L1 is a root');
+  assert.ok(!fromUnlisting.summary(upper.id)!.leafIds.includes('c5'), "the L2 owns none of the unlisted L1's leaves");
   assert.equal(CanonicalSummaryForest.derive(first, nextCompile(fixture()), { treeifyNonContiguousSummaries: true }), null, 'option change');
   assert.equal(CanonicalSummaryForest.derive(first, nextCompile(fixture()), { ...options, overlapExempt: new Set(['c0']) }), null, 'overlap exempt');
+});
+
+test('an appended chunk linked to an L1 that does not list it stays ownerless through derive', () => {
+  // Four chunks under one L1, the last summary in leaf order, so the appended
+  // chunk would sit beside its leaves.
+  const chronicle = new MockChronicle({ recallPairTokens: 55 });
+  for (let i = 0; i < 4; i++) chronicle.addChunk({ id: `d${i}`, rawTokens: 90 });
+  const owner = chronicle.produceL1(['d0', 'd1', 'd2', 'd3']);
+  const base: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const first = new CanonicalSummaryForest(base, options);
+  const next = nextCompile(base);
+  next.chunks.push({ id: 'd4', sequence: 4, rawTokens: 90, currentResolution: 0, lockedByAgent: false, pinned: false, l1Id: owner.id });
+  const derived = CanonicalSummaryForest.derive(first, next, options);
+  assert.ok(derived, 'derive extends the forest');
+  assert.deepEqual(derived.leaf('d4')?.availableLevels, [0], 'the chunk its L1 does not list renders only raw');
+  assert.deepEqual(shape(derived), shape(new CanonicalSummaryForest(next, options)));
+});
+
+test("derive reuses a gap-bearing forest whose chainless leaf its L1 doesn't list, as a full build owns it", () => {
+  // The L2 lists L1a and L1c around L1b, which still points at it, so L1b is a
+  // root and the L2 is gap-bearing. L1b lists g2 alone, while g3 still links
+  // it. preserveGapBearingSummaries cuts no chain, so g3's empty chain is the
+  // listing's own verdict, and derive keeps the forest: only treeification
+  // cuts chains.
+  const chronicle = new MockChronicle({ recallPairTokens: 55 });
+  for (let i = 0; i < 6; i++) chronicle.addChunk({ id: `g${i}`, rawTokens: 90 });
+  const [L1a, L1b, L1c] = [['g0', 'g1'], ['g2', 'g3'], ['g4', 'g5']].map((ids) => chronicle.produceL1(ids));
+  const l2 = chronicle.produceUpper(2, [L1a!.id, L1b!.id, L1c!.id]);
+  l2.sourceIds = [L1a!.id, L1c!.id];
+  L1b!.sourceIds = ['g2'];
+  const base: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const first = new CanonicalSummaryForest(base, options);
+  assert.deepEqual(first.gapBearingSummaryIds, [l2.id], 'premise: the L2 is gap-bearing');
+  assert.deepEqual(first.treeifiedSummaryIds, [], 'premise: nothing is treeified');
+  assert.deepEqual(first.leaf('g3')?.summaryIds, [], 'premise: g3 has no chain');
+  assert.equal(base.chunks[3]!.l1Id, L1b!.id, 'premise: g3 still links L1b');
+  const next = nextCompile(base);
+  const derived = CanonicalSummaryForest.derive(first, next, options);
+  assert.ok(derived, 'derive keeps the forest');
+  assert.deepEqual(shape(derived), shape(new CanonicalSummaryForest(next, options)));
+});
+
+test("derive extends a new L1's leaves, and leaves a chunk linked to it that it doesn't list ownerless", () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 55 });
+  for (let i = 0; i < 3; i++) chronicle.addChunk({ id: `n${i}`, rawTokens: 90 });
+  const base: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const first = new CanonicalSummaryForest(base, options);
+  const next = nextCompile(base);
+  const l1 = { ...chronicle.produceL1(['n0', 'n1']) };
+  (next.summaries as Map<string, typeof l1>).set(l1.id, l1);
+  for (const chunk of next.chunks) chunk.l1Id = l1.id;
+  const derived = CanonicalSummaryForest.derive(first, next, options);
+  assert.ok(derived, 'derive extends the forest');
+  assert.deepEqual(derived.leaf('n2')?.availableLevels, [0], 'the chunk the L1 does not list stays ownerless');
+  assert.deepEqual(shape(derived), shape(new CanonicalSummaryForest(next, options)));
+});
+
+test('derive declines a parent that stops listing a child inside its span, which the full build refuses', () => {
+  const chronicle = new MockChronicle({ recallPairTokens: 55 });
+  for (let i = 0; i < 6; i++) chronicle.addChunk({ id: `e${i}`, rawTokens: 90 });
+  const l1s = [['e0', 'e1'], ['e2', 'e3'], ['e4', 'e5']].map((ids) => chronicle.produceL1(ids));
+  const l2 = chronicle.produceUpper(2, l1s.map((s) => s.id));
+  const base: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const first = new CanonicalSummaryForest(base);
+  const next = nextCompile(base);
+  next.summaries.get(l2.id)!.sourceIds = [l1s[0]!.id, l1s[2]!.id];
+  assert.throws(() => new CanonicalSummaryForest(next), 'premise: the full build refuses the hole');
+  assert.equal(CanonicalSummaryForest.derive(first, next), null, 'derive returns no forest for it');
+});
+
+// With treeifyNonContiguousSummaries, a summary whose leaves aren't
+// contiguous is cut from the chains of its leaves, with what is above it. A
+// listing change under it changes what a full build makes, so derive must not
+// reuse the old forest.
+const treeify = { treeifyNonContiguousSummaries: true };
+
+test('derive never reuses a treeified forest after a treeified L1 stops listing its leaves', () => {
+  // a and c under L1 A, b ownerless between them, d under L1 B; L2 P over A
+  // and B. A and P are treeified, so a and c have no chain, and d's is [B].
+  const chronicle = new MockChronicle({ recallPairTokens: 55 });
+  for (const id of ['a', 'b', 'c', 'd']) chronicle.addChunk({ id, rawTokens: 90 });
+  const A = chronicle.produceL1(['a', 'c']);
+  const B = chronicle.produceL1(['d']);
+  const P = chronicle.produceUpper(2, [A.id, B.id]);
+  const base: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const first = new CanonicalSummaryForest(base, treeify);
+  assert.deepEqual([...first.treeifiedSummaryIds].sort(), [A.id, P.id].sort(), 'premise: A and P are treeified');
+  const next = nextCompile(base);
+  next.summaries.get(A.id)!.sourceIds = [];
+  const full = new CanonicalSummaryForest(next, treeify);
+  assert.deepEqual(full.leaf('d')?.summaryIds, [B.id, P.id], 'premise: the full build puts d under P again');
+  const derived = CanonicalSummaryForest.derive(first, next, treeify) ?? full;
+  assert.deepEqual(shape(derived), shape(full));
 });
 
 test('deriving twice from one forest leaves every forest coherent', () => {
