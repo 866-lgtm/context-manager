@@ -578,7 +578,7 @@ describe('AutobiographicalStrategy — drain progresses past flat-length ticks (
     // One trigger, as a single onNewMessage would do.
     (strategy as any).driveSpeculativeDrain((manager as any).createStrategyContext());
 
-    // Let the microtask recursion + async ticks settle.
+    // Let the timer recursion + async ticks settle.
     for (let i = 0; i < 100 && strategy.mergeQ.length > 0; i++) {
       await new Promise(r => setTimeout(r, 10));
     }

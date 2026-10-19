@@ -122,9 +122,11 @@ function logCompressionCall(entry: Record<string, unknown>, namespace: string): 
  *   not support). Repeating it changes nothing; a ladder may try a different
  *   request, and a completed ladder of such outcomes exhausts the family.
  * - `transient`: capacity, transport, credentials, or anything unclassified.
- *   It says nothing about the request, so it never spends a ladder rung or
- *   exhausts a family: the compression lane pauses and the same request is
- *   tried again later.
+ *   One says nothing about the request, so by itself it spends no ladder rung
+ *   and exhausts no family: the compression lane pauses and the same request
+ *   is tried again later. COMPRESSION_PERSISTENT_FAILURES of them on one
+ *   rung, counted while other compression lands in their domain, decide that
+ *   rung (CompressionFailureStreak).
  * - `abort`: a cancellation, or a host's withdrawal of the call
  *   (CompressionWithdrawn). Neither evidence nor a reason to pause.
  */
@@ -760,6 +762,8 @@ interface CompressionRefusalQuarantineRecord {
  * already tried has deterministically answered, so a ladder interrupted by a
  * transient failure resumes at the interrupted rung instead of paying again
  * for requests whose outcome is known, or exhausting a viable family.
+ * Split-stitch is one unit: a transient failure inside it re-runs the whole
+ * rung, the pieces it had settled included.
  *
  * Kept separate from the quarantine ledger, whose projection IS the
  * quarantined set (status and the klaxon count it). Branch-scoped like the
@@ -1850,10 +1854,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * The lane's runs of failures (CompressionFailureStreak): an L1 chunk's by
    * its run subject (chunkRunSubject), with its chunk's key, and a queued
-   * merge's by mergeFailureKey. An answer or a decision ends one, and like
-   * the failure orders a run is dropped once its chunk or merge is no longer
-   * pending (orderCompressionQueue). While it stands it holds merges around
-   * its span (pendingRetrySpans).
+   * merge's by mergeFailureKey. An answer or a decision of its rung ends one,
+   * whether it came now or is reused from progress, with one exception:
+   * split-stitch's outcome reused from progress (knownSplit) ends none, since
+   * the family's exhaustion follows it with no call between, and tick ends
+   * the chunk's runs where that exhaustion stops the request. An L1 chunk's
+   * runs all end where this process won't retry its request
+   * (endChunkFailureRuns): tick's skip for its quarantine, the chunk
+   * compressed, or its request found or made unable to go (an exhaustion
+   * whose record the ledger holds, a joined call whose family the ledger
+   * holds, the overlap guard while the overlap stands). Like the failure
+   * orders, a run is dropped once its chunk or merge is no longer pending
+   * (orderCompressionQueue). A clear lifts a quarantine and ends no run.
+   * While a run stands it holds merges around its span (pendingRetrySpans).
    */
   private compressionFailureRuns = new Map<string, { run: CompressionFailureStreak; chunkKey: string }>();
   private mergeFailureRuns = new Map<string, CompressionFailureStreak>();
@@ -4340,6 +4353,54 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
   }
 
+  /**
+   * The durable quarantine in `projection` that stops `record`'s request,
+   * if any. The gate skips a chunk on it, and a joined call reads it again
+   * once the call it joined is in, so both say the same of a request.
+   */
+  private durableQuarantineFor(
+    projection: Map<string, ActiveCompressionQuarantine>,
+    record: CompressionRefusalQuarantineRecord,
+  ): ActiveCompressionQuarantine | undefined {
+    // Bounded by chunk hash, not just request identity (2026-08-06
+    // ear-loop): as sibling chunks mint, the recall frontier shifts, so
+    // every maintenance pass built a NEW key/familyKey for the same
+    // refusing span — each cycle burned a full refused call and minted a
+    // duplicate quarantine record, forever. A GENUINE shape change
+    // (carriers arrive, tools arrive, config change) deserves a fresh
+    // attempt — that self-healing is deliberate and pinned by tests — so
+    // the gate is a CAP, not a wall: up to CHUNK_QUARANTINE_SHAPE_CAP
+    // distinct quarantined shapes per chunk and request regime, then sticky
+    // until success-clear or the paid-off sweep, which match by chunkSourceHash
+    // and so clear every shape of the span, or an operator's clear: of every
+    // record, or of one by its key, which leaves the span's other shapes
+    // counting toward the cap.
+    const sameHash = [...projection.values()].filter(
+      (active) => active.record.chunkSourceHash === record.chunkSourceHash &&
+        active.record.normalizedConfig?.accountingVersion === COMPRESSION_BUDGET_ACCOUNTING_VERSION,
+    );
+    // The shape cap is per request regime, not merely per source chunk. Enabling
+    // the final source-only rung is a genuine request-family change and must
+    // earn a fresh bounded family even when the old regime already filled its
+    // cap. Within the new regime the cap remains sticky.
+    const sameRegime = sameHash.filter((active) =>
+      active.record.normalizedConfig?.sourceOnlyFallbackEnabled ===
+        record.normalizedConfig.sourceOnlyFallbackEnabled &&
+      active.record.normalizedConfig?.sourceOnlyFallbackRequestHash ===
+        record.normalizedConfig.sourceOnlyFallbackRequestHash &&
+      // Same rule for the tool-prose rung: enabling or re-pointing it is a
+      // request-family change (no options and some options differ). The
+      // options are compared as canonicalJson gives them, since a record read
+      // back from the store has their keys in another order than
+      // toolProseHoistOptions builds them in.
+      canonicalJson(active.record.normalizedConfig?.toolProseFallback ?? null) ===
+        canonicalJson(record.normalizedConfig.toolProseFallback ?? null),
+    );
+    return projection.get(record.key)
+      ?? sameRegime.find((active) => active.record.familyKey === record.familyKey)
+      ?? (sameRegime.length >= AutobiographicalStrategy.CHUNK_QUARANTINE_SHAPE_CAP ? sameRegime[0] : undefined);
+  }
+
   private appendCompressionQuarantineEvent(
     event: NewCompressionQuarantineEvent,
   ): CompressionQuarantineEvent {
@@ -5289,6 +5350,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** End the L1 run of `subject` if it is the run of `key`: that rung answered, or its run decided it. */
   private endCompressionFailureRun(subject: string, key: string): void {
     if (this.compressionFailureRuns.get(subject)?.run.key === key) this.compressionFailureRuns.delete(subject);
+  }
+
+  /**
+   * This process won't retry the request of the chunk keyed `key` while what
+   * stopped it lasts: tick found its quarantine and skipped it, the chunk
+   * compressed, or its request was found or made unable to go (an exhaustion
+   * whose record the ledger holds, a joined call whose family the ledger
+   * holds, the overlap guard while the overlap stands).
+   * A run holds the summaries beside its chunk's span waiting
+   * (pendingRetrySpans) because this process expects to retry the chunk, so
+   * every run of the chunk ends, on any rung. A later request shape the
+   * durable gate lets through, a retry after a clear, or one after the
+   * overlap is mended starts its count afresh, and if the pair beside the
+   * span merged meanwhile, its summary lands beside their parent, as after
+   * a restart: a lopsided merge, with nothing lost. Says whether a run
+   * ended, so the caller can run merge discovery again.
+   */
+  private endChunkFailureRuns(key: string): boolean {
+    let ended = false;
+    for (const [subject, entry] of this.compressionFailureRuns) {
+      if (entry.chunkKey !== key) continue;
+      this.compressionFailureRuns.delete(subject);
+      ended = true;
+    }
+    return ended;
   }
 
   /**
@@ -6311,13 +6397,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Background-drain loop: keeps calling tick() while there's queued work,
    * subject to the preflight hook, and to the speculation cap through tick's
-   * L1 step (speculativeCapHolds). Recurses via
-   * `queueMicrotask` so one chunk's compression doesn't block the
-   * scheduling of the next.
+   * L1 step (speculativeCapHolds). Each next tick runs from a timer
+   * (`setTimeout` 0), so one chunk's compression doesn't block the
+   * scheduling of the next. No caller awaits that tick, so nothing it throws
+   * leaves the timer: a tick that comes due on a closed store doesn't run,
+   * and whatever a tick throws is logged. A tick already running when the
+   * store closes ends in the drain's own `.catch`, which logs it.
    *
-   * Stops if a tick fails to make progress (queue size unchanged) — guards
-   * against runaway recursion when tick is a no-op (e.g. no membrane
-   * configured, or a subclass override that doesn't process the queue).
+   * Stops if a tick fails to make progress (no queue item consumed, by
+   * `_drainProgress`) — guards against runaway recursion when tick is a
+   * no-op (e.g. no membrane configured, or a subclass override that doesn't
+   * process the queue).
    */
   protected driveSpeculativeDrain(ctx: StrategyContext): void {
     this.requireLoadedBranch('driveSpeculativeDrain');
@@ -6362,7 +6452,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // turn start while a post-restart drain ground ~10 compiles). A
         // macrotask hop lets pending sockets/timers run between ticks,
         // capping the added wake latency at ~one tick's compile.
-        setTimeout(() => this.driveSpeculativeDrain(ctx), 0);
+        setTimeout(() => {
+          // No caller awaits this tick, so nothing it throws may leave the
+          // timer: an uncaught exception ends the host's process. A tick that
+          // comes due on a store the host has closed, as its stop() closes
+          // one, doesn't run, and the drain ends quietly, as on a withdrawal.
+          // Whatever the tick throws is logged, as below.
+          try {
+            if (this.store?.isClosed()) return;
+            this.driveSpeculativeDrain(ctx);
+          } catch (err) {
+            this.diag.error(`AutobiographicalStrategy: speculative-drain error: ${describeCompressionFailure(err)}`);
+          }
+        }, 0);
       })
       .catch((err) => {
         // A host's withdrawal stops the drain quietly: the host asked for it.
@@ -6500,6 +6602,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) return;
 
       let quarantineSkipped = false;
+      let requestStopped = false;
       const work: { chunk: Chunk; skipped?: true } = { chunk };
       this.pendingCompressionWork = work;
       const compression = this.compressChunkHierarchical(chunk, ctx, () => {
@@ -6507,6 +6610,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // No model call follows: from here the work in flight stops
         // counting (compressionWorkQueued), through the hop below too.
         work.skipped = true;
+      }, () => {
+        requestStopped = true;
       }).then(async () => {
         // Quarantine checks build compression contexts too. As in the
         // speculative drain, a macrotask hop keeps those builds from starving
@@ -6542,6 +6647,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this.compressionQueueGeneration !== queueGeneration,
           );
         }
+        // Merge discovery runs after a thrown attempt too, as after a return:
+        // a rung's answer, fresh or reused, ends its run inside the ladder, and
+        // a later call can still throw (a transient failure, a withdrawal), so
+        // the merges that run held are found here. A failure of its own is
+        // logged, and the attempt's error stays the one acted on: tick's
+        // callers act on it (a host may count a withdrawal as no failure), a
+        // window wait goes on with the scan below, and a merge discovery queued
+        // is in memory before the write that failed.
+        if (this.isCompressionBranchCurrent(sourceBranch)) {
+          try {
+            this.checkMergeThreshold();
+          } catch (discoveryError) {
+            this.diag.warn(`[autobiographical] merge discovery after a failed compression attempt failed (the attempt's error stands): ${describeCompressionFailure(discoveryError)}`);
+          }
+        }
         // A split-stitch window wait, this instance's own or one a joined call
         // rethrew: nothing failed here and no call was made, so the scan goes
         // on to the work behind it, unless the branch switched meanwhile. The
@@ -6567,19 +6687,44 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // failed, and tick builds their requests before it builds this one's
         // only to find its quarantine again. A rebuild during the yield above
         // may have queued it before it had that order, so the queue is sorted
-        // now.
+        // now. Its runs end (endChunkFailureRuns): this request won't be
+        // retried, so the merges beside its span stop waiting for it.
+        if (this.endChunkFailureRuns(key)) this.checkMergeThreshold();
         this.compressionFailureOrder.set(key, ++this.compressionFailureSequence);
         this.orderCompressionQueue();
       } else {
-        // Decided (landed, exhausted, held by another process's record, or
-        // its family dropped while its ladder ran): no longer failing. A
-        // dropped family's failures say nothing about the next attempt, which
-        // starts afresh: a clear asks for one, a mint leaves the span nothing
+        // Returned without a failure: decided (landed, exhausted, held by
+        // another process's record, or its family dropped while its ladder
+        // ran), or no call was made. No longer failing. A dropped family's
+        // recorded outcomes go with it, so the next attempt pays for its
+        // ladder afresh: a clear asks for one, a mint leaves the span nothing
         // to do, and a sweep drops only progress nothing advanced for 30 days,
         // progress a summary already paid off, and progress whose span can't
         // be cut again (a message of it is gone from the store, or an entry
         // older releases wrote carries no ids and no chunk record matches it).
+        // The chunk's runs are not the family's: they count failures of the
+        // chunk's rungs on their route, so they carry into that attempt with
+        // their counts.
+        // The chunk's runs end where this process won't retry its request
+        // (endChunkFailureRuns): the chunk compressed (a mint, an adoption,
+        // the dedup guard, a thin stub, or the L1 of a call it joined), which
+        // marks this chunk object even where a rebuild during the call cut
+        // another in its place, with the same key, since a key is a chunk's
+        // sources; or its request was found or made unable to go
+        // (onRequestStopped: an exhaustion whose record the ledger holds, a
+        // joined call whose family the ledger holds, the overlap guard while
+        // the overlap stands). Otherwise they stand, since a retry is coming:
+        // tools not yet pushed, a family dropped meanwhile, or a hold placed
+        // during a joined call, which discarded another instance's answer (the
+        // chunk is asked for again once the hold is released). This ladder's
+        // own answer ends its rung's run when it comes (runAttempt, or the
+        // complete stitch), before a hold can discard it, so no run stands for
+        // that hold. Merge discovery runs after every such return, as after a
+        // thrown attempt, since a run may have ended here or inside the
+        // ladder, where a rung's answer, fresh or reused, ends its run.
+        if (chunk.compressed || requestStopped) this.endChunkFailureRuns(key);
         this.compressionFailureOrder.delete(key);
+        this.checkMergeThreshold();
       }
       // Attempts, including fresh refusals, still consume the tick. Existing
       // overrides that omit the optional notification keep that behavior.
@@ -7848,6 +7993,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Only the authoritative durable-family gate reports a no-op skip. This
     // optional notification preserves the Promise<void> subclass contract.
     onQuarantineSkip?: () => void,
+    // The chunk's request was found or made unable to go, so this process
+    // won't retry it while that lasts: the overlap guard while the overlap
+    // stands, a joined call whose family the reloaded ledger holds, or an
+    // exhaustion whose record the ledger holds. tick ends the chunk's runs
+    // on it (endChunkFailureRuns).
+    onRequestStopped?: () => void,
   ): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('compressChunkHierarchical');
     phaseChannel.report('compress-chunk'); // liveness-watchdog phase
@@ -7927,6 +8078,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `investigate before resuming this span.`,
         );
       }
+      // Refused on every attempt while the overlap stands, so no retry fills
+      // the span meanwhile: the merges beside it stop waiting.
+      onRequestStopped?.();
       return;
     }
 
@@ -8515,41 +8669,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
     const runSubject = chunkRunSubject(quarantineRecord.chunkSourceHash, chunk.messages);
     const durableQuarantine = this.readCompressionQuarantineProjection();
-    // Bounded by chunk hash, not just request identity (2026-08-06
-    // ear-loop): as sibling chunks mint, the recall frontier shifts, so
-    // every maintenance pass built a NEW key/familyKey for the same
-    // refusing span — each cycle burned a full refused call and minted a
-    // duplicate quarantine record, forever. A GENUINE shape change
-    // (carriers arrive, tools arrive, config change) deserves a fresh
-    // attempt — that self-healing is deliberate and pinned by tests — so
-    // the gate is a CAP, not a wall: up to CHUNK_QUARANTINE_SHAPE_CAP
-    // distinct quarantined shapes per chunk, then sticky until
-    // success-clear, paid-off sweep, or operator clear (all of which
-    // already match by chunkSourceHash).
-    const sameHash = [...durableQuarantine.values()].filter(
-      (active) => active.record.chunkSourceHash === quarantineRecord.chunkSourceHash &&
-        active.record.normalizedConfig?.accountingVersion === COMPRESSION_BUDGET_ACCOUNTING_VERSION,
-    );
-    // The shape cap is per request regime, not merely per source chunk. Enabling
-    // the final source-only rung is a genuine request-family change and must
-    // earn a fresh bounded family even when the old regime already filled its
-    // cap. Within the new regime the cap remains sticky.
-    const sameRegime = sameHash.filter((active) =>
-      active.record.normalizedConfig?.sourceOnlyFallbackEnabled ===
-        quarantineRecord.normalizedConfig.sourceOnlyFallbackEnabled &&
-      active.record.normalizedConfig?.sourceOnlyFallbackRequestHash ===
-        quarantineRecord.normalizedConfig.sourceOnlyFallbackRequestHash &&
-      // Same rule for the tool-prose rung: enabling or re-pointing it is a
-      // request-family change (no options and some options differ). The
-      // options are compared as canonicalJson gives them, since a record read
-      // back from the store has their keys in another order than
-      // toolProseHoistOptions builds them in.
-      canonicalJson(active.record.normalizedConfig?.toolProseFallback ?? null) ===
-        canonicalJson(quarantineRecord.normalizedConfig.toolProseFallback ?? null),
-    );
-    const durableActive = durableQuarantine.get(quarantineRecord.key)
-      ?? sameRegime.find((active) => active.record.familyKey === quarantineRecord.familyKey)
-      ?? (sameRegime.length >= AutobiographicalStrategy.CHUNK_QUARANTINE_SHAPE_CAP ? sameRegime[0] : undefined);
+    const durableActive = this.durableQuarantineFor(durableQuarantine, quarantineRecord);
     if (durableActive) {
       this.compressionRefusalQuarantine = durableQuarantine;
       if (!this.warnedQuarantineSkips.has(quarantineRecord.chunkSourceHash)) {
@@ -8634,6 +8754,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // the span's progress and quarantine debt in the shared slots.
         chunk.compressed = true;
         chunk.summaryId = coalescedSummary.id;
+      } else if (this.durableQuarantineFor(this.compressionRefusalQuarantine, quarantineRecord)) {
+        // The reload took up the ledger, where the call's family is now
+        // quarantined, by the exhaustion of the call this one joined or by a
+        // record it found: the gate would skip this request at its next
+        // attempt, so this process won't retry it.
+        onRequestStopped?.();
       }
       return;
     }
@@ -8817,6 +8943,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               errorType: compressionErrorType(error) ?? 'invalid_request',
             });
           }
+          // The rejection answers the request with its carriers, whose
+          // failures ran under the rung's own label: it ends that run, whether
+          // it came now or is reused from progress.
+          this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, false));
           this.diag.error(
             `[autobiographical] transport rejected reasoning carriers on '${curveLabel}' ` +
               `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -8897,10 +9027,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const canonicalRecallLevels = keptSummaries.map((summary) => summary.level);
 
       // ---- Durable ladder progress (CompressionFamilyProgress) ----
-      // Transient failures never spend the ladder. Every deterministic answer
-      // a request in this family has given is kept, written before the next
-      // rung's call, so a ladder interrupted by an outage resumes at the
-      // interrupted rung without paying again for what it already knows.
+      // A transient failure spends no rung by itself (a rung its failures
+      // decide is a deterministic outcome: CompressionFailureStreak). Every
+      // deterministic answer a request in this family has given is kept,
+      // written before the next rung's call, so a ladder interrupted by an
+      // outage resumes at the interrupted rung without paying again for what
+      // it already knows, split-stitch's settled pieces aside (the rung is
+      // one unit, re-run whole after a transient failure inside it).
       // Read afresh: another strategy on this store may have advanced it.
       const progress = this.readCompressionFamilyProgress().get(quarantineRecord.familyKey);
       const knownOutcomes = new Map<string, CompressionRefusalOutcomeRecord>();
@@ -8959,7 +9092,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
        * What either exhaustion exit does once the family's exhaustion is
        * decided: a family dropped meanwhile is reported; one whose record the
        * ledger now holds, this ladder's or another process's, has its
-       * progress forgotten; and only a record this ladder wrote is logged.
+       * progress forgotten, and tick is told that its request won't go again
+       * (onRequestStopped), so tick ends the chunk's runs; and only a record
+       * this ladder wrote is logged.
        */
       const settleExhaustion = (exhaustion: 'written' | 'held' | 'dropped' | undefined): void => {
         if (exhaustion === undefined) return;
@@ -8969,6 +9104,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
         this.forgetCompressionFamilyProgress((entry) => entry.familyKey === quarantineRecord.familyKey);
         if (exhaustion === 'written') logExhausted();
+        onRequestStopped?.();
       };
       const persistProgress = (): void => {
         // The check and the write are synchronous, with no await between them.
@@ -8979,6 +9115,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         );
         progressSeen = true;
       };
+      /**
+       * An answer ends its rung's runs of failures, on both request shapes,
+       * whether it came now or is reused from progress: the rung is decided
+       * for this family, so no retry of it is coming. Split-stitch's outcome
+       * reused from progress (knownSplit) is the one reuse that calls none:
+       * the family's exhaustion follows it with no call between, and tick ends
+       * the chunk's runs where that exhaustion stops the request.
+       */
+      const endRungRuns = (curveLabel: string): void => {
+        for (const stripped of [false, true]) this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, curveLabel, stripped));
+      };
       /** Keep one deterministic answer; durable before the next rung's call. */
       const noteOutcome = (outcome: CompressionRefusalOutcomeRecord): void => {
         const key = `${outcome.curveLabel}\u0000${outcome.requestHash}`;
@@ -8986,8 +9133,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         knownOutcomes.set(key, outcome);
         progressOutcomes.push(outcome);
         familyRecord.push(outcome);
-        // An answer ends that rung's run of failures.
-        for (const stripped of [false, true]) this.endCompressionFailureRun(runSubject, chunkRunKey(runSubject, outcome.curveLabel, stripped));
+        endRungRuns(outcome.curveLabel);
         persistProgress();
       };
       /**
@@ -9052,6 +9198,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             operation: 'compress_l1',
             metadata: { quarantine_key: quarantineRecord.key, curveLabel, requestHash, outcome: known.outcome },
           }, this.ns);
+          // Another ladder's answer, perhaps another process's, decided the
+          // rung: a run this process opened on it before then ends here.
+          endRungRuns(curveLabel);
           return { kind: 'decided', outcome: known, reused: true };
         }
         try {
@@ -9638,8 +9787,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const MAX_WINDOW_CALLS = this.config.compressionSplitMaxCallsPer10Min ?? 80;
           const windowStart = Date.now();
           this.splitCallTimes = this.splitCallTimes.filter((t) => windowStart - t < WINDOW_MS);
-          // `attempt=false` for the root range: the source-only-final rung has just refused the
-          // whole chunk in exactly this shape, so the rung starts by splitting rather than repeating it.
+          // `attempt=false` for the root range: the whole chunk in this shape is
+          // source-only-final's request, which gave no summary, so the rung starts by splitting
+          // rather than repeating it. Where the chunk is part of a read document their
+          // instructions differ: source-only-final takes the reading instruction, and a piece
+          // always the compression one.
           const fold = async (a: number, b: number, attempt = true): Promise<boolean> => {
             if (abortReason) return false;
             const subset = chunk.messages.slice(a, b + 1);
@@ -9780,6 +9932,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           this.lastSplitAttempted = { ...attempted, complete };
           if (complete && lastGood && parts.some((p) => p.kind === 'fold')) {
+            // The rung answered. Its pieces end only their own runs, so the
+            // run a failure inside the rung opened under its own label ends
+            // here, whether or not a summary is written after.
+            endRungRuns('split-stitch');
             const stitchedText = parts.map((p) => p.text).join('\n\n');
             const outputTokens = parts.reduce((n, p) => n + p.tokens, 0);
             const contentHash = sha256Json(stitchedText);
@@ -9892,8 +10048,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // content exists; ask once, explicitly, for it as plain prose before
       // giving up. Retry-only: first attempts stay byte-canonical.
       const sourceOnlyFinalWon = successfulTrace?.curveLabel === 'source-only-final';
-      // A tool-prose rung only runs after the canonical request was REFUSED, so
-      // the canonical plain-prose retry below would be a guaranteed burned call.
+      // A tool-prose rung follows a refusal: the canonical's, or
+      // source-only-final's, which can come after the canonical's incomplete
+      // answer. The plain-prose retry below resends the canonical with one
+      // more line, which mends neither a refusal nor a truncation, so it
+      // would be a burned call.
       const toolProseWonTrace =
         successfulTrace?.curveLabel === 'tool-prose-hoist' ||
         successfulTrace?.curveLabel === 'source-only-tool-prose-hoist'
@@ -10243,7 +10402,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * pending chunk: a chunk the lane won't attempt, such as a held one (tick
    * ends its scan there), would keep the run before it waiting for as long as
    * it waits, the stranding the newest-run rule in contiguousMergeCandidates
-   * exists to prevent.
+   * exists to prevent. For the same reason a chunk's runs end where this
+   * process won't retry its request (endChunkFailureRuns).
    */
   private pendingRetrySpans(messageOrder: Map<MessageId, number>): Array<[number, number, number]> {
     const spans: Array<[number, number, number]> = [];
@@ -10363,12 +10523,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // a run whose hole a retry will fill: work put back after a failure is
     // produced behind the live end, so the run before it is not stranded and
     // waits too, rather than merging lopsided before the summary lands. Once
-    // that work is decided (minted, or exhausted into quarantine), its hole
-    // is filled or stranded for good, and the rule above applies. Past the
-    // speculative cap the run waits as below it: the cap holds L1 production
-    // only while an L1 merge is queued to bring the count back down
-    // (speculativeCapHolds), so the retry that fills the hole comes once the
-    // count is back under the cap or no L1 merge is left queued.
+    // that work is minted its hole is filled, and once its request is
+    // quarantined the hole is stranded until a later request shape or a
+    // clear lands it, and the rule above applies. Past the speculative cap
+    // the run waits as below it: the cap holds L1 production only while an
+    // L1 merge is queued to bring the count back down (speculativeCapHolds),
+    // so the retry that fills the hole comes once the count is back under
+    // the cap or no L1 merge is left queued.
     for (let i = 0; i < runs.length; i++) {
       const r = runs[i]!;
       const isNewest = i === runs.length - 1;
