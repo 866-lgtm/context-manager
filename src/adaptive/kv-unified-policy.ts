@@ -57,7 +57,7 @@ export interface KvUnifiedWelfarePolicy {
    * since it last moved) are each priced at the lower edge of the band they
    * fall in, so a weight changes only when the age crosses a band edge.
    * Exact ages change every leaf's weight on every append, which is what
-   * keeps a solve from reusing anything from the compile before (#45). 0
+   * keeps a solve from reusing any score from the compile before (#45). 0
    * prices exact ages. With banding on, the stability age is 0 for half a
    * half-life after a move and read at whole doublings from there, and
    * recency is the floor from eight half-lives out (see continuityLeafBase). */
@@ -85,21 +85,22 @@ export const DEFAULT_KV_UNIFIED_WELFARE_POLICY: KvUnifiedWelfarePolicy = {
   ageBandSteps: 0,
 };
 
-/** The lower edge of the geometric band `age` falls in, with `steps` bands
- * per doubling: 2^(floor(log2(age) · steps) / steps). Ages below 1 and a
- * `steps` of 0 are returned as given. */
 /** The finest banding the policy accepts: 64 bands per doubling is a
  * step of 1.1%, below any weight's sensitivity, and keeps the edge table
  * (one entry per band, scanned per leaf) small. */
 export const MAX_AGE_BAND_STEPS = 64;
 
+/** The lower edge of the geometric band `age` falls in, with `steps` bands
+ * per doubling: 2^(floor(log2(age) · steps) / steps). Ages below 1 and a
+ * `steps` of 0 are returned as given. */
 export function bandedAge(age: number, steps: number): number {
   if (!(steps > 0) || !(age >= 1) || !Number.isFinite(age)) return age;
   // The octave the age falls in, then its band within the octave from the
   // table of fractional edges (every solve calls this three times per
   // leaf, so no pow per call). Floating-point: log2 of an age beside a
-  // doubling can floor an octave off either way; the doublings decide.
-  let exponent = Math.floor(Math.log2(age));
+  // doubling can floor an octave off either way; the doublings decide. The
+  // exponent is capped where 2^exponent is still finite.
+  let exponent = Math.min(1023, Math.floor(Math.log2(age)));
   let octave = 2 ** exponent;
   if (octave > age) { exponent--; octave /= 2; }
   else if (octave * 2 <= age) { exponent++; octave *= 2; }
@@ -532,9 +533,10 @@ export function continuityLeafBase(
   const recencyAge = bandedAge(midpointAgeTokens, policy.ageBandSteps);
   // With banding on, recency is the floor from eight half-lives out (the
   // exact age, so the cutoff sits where it is documented rather than at the
-  // first band edge past it): the decayed share is below 2^-8 of the range
-  // there, and every band edge past it would re-price the old history for
-  // less than that.
+  // first band edge past it): the decayed share is about 2^-8 of the range
+  // there (the band just below the cutoff is read at its lower edge, so the
+  // step is about 1.5x that), and every band edge past it would re-price
+  // the old history for less.
   const recency = policy.ageBandSteps > 0 && midpointAgeTokens >= 8 * halfLife
     ? policy.continuityRecencyFloor
     : policy.continuityRecencyFloor + (1 - policy.continuityRecencyFloor) * 2 ** (-recencyAge / halfLife);

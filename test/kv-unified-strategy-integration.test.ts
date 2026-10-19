@@ -700,6 +700,8 @@ test('ages are banded at 4 steps per doubling unless the recipe policy says othe
   };
   assert.equal(await stepsOf({ ...KV_UNIFIED }), 4);
   assert.equal(await stepsOf({ ...KV_UNIFIED, policy: { ...(KV_UNIFIED as { policy: object }).policy, ageBandSteps: 0 } }), 0);
+  // A caller forwarding an optional setting leaves the key present and undefined.
+  assert.equal(await stepsOf({ ...KV_UNIFIED, policy: { ...(KV_UNIFIED as { policy: object }).policy, ageBandSteps: undefined } }), 4);
 });
 
 test('the hysteresis certificate is on unless the recipe says false', async () => {

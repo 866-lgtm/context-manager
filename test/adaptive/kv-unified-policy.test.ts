@@ -1636,6 +1636,10 @@ test('bandedAge reads an age at the lower edge of its geometric band', () => {
     }
   }
   assert.equal(bandedAge(2 ** 0.75 * 1.0000001, 4), 2 ** 0.75, 'just above an edge is that edge');
+  for (const s of [1, 4, 64]) {
+    const top = bandedAge(Number.MAX_VALUE, s);
+    assert.ok(Number.isFinite(top) && top <= Number.MAX_VALUE, `steps ${s}: the top of the range stays finite (${top})`);
+  }
 });
 
 test('banded ages move a weight only when the age crosses a band edge', () => {
