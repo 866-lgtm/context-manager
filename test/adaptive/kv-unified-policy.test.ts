@@ -2016,13 +2016,14 @@ test('a remembered joint ceiling failure is forgotten when the wall changes', ()
   const carried = build(405, reuse);
   assert.equal(carried.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again at the new wall');
   assert.deepEqual(carried.result.produced, fresh.result.produced);
-  // A pin, a head window, or a level bound that only touches the level a
-  // candidate would add (the live forest's allowed levels do not change)
-  // changes the label count too.
-  const pinned = (budget: number, holder: KvUnifiedReuse, how: 'pin' | 'head' | 'max' = 'pin') => {
+  // A pin, a head window, a level bound that only touches the level a
+  // candidate would add, or a leaf's size: the signature digests every
+  // input the solve reads, so each is a new question.
+  const pinned = (budget: number, holder: KvUnifiedReuse, how: 'pin' | 'head' | 'max' | 'tokens' = 'pin') => {
     const inputs = fixture();
     if (how === 'head') { inputs.headChunkIds = new Set(['latent-0']); inputs.headTokens = 90; }
     else if (how === 'max') for (const chunk of inputs.chunks) chunk.pinMaxLevel = 1;
+    else if (how === 'tokens') for (const chunk of inputs.chunks) chunk.rawTokens *= 2;
     else inputs.chunks[1].pinned = true;
     const strategy = new KvUnifiedStrategy({
       policy: { alpha: 0.7, budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0, budgetOverLambda: 100_000, cacheLambda: 0, continuityLambda: 0 },
@@ -2053,6 +2054,14 @@ test('a remembered joint ceiling failure is forgotten when the wall changes', ()
   const carriedMax = pinned(500, bounded, 'max');
   assert.equal(carriedMax.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again after a bound on the proposed level');
   assert.deepEqual(carriedMax.result.produced, freshMax.result.produced);
+  // So does a leaf's token estimate.
+  const resized: KvUnifiedReuse = {};
+  build(500, resized);
+  const freshTokens = pinned(500, {}, 'tokens');
+  assert.equal(freshTokens.strategy.lastTimings?.demandSolves, 1, 'premise: with the leaves twice the size the joint forest fits at 500');
+  const carriedTokens = pinned(500, resized, 'tokens');
+  assert.equal(carriedTokens.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again after the estimates moved');
+  assert.deepEqual(carriedTokens.result.produced, freshTokens.result.produced);
 });
 
 test('a root the forest treeified away from a crossed parent is not a merge candidate', () => {

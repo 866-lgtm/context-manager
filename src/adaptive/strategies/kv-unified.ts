@@ -391,7 +391,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
     // exceed it again: its holder says so, and is kept so that it still
     // says so next compile.
     const key = whatIfKey(conservative);
-    const failure = jointFailureSignature(inputs, whatIf.base, this.options, budget.totalBudget, policy);
+    const failure = jointFailureSignature(inputs, this.options, budget.totalBudget, policy, multiplier);
     const remembered = whatIf.carried?.get(key);
     if (remembered?.jointFailure === failure) {
       whatIf.kept?.set(key, remembered);
@@ -616,36 +616,48 @@ function latentHigherLevelCandidates(
     );
 }
 
-/** What decides how many labels a joint what-if solve creates, besides the
- * candidate set (the holder's key): the ceiling, the wall, the grid, the
- * policy terms that enter propagation, whether a presentation exists, the
- * forest's size, the levels each leaf may take as the live forest resolved
- * them (head and tail membership and constraints end up in that list), and
- * the leaves' own pins and locks, which also bound the levels a candidate
- * would add and which the live forest's lists cannot show. A remembered
- * ceiling failure is valid while these hold. */
-function jointFailureSignature(
-  inputs: PickerInputs, forest: CanonicalSummaryForest, options: KvUnifiedOptions, maxTokens: number, policy: KvUnifiedWelfarePolicy,
-): string {
-  let levels = 0;
+/** A digest of everything a joint what-if solve reads besides the candidate
+ * set (the holder's key): the leaves (sizes, salience, levels, pins, locks,
+ * head and tail membership), the summaries (levels, costs, ranges, parents),
+ * the presentation and receipt, the ceiling, the wall, the grid, the policy
+ * and the multiplier. Any of them can change how many labels the solve
+ * creates, so a remembered ceiling failure is valid only while all hold;
+ * a changed input is a new question. One pass over the inputs. */
+function jointFailureSignature(inputs: PickerInputs, options: KvUnifiedOptions, maxTokens: number, policy: KvUnifiedWelfarePolicy, multiplier: number): string {
+  let a = 0x811c9dc5, b = 0x9e3779b9;
+  const num = (value: number | undefined): void => {
+    const v = value === undefined ? -1.5 : value;
+    a = Math.imul(a ^ (v | 0), 16777619) ^ Math.imul((v * 1024) | 0, 0x85ebca6b);
+    b = Math.imul(b ^ Math.imul((v * 1024) | 0, 0xc2b2ae35), 0x27d4eb2f) ^ (v | 0);
+  };
+  const str = (value: string | null | undefined): void => {
+    const text = value ?? '';
+    num(text.length);
+    for (let i = 0; i < text.length; i++) { const c = text.charCodeAt(i); a = Math.imul(a ^ c, 16777619); b = Math.imul(b ^ c, 0x01000193 ^ 0x3b) + 1; }
+  };
+  num(options.labelCeiling); num(maxTokens);
+  num(options.tokenBucketSize); num(options.continuityBucketSize); num(options.fidelityBucketSize);
+  num(options.adoptEpsilon); num(options.hysteresisCertificate ? 1 : 0); num(multiplier);
+  for (const key of Object.keys(policy).sort()) num((policy as unknown as Record<string, number>)[key]);
+  num(inputs.headTokens); num(inputs.tailTokens);
   for (let i = 0; i < inputs.chunks.length; i++) {
     const chunk = inputs.chunks[i];
-    const leaf = forest.leaf(chunk.id);
-    if (!leaf) continue;
-    let code = leaf.externallyAccounted ? 1 : 0;
-    for (const level of leaf.allowedLevels) code = Math.imul(code, 31) + level + 1;
-    code = Math.imul(code, 31) + ((chunk.pinned ? 1 : 0) | (chunk.lockedByAgent ? 2 : 0) |
-      (((chunk.pinLevel ?? -1) + 2) << 2) | (((chunk.pinMaxLevel ?? -1) + 2) << 8));
-    levels = Math.imul(levels ^ (i + 1), 0x9e3779b1) ^ code;
+    str(chunk.id); num(chunk.sequence); num(chunk.rawTokens); num(chunk.salience); num(chunk.currentResolution);
+    num((chunk.pinned ? 1 : 0) | (chunk.lockedByAgent ? 2 : 0) | (inputs.headChunkIds.has(chunk.id) ? 4 : 0) | (inputs.tailChunkIds.has(chunk.id) ? 8 : 0));
+    num(chunk.pinLevel); num(chunk.pinMaxLevel);
   }
-  return [
-    options.labelCeiling ?? '', maxTokens,
-    options.tokenBucketSize ?? '', options.continuityBucketSize ?? '', options.fidelityBucketSize ?? '',
-    policy.alpha, policy.budgetLowRatio, policy.budgetHighRatio, policy.budgetUnderLambda, policy.budgetOverLambda,
-    policy.cacheLambda, policy.cacheScale, policy.continuityLambda, policy.continuityScale, policy.ageBandSteps,
-    options.presentation ? 1 : 0, inputs.headTokens, inputs.tailTokens, inputs.chunks.length, inputs.summaries.size,
-    levels >>> 0,
-  ].join(':');
+  for (const summary of inputs.summaries.values()) {
+    str(summary.id); num(summary.level); num(summary.tokens); num(inputs.recallPairTokens?.get(summary.id));
+    str(getSummaryParentId(summary)); str(summary.sourceRange.first); str(summary.sourceRange.last); num(summary.sourceIds.length);
+  }
+  const presentation = options.presentation;
+  num(presentation ? 1 : 0);
+  if (presentation) {
+    num(presentation.currentSeq);
+    for (const [id, leaf] of presentation.leaves) { str(id); num(leaf.level); num(leaf.lastChangedSeq); str(leaf.repHash); }
+  }
+  num(options.cache ? options.cache.markers.length : -1); str(options.cache?.immutablePrefixHash); str(options.currentImmutablePrefixHash);
+  return `${(a >>> 0).toString(16)}:${(b >>> 0).toString(16)}`;
 }
 
 /** The holder key of a what-if over these candidates at these costs. */
