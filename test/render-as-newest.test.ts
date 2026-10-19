@@ -449,6 +449,30 @@ describe('renderAsNewest', () => {
     });
   });
 
+  it('a compression hold that has timed out reads as released, as the next compile reads it', async () => {
+    // Shards of about 100 tokens: held, the body starts the protected recent
+    // window and renders whole; released, the recent window's 300 tokens
+    // hold only its last shards, and the compile sends the rest from the
+    // middle. The render comes after the hold's deadline, with no other
+    // manager call between, so nothing else has released it.
+    const clock = { t: 1_000 };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-render-as-newest-'));
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy: sharding({ recentWindowTokens: 300 }), now: () => clock.t });
+    try {
+      const body = manager.addMessage('user', longText('BODY', 600), undefined, undefined, { holdCompression: { timeoutMs: 100 } });
+      const after = manager.addMessage('user', [{ type: 'text', text: 'after' }]);
+      assert.notEqual(manager.renderAsNewest([body])![0], null, 'held, the body is in the recent window');
+      clock.t = 1_200;
+      const [forBody, forAfter] = manager.renderAsNewest([body, after])!;
+      assert.equal(forBody, null, 'released, some of its shards go to the middle');
+      const compiled = await manager.compile(BUDGET);
+      assert.deepEqual(sent(forAfter!), sent(compiled.messages.at(-1)!.content));
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('the manager refuses before its strategy has initialized', async () => {
     await withManager(memory({}), async (manager) => {
       const id = manager.addMessage('user', [{ type: 'text', text: 'stored' }]);

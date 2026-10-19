@@ -1509,7 +1509,9 @@ export class ContextManager {
    * filter leaves out. It throws for an id no stored message has, before
    * the strategy has initialized, and where the strategy's select would
    * throw first, as the autobiographical strategy does on a branch it
-   * hasn't loaded.
+   * hasn't loaded. Like a compile, it releases compression holds that have
+   * timed out before it renders, so it reads the holds the next compile
+   * will.
    */
   renderAsNewest(ids: readonly MessageId[]): Array<ContentBlock[] | null> | undefined {
     this.requireInitialized('renderAsNewest');
@@ -1522,6 +1524,7 @@ export class ContextManager {
       );
     }
     if (typeof this.strategy.renderAsNewest !== 'function') return undefined;
+    this.expireCompressionHolds();
     return this.strategy.renderAsNewest(this.strategyMessageView(), ids);
   }
 

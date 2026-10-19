@@ -12,7 +12,8 @@
   no such hook, and `null` for a message the next compile doesn't send
   among its newest: one the view leaves out, or one it sends elsewhere,
   such as a body too big for the window's recent part. It refuses an id no
-  stored message has. What the next compile decides from its budget isn't
+  stored message has, and, like a compile, releases compression holds that
+  have timed out before it renders. What the next compile decides from its budget isn't
   foreseen: windowed passthrough's re-anchor, or its refusal of a newest
   message bigger than the budget; the memory strategy's refusal of a recent
   window over budget, or the adaptive select's drop of a provisional
