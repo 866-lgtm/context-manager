@@ -491,6 +491,35 @@ function hasToolBlocks(content: readonly ContentBlock[]): boolean {
   return content.some((block) => block.type === 'tool_use' || block.type === 'tool_result');
 }
 
+/** A tool-pruning decision (AutobiographicalStrategy.toolPruning), as the
+ *  strategy's private members hold it. */
+type ToolPruningDecision = {
+  readonly replaced: ReadonlyMap<MessageId, ReadonlyMap<number, string>>;
+  readonly inputCap: number;
+};
+
+/** Whether two messages' replacements (each result's place and marker) are
+ *  the same; two absent ones are. */
+function sameMarkers(a: ReadonlyMap<number, string> | undefined, b: ReadonlyMap<number, string> | undefined): boolean {
+  if (!a || !b) return a === b;
+  if (a.size !== b.size) return false;
+  for (const [index, marker] of b) if (a.get(index) !== marker) return false;
+  return true;
+}
+
+/** `block` with its input truncated, when its serialized input is over
+ *  `cap` tokens (`toolUseInputMaxTokens`), at four characters a token: the
+ *  input becomes `{ _truncated, _originalTokens, _keys }`, `_keys` holding
+ *  its first five keys. Null when the input fits. */
+function truncatedToolUse(block: Extract<ContentBlock, { type: 'tool_use' }>, cap: number): ContentBlock | null {
+  const inputTokens = Math.ceil(JSON.stringify(block.input).length / 4);
+  if (inputTokens <= cap) return null;
+  return {
+    ...block,
+    input: { _truncated: true, _originalTokens: inputTokens, _keys: Object.keys(block.input).slice(0, 5) },
+  };
+}
+
 /** Standard compression instruction for chat/general chunks. */
 function formatInstruction(targetTokens: number): string {
   return (
@@ -6801,7 +6830,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the request before it.
       const prevCacheKeys = this._prevCacheKeys;
       try {
-        return this.selectPath(store, budget, opts);
+        return this.withToolPruning(store, () => this.selectPath(store, budget, opts));
       } catch (err) {
         this._prevCacheKeys = prevCacheKeys;
         throw err;
@@ -6877,7 +6906,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     try {
       this.rebuildChunks(store);
       if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
-      return this.selectPath(store, budget, opts);
+      return this.withToolPruning(store, () => this.selectPath(store, budget, opts));
     } finally {
       this._dryRunSelect = false;
       // Only stats this dry run produced are its preview's: on a throw before
@@ -7608,7 +7637,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const savedDryRun = this._dryRunSelect;
     this._dryRunSelect = true;
     try {
-      return this.reconstructRenderStats(store);
+      return this.withToolPruning(store, () => this.reconstructRenderStats(store));
     } finally {
       this._dryRunSelect = savedDryRun;
       this._imageWatermark = savedWatermark;
@@ -7627,8 +7656,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const headEnd = this.getHeadWindowEnd(store);
     const recentStart = this.getRecentWindowStart(store);
 
+    // Each message priced as a compile sends it before any cut, its images
+    // whole: this reconstruction strips none.
     const sumTokens = (slice: StoredMessage[]): number =>
-      slice.reduce((acc, m) => acc + store.estimateTokens(m), 0);
+      slice.reduce((acc, m) => acc + store.estimateTokens(this.prunedForSend(store, m)), 0);
 
     const headMsgs = messages.slice(headStart, headEnd);
     const tailMsgs = messages.slice(recentStart);
@@ -7691,7 +7722,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): { messages: number; tokens: number } {
     if (recentStart >= messages.length) return { messages: 0, tokens: 0 };
 
-    const est = (i: number): number => pse?.[i] ?? store.estimateTokens(messages[i]);
+    // Without estimates (the hierarchical selection), the pruned form's
+    // own, with its images whole: that selection's strip counts only the
+    // images it sends.
+    const est = (i: number): number => pse?.[i] ?? store.estimateTokens(this.prunedForSend(store, messages[i]!));
     const accepted: number[] = [];
     let acceptedTokens = 0;
     for (let i = messages.length - 1; i >= recentStart; i--) {
@@ -12333,7 +12367,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           const rawRun = currentRun as Extract<Run, { kind: 'raw' }>;
           rawRun.ids.push(shard.id);
-          const text = shard.content.filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text');
+          const text = this.prunedForSend(store, shard).content
+            .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text');
           for (const block of text) rawRun.parts.push(block.text);
           rawRun.tokens += this.estimateTokens(text);
         };
@@ -12835,6 +12870,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *      more than the cap plus 50. The calibration sample compares provider
    *      usage with the render stats, which counted those prices, so a store
    *      holding capped content learned a multiplier that made up for them.
+   *   4: a tool result `toolResultMaxLastN` replaces, and a `tool_use` input
+   *      `toolUseInputMaxTokens` truncates, priced as sent (toolPruning,
+   *      prunedForSend), where the plan and the render stats counted each
+   *      whole while the request carried the marker or the truncation. A
+   *      store holding either learned a multiplier low enough to make up for
+   *      the over-count, or, where the over-count put every sample out of
+   *      band, learned nothing from it.
    *
    * A record without a stamp was written by 0.13.0 or earlier: by 0.11.0 to
    * 0.13.0 under epoch 1's pricing, or by a release before 0.11.0, under
@@ -12862,7 +12904,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (reportRealInputTokens); rolling forward again treats that as an older
    * record.
    */
-  static readonly CALIBRATION_PRICING_EPOCH = 3;
+  static readonly CALIBRATION_PRICING_EPOCH = 4;
 
   /**
    * For each pricing epoch, the content it repriced: a predicate over the
@@ -12918,6 +12960,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const rounding = 0.5 * m.content.length;
         return (1.8 * (store.estimateTokens(m) + rounding)) / factor + rounding > cap + 50;
       });
+    },
+    // 4: a tool result the per-tool limit replaces, or a tool_use input over
+    // the input cap, under the host's config: both were priced whole before.
+    4: (messages, strategy, store) => {
+      const pruning = strategy.toolPruning(store);
+      if (pruning.replaced.size > 0) return true;
+      if (!(pruning.inputCap > 0)) return false;
+      return messages.some((m) => m.content.some((b) => b.type === 'tool_use' && truncatedToolUse(b, pruning.inputCap) !== null));
     },
   };
 
@@ -14058,7 +14108,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = headStart; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
       const { content, extra } = this.cappedForSend(store, msg, msgCap);
-      const tokens = store.estimateTokens(msg) + extra;
+      // The pruned form's price with its images whole: this selection's
+      // strip counts only the images it sends (#219).
+      const tokens = store.estimateTokens(this.prunedForSend(store, msg)) + extra;
       // The head is sent whole by definition: stopping it mid-window drops
       // messages no summary covers. Refuse honestly beyond grace.
       if (totalTokens + tokens > graceLimit) {
@@ -14431,7 +14483,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           } else {
             const msg = item.msg;
             const { content, extra } = this.cappedForSend(store, msg, msgCap);
-            const tokens = store.estimateTokens(msg) + extra;
+            const tokens = store.estimateTokens(this.prunedForSend(store, msg)) + extra;
             if (totalTokens + tokens > graceLimit) {
               throw this.overBudgetError(budget, {
                 stage: 'Hierarchical emission overran the budget',
@@ -14507,7 +14559,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (let mi = 0; mi < middleRawSorted.length; mi++) {
           const { msg } = middleRawSorted[mi]!;
           const { content, extra } = this.cappedForSend(store, msg, msgCap);
-          const tokens = store.estimateTokens(msg) + extra;
+          const tokens = store.estimateTokens(this.prunedForSend(store, msg)) + extra;
           if (totalTokens + tokens > graceLimit) {
             // These messages are the UNCOMPRESSED middle — no summary covers
             // them (see the middleRaw construction above). Dropping them
@@ -15319,9 +15371,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /** Message index marking the image-strip depth boundary: walks newest→oldest
-   *  summing the same per-message estimate as getRecentWindowStart, and returns
-   *  the index of the first message still within `depthTokens`. Messages before
-   *  this index have their images stripped to placeholders. */
+   *  summing each stored message's estimate, before tool pruning and image
+   *  strips (the recent window's walk, getUnheldRecentWindowStart, sums them
+   *  after both), and returns the index of the first message still within
+   *  `depthTokens`. Messages before this index have their images stripped to
+   *  placeholders. */
   protected getImageStripStart(store: MessageStoreView, depthTokens: number): number {
     const messages = store.getAll();
     let tokens = 0;
@@ -15522,8 +15576,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * size (42k rendered of a 120k window), and pricing them post-strip in the
    * walk-back alone made the picker's raw-priced tail overflow the budget
    * (318k) — the estimate must be consistent EVERYWHERE.
+   * Each message is priced in the form it's sent in (prunedForSend), so a
+   * tool result `toolResultMaxLastN` replaces costs its marker and a
+   * `tool_use` input `toolUseInputMaxTokens` truncates costs its truncation.
+   * The strip depth is still measured over the stored messages, as
+   * getImageStripStart measures it.
    */
   protected postStripEstimates(store: MessageStoreView): number[] {
+    return this.withToolPruning(store, () => this.postStripEstimatesHeld(store, this._toolPruningInUse!.pruning));
+  }
+
+  private postStripEstimatesHeld(
+    store: MessageStoreView,
+    pruning: ToolPruningDecision,
+  ): number[] {
     const messages = store.getAll();
     const stripDepth = this.config.imageStripDepthTokens ?? 0;
     const maxLive = this.config.maxLiveImages ?? 0;
@@ -15541,7 +15607,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (
       memo && memo.messages === messages && memo.calibration === memoCalibration &&
       memo.stripDepth === stripDepth && memo.maxLive === maxLive && memo.maxLiveBytes === maxLiveBytes &&
-      memo.ratio === ratio
+      memo.ratio === ratio && memo.pruning === pruning
     ) return memo.out;
     const out = new Array<number>(messages.length);
     const stripActive = stripDepth > 0 || maxLive > 0 || maxLiveBytes > 0;
@@ -15561,9 +15627,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let rawDepth = 0; // raw-estimate depth from the newest message (mirrors getImageStripStart)
     for (let i = messages.length - 1; i >= 0; i--) {
       const raw = store.estimateTokens(messages[i]);
-      let est = raw;
+      const sent = this.prunedForSend(store, messages[i]!);
+      let est = sent === messages[i] ? raw : store.estimateTokens(sent);
       if (stripActive) {
-        for (const b of messages[i].content) {
+        for (const b of sent.content) {
           if (b.type !== 'image') continue;
           const bytes = AutobiographicalStrategy.imageBlockBytes(b);
           const beyondDepth = stripDepth > 0 && rawDepth > stripDepth;
@@ -15583,12 +15650,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Belt and braces: a message never costs less than nothing.
       out[i] = Math.max(0, est);
     }
-    this._postStripMemo = { messages, calibration: memoCalibration, stripDepth, maxLive, maxLiveBytes, ratio, out };
+    this._postStripMemo = { messages, calibration: memoCalibration, stripDepth, maxLive, maxLiveBytes, ratio, pruning, out };
     return out;
   }
 
   private _postStripMemo: {
-    messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; ratio: number | undefined; out: number[];
+    messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; ratio: number | undefined; pruning: object; out: number[];
   } | null = null;
 
   /** Byte wall default: 20MB of base64 (API total-request cap is 32MB). */
@@ -16202,14 +16269,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Shared structural passes for both selectors. Repair pairing before
-   * pruning so duplicate/orphan results are removed and displaced results
-   * occupy their final positions before the per-tool last-N tally.
+   * Shared structural pass for both selectors: repair tool pairing over the
+   * entries as selected. What sending does to a raw message's tool blocks
+   * (toolPruning) was already applied as each was emitted (cappedForSend),
+   * since it's decided from the whole conversation, not from the selection.
    */
   private postProcessToolEntries(entries: ContextEntry[]): void {
     this.trimOrphanedToolUse(entries);
     this.enforceToolPairing(entries);
-    this.pruneToolEntries(entries);
   }
 
   /**
@@ -16423,121 +16490,209 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Prune tool_use / tool_result blocks in place on the entries (an edited
-   * entry gets its own copy of its content array, never the store's):
-   *  1. Truncate `tool_use.input` blocks whose serialized JSON exceeds
-   *     `toolUseInputMaxTokens`.
-   *  2. For each tool name, keep only the last N `tool_result` blocks
-   *     per `toolResultMaxLastN`; older ones get their `content` replaced
-   *     with a brief marker naming the tool and the limit. A limit of 0
-   *     replaces every result of the tool.
-   *
-   * The first pass does nothing when `toolUseInputMaxTokens` is unset or 0,
-   * and the second when `toolResultMaxLastN` is unset, or for a tool whose
-   * limit is unset or negative.
-   * Pruning runs AFTER selection and orphan-trimming, so it doesn't
-   * affect chunk formation or the recall/pin layout.
+   * What sending a raw message does to its tool blocks, decided from the
+   * whole conversation before any selection, so that the plan,
+   * the render and the render stats price and send one form:
+   *  - `replaced`: each `tool_result` that `toolResultMaxLastN` replaces, by
+   *    its message's id and its place in that message's content, with the
+   *    marker its content becomes. The count is of calls. A result answers
+   *    the earliest call with its id, in an earlier message, that no result
+   *    has answered yet, the order pairing repair's look-ahead pairs them in
+   *    where it reaches: a result beyond its reach still answers its call and
+   *    keeps the slot, as a folded one does. A result with no such call goes
+   *    with the call its id last answered, as a further result, and takes no
+   *    slot. A result with neither, before any call with its id or beside
+   *    only its own message's call, answers none and is left as it is:
+   *    pairing repair drops it. Each
+   *    tool's answered calls are ordered by their call's message, and calls
+   *    made in one message by where the results that answer them are
+   *    stored, the order the render sends a batch the repair leaves alone.
+   *    All but the last N have every result replaced, whether they render
+   *    raw, folded or not at all: no selection brings a replaced result
+   *    back. Where the repair moves a batch's results (part of a batch
+   *    whose results are split across messages, or all of one when a recall
+   *    pair or pin comes between the calls and their results), it sends the
+   *    moved results first, in call order, so the render's order can differ,
+   *    while still sending at most N whole.
+   *  - `inputCap`: `toolUseInputMaxTokens`. A `tool_use` input over it is
+   *    truncated by its own size alone (see prunedForSend).
+   * Memoized per listing and per the two settings, a map of limits by its
+   * content, since it can change in place. The store's listing is a new array
+   * after each write, so a compile computes this once. A merged view lists
+   * afresh at every read (mergeMessageStoreViews), so whatever prices every
+   * raw message holds the decision while it does (withToolPruning). Calls
+   * are matched by id, which pairing repair takes to be unique: where a host
+   * reuses an id, the repair can pair a result, or a further one, with a
+   * different call with that id than this count does, and so send more than
+   * N whole. A decision isn't changed once returned, by this method or an
+   * override: a different decision is a new object, which is what the
+   * prices kept per decision (postStripEstimates) rely on.
    */
-  protected pruneToolEntries(entries: ContextEntry[]): void {
-    // Each edited entry's content as it was, so the edit's raw replay forms can
-    // be released once both passes are done (see raw-forms.ts).
-    //
-    // An entry's content array can be its message's own, from the store's
-    // cached getAll() view (immutable to callers), whenever no message cap cut
-    // it. So the first edit gives the entry a copy and leaves that array as it
-    // was. An edit written into it would reach every getAll() caller until the
-    // next store write, and the next compile would start from the marker
-    // instead of the original (the compile-twice test in raw-forms.test.ts).
-    const originals = new Map<ContextEntry, ContentBlock[]>();
-    const replaceBlock = (entry: ContextEntry, index: number, block: ContentBlock): void => {
-      if (!originals.has(entry)) {
-        originals.set(entry, entry.content);
-        entry.content = entry.content.slice();
+  protected toolPruning(store: MessageStoreView): {
+    readonly replaced: ReadonlyMap<MessageId, ReadonlyMap<number, string>>;
+    readonly inputCap: number;
+  } {
+    const messages = store.getAll();
+    const limits = this.config.toolResultMaxLastN;
+    const inputCap = this.config.toolUseInputMaxTokens ?? 0;
+    // A limit that is neither a number nor a map of them, such as a caller's
+    // explicit null, sets no limit.
+    const limited = typeof limits === 'number' || (typeof limits === 'object' && limits !== null);
+    const limitsKey = typeof limits === 'object' && limits !== null ? JSON.stringify(limits) : limits;
+    const memo = this._toolPruningMemo;
+    if (memo && memo.messages === messages && memo.limitsKey === limitsKey && memo.inputCap === inputCap) return memo.pruning;
+    const replaced = new Map<MessageId, Map<number, string>>();
+    if (limited) {
+      type Call = { toolName: string; message: number; place: number; results: Array<{ message: MessageId; index: number }> };
+      // Calls no result has answered yet, oldest first, by id, and the call
+      // each id's latest first answer went to.
+      const waiting = new Map<string, Call[]>();
+      const answeredLast = new Map<string, Call>();
+      const answeredByTool = new Map<string, Call[]>();
+      let place = 0;
+      for (let at = 0; at < messages.length; at++) {
+        const m = messages[at]!;
+        // A message's calls wait from the next message on: pairing repair
+        // drops a result in its call's own message.
+        const opened: Array<[string, Call]> = [];
+        for (let i = 0; i < m.content.length; i++, place++) {
+          const block = m.content[i]!;
+          if (block.type === 'tool_use') {
+            opened.push([block.id, { toolName: block.name, message: at, place: -1, results: [] }]);
+          } else if (block.type === 'tool_result') {
+            let call = waiting.get(block.toolUseId)?.shift();
+            if (call) {
+              call.place = place;
+              answeredLast.set(block.toolUseId, call);
+              let answered = answeredByTool.get(call.toolName);
+              if (!answered) answeredByTool.set(call.toolName, (answered = []));
+              answered.push(call);
+            } else {
+              call = answeredLast.get(block.toolUseId);
+            }
+            call?.results.push({ message: m.id, index: i });
+          }
+        }
+        for (const [id, call] of opened) {
+          let queue = waiting.get(id);
+          if (!queue) waiting.set(id, (queue = []));
+          queue.push(call);
+        }
       }
-      entry.content[index] = block;
-    };
-
-    // Pass 1: build toolUseId → toolName map and apply input truncation
-    const toolUseInputCap = this.config.toolUseInputMaxTokens ?? 0;
-    const toolUseIdToName = new Map<string, string>();
-
-    for (const entry of entries) {
-      for (let i = 0; i < entry.content.length; i++) {
-        const block = entry.content[i];
-        if (block.type !== 'tool_use') continue;
-        toolUseIdToName.set(block.id, block.name);
-
-        if (toolUseInputCap > 0) {
-          const inputJson = JSON.stringify(block.input);
-          const inputTokens = Math.ceil(inputJson.length / 4);
-          if (inputTokens > toolUseInputCap) {
-            const keys = Object.keys(block.input).slice(0, 5);
-            replaceBlock(entry, i, {
-              ...block,
-              input: {
-                _truncated: true,
-                _originalTokens: inputTokens,
-                _keys: keys,
-              },
-            });
+      for (const [toolName, answered] of answeredByTool) {
+        const limit = typeof limits === 'number' ? limits : (limits as Record<string, number | null | undefined>)[toolName];
+        if (typeof limit !== 'number' || !(limit >= 0)) continue;
+        // A fractional limit keeps its whole part and names itself in the
+        // marker, as it always has.
+        const keep = Math.floor(limit);
+        if (answered.length <= keep) continue;
+        answered.sort((a, b) => a.message - b.message || a.place - b.place);
+        const marker = AutobiographicalStrategy.toolResultMarker(toolName, limit);
+        for (const call of answered.slice(0, answered.length - keep)) {
+          for (const result of call.results) {
+            let inMessage = replaced.get(result.message);
+            if (!inMessage) replaced.set(result.message, (inMessage = new Map()));
+            inMessage.set(result.index, marker);
           }
         }
       }
     }
+    const pruning = { replaced, inputCap };
+    this._toolPruningMemo = { messages, limitsKey, inputCap, pruning };
+    return pruning;
+  }
 
-    // Pass 2: collect real tool_result occurrences per tool name, in order.
-    // Pairing stubs carry no tool output and must neither consume a last-N
-    // slot nor lose their explanation to a truncation marker.
-    const occurrencesByTool = new Map<string, Array<{ entry: ContextEntry; blockIndex: number }>>();
-    for (const entry of entries) {
-      for (let i = 0; i < entry.content.length; i++) {
-        const block = entry.content[i];
-        if (block.type !== 'tool_result') continue;
-        if (this.generatedToolResultStubs.has(block)) continue;
-        const toolName = toolUseIdToName.get(block.toolUseId);
-        if (!toolName) continue;
-        let arr = occurrencesByTool.get(toolName);
-        if (!arr) {
-          arr = [];
-          occurrencesByTool.set(toolName, arr);
-        }
-        arr.push({ entry, blockIndex: i });
+  private _toolPruningMemo: {
+    messages: readonly StoredMessage[];
+    limitsKey: unknown;
+    inputCap: number;
+    pruning: ToolPruningDecision;
+  } | null = null;
+
+  /** The marker a replaced result's content becomes. The whole result is
+   *  replaced, not cut short. It names the limit rather than counting what
+   *  follows: later results may be replaced too, and with a limit of 0
+   *  every one is. Every result the context shows is among the tool's last
+   *  N, so "shows only" holds whichever of them are folded. */
+  private static toolResultMarker(toolName: string, limit: number): string {
+    return limit === 0
+      ? `[result of tool '${toolName}' left out: this context shows none of its results]`
+      : `[result of tool '${toolName}' left out: this context shows only the tool's last ${limit === 1 ? 'result' : `${limit} results`}]`;
+  }
+
+  /**
+   * `msg` as this strategy sends it before any cut: each `tool_result`
+   * toolPruning replaces carries its marker, and each `tool_use` input over
+   * `toolUseInputMaxTokens` becomes `{ _truncated, _originalTokens, _keys }`
+   * (its first five keys as stored, which the store sorts). `msg` itself when
+   * neither touches it. A compile
+   * prices and emits every raw message from this form: postStripEstimates,
+   * cappedForSend, the hierarchical selection's raw prices, the adaptive
+   * middle's shard path, which sends a shard's text, and the render stats
+   * before the first compile. A raw replay form an edit changes is released
+   * (see raw-forms.ts). The store's own message is never written: chunking
+   * and compression read it. Each message's form is kept with the
+   * replacements and input cap it was made for, so a later decision that
+   * leaves the message as it was gives the same form, with its estimates
+   * cached as the message's own are, for as long as the store keeps the
+   * message's object (across an append; an edit or a branch switch gives
+   * every message a new one). An override must likewise give one
+   * form for one message and decision: postStripEstimates keeps its prices
+   * per listing and decision.
+   */
+  protected prunedForSend(store: MessageStoreView, msg: StoredMessage): StoredMessage {
+    const pruning = this._toolPruningInUse?.store === store ? this._toolPruningInUse.pruning : this.toolPruning(store);
+    const results = pruning.replaced.get(msg.id);
+    if (!results && !(pruning.inputCap > 0)) return msg;
+    const kept = this._prunedForSend.get(msg);
+    if (kept && kept.inputCap === pruning.inputCap && sameMarkers(kept.results, results)) return kept.sent;
+    let content: ContentBlock[] | null = null;
+    let inputs = false;
+    for (let i = 0; i < msg.content.length; i++) {
+      const block = msg.content[i]!;
+      let next: ContentBlock = block;
+      if (block.type === 'tool_use' && pruning.inputCap > 0) {
+        inputs = true;
+        next = truncatedToolUse(block, pruning.inputCap) ?? block;
+      } else if (block.type === 'tool_result') {
+        const marker = results?.get(i);
+        if (marker !== undefined) next = { ...block, content: marker };
       }
+      if (next !== block) (content ??= msg.content.slice())[i] = next;
     }
+    const sent = content ? { ...msg, content: releaseEditedRawForms(msg.content, content) } : msg;
+    // A message with no tool call to measure and nothing replaced costs a
+    // scan, so only the others are kept.
+    if (content || inputs) this._prunedForSend.set(msg, { inputCap: pruning.inputCap, results, sent });
+    return sent;
+  }
 
-    // Pass 3: apply per-tool max-last-N
-    const cfg = this.config.toolResultMaxLastN;
-    if (cfg !== undefined) {
-      for (const [toolName, occs] of occurrencesByTool) {
-        let limit: number | undefined;
-        if (typeof cfg === 'number') limit = cfg;
-        else if (typeof cfg === 'object') limit = cfg[toolName];
-        if (limit === undefined || limit < 0) continue;
+  private readonly _prunedForSend = new WeakMap<
+    StoredMessage,
+    { inputCap: number; results: ReadonlyMap<number, string> | undefined; sent: StoredMessage }
+  >();
 
-        const excessCount = occs.length - limit;
-        if (excessCount <= 0) continue;
-
-        for (let i = 0; i < excessCount; i++) {
-          const { entry, blockIndex } = occs[i];
-          const orig = entry.content[blockIndex];
-          if (orig.type !== 'tool_result') continue;
-          replaceBlock(entry, blockIndex, {
-            ...orig,
-            // The whole result is replaced, not cut short. Name the limit
-            // rather than count what follows: later results may be replaced
-            // too, and with a limit of 0 every one is.
-            content: limit === 0
-              ? `[result of tool '${toolName}' left out: this context shows none of its results]`
-              : `[result of tool '${toolName}' left out: this context shows only the tool's last ${limit === 1 ? 'result' : `${limit} results`}]`,
-          });
-        }
-      }
-    }
-
-    for (const [entry, before] of originals) {
-      entry.content = releaseEditedRawForms(before, entry.content);
+  /** Hold `store`'s decision while `fn` prices it. A selection,
+   *  postStripEstimates and the render stats before the first compile
+   *  (getRenderStats) price every raw message, and a merged view lists
+   *  afresh at every read (mergeMessageStoreViews), so prunedForSend reads
+   *  the decision held here rather than the view. Nothing holds it outside
+   *  those, so a view read later decides from its listing then. */
+  private withToolPruning<T>(store: MessageStoreView, fn: () => T): T {
+    if (this._toolPruningInUse?.store === store) return fn();
+    const held = this._toolPruningInUse;
+    this._toolPruningInUse = { store, pruning: this.toolPruning(store) };
+    try {
+      return fn();
+    } finally {
+      this._toolPruningInUse = held;
     }
   }
+
+  private _toolPruningInUse: {
+    store: MessageStoreView;
+    pruning: ToolPruningDecision;
+  } | null = null;
 
   protected isChunkOldEnough(chunk: Chunk): boolean {
     return true;
@@ -17089,23 +17244,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * A stored message as this strategy sends it under `maxMessageTokens`
-   * (`msgCap`), cut by `truncateContent`, and what sending that adds
-   * to the message's price (`cappedPriceExtra`). Each site that prices a raw
-   * message as part of what a compile sends adds `extra` to the price it
-   * gives an uncapped one, so the cut is priced as it renders: the plan's
-   * chunks, the head and tail reservations, the refusal's floor, the
-   * emission checks, the recent window's eviction walk and the render stats.
+   * A stored message as this strategy sends it: its tool blocks as
+   * toolPruning decides (prunedForSend), then cut under `maxMessageTokens`
+   * (`msgCap`) by `truncateContent`, and what the cut adds to the price of
+   * that pruned form (`cappedPriceExtra`). Pruning comes first, so the cap
+   * never cuts a result that's replaced anyway. Each site that prices a raw
+   * message as part of what a compile sends adds `extra` to the pruned
+   * form's price (postStripEstimates in the adaptive selection, the pruned
+   * form's estimate in the hierarchical one), so the message is priced as it
+   * renders: the plan's chunks, the head and tail reservations, the
+   * refusal's floor, the emission checks, the recent window's eviction walk
+   * and the render stats.
    * The adaptive middle's shard path sends a body's raw shards' text uncut,
    * so their chunks' raw prices take no extra.
-   * A site that emits the message sends `content`. The head and recent
-   * windows' sizes and the image strip's depth are measured before the cap
-   * (getHeadWindowEnd, getUnheldRecentWindowStart, getImageStripStart), in
-   * the stored history that compression summarizes. Whether the cap cuts is
-   * decided, unless `truncateContent` is overridden, by
-   * `estimateTextOnlyTokens(msg)`, the cut's own estimate, which counts
-   * thinking and tool calls too and is cached on the message, so a message
-   * under the cap costs each site a lookup.
+   * A site that emits the message sends `content`. None of the windows' sizes
+   * is measured after the cap. The head window's size and the image strip's
+   * depth are measured over the stored messages (getHeadWindowEnd,
+   * getImageStripStart), the history that compression summarizes. The
+   * recent window's is measured over each message's pruned form, after image
+   * strips (getUnheldRecentWindowStart, through postStripEstimates). Whether
+   * the cap cuts is decided, unless `truncateContent` is overridden, by
+   * `estimateTextOnlyTokens` of the pruned form, the cut's own estimate,
+   * which counts thinking and tool calls too and is cached on the message,
+   * so a message under the cap costs each site a lookup.
    */
   protected cappedForSend(
     store: MessageStoreView,
@@ -17118,8 +17279,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // extra is 0. The estimate is the message's cached one for its own
     // content, and otherwise of the content it's given, such as an
     // override's rewrite passed on to this class's cut.
-    const content = this.truncateContent(msg.content, msgCap, (blocks) =>
-      blocks === msg.content ? this.estimateTextOnlyTokens(msg) : this.estimateTextOnlyTokens({ content: blocks } as StoredMessage));
-    return { content, extra: cappedPriceExtra(store, msg, content) };
+    const sent = this.prunedForSend(store, msg);
+    const content = this.truncateContent(sent.content, msgCap, (blocks) =>
+      blocks === sent.content ? this.estimateTextOnlyTokens(sent) : this.estimateTextOnlyTokens({ content: blocks } as StoredMessage));
+    return { content, extra: cappedPriceExtra(store, sent, content) };
   }
 }
