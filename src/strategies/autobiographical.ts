@@ -75,7 +75,7 @@ import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
-import { CAP_OMISSION_TEXT, capContent, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
+import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
@@ -6321,7 +6321,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const accepted: number[] = [];
     let acceptedTokens = 0;
     for (let i = messages.length - 1; i >= recentStart; i--) {
-      const tokens = msgCap > 0 ? Math.min(est(i), msgCap + 50) : est(i);
+      const tokens = est(i) + this.cappedForSend(store, messages[i], msgCap).extra;
       if (this.isOverBudget(totalTokensBefore + acceptedTokens + tokens, maxTokens)) {
         // Newest-first eviction: everything from recentStart..i is being
         // dropped. These live in the RECENT window, so by definition no
@@ -6369,8 +6369,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let emittedTokens = 0;
     for (const i of accepted) {
       const msg = messages[i];
-      const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-      const tokens = msgCap > 0 ? Math.min(est(i), msgCap + 50) : est(i);
+      const { content, extra } = this.cappedForSend(store, msg, msgCap);
+      const tokens = est(i) + extra;
       entries.push({
         index: entries.length,
         sourceMessageId: msg.id,
@@ -9719,14 +9719,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // every head and tail message has been accounted for.
     for (let i = headStart; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
-      const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+      const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       headMessageIds.add(msg.id);
       headTokens += tokens;
     }
     const effectiveRecentStart = Math.max(recentStart, headEnd);
     for (let i = effectiveRecentStart; i < messages.length; i++) {
       const msg = messages[i];
-      const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+      const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       tailMessageIds.add(msg.id);
       tailTokens += tokens;
     }
@@ -9760,7 +9760,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           : messages.length - 1;
         const floorStart = Math.min(newestTurn, this.holdBoundary(store));
         for (let i = floorStart; i < messages.length; i++) {
-          floorTokens += msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+          floorTokens += pse[i] + this.cappedForSend(store, messages[i], msgCap).extra;
         }
       }
       throw this.overBudgetError(budget, {
@@ -9784,11 +9784,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const prefixBudget = rejectionBudget - tailTokens;
     let totalTokens = 0;
 
-    // Emit the already-reserved head entries verbatim.
+    // Emit the already-reserved head entries raw, each cut at the cap as any
+    // raw message is.
     for (let i = headStart; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
-      const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-      const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+      const { content, extra } = this.cappedForSend(store, msg, msgCap);
+      const tokens = pse[i] + extra;
       entries.push({
         index: entries.length,
         sourceMessageId: msg.id,
@@ -9864,9 +9865,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = segStart; i < segEnd && i < messages.length; i++) {
       const msg = messages[i];
       const ch = chunkAtPosition ? chunkAtPosition[i] : chunksByMessageId.get(msg.id);
-      const tokens = msgCap > 0
-        ? Math.min(pse[i], msgCap + 50)
-        : pse[i];
+      // This is the chunk's raw price. The shard path in step 5 sends a run
+      // of a body's raw shards as one entry, their text joined and uncut, so
+      // a shard takes no extra here. (That entry is one text block, which the
+      // store prices at the rate its first 2,000 characters set, and it
+      // leaves out a shard's other blocks, so it can still differ from these
+      // prices, cap or no cap.) A shard the plan folds is priced as its
+      // summary. The head and recent windows cut a shard as they emit it.
+      const tokens = msg.bodyGroupId ? pse[i] : pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       const bound = pinBounds.size > 0 ? pinBounds.get(i) : undefined;
       const l1Id = ch?.summaryId ?? l1ByMessage.get(msg.id);
       pickerChunks.push({
@@ -9887,9 +9893,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // — but mark them as in-head/in-tail so the picker won't fold them.
     for (let i = headStart; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
-      const tokens = msgCap > 0
-        ? Math.min(pse[i], msgCap + 50)
-        : pse[i];
+      const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       pickerChunks.push({
         id: msg.id,
         sequence: i,
@@ -9902,9 +9906,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     for (let i = effectiveRecentStart; i < messages.length; i++) {
       const msg = messages[i];
-      const tokens = msgCap > 0
-        ? Math.min(pse[i], msgCap + 50)
-        : pse[i];
+      const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       pickerChunks.push({
         id: msg.id,
         sequence: i,
@@ -10427,8 +10429,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Non-shard path: existing behavior.
       const resolution = levelAt(i, msg.id);
       if (resolution === 0) {
-        const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-        const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+        const { content, extra } = this.cappedForSend(store, msg, msgCap);
+        const tokens = pse[i] + extra;
         if (totalTokens + tokens > prefixBudget) {
           throw emissionOverBudget(totalTokens + tokens);
         }
@@ -10446,8 +10448,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId, summariesById, l1ByMessage, ancestorMemo,
           chunkAtPosition ? chunkAtPosition[i] ?? null : undefined);
         if (!ancestor) {
-          const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-          const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+          const { content, extra } = this.cappedForSend(store, msg, msgCap);
+          const tokens = pse[i] + extra;
           if (totalTokens + tokens > prefixBudget) {
             throw emissionOverBudget(totalTokens + tokens);
           }
@@ -10868,6 +10870,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *   1: signed thinking priced by signature length (0.11.0 on)
    *   2: membrane's XML-history carriers (tool_attempt, tool_notice) priced as
    *      the markup they replay as, where they had estimated as 0
+   *   3: a raw message `maxMessageTokens` cuts priced as it renders, at its
+   *      uncapped price plus what the cut changes (cappedPriceExtra), and one
+   *      it leaves whole at its uncapped price, where each was priced at no
+   *      more than the cap plus 50. The calibration sample compares provider
+   *      usage with the render stats, which counted those prices, so a store
+   *      holding capped content learned a multiplier that made up for them.
    *
    * A record without a stamp was written by 0.13.0 or earlier: by 0.11.0 to
    * 0.13.0 under epoch 1's pricing, or by a release before 0.11.0, under
@@ -10895,18 +10903,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (reportRealInputTokens); rolling forward again treats that as an older
    * record.
    */
-  static readonly CALIBRATION_PRICING_EPOCH = 2;
+  static readonly CALIBRATION_PRICING_EPOCH = 3;
 
   /**
    * For each pricing epoch, the content it repriced: a predicate over the
-   * store that is true when the store holds any. A multiplier from an older
+   * store that is true when the store holds any, given the strategy whose
+   * config can decide it (epoch 3 reads the cap). A multiplier from an older
    * epoch is discarded only if some epoch since then repriced content this
    * store actually holds. Otherwise its residual still means what it meant
    * (e.g. a store on another provider's tokenizer, which never carries
    * signed thinking), and it is re-stamped instead. An epoch without an
    * entry here counts as repricing everything (discard, as before).
    */
-  static readonly CALIBRATION_EPOCH_REPRICES: Readonly<Record<number, (messages: readonly StoredMessage[]) => boolean>> = {
+  static readonly CALIBRATION_EPOCH_REPRICES: Readonly<Record<number, (
+    messages: readonly StoredMessage[],
+    strategy: AutobiographicalStrategy,
+    store: MessageStoreView,
+  ) => boolean>> = {
     // 1: signed thinking priced by signature length, not a flat 600. A block
     // with a numeric `tokenEstimate` is priced by that stamp in both epochs
     // (MessageStore and ContextLog read it first), so it wasn't repriced.
@@ -10918,13 +10931,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // 2: XML-history carriers, which estimated as 0 before (an unknown block)
     // and are now priced by MessageStore.xmlHistoryCarrierTokens.
     2: (messages) => messages.some((m) => m.content.some((b) => MessageStore.xmlHistoryCarrierTokens(b) > 0)),
+    // 3: a raw message the cap cuts, or one it leaves whole whose price the
+    // cap plus 50 had limited, under the host's cap. Whether the cap looks is
+    // the cut's own estimate passing it. Whether the old price limited a
+    // message depends on the multiplier it was priced under, so this asks
+    // whether its estimate could have passed the cap plus 50 at the clamp's
+    // ceiling, from the estimate at a multiplier of 1. That over-counts, and
+    // a store it counts in wrongly restarts from 1, which one sample sets.
+    3: (messages, strategy, store) => {
+      const cap = strategy.config.maxMessageTokens;
+      if (!(typeof cap === 'number' && cap > 0)) return false;
+      const applied = store.getTokenCalibration?.() ?? 1;
+      const factor = Number.isFinite(applied) && applied > 0 ? applied : 1;
+      return messages.some((m) =>
+        strategy.estimateTextOnlyTokens(m) > cap || (store.estimateTokens(m) / factor) * 1.8 > cap + 50);
+    },
   };
 
   /** Whether any epoch in (fromEpoch, CALIBRATION_PRICING_EPOCH] repriced content in this store. */
-  protected calibrationRepricedSince(fromEpoch: number, messages: readonly StoredMessage[]): boolean {
+  protected calibrationRepricedSince(fromEpoch: number, messages: readonly StoredMessage[], store: MessageStoreView): boolean {
     for (let e = fromEpoch + 1; e <= AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH; e++) {
       const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[e];
-      if (!reprices || reprices(messages)) return true;
+      if (!reprices || reprices(messages, this, store)) return true;
     }
     return false;
   }
@@ -10966,7 +10994,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const epoch = stamped ? saved.pricing! : 1;
           const fromEpoch = stamped ? epoch : null;
           const pinned = saved.multiplier! >= 1.8 || saved.multiplier! <= 0.6;
-          const repriced = epoch < current && this.calibrationRepricedSince(epoch, store.getAll());
+          const repriced = epoch < current && this.calibrationRepricedSince(epoch, store.getAll(), store);
           if (epoch === current) {
             this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
             this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
@@ -11879,21 +11907,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     let totalTokens = 0;
 
-    // Phase 0: Head window — preserved verbatim (from headStart, not necessarily 0)
+    // Phase 0: Head window — every message sent raw, each cut at the cap as
+    // any raw message is (from headStart, not necessarily 0)
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     for (let i = headStart; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
-      const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-      // The head is verbatim by definition — truncating it mid-window drops
+      const { content, extra } = this.cappedForSend(store, msg, msgCap);
+      const tokens = store.estimateTokens(msg) + extra;
+      // The head is sent whole by definition: stopping it mid-window drops
       // messages no summary covers. Refuse honestly beyond grace.
       if (totalTokens + tokens > graceLimit) {
         throw this.overBudgetError(budget, {
           stage: 'Hierarchical emission overran the budget',
           budget: graceLimit,
           actual: totalTokens + tokens,
-          // The head is verbatim by definition, and its size is cold
+          // The head is sent whole by definition, and its size is cold
           // configuration (headWindowTokens isn't a hot setting). Besides a
           // larger budget, a head-window reset clears it, which starts a new
           // topic and isn't a lever the list names (OverBudgetClearedBy).
@@ -12257,10 +12286,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this.rsSummary(summary.level, pairTokens, summary.id);
           } else {
             const msg = item.msg;
-            const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-            const tokens = msgCap > 0
-              ? Math.min(store.estimateTokens(msg), msgCap + 50)
-              : store.estimateTokens(msg);
+            const { content, extra } = this.cappedForSend(store, msg, msgCap);
+            const tokens = store.estimateTokens(msg) + extra;
             if (totalTokens + tokens > graceLimit) {
               throw this.overBudgetError(budget, {
                 stage: 'Hierarchical emission overran the budget',
@@ -12335,10 +12362,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const middleRawSorted = [...middleRaw].sort((a, b) => a.position - b.position);
         for (let mi = 0; mi < middleRawSorted.length; mi++) {
           const { msg } = middleRawSorted[mi]!;
-          const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-          const tokens = msgCap > 0
-            ? Math.min(store.estimateTokens(msg), msgCap + 50)
-            : store.estimateTokens(msg);
+          const { content, extra } = this.cappedForSend(store, msg, msgCap);
+          const tokens = store.estimateTokens(msg) + extra;
           if (totalTokens + tokens > graceLimit) {
             // These messages are the UNCOMPRESSED middle — no summary covers
             // them (see the middleRaw construction above). Dropping them
@@ -13934,7 +13959,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Index of the first message AFTER the head window.
-   * Messages [headStart, headEnd) are preserved verbatim.
+   * Messages [headStart, headEnd) are sent raw, never summarized.
    *
    * The token-derived boundary is priced with the live calibration multiplier,
    * so it moves whenever calibration does. Moving it DOWN used to be a ratchet:
@@ -14897,9 +14922,49 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Cut a message's text and string tool-result content to `maxTokens`, with
    * the cap both strategies share (`capContent`, message-cap.ts). Whether it
    * looks is decided by `estimateTextOnlyTokens`, which counts thinking and
-   * tool input too, so a thinking block alone can make it look.
+   * tool input too, so a thinking block alone can make it look. `estimate`,
+   * when given, is that estimate for `content` as it stands, such as a stored
+   * message's cached one (cappedForSend). This is the strategy's one cut: raw
+   * messages and summaries alike go through it, so an override changes both,
+   * and the price of a raw message follows what the override sends.
    */
-  protected truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
-    return capContent(content, maxTokens, (blocks) => this.estimateTextOnlyTokens({ content: blocks } as StoredMessage));
+  protected truncateContent(
+    content: ContentBlock[],
+    maxTokens: number,
+    estimate?: (content: ContentBlock[]) => number,
+  ): ContentBlock[] {
+    return capContent(content, maxTokens, estimate ?? ((blocks) => this.estimateTextOnlyTokens({ content: blocks } as StoredMessage)));
+  }
+
+  /**
+   * A stored message as this strategy sends it under `maxMessageTokens`
+   * (`msgCap`), cut by `truncateContent`, and what sending that adds
+   * to the message's price (`cappedPriceExtra`). Each site that prices a raw
+   * message as part of what a compile sends adds `extra` to the price it
+   * gives an uncapped one, so the cut is priced as it renders: the plan's
+   * chunks, the head and tail reservations, the refusal's floor, the
+   * emission checks, the recent window's eviction walk and the render stats.
+   * The adaptive middle's shard path sends a body's raw shards' text uncut,
+   * so their chunks' raw prices take no extra.
+   * A site that emits the message sends `content`. The head and recent
+   * windows' sizes and the image strip's depth are measured before the cap
+   * (getHeadWindowEnd, getUnheldRecentWindowStart, getImageStripStart), in
+   * the stored history that compression summarizes. Whether the cap cuts is
+   * decided, unless `truncateContent` is overridden, by
+   * `estimateTextOnlyTokens(msg)`, the cut's own estimate, which counts
+   * thinking and tool calls too and is cached on the message, so a message
+   * under the cap costs each site a lookup.
+   */
+  protected cappedForSend(
+    store: MessageStoreView,
+    msg: StoredMessage,
+    msgCap: number,
+  ): { content: ContentBlock[]; extra: number } {
+    // The default cut, capContent, reads a cap that isn't a positive number
+    // as no cap, such as a caller's explicit `maxMessageTokens: undefined`,
+    // which stays in the config, and returns the content itself, so the
+    // extra is 0. The estimate given is of the content cut, msg.content.
+    const content = this.truncateContent(msg.content, msgCap, () => this.estimateTextOnlyTokens(msg));
+    return { content, extra: cappedPriceExtra(store, msg, content) };
   }
 }

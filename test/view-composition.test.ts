@@ -429,7 +429,9 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
 });
 
 describe('the message cap\'s omission marker, in both strategies', () => {
-  const budget = { maxTokens: 300, reserveForResponse: 50 }; // usable 250, as the cap tests above
+  // Room for the image the cap keeps, which a capped message's price counts
+  // as it renders (#223), at the store's 1,600 tokens.
+  const budget = { maxTokens: 3000, reserveForResponse: 50 };
   const strategies = [
     ['windowed passthrough', () => new WindowedPassthroughStrategy({ maxMessageTokens: 100 })],
     ['autobiographical', () => new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 100_000, maxMessageTokens: 100 })],

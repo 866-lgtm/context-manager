@@ -6,6 +6,7 @@
  */
 import type { ContentBlock } from '@animalabs/membrane';
 import { isEmptyTextBlock, releaseVanishedRawForms } from '../raw-forms.js';
+import type { MessageStoreView, StoredMessage } from '../types/index.js';
 
 /** A text block that holds nothing, the one rule the cap and the raw-form
  *  release share (raw-forms.ts). */
@@ -102,15 +103,18 @@ function safeSlice(str: string, start: number, end: number): string {
  * or dropped block gives up its raw replay form, along with every block
  * sharing it, so the cut reaches the wire, except that a block that holds
  * nothing gives up its item's form only when no block left carries that item
- * (`releaseVanishedRawForms`). A `maxTokens` of 0 or less means no cap, as
- * `maxMessageTokens` does.
+ * (`releaseVanishedRawForms`). A `maxTokens` that isn't a positive number,
+ * such as 0, a negative, NaN or undefined, means no cap, as
+ * `maxMessageTokens` does. Cut at NaN characters, the first text block that
+ * holds anything would come back as its suffix alone, and the cap's notices
+ * would stand in for what follows it.
  */
 export function capContent(
   content: ContentBlock[],
   maxTokens: number,
   estimate: (content: ContentBlock[]) => number,
 ): ContentBlock[] {
-  if (maxTokens <= 0) return content;
+  if (!(maxTokens > 0)) return content;
   if (estimate(content) <= maxTokens) return content;
 
   const maxChars = maxTokens * 4;
@@ -180,4 +184,28 @@ export function capContent(
     return releaseVanishedRawForms(content, [capMarker()]);
   }
   return releaseVanishedRawForms(content, result);
+}
+
+/**
+ * What sending `capped`, which the cap made of `message`'s content (with
+ * `capContent`, or a strategy's override of its cut), adds to the message's
+ * price: the store's estimate of `capped`, less its estimate
+ * of the message as stored, and 0 where the cap left the content whole. Both
+ * strategies price a capped message at its uncapped price plus this, so the
+ * cut is priced as it renders (#223). The cap keeps four characters a token,
+ * and the store prices the text it keeps at its own rates. It cuts text
+ * blocks and string tool results alone and passes every other block through,
+ * as it was or as a copy that gave up a raw form it shared with a cut block,
+ * so the difference holds the kept and cut text, the suffix, the
+ * omission notices and the marker, and an image or a tool call keeps
+ * whatever price the site's uncapped price gives it. A block the cut makes
+ * give up its raw form estimates as it did, so it adds nothing.
+ */
+export function cappedPriceExtra(store: MessageStoreView, message: StoredMessage, capped: ContentBlock[]): number {
+  // Content the cap left whole is the message's own array, whose two
+  // estimates would sum the same blocks, so this returns 0 without taking
+  // either: with no cap set, every raw message comes through here at every
+  // site that prices it.
+  if (capped === message.content) return 0;
+  return store.estimateTokens({ content: capped } as StoredMessage) - store.estimateTokens(message);
 }
