@@ -1040,7 +1040,17 @@ const ZERO_APPROXIMATION: ApproximationEnvelope = Object.freeze({
  * component envelopes are one-sided: how much worse the representative may
  * be than an exact path it stands in for.  Subsequent actions add the same
  * component costs at the same structural/cache state, so the envelope carries
- * forward unchanged until another prune. */
+ * forward unchanged until another prune.
+ *
+ * A path is attached only to a representative with no more rendered tokens
+ * than its own. A later action adds the same tokens to both, so a
+ * representative the wall prunes takes with it only paths the wall would
+ * have pruned too, and the error it carries for them is never owed. Attached
+ * to a representative with more tokens, a path whose own continuation fits
+ * could lose its error when that representative crosses the wall, and the
+ * bound read from the surviving labels would miss its cut (#254). The
+ * fewest-tokens representative always qualifies, so every path is attached.
+ * The packed and subtree engines apply the same rule. */
 function coverApproximationPool(
   pool: readonly ParetoLabel[],
   representatives: readonly ParetoLabel[],
@@ -1055,6 +1065,7 @@ function coverApproximationPool(
     let chosenCost = Number.POSITIVE_INFINITY;
     for (let i = 0; i < covered.length; i++) {
       const candidate = covered[i];
+      if (candidate.renderedTokens > source.renderedTokens) continue;
       const cost =
         Math.abs(candidate.renderedTokens - source.renderedTokens) +
         Math.max(0, candidate.continuityLoss - source.continuityLoss) +
