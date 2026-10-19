@@ -18,9 +18,11 @@
   a positive number, such as NaN, is no cap in the windowed strategy too,
   which cut away a message's text and left the cap's notices in its place.
   - Where `maxMessageTokens` is set, a compile fits fewer raw messages in its
-    budget wherever a capped message sends more than the cap plus 50: every
-    message the cap cuts does at caps such as connectome-host's 10,000, and
-    at any cap a message's images, tool calls or thinking can take it past.
+    budget wherever a capped message sends more than the cap plus 50. A
+    prose block cut at connectome-host's cap of 10,000 does at calibration
+    multipliers above about 0.73, and a string tool result cut there does at
+    any the clamp allows. At any cap a message's images, tool calls or
+    thinking can take it past.
     The autobiographical strategy then folds or evicts sooner, and can refuse
     with `OverBudgetError` where it sent a window over its budget. The
     windowed strategy re-anchors sooner, and refuses a newest message that
@@ -35,7 +37,9 @@
     price could have limited, with an `[estimator-calibration]` warning and
     `calibration.reset` in the render stats, and the first provider sample
     sets it again. A store with no cap, or nothing near it, keeps its
-    multiplier.
+    multiplier, where its view reports the multiplier it estimates at, as
+    `MessageStore`'s does. One that doesn't is read at 0.6, so its store can
+    be counted for a message well under the cap.
   - The hierarchical selection, which runs when `adaptiveResolution` is off
     (the default), prices raw messages before the image strip. So a capped
     message whose image the strip replaces is now priced with that image
