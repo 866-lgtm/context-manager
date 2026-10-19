@@ -209,10 +209,15 @@ describe('ContextManager auxiliaryMessageViews', () => {
     });
 
     await side.compile(); // prime any caches
-    main.addMessage('alice', text('after-prime'));
+    const appended = main.addMessage('alice', text('after-prime'));
     const result = await side.compile();
     const rendered = result.messages.map((m) => (m.content[0] as { text: string }).text);
     assert.deepEqual(rendered, ['after-prime']);
+    // The merged listing is memoized on the source arrays; an edit on the
+    // other instance changes the aux slot's array as an append does.
+    main.editMessage(appended, text('after-edit'));
+    const edited = await side.compile();
+    assert.deepEqual(edited.messages.map((m) => (m.content[0] as { text: string }).text), ['after-edit']);
 
     await side.close();
     await main.close();

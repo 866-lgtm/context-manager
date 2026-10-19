@@ -92,8 +92,9 @@ const mergedListings: MergedListingNode = { next: new WeakMap() };
  * Cost: the merged listing is built once per combination of source
  * listings and served from a memo while every source returns the same
  * array. The sources are the stores' own cached listings (MessageStore
- * memoizes getAll on branch and write version), so a compile's ten-odd
- * getAll/getFrom/getTail calls, across the fresh view objects the host
+ * memoizes getAll on branch and write version), so a compile's reads
+ * (two getAll/getFrom/getTail calls for the windowed strategy, ten-odd for
+ * the autobiographical one), across the fresh view objects the host
  * builds for each strategy call, share one O(n log n) merge; the next
  * append misses on the changed source and merges again. The memo also
  * keeps the listing's identity stable, which the strategy's per-listing
