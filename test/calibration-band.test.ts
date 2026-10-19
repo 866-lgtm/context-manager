@@ -12,7 +12,7 @@ import assert from 'node:assert';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Membrane, MockAdapter, NativeFormatter } from '@animalabs/membrane';
+import { Membrane, MockAdapter, NativeFormatter, type ContentBlock } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
 
@@ -559,16 +559,24 @@ describe('estimator calibration band', () => {
     // `fits: false` instead), so a preview under a provisional 1.45 said the
     // window doesn't fit where the real compile drops to 1 and fits. Store B's
     // signature ("Adaptive picker exhausted ...") is this path. It needs the
-    // picker over and the emitter under: a sharded body of prose followed by
-    // JSON is planned shard by shard (the JSON shards at the dense rate) and
-    // emitted as one joined text, priced by its first 2000 chars (prose). A
-    // small recent window keeps the body in the middle, where no summary
-    // exists yet to fold it.
+    // picker over and the emitter under, so that the picker's refusal is the
+    // only one the preview can fall back at. The strategy's own prices don't
+    // give that for a body of text, since the middle counts a body's raw
+    // shards as the plan does, so the emitter here counts less by
+    // construction: an estimateTokens that halves its answer, which in this
+    // fixture, with no summaries yet, prices the raw run the middle sends and
+    // nothing the plan counts. A small recent window keeps the sharded body in
+    // the middle, where no summary exists yet to fold it.
+    class HalfCountingEmitter extends AutobiographicalStrategy {
+      protected override estimateTokens(content: ContentBlock[]): number {
+        return Math.ceil(super.estimateTokens(content) / 2);
+      }
+    }
     const BODY = `${'the quick brown fox jumps over the lazy dog and keeps running. '.repeat(45)}` +
       JSON.stringify(Array.from({ length: 400 }, (_, i) => ({ id: i, key: `k_${i}`, value: [i, i * 2, i * 3], flag: i % 2 === 0 })));
     const openSharded = async (name: string, seed: boolean) => {
       const membrane = new Membrane(new MockAdapter({}), { formatter: new NativeFormatter() });
-      const strategy = new AutobiographicalStrategy({
+      const strategy = new HalfCountingEmitter({
         targetChunkTokens: 1_000, headWindowTokens: 0, recentWindowTokens: 1_000,
         compressionModel: 'mock', adaptiveResolution: true,
       });

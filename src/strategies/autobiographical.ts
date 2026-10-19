@@ -9867,11 +9867,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const ch = chunkAtPosition ? chunkAtPosition[i] : chunksByMessageId.get(msg.id);
       // This is the chunk's raw price. The shard path in step 5 sends a run
       // of a body's raw shards as one entry, their text joined and uncut, so
-      // a shard takes no extra here. (That entry is one text block, which the
-      // store prices at the rate its first 2,000 characters set, and it
-      // leaves out a shard's other blocks, so it can still differ from these
-      // prices, cap or no cap.) A shard the plan folds is priced as its
-      // summary. The head and recent windows cut a shard as they emit it.
+      // a shard takes no extra here. It prices that entry as the shards'
+      // text it joins, each by estimateTokens, the store's price, so a shard
+      // of text alone is counted there as here; a shard's other blocks are
+      // priced here, and the shard path leaves them out. A shard the plan
+      // folds is priced as its summary. The head and recent windows cut a
+      // shard as they emit it.
       const tokens = msg.bodyGroupId ? pse[i] : pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       const bound = pinBounds.size > 0 ? pinBounds.get(i) : undefined;
       const l1Id = ch?.summaryId ?? l1ByMessage.get(msg.id);
@@ -10313,7 +10314,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         //  - resolution transitions raw ↔ folded
         //  - the L_k ancestor changes
         type Run =
-          | { kind: 'raw'; parts: string[]; ids: string[] }
+          | { kind: 'raw'; parts: string[]; ids: string[]; tokens: number }
           | { kind: 'summary'; ancestor: SummaryEntry };
         let currentRun: Run | null = null;
         const participant = shards[0].participant;
@@ -10329,7 +10330,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // doc content that the picker explicitly chose to keep raw.
             // (`maxMessageTokens` is for per-message caps on chat / tool
             // results, not for sharded bodyGroup composites.)
-            const tokens = this.estimateTokens(content);
+            const tokens = currentRun.tokens;
             if (totalTokens + tokens > prefixBudget) {
               throw emissionOverBudget(totalTokens + tokens);
             }
@@ -10385,32 +10386,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           }
           currentRun = null;
         };
+        // A raw run joins its shards' text into one block and is priced as
+        // the parts it joins, each shard's text by estimateTokens, which is
+        // what the plan counted for a shard of text alone. The store's
+        // default estimator prices a text block at the rate its first 2,000
+        // characters set, so the joined block's own estimate would put the
+        // whole run at that rate, and this entry and the plan would disagree
+        // wherever the shards' densities differ.
+        const addRaw = (shard: StoredMessage): void => {
+          if (currentRun?.kind !== 'raw') {
+            flushRun();
+            currentRun = { kind: 'raw', parts: [], ids: [], tokens: 0 };
+          }
+          const rawRun = currentRun as Extract<Run, { kind: 'raw' }>;
+          rawRun.ids.push(shard.id);
+          const text = shard.content.filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text');
+          for (const block of text) rawRun.parts.push(block.text);
+          rawRun.tokens += this.estimateTokens(text);
+        };
 
         for (const shard of shards) {
           const resolution = levelAt(positionOf.get(shard.id) ?? -1, shard.id);
           if (resolution === 0) {
-            if (currentRun?.kind !== 'raw') {
-              flushRun();
-              currentRun = { kind: 'raw', parts: [], ids: [] };
-            }
-            const rawRun = currentRun as { kind: 'raw'; parts: string[]; ids: string[] };
-            rawRun.ids.push(shard.id);
-            for (const block of shard.content) {
-              if (block.type === 'text') rawRun.parts.push(block.text);
-            }
+            addRaw(shard);
           } else {
             const ancestor = this.findAncestorAt(shard.id, resolution, chunksByMessageId, summariesById, l1ByMessage, ancestorMemo);
             if (!ancestor) {
               // Fall back to raw
-              if (currentRun?.kind !== 'raw') {
-                flushRun();
-                currentRun = { kind: 'raw', parts: [], ids: [] };
-              }
-              const rawRun = currentRun as { kind: 'raw'; parts: string[]; ids: string[] };
-              rawRun.ids.push(shard.id);
-              for (const block of shard.content) {
-                if (block.type === 'text') rawRun.parts.push(block.text);
-              }
+              addRaw(shard);
               continue;
             }
             // If we're already in a summary run for the SAME ancestor, this
@@ -11369,6 +11372,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  (b) have sourceMessageId pointing to messages in the same bodyGroup
    * merge them into one composite entry whose body is the byte-faithful
    * concatenation of their text content. Other entries pass through.
+   *
+   * The merge prices nothing: the head and recent windows priced each shard
+   * as they emitted it, as the plan priced it, so the budget and the render
+   * stats count a composite as the parts it joins, where the store's default
+   * estimator would price the joined text at its first 2,000 characters'
+   * rate. What re-estimates entries from their content after this, to place
+   * kv-unified's cache markers, report the fold diff or record the rendered
+   * layout, reads the joined text.
    *
    * `messages` is the caller's `store.getAll()` listing; overrides should
    * forward it, since a filtered view re-lists the whole history per call.
@@ -14526,16 +14537,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Price a rendered body the way the store prices it. The plan and the
-   * emission must agree: every recall pair, envelope and merged entry this
-   * strategy prices here is later emitted and measured against the same
-   * budget the store's calibrated estimate feeds, so the store's view is the
-   * authority whenever one is bound (per-class chars/token rates, the signed-
-   * thinking rule, the closed-loop calibration multiplier). Before a view is
-   * bound the fallback mirrors the store's raw rules. The old local rule
-   * priced text at a flat chars/4 — under `carrierPolicy: 'live-strip'`,
-   * where the exact mint `tokens` no longer floors the recall-pair price,
-   * that under-priced dense summary prose by ~25-30% (2026-09-21, measured
-   * against count_tokens on a 500-summary window: 526k planned, 728k real).
+   * emission must agree: every recall pair, envelope and raw shard's text
+   * this strategy prices here (the adaptive middle prices a joined run of
+   * shards as the sum of its shards' prices) is later emitted and measured
+   * against the same budget the store's calibrated estimate feeds, so the
+   * store's view is the authority whenever one is bound (per-class
+   * chars/token rates, the signed-thinking rule, the closed-loop calibration
+   * multiplier). Before a view is bound the fallback mirrors the store's raw
+   * rules. The old local rule priced text at a flat chars/4 — under
+   * `carrierPolicy: 'live-strip'`, where the exact mint `tokens` no longer
+   * floors the recall-pair price, that under-priced dense summary prose by
+   * ~25-30% (2026-09-21, measured against count_tokens on a 500-summary
+   * window: 526k planned, 728k real).
    */
   protected estimateTokens(content: ContentBlock[]): number {
     const view = this._storeView;
