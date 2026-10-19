@@ -148,6 +148,12 @@ export const COMBINED_RECALL_SEPARATOR_TEXT = '\n\n---\n\n';
  */
 export const RECALL_RESUME_TEXT = '[CM] The conversation resumes.';
 
+/** The message an entry ends on: a composite's last source, or its one source.
+ *  For a body the head and the recent window share, that's a recent message. */
+function lastSourceOf(entry: ContextEntry): MessageId | undefined {
+  return entry.sourceMessageIds?.at(-1) ?? entry.sourceMessageId;
+}
+
 /** The summary id a `[CM] Recall memory <id>.` header names, or undefined for
  *  any other message. A recall pair is such a header and the answer after it. */
 function recallHeaderId(message: { participant: string; content: ContentBlock[] }): string | undefined {
@@ -1374,6 +1380,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private kvUnifiedPendingLayout: RenderLayout | null = null;
   private kvUnifiedPendingMarkerUnitIndices: number[] = [];
   private kvUnifiedPendingImmutablePrefixHash: string | null = null;
+  /** Set once this strategy has said that an accepted request's cache markers
+   * didn't match its compile's (reportKvUnifiedAccepted), so a mismatch that
+   * repeats every turn is said once. */
+  private kvUnifiedMarkerMismatchReported = false;
   /** Legacy snapshot used by the unapproved first implementation. Read-only. */
   protected get compressionRefusalQuarantineStateId(): string {
     return `${this.ns}/autobio:compression-refusal-quarantine`;
@@ -10793,6 +10803,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               : this.kvUnifiedPendingLayout!.units[unitIndex].offset,
         })),
       };
+    } else if (
+      args.wireReceipt &&
+      args.wireReceipt.markers.length > 0 &&
+      args.submissionId === this.kvUnifiedReceipts.inFlightSubmissionId &&
+      this.kvUnifiedPendingLayout &&
+      this.kvUnifiedPendingImmutablePrefixHash &&
+      !this.kvUnifiedMarkerMismatchReported
+    ) {
+      // The request carried markers, but not one for each layout boundary its
+      // compile reconciled them to, which reconcileKvUnifiedMarkerIndices'
+      // contract rules out. A request with none (prompt caching off) has
+      // nothing to match. The pending compile is the in-flight submission's,
+      // so only a callback for that submission is compared with it, not a late
+      // one for a submission already settled, which the receipt chain takes as
+      // a duplicate.
+      this.kvUnifiedMarkerMismatchReported = true;
+      const boundaries = this.kvUnifiedPendingMarkerUnitIndices.length;
+      console.error(
+        `[kv-unified] submission ${args.submissionId}: the request carried ${args.wireReceipt.markers.length} ` +
+          `cache markers where its compile marked ${boundaries} layout boundar${boundaries === 1 ? 'y' : 'ies'}, ` +
+          `so this presentation keeps no cache reference and the next compile weighs no cache costs ` +
+          `(logged once per strategy)`,
+      );
     }
     this.kvUnifiedReceipts.accept(
       args.submissionId,
@@ -11248,6 +11281,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // 33%/66%/100%, plus one at the end of the tail. There is deliberately
       // no separate early/system marker: every history prefix already
       // includes tools, system, and the raw head on the provider wire.
+      //
+      // A marker can go only where an entry ends a solved layout unit, since
+      // reconcileKvUnifiedMarkerIndices records it as that unit's boundary.
+      // The layout renders the head as one unit, so an entry that ends on a
+      // head message is a boundary only when no later entry holds a head
+      // message. That is the head's last entry, or no entry when a body that
+      // the head and the recent window share runs on past the head's end. A
+      // tool-result repair spliced in between head messages holds none, so
+      // the test looks past it to the last entry that does. The head's
+      // entries come first, and an entry holds consecutive messages, so an
+      // entry holds a head message exactly when its first source is one.
+      let lastHeadEntry = -1;
+      for (let index = 0; index < n; index++) {
+        const first = entries[index]!.sourceMessageIds?.[0] ?? entries[index]!.sourceMessageId;
+        if (first !== undefined && headMessageIds.has(first)) lastHeadEntry = index;
+      }
+      const isBoundary = (index: number): boolean => {
+        const entry = entries[index]!;
+        if (!(entry.cacheLayoutKey || entry.sourceMessageId || entry.sourceMessageIds?.at(-1))) return false;
+        const last = lastSourceOf(entry);
+        return !(last !== undefined && headMessageIds.has(last) && index < lastHeadEntry);
+      };
       const marks = new Set<number>();
       if (historyEnd >= 0) {
         const cumulative: number[] = [0];
@@ -11259,11 +11314,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
         const legalBoundaries = entries
           .slice(0, historyEnd + 1)
-          .flatMap((entry, index) =>
-            (entry.cacheLayoutKey || entry.sourceMessageId || entry.sourceMessageIds?.at(-1))
-              ? [index]
-              : [],
-          );
+          .flatMap((_, index) => (isBoundary(index) ? [index] : []));
         const nearestBoundary = (fraction: number): number => {
           const target = cumulative[cumulative.length - 1]! * fraction;
           let best = legalBoundaries[0]!;
@@ -11326,10 +11377,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return firstChanged;
   }
 
-  /** Convert emitted message markers back to atomic solver-layout boundaries.
-   * Folded recall pairs and merged raw body shards carry `cacheLayoutKey` on
-   * the entry that ends the unit; fixed head/tail regions map to their single
-   * synthetic layout units. Every wire marker must reconcile exactly. */
+  /** Convert emitted message markers back to atomic solver-layout boundaries,
+   * each to the one where its entry ends. Folded recall pairs and the middle's
+   * raw shard runs carry `cacheLayoutKey` on the entry that ends the unit. Any
+   * other entry ends on the message it holds last (`lastSourceOf`, so a merged
+   * body on its last shard): a head message maps to the single synthetic head
+   * unit, which placeCacheMarkers marks only on the entry that ends the head,
+   * and any other message to its own unit, or a recent one without one to the
+   * opaque tail block. Every wire marker must reconcile exactly. */
   protected reconcileKvUnifiedMarkerIndices(
     entries: readonly ContextEntry[],
     layout: RenderLayout,
@@ -11339,8 +11394,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const indices: number[] = [];
     for (const entry of entries) {
       if (!entry.cacheMarker) continue;
-      const sourceId = entry.sourceMessageId;
-      const atomicKey = entry.cacheLayoutKey ?? entry.sourceMessageIds?.at(-1) ?? sourceId;
+      const sourceId = lastSourceOf(entry);
+      const atomicKey = entry.cacheLayoutKey ?? sourceId;
       // A tail message is its own raw unit (render-offsets `tailUnits`); the
       // opaque 'tail' block only carries tail tokens no chunk accounts for.
       const layoutKey = sourceId && headMessageIds.has(sourceId)
