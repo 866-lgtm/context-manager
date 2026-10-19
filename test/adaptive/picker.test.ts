@@ -600,7 +600,8 @@ test('picker: its lines name the namespace its owner gives it', () => {
   const inputs = greedyStore([['x', 'L1-0']], [['L1-0', 1, ['x'], 30]]);
   const solver = {
     name: 'stub',
-    solve: () => ({ frontier: new Map([['x', 0], ['t0', 0], ['gone', 1]]), produced: [] }),
+    // x at a level it has no summary at, and an entry for no chunk at all.
+    solve: () => ({ frontier: new Map([['x', 2], ['t0', 0], ['gone', 1]]), produced: [] }),
   } as unknown as ConstructorParameters<typeof Picker>[0];
   const lines: string[] = [];
   const original = console.error;
@@ -613,4 +614,7 @@ test('picker: its lines name the namespace its owner gives it', () => {
   assert.deepEqual(lines.filter((l) => l.startsWith('[picker-dead-ids]')), [
     '[picker-dead-ids] solver=stub: dropped 1 frontier entry referencing no live chunk (store surgery residue). ns=agents/tern',
   ]);
+  const unrealizable = lines.filter((l) => l.startsWith('[picker-unrealizable]'));
+  assert.equal(unrealizable.length, 1, lines.join('\n'));
+  assert.match(unrealizable[0]!, / ns=agents\/tern$/);
 });

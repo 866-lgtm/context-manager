@@ -28,15 +28,19 @@ export function withNamespace(message: string, namespace: string): string {
  * is logged, since a strategy learns its own at initialize, and so is
  * `console`, so a test's mock of console.error or console.warn sees the line.
  * Before it has one (a strategy no manager has initialized), a line names
- * none.
+ * none. The suffix ends the message: arguments after it, such as an error,
+ * print after it, as console prints them.
  */
 export function namespaceDiagnostics(namespace: () => string): Diagnostics {
-  const named = (message: string) => {
+  const named = (message: string, rest: unknown[]) => {
     const name = namespace();
-    return name ? withNamespace(message, name) : message;
+    if (!name) return message;
+    // Console reads the message as a format string when arguments follow it,
+    // so a '%' in the name is doubled to print as itself.
+    return withNamespace(message, rest.length > 0 ? name.replaceAll('%', '%%') : name);
   };
   return {
-    error: (message, ...rest) => console.error(named(message), ...rest),
-    warn: (message, ...rest) => console.warn(named(message), ...rest),
+    error: (message, ...rest) => console.error(named(message, rest), ...rest),
+    warn: (message, ...rest) => console.warn(named(message, rest), ...rest),
   };
 }

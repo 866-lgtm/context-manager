@@ -32,7 +32,6 @@ import {
   PassthroughStrategy,
   WindowedPassthroughStrategy,
 } from '../src/index.js';
-import { namespaceDiagnostics } from '../src/diagnostics.js';
 
 const t = (text: string) => ({ type: 'text', text }) as ContentBlock;
 /** A 1x1 PNG, and a WAV header with no samples, as base64. */
@@ -521,16 +520,13 @@ describe("content that doesn't match ContentBlock", () => {
     }
   });
 
-  // #239: a context log is its manager's namespace's, and its line says so, through the
-  // diagnostics the manager gives it.
-  it('a context log\'s line names the namespace its diagnostics give', async () => {
+  // #239: a context log of one namespace names it on its lines; the log with no namespace names
+  // none, as the next test's line shows.
+  it('a context log\'s line names its namespace', async () => {
     await withStore(async (store) => {
       ContextLog.register(store, 'agents/tern');
       store.appendToStateJson('agents/tern/context', { index: 0, participant: 'User', content: [t('x'), null] });
-      const log = new ContextLog(store, {
-        namespace: 'agents/tern',
-        diagnostics: namespaceDiagnostics(() => 'agents/tern'),
-      });
+      const log = new ContextLog(store, { namespace: 'agents/tern' });
       const lines = (await errorLines(() => {
         log.getAll();
       })).filter((line) => line.startsWith('[context-manager]'));

@@ -150,10 +150,11 @@ function effectiveConfigLines(emitted: string[]): EffectiveConfigLogLine[] {
  *  return everything that reached stderr plus the effective-config lines in it. */
 async function reportFromInitializing(
   strategy: AutobiographicalStrategy,
+  namespace?: string,
 ): Promise<{ emitted: string[]; reports: EffectiveConfigLogLine[] }> {
   cleanup();
   const emitted = await captureStderrLinesAsync(async () => {
-    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, namespace });
     manager.close();
   });
   cleanup();
@@ -451,8 +452,13 @@ describe('AutobiographicalStrategy: effective-config report', () => {
     const report = reports[0]!;
     assert.strictEqual(report.strategy, 'autobiographical');
     // The namespace it was initialized in, a field of the line, so one process's strategies'
-    // reports can be told apart (#239): the manager's default here.
+    // reports can be told apart (#239): the manager's default here, and its own when it has one.
     assert.strictEqual(report.namespace, 'default');
+    const named = await reportFromInitializing(
+      new AutobiographicalStrategy({ logEffectiveConfig: true }),
+      'agents/tern',
+    );
+    assert.deepStrictEqual(named.reports.map((line) => line.namespace), ['agents/tern']);
     assert.strictEqual(report.effective.targetChunkTokens, 1234);
     assert.strictEqual(report.provenance.targetChunkTokens, 'caller');
     assert.strictEqual(report.provenance.recentWindowTokens, 'library-default');

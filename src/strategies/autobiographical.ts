@@ -78,7 +78,7 @@ import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
-import { type Diagnostics, namespaceDiagnostics, withNamespace } from '../diagnostics.js';
+import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 
 /** A persisted reset record is trusted only if it has the expected shape. */
 function isCalibrationReset(v: unknown): v is CalibrationReset {
@@ -106,10 +106,11 @@ function logCompressionCall(entry: Record<string, unknown>, namespace: string): 
   if (!logPath) return;
   try {
     mkdirSync(dirname(logPath), { recursive: true });
-    const line = JSON.stringify({ ...entry, namespace, timestamp: Date.now() }) + '\n';
+    // Before initialize the strategy has no namespace, and names none.
+    const line = JSON.stringify({ ...entry, ...(namespace ? { namespace } : {}), timestamp: Date.now() }) + '\n';
     appendFileSync(logPath, line);
   } catch (err) {
-    console.warn(withNamespace('compression log write failed:', namespace), err);
+    namespaceDiagnostics(() => namespace).warn('compression log write failed:', err);
   }
 }
 

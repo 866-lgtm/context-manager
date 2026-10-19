@@ -1,4 +1,4 @@
-import type { Diagnostics } from './diagnostics.js';
+import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
@@ -232,9 +232,9 @@ export class MessageStore {
   private stateId: string;
 
   /**
-   * Where its lines go: an isolated slot is one namespace's, and its lines
-   * name it; a shared slot is no one namespace's, and its lines name none
-   * (#239).
+   * Where its stderr lines go: a slot of one namespace (an isolated
+   * manager's, or an auxiliary slot named by its namespace) names it; the
+   * shared slot is no one namespace's, and its lines name none (#239).
    */
   private readonly log: Diagnostics;
 
@@ -243,11 +243,10 @@ export class MessageStore {
     options: TokenEstimatorOptions & {
       /** Namespace for multi-agent support. Creates state ID: `{namespace}/messages` */
       namespace?: string;
-      /** Where its stderr lines go; the console when not given. */
-      diagnostics?: Diagnostics;
     } = {}
   ) {
-    this.log = options.diagnostics ?? console;
+    const namespace = options.namespace;
+    this.log = namespace ? namespaceDiagnostics(() => namespace) : console;
     this.stateId = options.namespace
       ? `${options.namespace}/messages`
       : DEFAULT_MESSAGE_STATE_ID;
@@ -533,7 +532,7 @@ export class MessageStore {
     } else {
       if (this.allCache) {
         cacheDiag(
-          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : !cacheWasCurrent ? 'cache was stale before the append' : this.allCache.branchId !== this.store.currentBranch().id ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
+          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : !cacheWasCurrent ? 'cache was stale before the append' : this.allCache.branchId !== this.store.currentBranch().id ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) stateId=${this.stateId} — cache dropped`,
         );
       }
       this.allCache = null;

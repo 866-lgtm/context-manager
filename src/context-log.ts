@@ -1,4 +1,4 @@
-import type { Diagnostics } from './diagnostics.js';
+import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
@@ -29,7 +29,10 @@ export class ContextLog {
   private tokenEstimator: (text: string) => number;
   private stateId: string;
 
-  /** Where its lines go: its manager's, which name the namespace the log is (#239). */
+  /**
+   * Where its stderr lines go: a log of one namespace names it; the log with
+   * no namespace names none (#239).
+   */
   private readonly log: Diagnostics;
 
   constructor(
@@ -38,11 +41,10 @@ export class ContextLog {
       estimator?: (text: string) => number;
       /** Namespace for multi-agent support. Creates state ID: `{namespace}/context` */
       namespace?: string;
-      /** Where its stderr lines go; the console when not given. */
-      diagnostics?: Diagnostics;
     } = {}
   ) {
-    this.log = options.diagnostics ?? console;
+    const namespace = options.namespace;
+    this.log = namespace ? namespaceDiagnostics(() => namespace) : console;
     this.stateId = ContextLog.stateIdFor(options.namespace);
     this.blobManager = new BlobManager(store);
     this.tokenEstimator = options.estimator ?? defaultTokenEstimator;

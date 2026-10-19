@@ -1598,7 +1598,8 @@ describe('fold journal durability and index', () => {
         ({ cm } = await open(strategy));
         const receipt = await acceptCompile(cm);
         assert.equal(receipt?.kind, 'baseline', `${what}: a baseline`);
-        assert.ok(errors.some((e) => e.includes('is unreadable')), `${what}: and it is reported`);
+        // As this journal's branch's, naming its namespace (#239).
+        assert.ok(errors.some((e) => e.includes('is unreadable') && e.endsWith(' ns=agents/tester')), `${what}: and it is reported: ${errors.join('\n')}`);
         errors.length = 0;
       }
     } finally {
@@ -1666,7 +1667,8 @@ describe('fold journal durability and index', () => {
     console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
     try {
       assert.equal((await acceptCompile(cm))?.kind, 'baseline');
-      assert.ok(errors.some((e) => e.includes("its layout doesn't rebuild: null")), `reported: ${errors.join('\n')}`);
+      // About this journal's branch, so it names the journal's namespace (#239).
+      assert.ok(errors.some((e) => e.includes("its layout doesn't rebuild: null") && e.endsWith(' ns=agents/tester')), `reported: ${errors.join('\n')}`);
     } finally {
       console.error = error;
       cm.close();

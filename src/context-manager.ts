@@ -372,13 +372,14 @@ export class ContextManager {
       throw new Error('ContextManagerConfig: "isolate" requires "namespace" to be set');
     }
     const messageNamespace = config.isolate ? config.namespace : undefined;
+    const messageSlot = MessageStore.registrationFor(messageNamespace).id;
 
     // Register states if needed. A slot that already exists is kept; any
     // other registration failure propagates (see isStateExistsFor).
     try {
       MessageStore.register(store, messageNamespace);
     } catch (error) {
-      if (!isStateExistsFor(error, MessageStore.registrationFor(messageNamespace).id)) throw error;
+      if (!isStateExistsFor(error, messageSlot)) throw error;
       // State already registered. Registrations persist in the store, so
       // on existing stores the snapshot cadence stays pinned to whatever
       // the FIRST registration said — retune it to the current constants
@@ -399,8 +400,9 @@ export class ContextManager {
           );
         } catch (err) {
           // Never fatal: a strategy-kind mismatch or transient store error
-          // must not block opening the context manager.
-          console.error('[message-store] snapshot-cadence retune failed:', err);
+          // must not block opening the context manager. Like the line above,
+          // it names the slot, which is the store's (#239).
+          console.error(`[message-store] snapshot-cadence retune failed for ${messageSlot}:`, err);
         }
       }
     }
@@ -415,21 +417,13 @@ export class ContextManager {
     // so strategies always have something to scope state IDs by, even when
     // the caller didn't supply a namespace.
     const strategyNamespace = config.namespace ?? 'default';
-    // Each store's lines name the namespace its state is: an isolated message
-    // slot's and the context log's are this manager's; a shared slot's and an
-    // auxiliary slot without a namespace are no one namespace's (#239).
-    const ownLines = namespaceDiagnostics(() => strategyNamespace);
-    const slotLines = (namespace: string | undefined): Diagnostics =>
-      namespace === undefined ? console : namespaceDiagnostics(() => namespace);
     const messageStore = new MessageStore(store, {
       estimator: config.tokenEstimator,
       namespace: messageNamespace,
-      diagnostics: slotLines(messageNamespace),
     });
     const contextLog = new ContextLog(store, {
       estimator: config.tokenEstimator,
       namespace: config.namespace,
-      diagnostics: ownLines,
     });
     const strategy = config.strategy ?? new PassthroughStrategy();
 
@@ -461,7 +455,6 @@ export class ContextManager {
       return [new MessageStore(store, {
         estimator: config.tokenEstimator,
         namespace: aux.namespace,
-        diagnostics: slotLines(aux.namespace),
       })];
     });
 

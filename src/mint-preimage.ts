@@ -538,7 +538,7 @@ function storeEnvelope(store: JsStore, envelope: MintPreimageEnvelope, requestHa
  * is indexed; a request whose envelope fails that check falls back to the
  * plain form, so a preimage is never left readable-but-wrong.
  *
- * Never throws. A memory outranks its receipt: a store that refuses the blob
+ * Never throws, unless `log` does. A memory outranks its receipt: a store that refuses the blob
  * (disk full, closed store) must not lose the summary the LLM just paid for,
  * so failures are loud on stderr and non-fatal — the same stance
  * `logCompressionCall` takes. A hash mismatch means the request object

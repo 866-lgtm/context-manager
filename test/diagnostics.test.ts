@@ -5,6 +5,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { format } from 'node:util';
 import { namespaceDiagnostics, withNamespace } from '../src/diagnostics.js';
 
 describe('withNamespace', () => {
@@ -34,10 +35,27 @@ describe('namespaceDiagnostics', () => {
     namespace = 'agents/wren';
     log.error('[autobiographical] write failed:', cause);
     log.warn('[autobiographical] repaired 2 chunk record(s)');
+    log.warn('[autobiographical] repair failed:', cause);
     assert.deepEqual(errors, [
       ['[autobiographical] write failed:', cause],
       ['[autobiographical] write failed: ns=agents/wren', cause],
     ]);
-    assert.deepEqual(warnings, [['[autobiographical] repaired 2 chunk record(s) ns=agents/wren']]);
+    assert.deepEqual(warnings, [
+      ['[autobiographical] repaired 2 chunk record(s) ns=agents/wren'],
+      ['[autobiographical] repair failed: ns=agents/wren', cause],
+    ]);
+  });
+
+  it('prints a namespace holding % as written, before the arguments that follow the message', (t) => {
+    const printed: string[] = [];
+    // Formatted as console formats its arguments.
+    t.mock.method(console, 'error', (...args: unknown[]) => printed.push(format(...args)));
+    const log = namespaceDiagnostics(() => 'agents/100%s');
+    log.error('[autobiographical] write failed:', 'disk full');
+    log.error('[autobiographical] repaired');
+    assert.deepEqual(printed, [
+      '[autobiographical] write failed: ns=agents/100%s disk full',
+      '[autobiographical] repaired ns=agents/100%s',
+    ]);
   });
 });

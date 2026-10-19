@@ -764,6 +764,13 @@ describe('sharded writes declare their group size', () => {
         assert.equal(bodies.find((b) => b.messageId === id)?.complete, true, `${id}: stored whole`);
       }
       cm.close();
+      // A manager in a namespace names it (#239).
+      const named = await ContextManager.open({ path, strategy: new PassthroughStrategy(), namespace: 'agents/tern' });
+      named.onMessage(() => { throw new Error('listener failed'); });
+      logged.length = 0;
+      named.addMessage('bob', [text('named')]);
+      assert.ok(logged.some((l) => l.includes('onMessage listener threw') && l.includes('the write stands: ns=agents/tern')), logged.join('\n'));
+      named.close();
     } finally {
       console.error = error;
       rmSync(path, { recursive: true, force: true });

@@ -2250,7 +2250,7 @@ describe('compression refusal recall curves', () => {
     first.manager.close();
   });
 
-  it('distinct namespaces run concurrent exhaustion independently and quarantine both', async () => {
+  it('distinct namespaces run concurrent exhaustion independently and quarantine both', async (t) => {
     const calls: RecordedCall[] = [];
     const membrane = {
       complete: async (request: NormalizedRequest) => {
@@ -2280,6 +2280,14 @@ describe('compression refusal recall curves', () => {
       compressed: false,
     };
 
+    // Each alert's line names the namespace it alerts for (#239).
+    const alerts: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => {
+      const line = String(args[0]);
+      if (line.startsWith('{') && line.includes('"compression:quarantine-alert"')) {
+        alerts.push(String((JSON.parse(line) as { namespace?: unknown }).namespace));
+      }
+    });
     await Promise.all([
       first.strategy.run(first.target, managerContext(first.manager)),
       second.run(secondChunk, secondCtx),
@@ -2290,6 +2298,7 @@ describe('compression refusal recall curves', () => {
       assert.equal(events.filter((event) => event.kind === 'exhausted').length, 1);
       assert.equal(events.filter((event) => event.kind === 'alert_sent').length, 1);
     }
+    assert.deepEqual(alerts.sort(), ['beta', 'default']);
     assert.equal(first.strategy.quarantineKeysView().length, 1);
     assert.equal(second.quarantineKeysView().length, 1);
     secondManager.close();
