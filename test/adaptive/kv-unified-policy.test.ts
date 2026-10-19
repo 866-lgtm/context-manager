@@ -1966,16 +1966,91 @@ test('a joint forest that exceeded the ceiling is not solved again while the can
   const reuse: KvUnifiedReuse = {};
   const first = build('joint', 40, reuse);
   assert.equal(first.strategy.lastTimings?.demandSolves, individual.strategy.lastTimings!.demandSolves + 1, 'premise: the joint attempt failed');
-  const holders = [...reuse.whatIf!.values()].filter((holder) => holder.jointCeiling !== undefined);
-  assert.equal(holders.length, 1, 'the joint holder remembers the ceiling');
-  assert.equal(holders[0].jointCeiling, 40);
+  const holders = [...reuse.whatIf!.values()].filter((holder) => holder.jointFailure !== undefined);
+  assert.equal(holders.length, 1, 'the joint holder remembers the failure');
   const second = build('joint', 40, reuse);
   assert.deepEqual(second.result.produced, first.result.produced);
   assert.equal(second.strategy.lastTimings?.demandSolves, individual.strategy.lastTimings!.demandSolves, 'no joint attempt');
-  assert.ok([...reuse.whatIf!.values()].some((holder) => holder.jointCeiling === 40), 'and still remembers it');
+  assert.ok([...reuse.whatIf!.values()].some((holder) => holder.jointFailure !== undefined), 'and still remembers it');
   // A different ceiling is a new question.
   const roomy = build('joint', 10_000, reuse);
   assert.equal(roomy.strategy.lastTimings?.demandSolves, 1, 'measured once with room');
+});
+
+test('a remembered joint ceiling failure is forgotten when the wall changes', () => {
+  // The six-leaf fixture over a ceiling of 40 at a wall of 500; at 405 the
+  // joint forest fits. A holder carried from the failed compile must not
+  // keep the ranking individual at the new wall.
+  const fixture = (): PickerInputs => {
+    const chronicle = new MockChronicle({ recallPairTokens: 60, mergeThreshold: 2 });
+    const raw = [90, 130, 70, 160, 110, 140];
+    const recall = [40, 75, 55, 90, 65, 80];
+    for (let index = 0; index < 6; index++) {
+      const id = `latent-${index}`;
+      chronicle.addChunk({ id, rawTokens: raw[index] });
+      chronicle.chunks[index].salience = 0.4 + 0.1 * index;
+      const l1 = chronicle.produceL1([id]);
+      chronicle.recallPairTokens.set(l1.id, recall[index]);
+    }
+    return {
+      chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+    };
+  };
+  const build = (budget: number, reuse: KvUnifiedReuse) => {
+    const strategy = new KvUnifiedStrategy({
+      policy: { alpha: 0.7, budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0, budgetOverLambda: 100_000, cacheLambda: 0, continuityLambda: 0 },
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 40, adoptEpsilon: 90_000, reuse,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode: 'joint' },
+    });
+    const result = strategy.solve(fixture(), { totalBudget: budget, targetBudget: budget * 0.9, slack: 0.1 });
+    return { strategy, result };
+  };
+  const reuse: KvUnifiedReuse = {};
+  const wide = build(500, reuse);
+  assert.ok([...reuse.whatIf!.values()].some((holder) => holder.jointFailure !== undefined), 'premise: the joint solve failed at 500');
+  assert.ok(wide.strategy.lastTimings!.demandSolves > 1, 'premise: the individual ranking ran');
+  const fresh = build(405, {});
+  assert.equal(fresh.strategy.lastTimings?.demandSolves, 1, 'premise: at 405 the joint forest fits');
+  assert.ok(fresh.result.produced.length > 0, 'premise: and the set is demanded');
+  const carried = build(405, reuse);
+  assert.equal(carried.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again at the new wall');
+  assert.deepEqual(carried.result.produced, fresh.result.produced);
+});
+
+test('a root the forest treeified away from a crossed parent is not a merge candidate', () => {
+  // Six leaves under one L1 each and a stored L2 over c0 and c2 alone: the
+  // forest removes the crossed L2, so the L1s of c0 and c2 are roots in it,
+  // but their stored entries still name the parent and the merge queue
+  // skips a source with one. The candidate runs break at those two (c1
+  // alone, then c3..c5), so the only merge demanded is one the queue can
+  // build, c3..c4, where before c0..c1 and c2..c3 were demanded and never
+  // queued.
+  const build = (mode: 'individual' | 'joint') => {
+    const chronicle = new MockChronicle({ recallPairTokens: 60, mergeThreshold: 2 });
+    const l1s = [];
+    for (let i = 0; i < 6; i++) {
+      chronicle.addChunk({ id: `c${i}`, rawTokens: 100 });
+      l1s.push(chronicle.produceL1([`c${i}`]));
+    }
+    const crossed = chronicle.produceUpper(2, [l1s[0].id, l1s[2].id]);
+    assert.ok(chronicle.summaries.get(l1s[0].id)?.parentId === crossed.id, 'premise: the stored L1 names the parent');
+    const inputs: PickerInputs = {
+      chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+    };
+    const strategy = new KvUnifiedStrategy({
+      policy: latentPolicy(0.25), treeifyNonContiguousSummaries: true,
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode },
+    });
+    return strategy.solve(inputs, { totalBudget: 400, targetBudget: 360, slack: 0.1 });
+  };
+  for (const mode of ['joint', 'individual'] as const) {
+    const result = build(mode);
+    assert.deepEqual(result.produced.map((request) => [request.level, request.range.firstChunkId, request.range.lastChunkId]),
+      [[2, 'c3', 'c4']], mode);
+  }
 });
 
 test('joint latent demand what-if solves reuse their forests across compiles without changing the ranking', () => {

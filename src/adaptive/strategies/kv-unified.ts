@@ -7,7 +7,7 @@ import type {
 } from '../folding-strategy.js';
 import type { PickerInputs } from '../picker.js';
 import { CanonicalSummaryForest, SparseLabelCeilingError } from '../kv-unified.js';
-import type { SummaryEntry } from '../../types/strategy.js';
+import { getSummaryParentId, type SummaryEntry } from '../../types/strategy.js';
 import {
   ParetoKvUnifiedPolicySolver,
   type ParetoPolicySolveResult,
@@ -387,12 +387,13 @@ export class KvUnifiedStrategy implements FoldingSolver {
       return solveWithLatentCandidates(inputs, whatIf, conservative, options, budget.totalBudget);
     };
     // A joint forest that exceeded the ceiling last compile, with the same
-    // candidate set and ceiling, would exceed it again: its holder says so,
-    // and is kept so that it still says so next compile.
+    // candidate set and the same inputs that decide the label count, would
+    // exceed it again: its holder says so, and is kept so that it still
+    // says so next compile.
     const key = whatIfKey(conservative);
-    const ceiling = this.options.labelCeiling ?? Number.POSITIVE_INFINITY;
+    const failure = jointFailureSignature(inputs, this.options, budget.totalBudget, policy);
     const remembered = whatIf.carried?.get(key);
-    if (remembered?.jointCeiling === ceiling) {
+    if (remembered?.jointFailure === failure) {
       whatIf.kept?.set(key, remembered);
       return this.rankIndividualLatentDemand(inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier);
     }
@@ -405,7 +406,7 @@ export class KvUnifiedStrategy implements FoldingSolver {
       // rather than failing on its account.
       if (!(error instanceof SparseLabelCeilingError)) throw error;
       const holder = whatIf.kept?.get(key);
-      if (holder) holder.jointCeiling = ceiling;
+      if (holder) holder.jointFailure = failure;
       return this.rankIndividualLatentDemand(inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier);
     }
   }
@@ -552,6 +553,11 @@ function latentHigherLevelCandidates(
     if (root.kind !== 'summary') { flush(); continue; }
     const summary = forest.summary(root.id);
     if (!summary) { flush(); continue; }
+    // A root whose stored entry still names a parent is one the forest
+    // treeified away from a crossed parent; the merge queue skips a source
+    // with a parent, so a merge over it would be demanded and never built.
+    const stored = inputs.summaries.get(summary.id);
+    if (stored && getSummaryParentId(stored)) { flush(); continue; }
     const previous = run.at(-1);
     if (
       previous &&
@@ -608,6 +614,20 @@ function latentHigherLevelCandidates(
       a.level - b.level ||
       a.request.range.firstChunkId.localeCompare(b.request.range.firstChunkId),
     );
+}
+
+/** What decides how many labels a joint what-if solve creates, besides the
+ * candidate set (the holder's key): the ceiling, the wall, the grid, the
+ * policy terms that enter propagation, whether a presentation exists, and
+ * the forest's size. A remembered ceiling failure is valid while these hold. */
+function jointFailureSignature(inputs: PickerInputs, options: KvUnifiedOptions, maxTokens: number, policy: KvUnifiedWelfarePolicy): string {
+  return [
+    options.labelCeiling ?? '', maxTokens,
+    options.tokenBucketSize ?? '', options.continuityBucketSize ?? '', options.fidelityBucketSize ?? '',
+    policy.alpha, policy.budgetLowRatio, policy.budgetHighRatio, policy.budgetUnderLambda, policy.budgetOverLambda,
+    policy.cacheLambda, policy.cacheScale, policy.continuityLambda, policy.continuityScale, policy.ageBandSteps,
+    options.presentation ? 1 : 0, inputs.headTokens, inputs.tailTokens, inputs.chunks.length, inputs.summaries.size,
+  ].join(':');
 }
 
 /** The holder key of a what-if over these candidates at these costs. */

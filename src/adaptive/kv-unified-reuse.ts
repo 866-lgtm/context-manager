@@ -21,9 +21,11 @@ export interface KvUnifiedReuse {
    * the live one. */
   subtree?: SubtreeMemo;
   whatIf?: Map<string, KvUnifiedReuse>;
-  /** The label ceiling under which this holder's joint what-if solve
-   * exceeded it. While the candidate set and the ceiling are unchanged the
-   * joint ranking goes straight to the individual one instead of paying
-   * the propagation up to the ceiling again on every compile. */
-  jointCeiling?: number;
+  /** The inputs under which this holder's joint what-if solve exceeded the
+   * label ceiling (the ceiling, the wall, the grid, the policy terms that
+   * enter propagation, the presentation, the forest's size; the candidate
+   * set is the holder's key). While they are unchanged the joint ranking
+   * goes straight to the individual one instead of paying the propagation
+   * up to the ceiling again on every compile; a change is a new question. */
+  jointFailure?: string;
 }
