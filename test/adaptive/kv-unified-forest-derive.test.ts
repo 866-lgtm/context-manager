@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { CanonicalSummaryForest } from '../../src/adaptive/kv-unified.js';
+import { CanonicalForestError, CanonicalSummaryForest } from '../../src/adaptive/kv-unified.js';
 import type { PickerInputs, PickerChunk } from '../../src/adaptive/picker.js';
 import { MockChronicle } from './harness.js';
 import { KvUnifiedStrategy } from '../../src/adaptive/strategies/kv-unified.js';
@@ -245,6 +245,85 @@ test('derive never reuses a treeified forest after a treeified L1 stops listing 
   assert.deepEqual(full.leaf('d')?.summaryIds, [B.id, P.id], 'premise: the full build puts d under P again');
   const derived = CanonicalSummaryForest.derive(first, next, treeify) ?? full;
   assert.deepEqual(shape(derived), shape(full));
+});
+
+test('derive never reuses a treeified forest after a treeified parent stops listing a child, which untreeifies the parent', () => {
+  // a, b, c, d under their own L1s. L2 P lists La and Lc, around b, so its
+  // leaves aren't contiguous; L2 R lists Ld; L3 Q lists P and R, so its leaves
+  // a, c and d aren't contiguous either. Both are treeified, so a and c keep
+  // their L1s alone and d keeps [Ld, R]. Once Q stops listing P, Q's leaves
+  // are d's alone, and a full build puts d under Q.
+  const { inputs: base, P, Q, R, Ld } = greptileShape();
+  const first = new CanonicalSummaryForest(base, treeify);
+  assert.deepEqual([...first.treeifiedSummaryIds].sort(), [P.id, Q.id].sort(), 'premise: P and Q are treeified');
+  assert.deepEqual(first.leaf('d')?.summaryIds, [Ld.id, R.id], 'premise: d is under R alone');
+  const next = nextCompile(base);
+  next.summaries.get(Q.id)!.sourceIds = [R.id];
+  const full = new CanonicalSummaryForest(next, treeify);
+  assert.deepEqual(full.leaf('d')?.summaryIds, [Ld.id, R.id, Q.id], 'premise: the full build puts d under Q');
+  const derived = CanonicalSummaryForest.derive(first, next, treeify) ?? full;
+  assert.deepEqual(shape(derived), shape(full));
+});
+
+/** Greptile's shape, built with MockChronicle: a, b, c, d under their own L1s,
+ *  P listing the L1s of a and c, R listing d's, Q listing P and R. */
+function greptileShape() {
+  const chronicle = new MockChronicle({ recallPairTokens: 55 });
+  for (const id of ['a', 'b', 'c', 'd']) chronicle.addChunk({ id, rawTokens: 90 });
+  const [La, , Lc, Ld] = ['a', 'b', 'c', 'd'].map((id) => chronicle.produceL1([id]));
+  const P = chronicle.produceUpper(2, [La!.id, Lc!.id]);
+  const R = chronicle.produceUpper(2, [Ld!.id]);
+  const Q = chronicle.produceUpper(3, [P.id, R.id]);
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  return { chronicle, inputs, P, Q, R, Ld: Ld! };
+}
+
+test('derive rebuilds a treeified forest even when the listing changes on the entries the old inputs hold', () => {
+  // The strategy passes its live entries in a new map each compile, so an
+  // entry edited in place shows the new state in the old inputs too.
+  const { chronicle, inputs, Q, R } = greptileShape();
+  const first = new CanonicalSummaryForest(inputs, treeify);
+  assert.ok(first.treeifiedSummaryIds.length > 0, 'premise: the forest is treeified');
+  Q.sourceIds = [R.id];
+  const next: PickerInputs = { ...inputs, chunks: chronicle.chunks.map((c) => ({ ...c })), summaries: new Map(chronicle.summaries) };
+  assert.equal(inputs.summaries.get(Q.id)!.sourceIds.length, 1, 'premise: the old inputs show the edit');
+  assert.equal(CanonicalSummaryForest.derive(first, next, treeify), null);
+});
+
+test('derive rebuilds a treeified forest when a summary no chain reaches is removed, which a full build reports', () => {
+  const removals: Array<[string, (s: ReturnType<typeof greptileShape>) => string]> = [
+    ['the treeified L2 P', (s) => s.P.id],
+    ['the treeified L3 Q', (s) => s.Q.id],
+  ];
+  for (const [name, pick] of removals) {
+    const shape = greptileShape();
+    const first = new CanonicalSummaryForest(shape.inputs, treeify);
+    const next = nextCompile(shape.inputs);
+    (next.summaries as Map<string, unknown>).delete(pick(shape));
+    assert.throws(() => new CanonicalSummaryForest(next, treeify), CanonicalForestError, `premise: a full build reports ${name} missing`);
+    assert.equal(CanonicalSummaryForest.derive(first, next, treeify), null, `with ${name} removed`);
+  }
+  // T lists two treeified L2s, one over a and c, one over b and d: T's leaves
+  // are contiguous, but it's on no chain once the two are cut.
+  const chronicle = new MockChronicle({ recallPairTokens: 55 });
+  for (const id of ['a', 'b', 'c', 'd']) chronicle.addChunk({ id, rawTokens: 90 });
+  const [La, Lb, Lc, Ld] = ['a', 'b', 'c', 'd'].map((id) => chronicle.produceL1([id]));
+  const P1 = chronicle.produceUpper(2, [La!.id, Lc!.id]);
+  const P2 = chronicle.produceUpper(2, [Lb!.id, Ld!.id]);
+  const T = chronicle.produceUpper(3, [P1.id, P2.id]);
+  const inputs: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const first = new CanonicalSummaryForest(inputs, treeify);
+  assert.ok(!first.leaf('a')!.summaryIds.includes(T.id), 'premise: T is on no chain');
+  const next = nextCompile(inputs);
+  (next.summaries as Map<string, unknown>).delete(T.id);
+  assert.throws(() => new CanonicalSummaryForest(next, treeify), CanonicalForestError, 'premise: a full build reports T missing');
+  assert.equal(CanonicalSummaryForest.derive(first, next, treeify), null, 'with T removed');
 });
 
 test('deriving twice from one forest leaves every forest coherent', () => {

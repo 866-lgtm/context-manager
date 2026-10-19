@@ -996,7 +996,8 @@ export class CanonicalSummaryForest {
    * costs are identical, and the options match. Summary nodes, treeified and
    * gap-bearing sets are shared. Leaves whose own fields or head/tail
    * membership changed are rebuilt; the rest are shared. Returns null when a
-   * full build is needed, which the caller does with the constructor.
+   * full build is needed, which the caller does with the constructor, and
+   * always for a forest that treeified a summary.
    */
   static derive(
     previous: CanonicalSummaryForest,
@@ -1013,6 +1014,13 @@ export class CanonicalSummaryForest {
       !Number.isFinite(inputs.headTokens) || inputs.headTokens < 0 ||
       !Number.isFinite(inputs.tailTokens) || inputs.tailTokens < 0
     ) return null;
+    // Treeification takes summaries a full build walks off their leaves'
+    // chains, and so off summaryMap, the record the checks below compare
+    // against. A listing change, an edit in place or a removal around them can
+    // then change what a full build makes without any check here seeing it,
+    // so a treeified forest is rebuilt in full. A forest that isn't treeified
+    // places every summary a chain reaches.
+    if (previous.treeifiedSummaryIds.length > 0) return null;
     const pi = previous.sourceInputs;
     // Summaries are compared with the previous forest's own record of them:
     // the strategy updates a child's parent link on the entry object itself
@@ -1047,10 +1055,6 @@ export class CanonicalSummaryForest {
       const leaf = oldLeaves[i], b = chunks[i];
       if (leaf.id !== b.id || leaf.sequence !== b.sequence) return null;
       const l1Id = leaf.summaryIds.length > 0 ? leaf.summaryIds[0] : undefined;
-      // A leaf that treeification left with no chain still links an L1, which
-      // may since have stopped listing it, so its emptiness proves nothing:
-      // a full build decides, as extend would for a treeified forest.
-      if (l1Id === undefined && b.l1Id !== undefined && previous.treeifiedSummaryIds.length > 0) return null;
       if (l1Id !== listedL1Id(b, inputs.summaries)) {
         // A leaf may become owned; any other change of ownership is a full build.
         if (l1Id !== undefined) return null;
