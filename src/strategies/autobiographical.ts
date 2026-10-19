@@ -13286,6 +13286,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
   }): void {
     this.requireLoadedBranch('reportKvUnifiedAccepted');
+    if (args.submissionId !== this.kvUnifiedReceipts.inFlightSubmissionId) {
+      // A callback for a submission already settled, or superseded by a later
+      // one, is a duplicate to the receipt chain, which changes nothing, and
+      // the chain refuses any other id. Either way the pending state is left
+      // as it is, for the in-flight submission's own callback (what it is when
+      // nothing is in flight, reportKvUnifiedFailed says).
+      this.kvUnifiedReceipts.accept(args.submissionId, args.acceptedAt ?? Date.now(), null);
+      return;
+    }
     let cache: ProviderCacheReference | null = null;
     if (
       args.wireReceipt &&
@@ -13308,7 +13317,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } else if (
       args.wireReceipt &&
       args.wireReceipt.markers.length > 0 &&
-      args.submissionId === this.kvUnifiedReceipts.inFlightSubmissionId &&
       this.kvUnifiedPendingLayout &&
       this.kvUnifiedPendingImmutablePrefixHash &&
       !this.kvUnifiedMarkerMismatchReported
@@ -13316,10 +13324,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The request carried markers, but not one for each layout boundary its
       // compile reconciled them to, which reconcileKvUnifiedMarkerIndices'
       // contract rules out. A request with none (prompt caching off) has
-      // nothing to match. The pending compile is the in-flight submission's,
-      // so only a callback for that submission is compared with it, not a late
-      // one for a submission already settled, which the receipt chain takes as
-      // a duplicate.
+      // nothing to match.
       this.kvUnifiedMarkerMismatchReported = true;
       const boundaries = this.kvUnifiedPendingMarkerUnitIndices.length;
       this.diag.error(
@@ -13365,7 +13370,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   reportKvUnifiedFailed(submissionId: string): void {
     this.requireLoadedBranch('reportKvUnifiedFailed');
+    const inFlight = submissionId === this.kvUnifiedReceipts.inFlightSubmissionId;
     this.kvUnifiedReceipts.fail(submissionId);
+    // As for an acceptance, a callback for any other submission leaves the
+    // pending state as it is: the in-flight submission's, or, after an
+    // acceptance that threw once the chain had settled its submission, that
+    // submission's, which the next begin replaces.
+    if (!inFlight) return;
     this.kvUnifiedPendingLayout = null;
     this.kvUnifiedPendingMarkerUnitIndices = [];
     this.kvUnifiedPendingImmutablePrefixHash = null;
