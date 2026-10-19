@@ -12963,9 +12963,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     },
     // 4: a tool result the per-tool limit replaces, or a tool_use input over
     // the input cap, under the host's config: both were priced whole before.
+    // So was every result of a tool whose limit in a map isn't a number, such
+    // as a null from a caller outside TypeScript. Before, such a limit was
+    // read as one (null as 0, replacing each result); now it sets none, and
+    // its results are priced as they are sent, whole.
     4: (messages, strategy, store) => {
       const pruning = strategy.toolPruning(store);
       if (pruning.replaced.size > 0) return true;
+      const limits = strategy.config.toolResultMaxLastN as Record<string, unknown> | number | null | undefined;
+      if (typeof limits === 'object' && limits !== null) {
+        const unread = new Set(Object.keys(limits).filter((tool) => limits[tool] !== undefined && typeof limits[tool] !== 'number'));
+        const tools = new Map<string, string>();
+        for (const m of unread.size > 0 ? messages : []) {
+          for (const b of m.content) {
+            if (b.type === 'tool_use') tools.set(b.id, b.name);
+            else if (b.type === 'tool_result' && unread.has(tools.get(b.toolUseId) ?? '')) return true;
+          }
+        }
+      }
       if (!(pruning.inputCap > 0)) return false;
       return messages.some((m) => m.content.some((b) => b.type === 'tool_use' && truncatedToolUse(b, pruning.inputCap) !== null));
     },

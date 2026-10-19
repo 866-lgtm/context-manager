@@ -569,6 +569,15 @@ describe('tool pruning, priced as sent', () => {
       reopened.cm.close();
     });
 
+    it('discards a multiplier from epoch 3 in a store whose limit for a tool was null', async () => {
+      // A null limit for a tool replaced each of its results before, priced
+      // whole; now it sets no limit, so a multiplier learned then is stale.
+      const reopened = await reopenWith({ multiplier: 0.89, at: 1, pricing: 3 }, { toolResultMaxLastN: { lookup: null } });
+      assert.equal(reopened.internals._calibration, 1);
+      assert.equal(reopened.cm.getRenderStats()!.calibration!.reset?.fromEpoch, 3);
+      reopened.cm.close();
+    });
+
     it('keeps a multiplier from epoch 3, re-stamped, where the limit replaces nothing', async () => {
       const reopened = await reopenWith({ multiplier: 0.89, at: 1, pricing: 3 }, { toolResultMaxLastN: 5 });
       assert.equal(reopened.internals._calibration, 0.89);
@@ -592,6 +601,8 @@ describe('tool pruning, priced as sent', () => {
       assert.equal(reprices(two, at({ toolResultMaxLastN: 1 }), view(two)), true, 'a replaced result');
       assert.equal(reprices(two, at({ toolResultMaxLastN: 2 }), view(two)), false, 'a limit nothing reaches');
       assert.equal(reprices(two, at({}), view(two)), false, 'no limit');
+      assert.equal(reprices(two, at({ toolResultMaxLastN: { lookup: null } }), view(two)), true, "a tool's null limit, read as 0 before");
+      assert.equal(reprices(two, at({ toolResultMaxLastN: { other: null } }), view(two)), false, 'a null limit for a tool with no results');
       const big = conversation(1, { body: 'x'.repeat(2_000) });
       assert.equal(reprices(big, at({ toolUseInputMaxTokens: 100 }), view(big)), true, 'an input over the cap');
       assert.equal(reprices(big, at({ toolUseInputMaxTokens: 1_000 }), view(big)), false, 'an input under the cap');

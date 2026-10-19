@@ -12,13 +12,14 @@
   spends its budget on that result's text, and the message is priced as it's
   sent, where it was priced at what the cap left of the result.
   - The estimator's calibration starts pricing epoch 4. A store holding a
-    result the limit replaces, or an input over the input cap, discards a
-    multiplier learned under 3, with an `[estimator-calibration]` warning and
-    `calibration.reset` in the render stats, and restarts from a provisional
-    1, which the first provider sample the sanity band accepts sets outright.
-    Kept, a multiplier learned low
+    result the limit replaces, an input over the input cap, or a result of a
+    tool whose limit is null (which replaced every result of that tool
+    before) discards a multiplier learned under 3, with an
+    `[estimator-calibration]` warning and `calibration.reset` in the render
+    stats, and restarts from a provisional 1, which the first provider sample
+    the sanity band accepts sets outright. Kept, a multiplier learned low
     against the over-count would price every window low once the over-count
     was gone, and a compile could go out over its hard budget by that margin
     with no refusal. At 1, a compile is off by the store's own multiplier
     until the first accepted sample, normally the first compile's. A store
-    holding neither keeps its multiplier.
+    holding none of these keeps its multiplier.
