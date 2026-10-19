@@ -88,6 +88,7 @@ const passthroughKeys = [
   'mergeHoldSummaryIds',
   'summaryTargetTokens',
   'identityReminder',
+  'witnessedIdentityReminder',
   'witnessedBeforeSequence',
   'witnessedInstruction',
 ] as const;
