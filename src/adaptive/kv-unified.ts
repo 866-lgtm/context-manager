@@ -1940,6 +1940,13 @@ export class CanonicalSummaryForest {
       floorTokens === null || !Number.isFinite(maxTokens)
         ? 0
         : Math.max(0, floorTokens - maxTokens);
+    // Producing the missing levels clears the refusal only where every
+    // conflicting leaf, given the levels it requests, has a level all its
+    // constraints admit. A lock against a pin at another level, or a raw pin
+    // against an exact constraint at a missing level, conflicts still.
+    const producingClears = missingLevels.length > 0 && this.constraintConflicts.every((conflict) =>
+      [...conflict.availableLevels, ...conflict.requestedMissingLevels].some((level) =>
+        conflict.constraints.every((constraint) => constraintAdmits(constraint, level))));
     return {
       reason,
       floorTokens,
@@ -1948,11 +1955,24 @@ export class CanonicalSummaryForest {
       missingLevels,
       requiredAdditionalTokens,
       suggestion:
-        reason === 'constraint-conflict'
-          ? 'Release or reconcile the listed constraints, or produce the missing levels.'
-          : `Raise W by at least ${requiredAdditionalTokens} tokens, or release a binding protection.`,
+        reason !== 'constraint-conflict'
+          ? `Raise W by at least ${requiredAdditionalTokens} tokens, or release a binding protection.`
+          : producingClears
+            ? 'Release or reconcile the listed constraints, or produce the missing levels.'
+            : 'Release or reconcile the listed constraints.',
     };
   }
+}
+
+/** Whether a leaf constraint admits `level`, as buildLeaf reads it: a
+ *  constraint whose own level isn't a non-negative integer admits nothing. */
+function constraintAdmits(constraint: CanonicalLeafConstraint, level: number): boolean {
+  if (constraint.kind === 'raw') return level === 0;
+  const bound = constraint.level;
+  if (bound === undefined || !Number.isInteger(bound) || bound < 0) return false;
+  if (constraint.kind === 'exact') return level === bound;
+  if (constraint.kind === 'max') return level <= bound;
+  return level >= bound;
 }
 
 function mergeCuts(a: PartialCut, b: PartialCut): PartialCut {
