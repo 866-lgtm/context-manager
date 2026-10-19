@@ -1,4 +1,4 @@
-import { afterEach, test } from 'node:test';
+import { afterEach, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -130,6 +130,104 @@ test('kv-unified failed submission clears single flight without committing', asy
   selected.reportKvUnifiedFailed('s1');
   assert.equal(receipts(selected).head, null);
   assert.equal(receipts(selected).inFlightSubmissionId, null);
+  manager.close();
+});
+
+/** The pending compile a begun submission carries, as its acceptance will read it. */
+function pendingOf(strategy: AutobiographicalStrategy) {
+  const fields = strategy as unknown as {
+    kvUnifiedPendingLayout: unknown;
+    kvUnifiedPendingMarkerUnitIndices: number[];
+    kvUnifiedPendingRender: unknown;
+  };
+  return {
+    layout: fields.kvUnifiedPendingLayout,
+    markers: fields.kvUnifiedPendingMarkerUnitIndices.length,
+    render: fields.kvUnifiedPendingRender,
+  };
+}
+
+/** A wire receipt with one marker per boundary the compile marked, so the acceptance builds a reference. */
+function wireReceiptFor(requestHash: string, markers: number) {
+  return {
+    requestHash,
+    markers: Array.from({ length: markers }, (_, ordinal) => ({
+      ordinal,
+      prefixHash: `prefix-${ordinal}`,
+      estimatedOffset: ordinal + 1,
+    })),
+  };
+}
+
+/** A store with s1 begun on one compile, then s2 begun on a later compile that has a message more, so
+ *  each has its own draft. s2 supersedes s1, and the line that logs it is the one console.error left
+ *  unprinted. */
+async function twoSubmissions(t: TestContext) {
+  const original = console.error.bind(console);
+  t.mock.method(console, 'error', (...args: unknown[]) => {
+    if (!args.map(String).join(' ').includes('was never settled')) original(...args);
+  });
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  const compile = () => manager.compile(
+    { maxTokens: 10_000, reserveForResponse: 0 },
+    undefined,
+    { kvUnifiedImmutablePrefixHash: 'immutable-v1' },
+  );
+  manager.addMessage('user', [{ type: 'text', text: 'hello continuity' }]);
+  await compile();
+  selected.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+  const first = pendingOf(selected);
+  manager.addMessage('assistant', [{ type: 'text', text: 'hello again' }]);
+  await compile();
+  selected.beginKvUnifiedSubmission({ submissionId: 's2', requestHash: 'wire2', layoutHash: 'layout2' });
+  const second = pendingOf(selected);
+  assert.ok(second.markers > 0, "premise: s2's compile marks a boundary");
+  assert.ok(second.render, "premise: s2's compile took a render record");
+  assert.notEqual(second.layout, first.layout, "premise: s2's draft isn't s1's");
+  return { selected, manager, first, second };
+}
+
+/** s2's acceptance keeps the reference its own compile describes: its layout, a marker per boundary
+ *  and its render record. */
+function acceptKeepsS2(selected: AutobiographicalStrategy, second: ReturnType<typeof pendingOf>): void {
+  assert.equal(receipts(selected).inFlightSubmissionId, 's2', 's2 is still in flight');
+  selected.reportKvUnifiedAccepted({ submissionId: 's2', acceptedAt: 2, wireReceipt: wireReceiptFor('wire2', second.markers) });
+  const cache = receipts(selected).cache;
+  assert.equal(receipts(selected).head?.submissionId, 's2');
+  assert.ok(cache, "s2's acceptance keeps a cache reference");
+  assert.equal(cache.immutablePrefixHash, 'immutable-v1');
+  assert.equal(cache.layout, second.layout, "it holds s2's own layout");
+  assert.equal(cache.markers.length, second.markers);
+  assert.equal(cache.render, second.render, "and s2's render record");
+}
+
+// The receipt chain takes a late accept or fail for a submission a later one superseded as a
+// duplicate, "never a state change" (KvUnifiedReceiptChain.begin), so it must leave the
+// in-flight submission's pending compile for that submission's own acceptance.
+for (const late of ['accept', 'fail'] as const) {
+  test(`a late ${late} for a superseded submission leaves the in-flight one its cache reference`, async (t) => {
+    const { selected, manager, first, second } = await twoSubmissions(t);
+    if (late === 'accept') {
+      selected.reportKvUnifiedAccepted({ submissionId: 's1', acceptedAt: 1, wireReceipt: wireReceiptFor('wire1', first.markers) });
+    } else {
+      selected.reportKvUnifiedFailed('s1');
+    }
+    acceptKeepsS2(selected, second);
+    manager.close();
+  });
+}
+
+// The chain refuses a callback for a submission it never began; the strategy hands it on rather than
+// dropping it, and the refusal leaves the in-flight submission's pending compile alone.
+test('a callback for a submission never begun is refused, and leaves the in-flight one its cache reference', async (t) => {
+  const { selected, manager, second } = await twoSubmissions(t);
+  assert.throws(
+    () => selected.reportKvUnifiedAccepted({ submissionId: 's0', acceptedAt: 1, wireReceipt: wireReceiptFor('wire0', second.markers) }),
+    /does not match the in-flight submission/,
+  );
+  assert.throws(() => selected.reportKvUnifiedFailed('s0'), /does not match the in-flight submission/);
+  acceptKeepsS2(selected, second);
   manager.close();
 });
 
