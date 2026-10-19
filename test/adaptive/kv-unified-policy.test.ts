@@ -4,6 +4,11 @@ import assert from 'node:assert/strict';
 import {
   ExactKvUnifiedPolicySolver,
   KvUnifiedPolicyError,
+  MAX_AGE_BAND_STEPS,
+  bandedAge,
+  continuityLeafBase,
+  fidelityLeafBase,
+  normalizePolicy,
   type AcceptedPresentationReference,
   type ExactPolicyCandidate,
 } from '../../src/adaptive/kv-unified-policy.js';
@@ -1605,4 +1610,89 @@ test('latent demand what-if solves reuse their own forests across compiles witho
       assert.ok(holder.certificate === undefined || holder.certificate !== reuse.certificate);
     }
   }
+});
+
+test('bandedAge reads an age at the lower edge of its geometric band', () => {
+  for (const age of [0, 0.5, 1, 2, 3, 7, 8, 1000.5]) assert.equal(bandedAge(age, 0), age, 'steps 0 is exact');
+  for (const age of [0, 0.5]) assert.equal(bandedAge(age, 4), age, 'ages below 1 are not banded');
+  assert.deepEqual([1, 2, 3, 4, 7, 8, 15, 16, 17].map((age) => bandedAge(age, 1)), [1, 2, 2, 4, 4, 8, 8, 16, 16]);
+  const steps = 4;
+  const ratio = 2 ** (1 / steps);
+  let previous = 0;
+  for (let age = 1; age < 5000; age += 0.37) {
+    const edge = bandedAge(age, steps);
+    assert.ok(edge <= age && age < edge * ratio, `age ${age} sits in [${edge}, ${edge * ratio})`);
+    assert.ok(edge >= previous, 'bands do not run backwards');
+    previous = edge;
+  }
+  for (let power = 0; power < 20; power++) {
+    const age = 2 ** power;
+    assert.equal(bandedAge(age, steps), age, 'an age on a doubling is its own edge');
+    if (power > 0) {
+      // 2^p / 2^(1/4) and 2^(p-1) * 2^(3/4) name the same edge but land an
+      // ulp apart under some Math.pow implementations (node 24 vs 22).
+      const below = bandedAge(age - 1e-9, steps);
+      assert.ok(Math.abs(below - age / ratio) <= 4 * Number.EPSILON * age, `just below ${age} is the band under it, got ${below}`);
+    }
+  }
+  assert.equal(bandedAge(2 ** 0.75 * 1.0000001, 4), 2 ** 0.75, 'just above an edge is that edge');
+  for (const s of [1, 4, 64]) {
+    const top = bandedAge(Number.MAX_VALUE, s);
+    assert.ok(Number.isFinite(top) && top <= Number.MAX_VALUE, `steps ${s}: the top of the range stays finite (${top})`);
+  }
+});
+
+test('banded ages move a weight only when the age crosses a band edge', () => {
+  const chunk = { id: 'c', sequence: 100, rawTokens: 1000, currentResolution: 0, pinned: false, lockedByAgent: false };
+  const banded = normalizePolicy({ ageBandSteps: 1 });
+  const exact = normalizePolicy({ ageBandSteps: 0 });
+  // Ages 8..15 share a band at one step per doubling; 16 starts the next.
+  const fidelity = (newest: number, policy = banded) => fidelityLeafBase(chunk, newest, policy);
+  assert.equal(fidelity(100 + 7), fidelity(100 + 14), 'ages 8 and 15 price alike');
+  assert.notEqual(fidelity(100 + 14), fidelity(100 + 15), 'age 16 is the next band');
+  assert.equal(fidelity(100 + 7), fidelity(100 + 7, exact), 'an edge prices as the exact age does');
+  assert.notEqual(fidelity(100 + 14), fidelity(100 + 14, exact));
+  const previous = { repHash: 'raw:c', level: 0, lastChangedSeq: 100 };
+  const continuity = (midpointTokens: number, currentSeq: number, policy = banded) =>
+    continuityLeafBase(chunk, previous, currentSeq, midpointTokens, policy);
+  // Recency 8192..16383 tokens and stability 8..15 turns are one band each.
+  assert.equal(continuity(8_192, 108), continuity(16_383, 115), 'recency and stability share bands too');
+  assert.notEqual(continuity(8_192, 108), continuity(16_384, 108));
+  assert.notEqual(continuity(8_192, 108), continuity(8_192, 116));
+  assert.equal(continuity(8_192, 108), continuity(8_192, 108, exact));
+  assert.equal(normalizePolicy({}).ageBandSteps, 0, 'the solver-level default is exact');
+  assert.throws(() => normalizePolicy({ ageBandSteps: -1 }), KvUnifiedPolicyError);
+  assert.throws(() => normalizePolicy({ ageBandSteps: Number.NaN }), KvUnifiedPolicyError);
+  assert.throws(() => normalizePolicy({ ageBandSteps: 0.5 }), KvUnifiedPolicyError, 'a band count is an integer');
+  assert.equal(normalizePolicy({ ageBandSteps: MAX_AGE_BAND_STEPS }).ageBandSteps, MAX_AGE_BAND_STEPS);
+  assert.throws(() => normalizePolicy({ ageBandSteps: MAX_AGE_BAND_STEPS + 1 }), KvUnifiedPolicyError, 'a band count is bounded');
+});
+
+test('banded continuity holds stability, reads it at doublings, and saturates recency', () => {
+  const chunk = { id: 'c', sequence: 100, rawTokens: 1000, currentResolution: 0, pinned: false, lockedByAgent: false };
+  const banded = normalizePolicy({ ageBandSteps: 4 });
+  const exact = normalizePolicy({ ageBandSteps: 0 });
+  const previous = { repHash: 'raw:c', level: 0, lastChangedSeq: 100 };
+  const continuity = (midpointTokens: number, currentSeq: number, policy = banded) =>
+    continuityLeafBase(chunk, previous, currentSeq, midpointTokens, policy);
+  const moved = 100;
+  const stableHalfLife = banded.continuityStableHalfLife;
+  // Stability is 1 for the first half of a half-life after a move, whatever
+  // the band count; exact ages decay from the first turn.
+  const hold = Math.ceil(stableHalfLife / 2) - 1;
+  assert.equal(continuity(1, moved), continuity(1, moved + hold), 'held for half a half-life');
+  assert.notEqual(continuity(1, moved), continuity(1, moved + hold + 1), 'then it decays');
+  assert.notEqual(continuity(1, moved, exact), continuity(1, moved + 1, exact), 'exact decays at once');
+  // From there it is read at whole doublings, not at the 4 bands per doubling
+  // the other ages use.
+  const doubling = 2 ** Math.ceil(Math.log2(Math.max(1, stableHalfLife / 2)));
+  assert.equal(continuity(1, moved + doubling), continuity(1, moved + 2 * doubling - 1), 'one band per doubling');
+  assert.notEqual(continuity(1, moved + doubling), continuity(1, moved + 2 * doubling), 'the doubling is the edge');
+  assert.notEqual(continuity(1, moved + doubling, exact), continuity(1, moved + doubling + 1, exact));
+  // Recency is at its floor from eight half-lives out; exact ages keep decaying.
+  const halfLife = banded.continuityRecencyHalfLifeTokens;
+  assert.equal(continuity(8 * halfLife, moved), continuity(16 * halfLife, moved), 'saturated at eight half-lives');
+  assert.equal(continuity(8 * halfLife, moved), continuity(64 * halfLife, moved));
+  assert.notEqual(continuity(4 * halfLife, moved), continuity(8 * halfLife, moved), 'not before');
+  assert.notEqual(continuity(8 * halfLife, moved, exact), continuity(16 * halfLife, moved, exact));
 });

@@ -51,6 +51,17 @@ export interface KvUnifiedWelfarePolicy {
   readonly continuityRecencyFloor: number;
   readonly continuityStableHalfLife: number;
   readonly continuityStableFloor: number;
+  /** Geometric bands the three age measures are read at, as bands per
+   * doubling: a leaf's fidelity age (sequences from the newest leaf), its
+   * continuity recency (tokens from the live edge) and its stability (turns
+   * since it last moved) are each priced at the lower edge of the band they
+   * fall in, so a weight changes only when the age crosses a band edge.
+   * Exact ages change every leaf's weight on every append, which is what
+   * keeps a solve from reusing any score from the compile before (#45). 0
+   * prices exact ages. With banding on, the stability age is 0 for half a
+   * half-life after a move and read at whole doublings from there, and
+   * recency is the floor from eight half-lives out (see continuityLeafBase). */
+  readonly ageBandSteps: number;
 }
 
 export const DEFAULT_KV_UNIFIED_WELFARE_POLICY: KvUnifiedWelfarePolicy = {
@@ -69,7 +80,51 @@ export const DEFAULT_KV_UNIFIED_WELFARE_POLICY: KvUnifiedWelfarePolicy = {
   continuityRecencyFloor: 0.2,
   continuityStableHalfLife: 16,
   continuityStableFloor: 0.25,
+  // Exact at the solver level; the strategy built from a recipe fills in
+  // its own default (see KvUnifiedConfig.policy.ageBandSteps).
+  ageBandSteps: 0,
 };
+
+/** The finest banding the policy accepts: 64 bands per doubling is a
+ * step of 1.1%, below any weight's sensitivity, and keeps the edge table
+ * (one entry per band, scanned per leaf) small. */
+export const MAX_AGE_BAND_STEPS = 64;
+
+/** The lower edge of the geometric band `age` falls in, with `steps` bands
+ * per doubling: 2^(floor(log2(age) · steps) / steps). Ages below 1 and a
+ * `steps` of 0 are returned as given. */
+export function bandedAge(age: number, steps: number): number {
+  if (!(steps > 0) || !(age >= 1) || !Number.isFinite(age)) return age;
+  // The octave the age falls in, then its band within the octave from the
+  // table of fractional edges (every solve calls this three times per
+  // leaf, so no pow per call). Floating-point: log2 of an age beside a
+  // doubling can floor an octave off either way; the doublings decide. The
+  // exponent is capped where 2^exponent is still finite.
+  let exponent = Math.min(1023, Math.floor(Math.log2(age)));
+  let octave = 2 ** exponent;
+  if (octave > age) { exponent--; octave /= 2; }
+  else if (octave * 2 <= age) { exponent++; octave *= 2; }
+  const edges = bandEdges(steps);
+  const ratio = age / octave;
+  let k = edges.length - 1;
+  while (k > 0 && edges[k] > ratio) k--;
+  return octave * edges[k];
+}
+
+const bandEdgeTables = new Map<number, Float64Array>();
+
+/** The fractional edges of one octave at `steps` bands per doubling:
+ * 2^(k/steps) for k in [0, steps). */
+function bandEdges(steps: number): Float64Array {
+  let table = bandEdgeTables.get(steps);
+  if (!table) {
+    const count = Math.max(1, Math.ceil(steps));
+    table = new Float64Array(count);
+    for (let k = 0; k < count; k++) table[k] = 2 ** (k / steps);
+    bandEdgeTables.set(steps, table);
+  }
+  return table;
+}
 
 export class KvUnifiedPolicyError extends Error {
   constructor(message: string) {
@@ -444,6 +499,9 @@ export function normalizePolicy(
   if (policy.budgetLowRatio > policy.budgetHighRatio) {
     throw new KvUnifiedPolicyError('budgetLowRatio must not exceed budgetHighRatio');
   }
+  if (!Number.isInteger(policy.ageBandSteps) || policy.ageBandSteps < 0 || policy.ageBandSteps > MAX_AGE_BAND_STEPS) {
+    throw new KvUnifiedPolicyError(`ageBandSteps must be an integer from 0 to ${MAX_AGE_BAND_STEPS}`);
+  }
   return policy;
 }
 
@@ -454,7 +512,7 @@ export function fidelityLeafBase(
   newestSequence: number,
   policy: KvUnifiedWelfarePolicy,
 ): number {
-  const age = Math.max(1, newestSequence - chunk.sequence + 1);
+  const age = bandedAge(Math.max(1, newestSequence - chunk.sequence + 1), policy.ageBandSteps);
   const salience = clamp(chunk.salience ?? 1, 0.2, 1);
   return salience * age ** (-policy.alpha) * chunk.rawTokens;
 }
@@ -478,15 +536,30 @@ export function continuityLeafBase(
   midpointAgeTokens: number,
   policy: KvUnifiedWelfarePolicy,
 ): number {
-  const recency =
-    policy.continuityRecencyFloor +
-    (1 - policy.continuityRecencyFloor) *
-      2 ** (-midpointAgeTokens / positive(policy.continuityRecencyHalfLifeTokens));
-  const tau = Math.max(0, currentSeq - previous.lastChangedSeq);
+  const halfLife = positive(policy.continuityRecencyHalfLifeTokens);
+  const recencyAge = bandedAge(midpointAgeTokens, policy.ageBandSteps);
+  // With banding on, recency is the floor from eight half-lives out (the
+  // exact age, so the cutoff sits where it is documented rather than at the
+  // first band edge past it): the decayed share is about 2^-8 of the range
+  // there (the band just below the cutoff is read at its lower edge, so the
+  // step is about 1.5x that), and every band edge past it would re-price
+  // the old history for less.
+  const recency = policy.ageBandSteps > 0 && midpointAgeTokens >= 8 * halfLife
+    ? policy.continuityRecencyFloor
+    : policy.continuityRecencyFloor + (1 - policy.continuityRecencyFloor) * 2 ** (-recencyAge / halfLife);
+  // With banding on, stability is 1 for the first half of a half-life after
+  // a move and read at whole doublings of tau from there: a move resets tau
+  // for every leaf it touched at once, and finer bands would re-price that
+  // whole region on each of its next turns.
+  const stableHalfLife = positive(policy.continuityStableHalfLife);
+  const exactTau = Math.max(0, currentSeq - previous.lastChangedSeq);
+  const tau = policy.ageBandSteps > 0
+    ? (exactTau < stableHalfLife / 2 ? 0 : bandedAge(exactTau, 1))
+    : exactTau;
   const stability =
     policy.continuityStableFloor +
     (1 - policy.continuityStableFloor) *
-      2 ** (-tau / positive(policy.continuityStableHalfLife));
+      2 ** (-tau / stableHalfLife);
   const salience = clamp(chunk.salience ?? 1, 0.2, 1);
   return salience * chunk.rawTokens * recency * stability;
 }

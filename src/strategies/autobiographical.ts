@@ -13819,6 +13819,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       const strategy = new KvUnifiedStrategy({
         ...configured,
+        // Ages are read in geometric bands unless the recipe's policy says
+        // otherwise (ageBandSteps: 0 prices exact ages); the solver treats an
+        // absent value as exact.
+        policy: { ...configured.policy, ageBandSteps: configured.policy?.ageBandSteps ?? 4 },
         // The certified hysteresis exit is on unless the recipe says
         // `hysteresisCertificate: false`. It only skips the full solve when it
         // proves the carried layout is the policy's choice, and declines to
