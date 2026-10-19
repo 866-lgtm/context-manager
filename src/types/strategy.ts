@@ -741,6 +741,13 @@ export interface CompressionQuarantineStatus {
   keys: string[];
   /** The quarantined spans, each once however many records it holds, the longest waiting first. */
   spans: CompressionQuarantineSpan[];
+  /**
+   * Present when the quarantine couldn't be read, such as when the store
+   * failed to return its ledger. `count`, `keys` and `spans` are then empty
+   * and say nothing about what's quarantined, and the alarm neither sounds
+   * its all-clear nor calls its handler until a read succeeds.
+   */
+  unreadable?: true;
 }
 
 /** One quarantined span: a chunk's messages, which stay raw while it's quarantined. */

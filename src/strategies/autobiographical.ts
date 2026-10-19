@@ -1122,6 +1122,37 @@ interface ActiveCompressionQuarantine {
   sentAlertKeys: Set<string>;
 }
 
+/**
+ * Whether a ledger value can stand as a quarantine record: an object with a
+ * string key and chunk hash, which name the entry and its span. Every reader
+ * of an active entry takes its record as given, and the ledger is read back
+ * from the store unchecked, so a value edited or damaged there can be
+ * anything.
+ */
+function isUsableQuarantineRecord(record: unknown): record is CompressionRefusalQuarantineRecord {
+  return typeof record === 'object' && record !== null &&
+    typeof (record as { key?: unknown }).key === 'string' &&
+    typeof (record as { chunkSourceHash?: unknown }).chunkSourceHash === 'string';
+}
+
+/** A quarantine entry's outcomes as read back from the ledger: the objects in a list that carry a string `outcome`, and nothing else. */
+function outcomeList(value: unknown): CompressionRefusalOutcomeRecord[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is CompressionRefusalOutcomeRecord =>
+      typeof entry === 'object' && entry !== null && typeof (entry as { outcome?: unknown }).outcome === 'string')
+    : [];
+}
+
+/**
+ * Whether a ledger value can stand as an entry's generation: a non-empty
+ * string, as every writer makes one (an event id chronicle assigns, or
+ * `legacy:<key>`). Clears and alerts find an entry by comparing generations
+ * with `===`, which a value read back as an object could never satisfy.
+ */
+function isUsableGenerationId(value: unknown): value is string {
+  return typeof value === 'string' && value !== '';
+}
+
 interface SerializedCompressionQuarantine {
   generationId: string;
   record: CompressionRefusalQuarantineRecord;
@@ -1719,7 +1750,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * deciding a viable request by chance: if each call failed independently
    * 30% of the time, a request would see eight failures in a row about
    * 0.007% of the time. A decided L1 family is quarantined until its chunk
-   * compresses, the paid-off sweep clears it, or an operator does; a decided
+   * compresses, the paid-off sweep clears it, an operator does, or its ledger
+   * entry is found unusable (projectCompressionQuarantineEvents); a decided
    * merge counts one of its bounded attempts.
    */
   static readonly COMPRESSION_PERSISTENT_FAILURES = 8;
@@ -2375,6 +2407,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.initializingBranchIdentity = null;
     this.compressionBranchGeneration++;
     this.clearBranchMirrors();
+    // Damage in the quarantine is named once per load: this load's reads name
+    // what they find, on whatever store, namespace and branch it binds to.
+    this.namedDroppedQuarantineKeys.clear();
+    this.namedUnlistedQuarantineState.clear();
 
     // Bind to the chronicle store + namespace for persistent strategy state.
     this.store = ctx.store;
@@ -4267,14 +4303,35 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return plan;
   }
 
+  /**
+   * The active quarantine, replayed from the ledger (and the legacy snapshot
+   * before it). An entry is made only from a usable record
+   * (isUsableQuarantineRecord) and a usable generation (isUsableGenerationId),
+   * whichever event or snapshot carries them, and an exhaustion's record must
+   * carry the exhaustion's own key, which clears, alerts and checkpoints go
+   * by. An entry left out that way is no longer in the quarantine, so it no
+   * longer holds its chunk back: a chunk no other entry holds is tried again.
+   * The key of each ledger entry left out for that reason, and not in the
+   * quarantine through another event, goes into `dropped`, for the caller to
+   * name. A checkpoint, known by its kind, replaces what came before it with
+   * its list. One that holds no list holds no entry, so it replaces what came
+   * before it with nothing, and it goes into `unlisted` by its index in the
+   * ledger. Reading past it instead would bring back the legacy snapshot's
+   * records whose clears the checkpoint writer's redaction removed. The
+   * legacy snapshot is only read: the code that wrote it, replaced by the
+   * ledger the day it arrived, gave every record its chunk hash, so a record
+   * there without one is skipped as a keyless one always was.
+   */
   private projectCompressionQuarantineEvents(
     events: CompressionQuarantineEvent[],
     legacyRecords: CompressionRefusalQuarantineRecord[] = [],
+    dropped?: Set<string>,
+    unlisted?: Set<string>,
   ): Map<string, ActiveCompressionQuarantine> {
     const active = new Map<string, ActiveCompressionQuarantine>();
     const legacyClaims = new Map<string, ActiveCompressionQuarantine>();
     for (const record of legacyRecords) {
-      if (!record || typeof record.key !== 'string') continue;
+      if (!isUsableQuarantineRecord(record)) continue;
       active.set(record.key, {
         generationId: `legacy:${record.key}`,
         record,
@@ -4284,22 +4341,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         sentAlertKeys: new Set([record.key]),
       });
     }
-    for (const event of events) {
-      if (!event || typeof event.key !== 'string') continue;
+    for (const [index, event] of events.entries()) {
+      if (!event) continue;
+      // A checkpoint is known by its kind; its key isn't read.
       if (event.kind === 'checkpoint') {
         active.clear();
-        for (const item of event.active ?? []) {
-          if (!item?.record || typeof item.record.key !== 'string' || !item.generationId) continue;
+        if (!Array.isArray(event.active)) {
+          unlisted?.add(`the ledger's checkpoint at index ${index}`);
+          continue;
+        }
+        for (const item of event.active) {
+          if (!isUsableGenerationId(item?.generationId) || !isUsableQuarantineRecord(item.record)) {
+            const key = (item as { record?: { key?: unknown } | null } | null | undefined)?.record?.key;
+            if (typeof key === 'string') dropped?.add(key);
+            continue;
+          }
           active.set(item.record.key, {
             generationId: item.generationId,
             record: item.record,
-            outcomes: Array.isArray(item.outcomes) ? item.outcomes : [],
+            outcomes: outcomeList(item.outcomes),
             ...(item.pendingAlert ? { pendingAlert: item.pendingAlert } : {}),
             sentAlertKeys: new Set(Array.isArray(item.sentAlertKeys) ? item.sentAlertKeys : []),
           });
         }
         continue;
       }
+      if (typeof event.key !== 'string') continue;
       if (event.kind === 'claim') {
         const generationId = event.eventId;
         if (!generationId) continue;
@@ -4312,20 +4379,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         continue;
       }
       if (event.kind === 'exhausted') {
-        const generationId = event.record ? event.eventId : event.targetClaimId;
-        const base = event.record
-          ? {
-              generationId: generationId!,
-              record: event.record,
-              outcomes: event.outcomes,
-              sentAlertKeys: new Set<string>(),
-            }
-          : generationId ? legacyClaims.get(generationId) : undefined;
-        if (!base || !generationId) continue;
+        // An exhaustion carries its record, or (in the format before the
+        // record moved onto it) targets the claim that does.
+        const own = Boolean(event.record);
+        const record = own
+          ? event.record
+          : event.targetClaimId ? legacyClaims.get(event.targetClaimId)?.record : undefined;
+        const generationId = own ? event.eventId : event.targetClaimId;
+        if (!isUsableQuarantineRecord(record) || record.key !== event.key || !isUsableGenerationId(generationId)) {
+          dropped?.add(event.key);
+          continue;
+        }
         active.set(event.key, {
-          ...base,
           generationId,
-          outcomes: event.outcomes,
+          record,
+          outcomes: outcomeList(event.outcomes),
+          sentAlertKeys: new Set<string>(),
         });
         continue;
       }
@@ -4340,16 +4409,86 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (current.pendingAlert?.eventId === event.pendingEventId) current.pendingAlert = undefined;
       }
     }
+    // A key a damaged event named can stand in the quarantine through an
+    // earlier or later usable one; only keys left out of it are named.
+    if (dropped) for (const key of dropped) if (active.has(key)) dropped.delete(key);
     return active;
   }
 
+  /**
+   * The quarantine, read from the store. A ledger or legacy snapshot whose
+   * value isn't a list holds no entry the strategy can use, so it's read as
+   * holding nothing, as a ledger that isn't a list always was, and named
+   * (reportUnlistedQuarantineState). A ledger like that has lost the clears
+   * it held too, so the legacy snapshot it superseded isn't read beside it,
+   * as a checkpoint that holds no list replaces what came before it with
+   * nothing (projectCompressionQuarantineEvents): its cleared records would
+   * come back. A stored null reads as no value at all.
+   */
   private readCompressionQuarantineProjection(): Map<string, ActiveCompressionQuarantine> {
     if (!this.store) return new Map();
     const ledger = this.store.getStateJson(this.compressionRefusalQuarantineLedgerStateId);
     const legacy = this.store.getStateJson(this.compressionRefusalQuarantineStateId);
-    return this.projectCompressionQuarantineEvents(
+    const dropped = new Set<string>();
+    const unlisted = new Set<string>();
+    const ledgerHoldsNoList = ledger != null && !Array.isArray(ledger);
+    if (ledgerHoldsNoList) unlisted.add('the ledger');
+    if (legacy != null && !Array.isArray(legacy)) unlisted.add('the legacy snapshot');
+    const active = this.projectCompressionQuarantineEvents(
       Array.isArray(ledger) ? ledger as CompressionQuarantineEvent[] : [],
-      Array.isArray(legacy) ? legacy as CompressionRefusalQuarantineRecord[] : [],
+      !ledgerHoldsNoList && Array.isArray(legacy) ? legacy as CompressionRefusalQuarantineRecord[] : [],
+      dropped,
+      unlisted,
+    );
+    if (dropped.size > 0) this.reportDroppedQuarantineEntries(dropped);
+    if (unlisted.size > 0) this.reportUnlistedQuarantineState(unlisted);
+    return active;
+  }
+
+  /** What of the quarantine's stored state a line has named as holding no list, so each is named once per load (initialize clears it). */
+  private namedUnlistedQuarantineState = new Set<string>();
+
+  /**
+   * Name each stored quarantine value, or checkpoint in the ledger, that
+   * holds no list, once per load: it's read as holding nothing, so the
+   * quarantine has lost whatever it held.
+   */
+  private reportUnlistedQuarantineState(what: Set<string>): void {
+    const fresh = [...what].filter((name) => !this.namedUnlistedQuarantineState.has(name));
+    if (fresh.length === 0) return;
+    for (const name of fresh) this.namedUnlistedQuarantineState.add(name);
+    const one = fresh.length === 1;
+    this.diag.warn(
+      `[compression-quarantine] on branch '${this.store?.currentBranch().name ?? ''}', ${fresh.join(' and ')} ` +
+        `${one ? 'holds' : 'hold'} no list, so the quarantine reads no entry from ${one ? 'it' : 'them'} ` +
+        `and has lost whatever ${one ? 'it' : 'they'} held`,
+    );
+  }
+
+  /** Keys of ledger entries the projection left out that a line has named, so each is named once per load (initialize clears it). */
+  private namedDroppedQuarantineKeys = new Set<string>();
+
+  /**
+   * Name the ledger entries the projection left out for want of a usable
+   * record or generation, each once per load. Such an entry is no longer in
+   * the quarantine, so it no longer holds its chunk back, and a chunk no
+   * other entry holds (durableQuarantineFor) is tried again. No clear
+   * reaches it, since a clear takes only what's in the quarantine; it stays
+   * in the ledger, read past, until a checkpoint
+   * (checkpointCompressionQuarantineIfNeeded, once the ledger holds
+   * COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS events) rewrites the ledger
+   * without it.
+   */
+  private reportDroppedQuarantineEntries(keys: Set<string>): void {
+    const fresh = [...keys].filter((key) => !this.namedDroppedQuarantineKeys.has(key));
+    if (fresh.length === 0) return;
+    for (const key of fresh) this.namedDroppedQuarantineKeys.add(key);
+    const one = fresh.length === 1;
+    this.diag.warn(
+      `[compression-quarantine] on branch '${this.store?.currentBranch().name ?? ''}', left out ledger ${one ? 'entry' : 'entries'} it can't use ` +
+        `(keys=${fresh.map((key) => key.slice(0, 12)).join(',')}): ${one ? 'it no longer holds its chunk' : 'they no longer hold their chunks'} back, ` +
+        `no clear reaches ${one ? 'it' : 'them'}, and ${one ? 'it stays' : 'they stay'} in the ledger until a checkpoint ` +
+        `rewrites the ledger, which needs ${COMPRESSION_QUARANTINE_CHECKPOINT_EVENTS} events in it`,
     );
   }
 
@@ -4374,7 +4513,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // until success-clear or the paid-off sweep, which match by chunkSourceHash
     // and so clear every shape of the span, or an operator's clear: of every
     // record, or of one by its key, which leaves the span's other shapes
-    // counting toward the cap.
+    // counting toward the cap. A shape whose ledger entry is found unusable
+    // is left out of the projection, and so stops counting too.
     const sameHash = [...projection.values()].filter(
       (active) => active.record.chunkSourceHash === record.chunkSourceHash &&
         active.record.normalizedConfig?.accountingVersion === COMPRESSION_BUDGET_ACCOUNTING_VERSION,
@@ -4542,10 +4682,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * connectome-doctor) and the repeating alarm below.
    */
   getCompressionQuarantineStatus(now: number = Date.now()): CompressionQuarantineStatus {
-    if (!this.store) return { count: 0, keys: [], spans: [] };
+    return this.readCompressionQuarantineStatus(now).status;
+  }
+
+  /**
+   * The status, and the error when the quarantine couldn't be read, which the
+   * alarm logs. Health reads must never throw, so a read that fails comes
+   * back with `unreadable` set, which tells it from an empty quarantine.
+   */
+  private readCompressionQuarantineStatus(now: number): { status: CompressionQuarantineStatus; error?: unknown } {
+    if (!this.store) return { status: { count: 0, keys: [], spans: [] } };
     try {
       const projection = this.readCompressionQuarantineProjection();
-      if (projection.size === 0) return { count: 0, keys: [], spans: [] };
+      if (projection.size === 0) return { status: { count: 0, keys: [], spans: [] } };
       // A span can hold one record per request shape it exhausted
       // (CHUNK_QUARANTINE_SHAPE_CAP), so records overstate how many spans are
       // stuck. Each span is named by the current chunk whose message ids its
@@ -4591,20 +4740,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
       return {
-        count: projection.size,
-        keys: [...projection.keys()],
-        spans: [...spans.values()].sort((a, b) => (b.closedAgeMs ?? -1) - (a.closedAgeMs ?? -1)),
+        status: {
+          count: projection.size,
+          keys: [...projection.keys()],
+          spans: [...spans.values()].sort((a, b) => (b.closedAgeMs ?? -1) - (a.closedAgeMs ?? -1)),
+        },
       };
-    } catch {
-      // Health reads must never throw — a broken projection is itself a
-      // problem, but not one to surface by crashing the caller.
-      return { count: 0, keys: [], spans: [] };
+    } catch (error) {
+      return { status: { count: 0, keys: [], spans: [], unreadable: true }, error };
     }
   }
 
   private quarantineAlarmLastAt = 0;
   /** True while an alarm episode is open (alarmed and not yet all-cleared). */
   private quarantineAlarmActive = false;
+  /**
+   * The quarantine the open episode's alarm last sounded on, by namespace and
+   * branch: its all-clear is said only when that quarantine reads empty. Not
+   * by store object, which reopening the same store replaces.
+   */
+  private quarantineAlarmScope: { ns: string; branch: string } | null = null;
+  /** When the alarm last said the status couldn't be read, on a clock of its own so the alarm's repeat keeps its time. */
+  private quarantineUnreadableSaidAt = 0;
   /** When tick last swept ladder progress (sweepCompressionProgressIfDue). */
   private compressionProgressSweptAt = 0;
   private onQuarantineAlarm?: (status: CompressionQuarantineStatus) => void;
@@ -4616,9 +4773,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * unwired deployment cannot fail silently.
    *
    * Called with `count > 0` for each repeating alarm, and ONCE with
-   * `count === 0` when an alarm episode ends (all debt paid) — hosts should
-   * route the all-clear under a DISTINCT alert kind so a same-kind cooldown
-   * cannot swallow it.
+   * `count === 0` when an alarm episode ends (the quarantine it spoke of is
+   * empty) — hosts should route the all-clear under a DISTINCT alert kind so a
+   * same-kind cooldown cannot swallow it. The alarm speaks of the quarantine
+   * the strategy is reading: an episode follows the namespace and branch its
+   * alarm last sounded on, and only that quarantine reading empty ends it.
+   * Not called while the status can't be read (`unreadable`), or while the
+   * strategy reads another branch or namespace whose quarantine is empty,
+   * since neither says the episode's quarantine is; the stderr line says
+   * which.
    */
   setQuarantineAlarmHandler(fn: (status: CompressionQuarantineStatus) => void): void {
     this.onQuarantineAlarm = fn;
@@ -4642,12 +4805,42 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
     // Sweep BEFORE reading status: the klaxon must reflect real debt only.
     await this.sweepPaidOffQuarantineRecords();
-    const status = this.getCompressionQuarantineStatus();
+    const { status, error } = this.readCompressionQuarantineStatus(now);
+    if (status.unreadable) {
+      // A read that failed says nothing about the debt, so the episode, its
+      // repeat clock and the handler stay as they were. Said once an
+      // interval, on a clock of its own.
+      if (now - this.quarantineUnreadableSaidAt < interval) return;
+      this.quarantineUnreadableSaidAt = now;
+      this.diag.error(
+        `[compression-quarantine] ⚠️ quarantine status unreadable; the alarm stays ${this.quarantineAlarmActive ? 'up' : 'down'} until a read succeeds:`,
+        error,
+      );
+      return;
+    }
+    const scope = { ns: this.ns, branch: this.store?.currentBranch().name ?? '' };
     if (status.count === 0) {
       // All-clear must travel the SAME channel the alarm did — after an
       // alarm, silence is ambiguous (debt paid? alarm path dead?). Fires
       // once per episode, immediately on the emptying tick.
       if (this.quarantineAlarmActive) {
+        const episode = this.quarantineAlarmScope;
+        if (episode && (episode.ns !== scope.ns || episode.branch !== scope.branch)) {
+          // The alarm spoke of a quarantine this strategy isn't reading now,
+          // whose debt isn't known to be paid. The episode stays open, to end
+          // when that quarantine reads empty, and says so at the alarm's
+          // interval, with no handler call.
+          if (now - this.quarantineAlarmLastAt < interval) return;
+          this.quarantineAlarmLastAt = now;
+          // Namespaces are named on both sides when they differ.
+          const where = (at: { ns: string; branch: string }): string =>
+            `branch '${at.branch}'${episode.ns === scope.ns ? '' : ` of '${at.ns}'`}`;
+          this.diag.error(
+            `[compression-quarantine] ⚠️ the alarm for ${where(episode)} stays up while the strategy reads ${where(scope)}, ` +
+              `whose quarantine is empty; it ends with the all-clear when the strategy reads ${where(episode)} empty`,
+          );
+          return;
+        }
         this.quarantineAlarmActive = false;
         this.quarantineAlarmLastAt = 0;
         this.diag.error(
@@ -4664,6 +4857,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
     this.quarantineAlarmActive = true;
     this.quarantineAlarmLastAt = now;
+    this.quarantineAlarmScope = scope;
     // Two clocks, each labelled: how long since the span's chunk closed (how
     // long it has stayed raw), and when its earliest record was made (how
     // long it has been refused).
@@ -4712,8 +4906,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private async sweepPaidOffQuarantineRecords(): Promise<void> {
     if (!this.store) return;
+    let projection: Map<string, ActiveCompressionQuarantine>;
     try {
-      const projection = this.readCompressionQuarantineProjection();
+      projection = this.readCompressionQuarantineProjection();
+    } catch {
+      // The status read that follows fails the same way, and the alarm says
+      // so at its own interval rather than at every tick of an open episode.
+      return;
+    }
+    try {
       if (projection.size === 0) return;
       const records = this.store.getStateJson(this.chunksStateId);
       const chunkRecords = Array.isArray(records) ? (records as ChunkRecord[]) : [];
