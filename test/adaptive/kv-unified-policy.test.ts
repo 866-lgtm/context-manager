@@ -578,7 +578,7 @@ test('kv-unified a-posteriori bound covers exact welfare regret on varied small 
   }
 });
 
-test('the DAG engines charge a dropped cut only to a representative with no more tokens (#254)', () => {
+test('the DAG engines\' bound covers a cut whose heavier representative crosses the wall (#254)', () => {
   // Four 30-token leaves, two 55-token L1s and a 100-token L2, then an
   // ownerless 100-token leaf, under a 210-token wall on a coarse grid. After
   // the first four leaves the raw (120), L1 (110) and L2 (100) cuts share a
@@ -587,7 +587,8 @@ test('the DAG engines charge a dropped cut only to a representative with no more
   // over the wall (220) where the L1 cut fits (210). Charged to the raw cut,
   // the L1 cut's error left with it, and the surviving L2 cut carried none,
   // so the bound read 0 beside the worse cut. The oracle's answer is the L1
-  // cut, and every engine's reported bound has to cover it.
+  // cut. The DAG engines still select a worse one, and their reported bound
+  // has to cover the difference, as every engine's does.
   const chronicle = new MockChronicle({ recallPairTokens: 55 });
   for (let i = 0; i < 4; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 30 });
   const a = chronicle.produceL1(['c0', 'c1']);
@@ -608,13 +609,16 @@ test('the DAG engines charge a dropped cut only to a representative with no more
   assert.ok(oracle.feasible);
   assert.equal(oracle.selected.frontier.get('c0'), 1, 'the oracle takes the L1 cut');
   assert.equal(oracle.selected.renderedTokens, 210, 'which fits the wall exactly');
-  const over = GRID_ENGINES.flatMap((engine) => {
+  const results = GRID_ENGINES.map((engine) => {
     const result = new ParetoKvUnifiedPolicySolver(inputs, forest).solve({ ...options, ...engine.options });
     assert.ok(result.feasible, engine.name);
-    const bound = result.propagation!.approximationScoreErrorBound;
-    return result.selected.score <= oracle.selected.score + bound + 1e-6 ? []
-      : [`${engine.name}: ${result.selected.score} vs oracle ${oracle.selected.score} + bound ${bound}`];
+    return { name: engine.name, score: result.selected.score, bound: result.propagation!.approximationScoreErrorBound };
   });
+  for (const { name, score } of results.filter((result) => result.name !== 'subtree')) {
+    assert.ok(score > oracle.selected.score + 1e-6, `premise: ${name} selects a worse cut than the oracle, so its bound has a regret to cover (${score} vs ${oracle.selected.score})`);
+  }
+  const over = results.filter(({ score, bound }) => score > oracle.selected.score + bound + 1e-6)
+    .map(({ name, score, bound }) => `${name}: ${score} vs oracle ${oracle.selected.score} + bound ${bound}`);
   assert.deepEqual(over, [], 'every engine selects within its reported bound of the oracle');
 });
 

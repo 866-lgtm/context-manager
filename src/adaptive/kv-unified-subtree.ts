@@ -1068,12 +1068,12 @@ function bucketRepresentatives(pool: readonly Label[], cacheRelevant: boolean, o
   return result;
 }
 
-/** The DAG engines' envelope accounting, rule included: a label is covered
- * only by a representative with no more tokens than its own. These
- * labels are measured from the subtree's origin, so the wall is applied
- * again at every ancestor with the prefix added; a representative that
- * crosses it then can only take with it labels that would have crossed
- * too, and the error it carries for them is never owed. The cheapest
+/** The DAG engines' envelope accounting: a label is covered only by a
+ * representative with no more tokens than its own. These labels are
+ * measured from the subtree's origin, so the wall is applied again at
+ * every ancestor with the prefix added; a representative that crosses it
+ * then can only take with it labels that would have crossed too, and the
+ * error it carries for them is never owed. The fewest-tokens
  * representative always qualifies, so every label is covered. */
 function coverApproximationPool(pool: readonly Label[], representatives: readonly Label[], cacheRelevant: boolean): Label[] {
   const envelopes = representatives.map((label) => ({ ...label.approximation }));
