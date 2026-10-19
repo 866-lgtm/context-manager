@@ -89,7 +89,7 @@ describe('the manager\'s diagnostics', () => {
     t.after(() => rmSync(dir, { recursive: true, force: true }));
     const script = `
       import { JsStore } from '@animalabs/chronicle';
-      import { MessageStore } from ${JSON.stringify(fileURLToPath(new URL('../src/index.js', import.meta.url)))};
+      import { MessageStore } from ${JSON.stringify(new URL('../src/index.js', import.meta.url).href)};
       for (const [name, namespace] of [['isolated', 'agents/tern'], ['shared', undefined]]) {
         const store = JsStore.openOrCreate({ path: ${JSON.stringify(dir)} + '/' + name });
         MessageStore.register(store, namespace);
@@ -107,7 +107,10 @@ describe('the manager\'s diagnostics', () => {
       cwd: fileURLToPath(new URL('../../', import.meta.url)),
       env: { ...process.env, CM_CACHE_DIAG: '1' },
       encoding: 'utf8',
+      // A child that stalls fails this test by name rather than holding the whole run.
+      timeout: 60_000,
     });
+    assert.equal(result.error, undefined, String(result.error));
     assert.equal(result.status, 0, result.stderr);
     const cacheLines = result.stderr.split('\n').filter((line) =>
       line.startsWith('[cm-cache] getAllInternal MISS') ||
