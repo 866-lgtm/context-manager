@@ -277,6 +277,21 @@ test('an interior run merges at 2 even when fewer than threshold are eligible ov
   assert.deepEqual(p.pick(six, 6)?.map((s) => s.id), ['h0', 'h1'], 'five eligible, but [h0,h1] is interior');
 });
 
+test('the run just before an operator-held newest summary merges short of the threshold, down to two', () => {
+  const p = new Probe({ adaptiveResolution: true, autoTickOnNewMessage: false, mergeHoldSummaryIds: ['H'] });
+  p.setChunks(Array.from({ length: 5000 }, (_, i) => `m-${i}`));
+  const six = ['h0', 'h1', 'h2', 'h3', 'h4', 'H'].map((id, i) => summary(id, i * 10, i * 10 + 9));
+  assert.deepEqual(
+    p.pick(six, 6)?.map((s) => s.id),
+    ['h0', 'h1', 'h2', 'h3', 'h4'],
+    'the run cannot grow past the held newest summary, so it merges short of the threshold',
+  );
+  const q = new Probe({ adaptiveResolution: true, autoTickOnNewMessage: false, mergeHoldSummaryIds: ['G1', 'G2', 'H'] });
+  q.setChunks(Array.from({ length: 5000 }, (_, i) => `m-${i}`));
+  const seven = ['g0', 'G1', 'g2', 'G2', 'h0', 'h1', 'H'].map((id, i) => summary(id, i * 10, i * 10 + 9));
+  assert.deepEqual(q.pick(seven, 6)?.map((s) => s.id), ['h0', 'h1'], 'two before the held newest summary merge at two');
+});
+
 test('the compression-debt report names held ids and quarantine keys', () => {
   const p = gateProbe({ mergeHoldSummaryIds: ['h1'] });
   p.seedQuarantine(['x', 'y']);

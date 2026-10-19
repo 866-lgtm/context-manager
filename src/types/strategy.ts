@@ -1215,11 +1215,15 @@ export interface AutobiographicalConfig {
   mergeAttemptLimit?: number;
   /**
    * Operator merge holds: summary ids that are never offered as merge
-   * sources (they stay on the frontier: no summary above them forms).
-   * Held ids split the frontier into runs like a hole, so later history
-   * still merges around them. They still count as unmerged summaries,
-   * toward `maxSpeculativeL1s` and a level's `mergeThreshold`. Lifting a
-   * hold doesn't undo the merges formed around the summary: it can then
+   * sources (a held summary that hasn't merged stays on the frontier, and
+   * no summary above it forms). Held ids split the frontier into runs like
+   * a hole, so later history still merges around them. They still count as
+   * unmerged summaries: a held L1 toward `maxSpeculativeL1s`, and every
+   * held summary toward its level's `mergeThreshold`. The run of
+   * same-level summaries just before a held one can't grow past it, so it
+   * merges as a run between two summaries does, which can be at two, below
+   * `mergeThreshold`. Lifting a hold doesn't undo
+   * the merges formed around the summary: it can then
    * merge only with an unmerged summary of its level beside it, and one
    * with none beside it stays at its level. Sources of a merge quarantined
    * after provider failures are held the same way while its group could be
