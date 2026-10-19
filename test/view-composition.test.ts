@@ -92,6 +92,24 @@ describe('mergeMessageStoreViews', () => {
     assert.deepEqual(merged.getTail(2).map((m) => m.id), ['x2', 'p2']);
   });
 
+  it("answers a sequence through each view's sequenceOf, and through get where a view has none", () => {
+    const primary = fakeView([{ id: 'p1', sequence: 1 }]);
+    const reads: string[] = [];
+    primary.sequenceOf = (id) => (id === 'p1' ? 1 : undefined);
+    const get = primary.get;
+    primary.get = (id) => {
+      reads.push(id);
+      return get(id);
+    };
+    const aux = fakeView([{ id: 'x1', sequence: 2 }]);
+    const merged = mergeMessageStoreViews(primary, [aux]);
+
+    assert.equal(merged.sequenceOf?.('p1'), 1);
+    assert.equal(merged.sequenceOf?.('x1'), 2, 'the auxiliary view, through its get');
+    assert.equal(merged.sequenceOf?.('nope'), undefined);
+    assert.deepEqual(reads, [], "the primary's messages were never read");
+  });
+
   it('returns the primary view untouched when there is nothing to merge', () => {
     const primary = fakeView([{ id: 'p1', sequence: 1 }]);
     assert.equal(mergeMessageStoreViews(primary, []), primary);

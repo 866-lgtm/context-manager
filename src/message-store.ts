@@ -784,6 +784,19 @@ export class MessageStore {
   }
 
   /**
+   * A message's sequence, as `get(id)?.sequence` answers it. While the
+   * materialized cache is current (a compile has just listed the slot), it
+   * answers from there instead of reading the item through chronicle, which
+   * get() does even to report one field (#273).
+   */
+  sequenceOf(messageId: MessageId): number | undefined {
+    const index = this.lookupIndex(messageId);
+    if (index === undefined) return undefined;
+    const internal = this.cacheIsCurrent() ? this.allCache!.internals[index] : this.getInternal(index);
+    return internal?.sequence;
+  }
+
+  /**
    * Get a message as it was at a specific sequence (time travel).
    */
   getAt(messageId: MessageId, atSequence: Sequence): StoredMessage | null {
@@ -1150,6 +1163,7 @@ export class MessageStore {
     return {
       getAll: () => this.getAll(),
       get: (id) => this.get(id),
+      sequenceOf: (id) => this.sequenceOf(id),
       getFrom: (index) => this.getFrom(index),
       getTail: (count) => this.getTail(count),
       length: () => this.length(),

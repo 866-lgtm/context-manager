@@ -140,6 +140,13 @@ export function mergeMessageStoreViews(
       }
       return null;
     },
+    sequenceOf: (id: MessageId) => {
+      for (const view of [primary, ...auxiliary]) {
+        const sequence = view.sequenceOf ? view.sequenceOf(id) : view.get(id)?.sequence;
+        if (sequence !== undefined) return sequence;
+      }
+      return undefined;
+    },
     getFrom: (index: number) => all().slice(index),
     getTail: (count: number) => {
       const messages = all();
