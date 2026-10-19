@@ -432,23 +432,26 @@ describe('attribution reads what the raw entries name, not the stored history', 
     }
     const path = './test-attribution-lookups';
     rmSync(path, { recursive: true, force: true });
-    const get = MessageStore.prototype.get;
+    // The point read under get() and sequenceOf(): a read of one stored item
+    // through chronicle, whichever of them asked.
+    const proto = MessageStore.prototype as unknown as { getInternal(index: number): unknown };
+    const getInternal = proto.getInternal;
     let reads = 0;
     try {
       const cm = await ContextManager.open({ path, strategy: new EveryOther() });
       for (let i = 0; i < 40; i++) cm.addMessage(i % 2 ? 'bob' : 'alice', [text(`line ${i}`)]);
-      MessageStore.prototype.get = function (this: InstanceType<typeof MessageStore>, id) {
+      proto.getInternal = function (this: unknown, index: number) {
         reads++;
-        return get.call(this, id);
+        return getInternal.call(this, index);
       };
       const result = await cm.compile({ maxTokens: 100_000, reserveForResponse: 0 });
-      MessageStore.prototype.get = get;
+      proto.getInternal = getInternal;
       const raw = result.provenance!.messages.map((m) => (m.kind === 'raw' ? m.bodies.map((b) => [b.messageId, b.complete]) : null));
       assert.deepEqual(raw, cm.getAllMessages().filter((_, i) => i % 2 === 0).map((m) => [[m.id, true]]), 'each raw entry names its own complete body');
       assert.equal(reads, 0, `compile read ${reads} stored messages one at a time`);
       cm.close();
     } finally {
-      MessageStore.prototype.get = get;
+      proto.getInternal = getInternal;
       rmSync(path, { recursive: true, force: true });
     }
   });
