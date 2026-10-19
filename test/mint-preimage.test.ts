@@ -15,6 +15,7 @@
  *   nothing, and every test below that expects a preimage asks for one.
  */
 
+import { namespaceDiagnostics } from '../src/diagnostics.js';
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -984,6 +985,13 @@ describe('Mint preimage envelope registration', () => {
     assert.ok(
       reports.some(args => args.includes(failure)),
       `the report carries the registration failure: ${JSON.stringify(reports.map(args => String(args[0])))}`,
+    );
+    // Through the minting strategy's diagnostics, the report names its namespace (#239).
+    reports.length = 0;
+    persistMintRequestPreimage(store, request, requestHash, namespaceDiagnostics(() => 'agents/tern'));
+    assert.ok(
+      reports.some(args => args.includes(failure) && /^\[mint-preimage\] failed to persist request preimage [a-f0-9]{64}: ns=agents\/tern$/.test(String(args[0]))),
+      `the report names its namespace: ${JSON.stringify(reports.map(args => String(args[0])))}`,
     );
     store.close();
   });

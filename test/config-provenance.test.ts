@@ -131,6 +131,7 @@ interface EffectiveConfigLogLine {
   effective: Record<string, unknown>;
   provenance: Record<string, string>;
   presentAsUndefined: string[];
+  namespace: string;
 }
 
 /** The library talks to stderr for several reasons; this test is about one of
@@ -449,6 +450,9 @@ describe('AutobiographicalStrategy: effective-config report', () => {
     assert.strictEqual(emitted.filter((line) => line.includes('\n')).length, 0);
     const report = reports[0]!;
     assert.strictEqual(report.strategy, 'autobiographical');
+    // The namespace it was initialized in, a field of the line, so one process's strategies'
+    // reports can be told apart (#239): the manager's default here.
+    assert.strictEqual(report.namespace, 'default');
     assert.strictEqual(report.effective.targetChunkTokens, 1234);
     assert.strictEqual(report.provenance.targetChunkTokens, 'caller');
     assert.strictEqual(report.provenance.recentWindowTokens, 'library-default');

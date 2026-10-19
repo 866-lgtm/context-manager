@@ -1,3 +1,4 @@
+import type { Diagnostics } from './diagnostics.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
@@ -28,14 +29,20 @@ export class ContextLog {
   private tokenEstimator: (text: string) => number;
   private stateId: string;
 
+  /** Where its lines go: its manager's, which name the namespace the log is (#239). */
+  private readonly log: Diagnostics;
+
   constructor(
     private store: JsStore,
     options: {
       estimator?: (text: string) => number;
       /** Namespace for multi-agent support. Creates state ID: `{namespace}/context` */
       namespace?: string;
+      /** Where its stderr lines go; the console when not given. */
+      diagnostics?: Diagnostics;
     } = {}
   ) {
+    this.log = options.diagnostics ?? console;
     this.stateId = ContextLog.stateIdFor(options.namespace);
     this.blobManager = new BlobManager(store);
     this.tokenEstimator = options.estimator ?? defaultTokenEstimator;
@@ -382,7 +389,7 @@ export class ContextLog {
       sourceRelation: internal.sourceRelation,
       participant: internal.participant,
       content: this.blobManager.resolveBlobs(
-        wellFormedContent(internal.content, `context entry ${internal.index}`, this.malformedLogged),
+        wellFormedContent(internal.content, `context entry ${internal.index}`, this.malformedLogged, this.log),
       ),
       cacheMarker: internal.cacheMarker,
     };

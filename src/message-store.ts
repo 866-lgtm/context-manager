@@ -1,3 +1,4 @@
+import type { Diagnostics } from './diagnostics.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
@@ -230,13 +231,23 @@ export class MessageStore {
   private tokenEstimator: (text: string) => number;
   private stateId: string;
 
+  /**
+   * Where its lines go: an isolated slot is one namespace's, and its lines
+   * name it; a shared slot is no one namespace's, and its lines name none
+   * (#239).
+   */
+  private readonly log: Diagnostics;
+
   constructor(
     private store: JsStore,
     options: TokenEstimatorOptions & {
       /** Namespace for multi-agent support. Creates state ID: `{namespace}/messages` */
       namespace?: string;
+      /** Where its stderr lines go; the console when not given. */
+      diagnostics?: Diagnostics;
     } = {}
   ) {
+    this.log = options.diagnostics ?? console;
     this.stateId = options.namespace
       ? `${options.namespace}/messages`
       : DEFAULT_MESSAGE_STATE_ID;
@@ -568,7 +579,7 @@ export class MessageStore {
     // The old content as a read gives it, so an edit can replace a message
     // whose stored content doesn't match ContentBlock.
     const oldContent = this.blobManager.resolveBlobs(
-      wellFormedContent(oldMessage.content, `message ${messageId}`, this.malformedLogged),
+      wellFormedContent(oldMessage.content, `message ${messageId}`, this.malformedLogged, this.log),
     );
     const storedContent = this.blobManager.extractBlobs(newContent);
 
@@ -1842,7 +1853,7 @@ export class MessageStore {
   ): StoredMessage {
     // What doesn't match ContentBlock is left out before anything reads it,
     // blob resolution included (well-formed-content.ts).
-    const content = wellFormedContent(internal.content, `message ${id}`, this.malformedLogged);
+    const content = wellFormedContent(internal.content, `message ${id}`, this.malformedLogged, this.log);
     const stored: StoredMessage = {
       id,
       // chronicle record sequence captured when the message was appended

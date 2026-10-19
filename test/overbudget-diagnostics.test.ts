@@ -358,12 +358,13 @@ function answeringMembrane(during: () => void | Promise<void>): { membrane: Memb
 async function withManager(
   strategy: AutobiographicalStrategy,
   run: (manager: ContextManager) => Promise<void>,
-  opts?: { membrane?: true | Membrane },
+  opts?: { membrane?: true | Membrane; namespace?: string },
 ) {
   const directory = mkdtempSync(join(tmpdir(), 'cm-budget-diagnostics-'));
   // A stub is enough for tick to adopt an exact L1, which calls no model.
   const membrane = opts?.membrane ? { membrane: opts.membrane === true ? ({} as unknown as Membrane) : opts.membrane } : {};
-  const manager = await ContextManager.open({ path: join(directory, 'store'), strategy, ...membrane });
+  const namespace = opts?.namespace === undefined ? {} : { namespace: opts.namespace };
+  const manager = await ContextManager.open({ path: join(directory, 'store'), strategy, ...membrane, ...namespace });
   try {
     await run(manager);
   } finally {
@@ -558,7 +559,9 @@ describe('OverBudgetError diagnostics', () => {
       assert.deepEqual(error.clearedBy, [], 'no closed chunk waits for compression');
       assert.match(escalation, new RegExp(`deepestPlannedLevel=L${error.diagnostics.deepestLevel}`));
       assert.match(escalation, /deepestAvailableLevel=L5/);
-    });
+      // Its namespace ends the line (#239), so one process's strategies' lines can be told apart.
+      assert.match(escalation, / deepestAvailableLevel=L5 \(see adaptive-resolution-design\.md §13\.4\) ns=agents\/wren$/);
+    }, { namespace: 'agents/wren' });
   });
 
   it('keeps the original external constructor shape usable without inventing inventory', () => {

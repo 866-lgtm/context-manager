@@ -357,7 +357,7 @@ describe('Merge terminal-disposition gate', () => {
       assert.ok(flat.includes('raw-0') && !flat.includes(payload), 'each attempt replays the span with the marker');
     }
     const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
-    assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), ['[merge-l2]', '[merge-l2]']);
+    assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), ['[merge-l2] ns=default', '[merge-l2] ns=default']);
     assert.equal(fx.strategy.summariesView().filter((s) => s.level === 2).length, 1, 'merge canonized');
     await fx.manager.close();
   });

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { Picker } from '../../src/adaptive/picker.js';
+import { namespaceDiagnostics } from '../../src/diagnostics.js';
 import type { PickerChunk, PickerInputs } from '../../src/adaptive/picker.js';
 import type { SummaryEntry } from '../../src/types/strategy.js';
 import { FlatProfileStrategy } from '../../src/adaptive/strategies/flat-profile.js';
@@ -592,3 +593,24 @@ function runQuietly(solver: FlatProfileStrategy | OldestFirstStrategy, inputs: P
     console.error = original;
   }
 }
+
+// #239: a strategy's picker logs through the strategy's diagnostics, so its lines name the
+// namespace the strategy works for.
+test('picker: its lines name the namespace its owner gives it', () => {
+  const inputs = greedyStore([['x', 'L1-0']], [['L1-0', 1, ['x'], 30]]);
+  const solver = {
+    name: 'stub',
+    solve: () => ({ frontier: new Map([['x', 0], ['t0', 0], ['gone', 1]]), produced: [] }),
+  } as unknown as ConstructorParameters<typeof Picker>[0];
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(String(args[0])); };
+  try {
+    new Picker(solver, namespaceDiagnostics(() => 'agents/tern')).run(inputs, BUDGET(10_000, 0));
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(lines.filter((l) => l.startsWith('[picker-dead-ids]')), [
+    '[picker-dead-ids] solver=stub: dropped 1 frontier entry referencing no live chunk (store surgery residue). ns=agents/tern',
+  ]);
+});

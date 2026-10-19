@@ -754,6 +754,8 @@ describe('sharded writes declare their group size', () => {
       const middle = cm.addMessage('carol', [text('four '), text('five '), text('six')]);
       assert.deepEqual(heard, ['add', 'add', 'add', 'add', 'add', 'add', 'add'], 'every shard heard, nothing removed');
       assert.equal(logged.filter((l) => l.includes('onMessage listener threw')).length, 3);
+      // The manager's lines name its namespace, the default one here (#239).
+      assert.ok(logged.filter((l) => l.includes('onMessage listener threw')).every((l) => l.includes('the write stands: ns=default')), logged.join('\n'));
       assert.ok(logged.some((l) => l.includes(`'add' event for message ${plain};`)), 'each names the message it missed');
       assert.ok(logged.some((l) => l.includes('onMessage listener threw') && l.includes('(body group three);')), "and a shard's body group");
       const result = await cm.compile();

@@ -2936,7 +2936,8 @@ describe('prepared recall expansions: what is logged', () => {
       const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
       assert.equal(sentWithMarker.length, 1, `${location}: one sent request carried the data URL`);
       assert.equal(lines.length, 1, `${location}: one line, for the request that was sent`);
-      assert.equal(lines[0]!.endsWith('[canonical]'), location === 'parent', `${location}: ${lines[0]}`);
+      // The request's label ends the line's fields, before the namespace it was logged for (#239).
+      assert.equal(lines[0]!.endsWith('[canonical] ns=default'), location === 'parent', `${location}: ${lines[0]}`);
       fx.manager.close();
     }
   });
@@ -2962,7 +2963,7 @@ describe('prepared requests are logged when they are sent', () => {
       } finally { console.error = original; }
       assert.equal(mock.calls.length, sent ? 2 : 1);
       const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
-      assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), sent ? ['[canonical]', '[source-only-final]'] : ['[canonical]']);
+      assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), sent ? ['[canonical] ns=default', '[source-only-final] ns=default'] : ['[canonical] ns=default']);
       fx.manager.close();
     }
   });
@@ -3008,7 +3009,7 @@ describe('prepared requests are logged when they are sent', () => {
         assert.ok(!JSON.stringify(mock.calls[1]!.request).includes('private-'), 'the retry was stripped of it');
       }
       const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
-      assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), ['[canonical]'], `${name}: ${JSON.stringify(lines)}`);
+      assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), ['[canonical] ns=default'], `${name}: ${JSON.stringify(lines)}`);
       fx.manager.close();
     }
   });

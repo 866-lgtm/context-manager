@@ -64,6 +64,7 @@ import { randomUUID } from 'node:crypto';
 import type { JsStore } from '@animalabs/chronicle';
 import type { BranchRef, CompileProvenance, JournalMark, LayoutUnit, RenderedLayout } from './types/index.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
+import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
 
 export const STORE_IDENTITY_RECORD = 'context-manager/store-identity';
 export const ACCEPTED_LAYOUT_RECORD = 'context-manager/accepted-layout';
@@ -595,11 +596,15 @@ export class FoldJournal {
    *  that is ever asked, so this holds one id a branch, however long the
    *  history. An older receipt a retry finds may be heard again. */
   private readonly announced = new Map<string, string>();
+  /** stderr lines about this journal's namespace's receipts, each naming it (#239). */
+  private readonly diag: Diagnostics;
 
   constructor(
     private readonly store: JsStore,
     private readonly namespace: string,
-  ) {}
+  ) {
+    this.diag = namespaceDiagnostics(() => namespace);
+  }
 
   /**
    * Where the journal stands, for a compile to carry (see JournalMark).
@@ -817,7 +822,7 @@ export class FoldJournal {
       try {
         listener(receipt);
       } catch (err) {
-        logThrown('[fold-journal] receipt listener failed:', err);
+        logThrown('[fold-journal] receipt listener failed:', err, this.diag);
       }
     }
   }

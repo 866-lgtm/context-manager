@@ -58,6 +58,7 @@ import { randomUUID } from 'node:crypto';
 import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
 import { FoldJournal, branchRefOf } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
+import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
 import type { FoldQuery, FoldQueryResult, FoldReceipt, Presentation, ReceiptSource, RoundUsage } from './fold-journal.js';
 import type {
   BranchRef,
@@ -236,6 +237,8 @@ export class ContextManager {
   private debugLogContext: boolean;
   /** Namespace passed to strategies for scoping their persistent state slots. */
   private strategyNamespace: string;
+  /** stderr lines about this manager's work, each naming its namespace (#239). */
+  private readonly diag: Diagnostics = namespaceDiagnostics(() => this.strategyNamespace);
   /** Strategy-facing exclusion predicate (see ContextManagerBaseConfig.viewFilter). */
   private viewFilter?: (message: StoredMessage) => boolean;
   /**
@@ -408,13 +411,25 @@ export class ContextManager {
       if (!isStateExistsFor(error, ContextLog.stateIdFor(config.namespace))) throw error;
     }
 
+    // Namespace passed to strategies. Falls back to a stable per-store value
+    // so strategies always have something to scope state IDs by, even when
+    // the caller didn't supply a namespace.
+    const strategyNamespace = config.namespace ?? 'default';
+    // Each store's lines name the namespace its state is: an isolated message
+    // slot's and the context log's are this manager's; a shared slot's and an
+    // auxiliary slot without a namespace are no one namespace's (#239).
+    const ownLines = namespaceDiagnostics(() => strategyNamespace);
+    const slotLines = (namespace: string | undefined): Diagnostics =>
+      namespace === undefined ? console : namespaceDiagnostics(() => namespace);
     const messageStore = new MessageStore(store, {
       estimator: config.tokenEstimator,
       namespace: messageNamespace,
+      diagnostics: slotLines(messageNamespace),
     });
     const contextLog = new ContextLog(store, {
       estimator: config.tokenEstimator,
       namespace: config.namespace,
+      diagnostics: ownLines,
     });
     const strategy = config.strategy ?? new PassthroughStrategy();
 
@@ -446,13 +461,9 @@ export class ContextManager {
       return [new MessageStore(store, {
         estimator: config.tokenEstimator,
         namespace: aux.namespace,
+        diagnostics: slotLines(aux.namespace),
       })];
     });
-
-    // Namespace passed to strategies. Falls back to a stable per-store value
-    // so strategies always have something to scope state IDs by, even when
-    // the caller didn't supply a namespace.
-    const strategyNamespace = config.namespace ?? 'default';
 
     const manager = new ContextManager(
       store,
@@ -607,7 +618,7 @@ export class ContextManager {
             }
             if (landed !== null) this.messageStore.removeBodyGroup(landed);
           } catch (removal) {
-            console.error(
+            this.diag.error(
               `[context-manager] a sharded addMessage failed partway, and removing what it wrote threw, so body group ` +
                 `${decision.bodyGroupId}${landed !== null ? ` (first shard ${landed})` : ''} may be left short: ` +
                 describeThrown(removal),
@@ -712,7 +723,7 @@ export class ContextManager {
       }
     }
     if (expired.length === 0) return;
-    console.warn(
+    this.diag.warn(
       `[context-manager] compression hold timeout: releasing ${expired.length} hold(s) — ` +
         expired.map((e) => `${e.id} (held ${e.heldFor}ms)`).join(', '),
     );
@@ -775,7 +786,7 @@ export class ContextManager {
     } catch (err) {
       // Holds are already gone; the strategy's next rebuild (addMessage,
       // compile) re-queues the work.
-      console.error('Strategy onCompressionHoldsReleased failed:', err);
+      this.diag.error('Strategy onCompressionHoldsReleased failed:', err);
     }
   }
 
@@ -877,7 +888,7 @@ export class ContextManager {
       try {
         listener(event);
       } catch (err) {
-        logThrown(`[context-manager] an onMessage listener threw on a '${event.type}' event for ${describeStoreEvent(event)}; the write stands:`, err);
+        logThrown(`[context-manager] an onMessage listener threw on a '${event.type}' event for ${describeStoreEvent(event)}; the write stands:`, err, this.diag);
       }
     });
   }
@@ -1155,7 +1166,7 @@ export class ContextManager {
       opts
     );
     const selectionCause = this.strategy.takeSelectionCause?.();
-    if (_diag) console.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
+    if (_diag) this.diag.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
 
     const viewMessages = view.getAll();
     // Raw bodies are judged as stored: the view filter can hide a shard of a
@@ -1305,7 +1316,7 @@ export class ContextManager {
       const fresh = undescribed.filter((id) => !this.undescribedSummariesReported.has(id));
       if (fresh.length > 0) {
         for (const id of fresh) this.undescribedSummariesReported.add(id);
-        console.warn(
+        this.diag.warn(
           `[context-manager] ${this.strategy.name} rendered summaries it cannot describe ` +
           `(${fresh.slice(0, 5).join(', ')}${fresh.length > 5 ? ', …' : ''}); ` +
           'no rendered layout is reported for a compile that renders them',
@@ -1450,6 +1461,7 @@ export class ContextManager {
     const entry = {
       timestamp: Date.now(),
       type: 'compiled_context',
+      namespace: this.strategyNamespace,
       messageCount: result.messages.length,
       systemInjectionCount: result.systemInjections.length,
       messages: renderedMessages,
@@ -1869,7 +1881,7 @@ export class ContextManager {
     if (this.strategy.onNewMessage) {
       // Fire and forget - don't block on strategy processing
       this.strategy.onNewMessage(message, this.createStrategyContext()).catch((err) => {
-        console.error('Strategy onNewMessage failed:', err);
+        this.diag.error('Strategy onNewMessage failed:', err);
       });
     }
   }

@@ -38,6 +38,7 @@ describe('AutobiographicalStrategy compression model contract', () => {
       manager = await ContextManager.open({
         path: STORE_PATH,
         strategy,
+        namespace: 'agents/tern',
         membrane: {
           complete: async () => {
             membraneCalls++;
@@ -69,8 +70,8 @@ describe('AutobiographicalStrategy compression model contract', () => {
 
     assert.strictEqual(membraneCalls, 0, 'an unspecified model must never reach the membrane');
     assert.ok(
-      errors.some((line) => line.includes('compressionModel is NOT configured')),
-      'the halt must be visible on stderr',
+      errors.some((line) => line.includes('compressionModel is NOT configured') && line.endsWith(' ns=agents/tern')),
+      'the halt must be visible on stderr, naming the namespace it halts (#239)',
     );
 
     const entries = readFileSync(LOG_PATH, 'utf8')
@@ -80,6 +81,8 @@ describe('AutobiographicalStrategy compression model contract', () => {
     assert.strictEqual(entries.length, 1);
     assert.strictEqual(entries[0].event, 'no-compression-model');
     assert.strictEqual(entries[0].fatal, true);
+    // One process's strategies share the log: each entry names its namespace (#239).
+    assert.strictEqual(entries[0].namespace, 'agents/tern');
     assert.strictEqual(typeof entries[0].timestamp, 'number');
   });
 });

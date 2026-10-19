@@ -320,7 +320,40 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
     assert.deepStrictEqual(strategy.pickerRunBudgets, [260], 'the live pick alone');
     assert.strictEqual(strategy.pickerRunLevels[0]!.get(x), 1, 'the plan renders N1, through x');
     assert.strictEqual(lines.length, 1, lines.join('\n'));
-    assert.match(lines[0]!, new RegExp(`sample=${y}$`));
+    assert.match(lines[0]!, new RegExp(`sample=${y} ns=default$`));
+    manager.close();
+  });
+
+  // #239: a process can host several strategies, each in its own namespace, and their lines
+  // interleave on stderr; each diagnostic of the compile names the namespace it was logged for,
+  // after its fields, so a grep for its prefix still matches. The planner's [kv-timing] lines,
+  // which KV_TIMING turns on, come through the strategy's solver and name it too.
+  it('names the strategy\'s namespace on the compile\'s [kv-overlap], [plan-vs-actual] and [kv-timing] lines', async (t) => {
+    const logged: string[] = [];
+    const original = console.error.bind(console);
+    t.mock.method(console, 'error', (...args: unknown[]) => {
+      const line = String(args[0]);
+      if (/^\[(kv-overlap|plan-vs-actual|kv-timing)\]/.test(line)) logged.push(line);
+      else original(...args);
+    });
+    const timing = process.env.KV_TIMING;
+    process.env.KV_TIMING = '1';
+    t.after(() => {
+      if (timing === undefined) delete process.env.KV_TIMING;
+      else process.env.KV_TIMING = timing;
+    });
+    const strategy = makeStrategy(overlapOptions);
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, namespace: 'agents/tern' });
+    const { y } = seedOverlap(manager, strategy);
+
+    await manager.compile({ maxTokens: 260, reserveForResponse: 0 });
+    const of = (tag: string) => logged.filter((line) => line.startsWith(`[${tag}]`));
+    assert.strictEqual(of('kv-overlap').length, 1, logged.join('\n'));
+    assert.match(of('kv-overlap')[0]!, new RegExp(`sample=${y} ns=agents/tern$`));
+    assert.strictEqual(of('plan-vs-actual').length, 1, logged.join('\n'));
+    assert.match(of('plan-vs-actual')[0]!, / solver=\S+ ns=agents\/tern$/);
+    assert.ok(of('kv-timing').length > 0, logged.join('\n'));
+    for (const line of of('kv-timing')) assert.match(line, / ns=agents\/tern$/);
     manager.close();
   });
 
@@ -353,7 +386,7 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
     assert.strictEqual(strategy.pickerRunLevels[1]!.get(x), 1, 'and so does the shadow plan');
     assert.strictEqual(lines.length, 1, lines.join('\n'));
     assert.match(lines[0]!, /1 leaf\(s\) with conflicting lineage/);
-    assert.match(lines[0]!, new RegExp(`sample=${y}$`));
+    assert.match(lines[0]!, new RegExp(`sample=${y} ns=default$`));
     manager.close();
   });
 

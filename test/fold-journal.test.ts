@@ -1720,7 +1720,8 @@ describe('fold journal durability and index', () => {
     }
     assert.equal(receipt?.kind, 'baseline', 'the acceptance stands');
     assert.equal(layoutRecords(cm.getStore()).length, 1);
-    assert.ok(written.some((w) => w.includes('receipt listener failed: [object Object]')), `reported: ${written.join('')}`);
+    // Its line names the journal's namespace (#239).
+    assert.ok(written.some((w) => w.includes('receipt listener failed: [object Object] ns=agents/tester')), `reported: ${written.join('')}`);
     cm.close();
   });
 

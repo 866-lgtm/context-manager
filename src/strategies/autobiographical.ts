@@ -78,6 +78,7 @@ import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
+import { type Diagnostics, namespaceDiagnostics, withNamespace } from '../diagnostics.js';
 
 /** A persisted reset record is trusted only if it has the expected shape. */
 function isCalibrationReset(v: unknown): v is CalibrationReset {
@@ -96,16 +97,19 @@ function isCalibrationReset(v: unknown): v is CalibrationReset {
  *
  * Failures to write are logged to stderr but don't propagate — logging
  * is non-essential observability and should never break compression.
+ *
+ * Every entry names the namespace whose compression it describes, since one
+ * process's strategies share the log (#239).
  */
-function logCompressionCall(entry: Record<string, unknown>): void {
+function logCompressionCall(entry: Record<string, unknown>, namespace: string): void {
   const logPath = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
   if (!logPath) return;
   try {
     mkdirSync(dirname(logPath), { recursive: true });
-    const line = JSON.stringify({ ...entry, timestamp: Date.now() }) + '\n';
+    const line = JSON.stringify({ ...entry, namespace, timestamp: Date.now() }) + '\n';
     appendFileSync(logPath, line);
   } catch (err) {
-    console.warn('compression log write failed:', err);
+    console.warn(withNamespace('compression log write failed:', namespace), err);
   }
 }
 
@@ -1334,6 +1338,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected store: JsStore | null = null;
   /** Namespace for state-id scoping. Set in `initialize()`. */
   protected ns: string = '';
+  /** stderr lines about this strategy's work, each naming its namespace (#239). */
+  protected readonly diag: Diagnostics = namespaceDiagnostics(() => this.ns);
   protected get summariesStateId(): string { return `${this.ns}/autobio:summaries`; }
   protected get chunksStateId(): string { return `${this.ns}/autobio:chunks`; }
   /** Memories are identity-bearing: a substitute model writing summaries in
@@ -1346,8 +1352,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const msg = "autobio: compressionModel is NOT configured - refusing to write "
         + "memories with a substitute model. Memory formation is halted until the "
         + "recipe names the model whose voice these memories are.";
-      console.error(msg);
-      logCompressionCall({ event: "no-compression-model", fatal: true });
+      this.diag.error(msg);
+      logCompressionCall({ event: "no-compression-model", fatal: true }, this.ns);
       throw new Error(msg);
     }
     return m;
@@ -1527,7 +1533,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * until a branch is loaded — and it needs no cooperation from subclasses,
    * which a post-construction hook would.
    */
-  private reportEffectiveConfigOnce(): void {
+  private reportEffectiveConfigOnce(namespace: string): void {
     const report = this.unreportedEffectiveConfig;
     if (!report) return;
     this.unreportedEffectiveConfig = null;
@@ -1540,6 +1546,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       effective: report.effective,
       provenance: report.provenance,
       presentAsUndefined,
+      namespace,
     }));
   }
   /**
@@ -1861,7 +1868,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // First use of the fully-constructed instance: the deferred effective-config
     // report is emitted here so it can name the real strategy (see
     // reportEffectiveConfigOnce).
-    this.reportEffectiveConfigOnce();
+    this.reportEffectiveConfigOnce(ctx.namespace);
     // Invalidate the committed identity before touching any branch-scoped
     // mirror. A stale caller must fail closed for the entire initialization
     // interval, not continue using the previously loaded branch.
@@ -2060,7 +2067,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(s.phaseType ? { phaseType: s.phaseType } : {}),
       });
     }
-    console.warn(
+    this.diag.warn(
       `[autobiographical] chunk-persistence migration: ${l1s.length} L1s → ` +
       `${this.chunkRecords.length} records (${skippedStale} stale generations, ` +
       `${skippedGhost} fully-orphaned L1s skipped)`,
@@ -2099,7 +2106,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     if (!found) {
-      console.warn(
+      this.diag.warn(
         `[autobiographical] markChunkRecordCompressed: ${recordId} not found in persisted chunk log`,
       );
     }
@@ -2263,7 +2270,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.summaryIdCounter = Math.max(storedCounter, pastIds);
     if (this.summaryIdCounter > storedCounter) {
       this.store.setStateJson(this.counterStateId, this.summaryIdCounter);
-      console.warn(`[autobiographical] raised the summary-id counter from ${storedCounter} to ${this.summaryIdCounter}, past the summary ids the store holds`);
+      this.diag.warn(`[autobiographical] raised the summary-id counter from ${storedCounter} to ${this.summaryIdCounter}, past the summary ids the store holds`);
     }
 
     // A compressed chunk record names its L1 and holds the ordered message
@@ -2428,7 +2435,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (malformed > 0 || dupes > 0 || droppedIds.length > 0 || keptRebuiltIds.length > 0 ||
         reparentedIds.length > 0 || clearedIds.length > 0) {
       this.store.setStateJson(this.summariesStateId, this.summaries);
-      console.warn(
+      this.diag.warn(
         `[autobiographical] repaired summary state: removed ${malformed} malformed entr(ies) and deduped ${dupes}; ` +
           `dropped empty [${emptyIds.join(', ')}], with unreadable sources or range [${unreadableIds.join(', ')}], ` +
           `naming a missing summary [${ancestorIds.join(', ')}], naming one not below it [${misplacedIds.join(', ')}], ` +
@@ -2455,7 +2462,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
       if (repairedChunkRecords > 0) {
         this.store.setStateJson(this.chunksStateId, this.chunkRecords);
-        console.warn(
+        this.diag.warn(
           `[autobiographical] repaired ${repairedChunkRecords} chunk record(s) with missing L1 summaries`,
         );
       }
@@ -2480,7 +2487,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const removed = this.mergeQueue.length - validMergeQueue.length;
       this.mergeQueue = validMergeQueue;
       this.store.setStateJson(this.mergeQueueStateId, this.mergeQueue);
-      console.warn(`[autobiographical] removed ${removed} merge queue item(s) with missing or unreadable sources`);
+      this.diag.warn(`[autobiographical] removed ${removed} merge queue item(s) with missing or unreadable sources`);
     }
 
     this.compressionRefusalQuarantine = this.readCompressionQuarantineProjection();
@@ -2579,7 +2586,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.store.setStateJson(this.kvUnifiedReceiptStateId, null);
     // Cleared only after the write: if it throws, a later compile retries.
     this.kvUnifiedReceiptSupersedePending = false;
-    console.warn(
+    this.diag.warn(
       `[autobiographical] superseded a persisted kv-unified presentation receipt: ` +
         `${String(this.config.foldingStrategy ?? 'default')} has presented from this store; ` +
         `a later switch back to kv-unified starts from an empty receipt chain`,
@@ -2992,7 +2999,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const ids = entry.sourceIds;
     const range = entry.sourceRange as { first?: unknown; last?: unknown } | null | undefined;
     if (entry.level === 1 && (range?.first !== ids[0] || range?.last !== ids[ids.length - 1])) {
-      console.warn(
+      this.diag.warn(
         `[autobiographical] storing summary ${entry.id} at L1 with its sourceRange set to its first and last ` +
           `source, a bug in the code that built it: it held ${JSON.stringify(range)}`,
       );
@@ -3930,7 +3937,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         current_strategy_generation: this.compressionBranchGeneration,
         ...(record ? { quarantine_key: record.key, canonical_request_hash: record.canonicalRequestHash } : {}),
       },
-    });
+    }, this.ns);
   }
 
   private checkpointCompressionQuarantineIfNeeded(source: CompressionOperationBranch): void {
@@ -4024,13 +4031,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this.quarantineAlarmActive) {
         this.quarantineAlarmActive = false;
         this.quarantineAlarmLastAt = 0;
-        console.error(
+        this.diag.error(
           '[compression-quarantine] ✅ ALL CLEAR — quarantine empty, debt paid; alarm stands down',
         );
         try {
           this.onQuarantineAlarm?.(status);
         } catch (error) {
-          console.error('[compression-quarantine] all-clear handler failed:', error);
+          this.diag.error('[compression-quarantine] all-clear handler failed:', error);
         }
       }
       return;
@@ -4038,7 +4045,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.quarantineAlarmActive && now - this.quarantineAlarmLastAt < interval) return;
     this.quarantineAlarmActive = true;
     this.quarantineAlarmLastAt = now;
-    console.error(
+    this.diag.error(
       `[compression-quarantine] ⚠️ ${status.count} chunk(s) in compression quarantine — ` +
         `their spans stay raw and WILL eventually exhaust the context budget. ` +
         `Operator action required (inspect refusing content; branch, pin, or clear). ` +
@@ -4047,7 +4054,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     try {
       this.onQuarantineAlarm?.(status);
     } catch (error) {
-      console.error('[compression-quarantine] alarm handler failed:', error);
+      this.diag.error('[compression-quarantine] alarm handler failed:', error);
     }
   }
 
@@ -4085,10 +4092,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ? `span already compressed (${match.summaryId ?? 'summary'})`
           : 'orphaned by chunk-boundary drift (no matching chunk record)';
         await this.clearCompressionRefusalQuarantine(key);
-        console.error(`[compression-quarantine] cleared ${key.slice(0, 12)}… — ${reason}`);
+        this.diag.error(`[compression-quarantine] cleared ${key.slice(0, 12)}… — ${reason}`);
       }
     } catch (error) {
-      console.warn('[compression-quarantine] paid-off sweep failed (records remain, klaxon persists):', error);
+      this.diag.warn('[compression-quarantine] paid-off sweep failed (records remain, klaxon persists):', error);
     }
   }
 
@@ -4109,13 +4116,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (const [key, active] of projection) {
         if (active.record.chunkSourceHash !== hash) continue;
         await this.clearCompressionRefusalQuarantine(key);
-        console.error(
+        this.diag.error(
           `[compression-quarantine] cleared ${key.slice(0, 12)}… — its chunk compressed ` +
             `successfully under a newer request shape`,
         );
       }
     } catch (error) {
-      console.warn('[compression-quarantine] success-clear failed (records remain, klaxon persists):', error);
+      this.diag.warn('[compression-quarantine] success-clear failed (records remain, klaxon persists):', error);
     }
   }
   private emitCompressionQuarantineAlert(active: ActiveCompressionQuarantine): void {
@@ -4128,10 +4135,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       model: active.record.model,
       chunk_hash: active.record.chunkSourceHash,
       outcomes: active.outcomes,
+      namespace: this.ns,
     };
     // Structured and keyed only: no summary/chunk plaintext is emitted.
     console.error(JSON.stringify(payload));
-    logCompressionCall(payload);
+    logCompressionCall(payload, this.ns);
   }
 
   private async deliverPendingCompressionQuarantineAlerts(
@@ -4166,7 +4174,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               generation_id: active.generationId,
               error_type: error instanceof Error ? error.name : typeof error,
             },
-          });
+          }, this.ns);
           continue;
         }
         if (!this.isCompressionBranchCurrent(source)) return;
@@ -4352,7 +4360,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     if (!found) {
-      console.warn(
+      this.diag.warn(
         `[autobiographical] setMergedInto: ${entry.id} not found in persisted summary log — merge state not persisted`,
       );
     }
@@ -4614,7 +4622,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
     this.mergeQuarantine.set(record.key, record);
     this.persistMergeQuarantine();
-    console.error(
+    this.diag.error(
       `[merge-topology] ⛔ refused L${targetLevel} merge over ${sourceIds.length} source(s) ` +
         `(${sourceIds.join(', ')}): ${reason}. The node was NOT minted; entry quarantined ` +
         `(key=${record.key.slice(0, 12)}). Inspect the store, then clearMergeQuarantine.`,
@@ -4623,7 +4631,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       event: 'merge:topology-refused',
       operation: `merge_l${targetLevel}`,
       metadata: { ...record },
-    });
+    }, this.ns);
   }
 
   /**
@@ -4712,7 +4720,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const detail = violations.slice(0, 20).map((v) =>
       `  L${v.level} ${v.id}: ${v.leafCount} leaves ${v.span.first}..${v.span.last}, ${v.holes} hole(s)` +
       ` e.g. ${v.holeSample.join(',')}${v.holeOwners.length ? ` owned by ${v.holeOwners.join(',')}` : ''}`).join('\n');
-    console.error(
+    this.diag.error(
       `[store-topology] ⛔ ${violations.length} summar${violations.length === 1 ? 'y owns' : 'ies own'} ` +
         `non-contiguous leaves (policy=${policy}):\n${detail}` +
         (violations.length > 20 ? `\n  … +${violations.length - 20} more` : ''),
@@ -4722,7 +4730,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       policy,
       count: violations.length,
       violations: violations.slice(0, 50),
-    });
+    }, this.ns);
     if (policy === 'reject') throw new StoreTopologyError(violations);
   }
 
@@ -4757,7 +4765,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.mergeQueue = this.mergeQueue.filter(valid);
     if (this.mergeQueue.length === before) return;
     this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
-    console.warn(
+    this.diag.warn(
       `[autobiographical] discarded ${before - this.mergeQueue.length} stale/non-contiguous ` +
         `persisted merge queue entr${before - this.mergeQueue.length === 1 ? 'y' : 'ies'}; ` +
         `the current grammar will regroup surviving orphans`,
@@ -4792,7 +4800,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
     this.store?.setStateJson(this.mergeQueueStateId, this.mergeQueue);
-    console.warn(
+    this.diag.warn(
       `[autobiographical] L${merge.level} merge attempt ${merge.attempts}/${limit} rejected ` +
         `(${rejection.outcome}${rejection.stopReason ? `, stop=${rejection.stopReason}` : ''}) — ` +
         `entry retained for retry`,
@@ -4818,7 +4826,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
     this.mergeQuarantine.set(record.key, record);
     this.persistMergeQuarantine();
-    console.error(
+    this.diag.error(
       `[merge-quarantine] ⚠️ L${merge.level} merge over ${merge.sourceIds.length} sources ` +
         `quarantined after ${record.attempts} rejected attempt(s) ` +
         `(last: ${record.lastOutcome}${record.lastStopReason ? `, stop=${record.lastStopReason}` : ''}). ` +
@@ -4829,7 +4837,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       event: 'merge:quarantined',
       operation: `merge_l${merge.level}`,
       metadata: { ...record },
-    });
+    }, this.ns);
   }
 
   protected persistMergeQuarantine(): void {
@@ -4857,7 +4865,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.mergeQuarantine.clear();
     }
     this.persistMergeQuarantine();
-    console.warn(`[merge-quarantine] cleared ${key ? `key=${key.slice(0, 12)}` : 'ALL records'} — merges eligible for re-enqueue`);
+    this.diag.warn(`[merge-quarantine] cleared ${key ? `key=${key.slice(0, 12)}` : 'ALL records'} — merges eligible for re-enqueue`);
     this.checkMergeThreshold();
   }
 
@@ -4890,7 +4898,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     if (swept > 0) {
       this.persistMergeQuarantine();
-      console.warn(`[merge-quarantine] swept ${swept} paid-off/orphaned record(s)`);
+      this.diag.warn(`[merge-quarantine] swept ${swept} paid-off/orphaned record(s)`);
       this.checkMergeThreshold();
     }
   }
@@ -4911,7 +4919,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this.mergeQuarantineAlarmActive) {
         this.mergeQuarantineAlarmActive = false;
         this.mergeQuarantineAlarmLastAt = 0;
-        console.error('[merge-quarantine] ✅ ALL CLEAR — merge quarantine empty; alarm stands down');
+        this.diag.error('[merge-quarantine] ✅ ALL CLEAR — merge quarantine empty; alarm stands down');
       }
       return;
     }
@@ -4919,7 +4927,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.mergeQuarantineAlarmActive = true;
     this.mergeQuarantineAlarmLastAt = now;
     const keys = [...this.mergeQuarantine.keys()].map((k) => k.slice(0, 12)).join(',');
-    console.error(
+    this.diag.error(
       `[merge-quarantine] ⚠️ ${this.mergeQuarantine.size} merge(s) quarantined — their sources ` +
         `stay unmerged and deep-level folding is stalled for those spans. Operator action ` +
         `required (inspect llm-calls receipts; clearMergeQuarantine to retry). keys=${keys}`,
@@ -5090,7 +5098,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const runs = this.contiguousSourceRuns(sources, messageOrder);
     const run = runs.reduce<SummaryEntry[]>((best, r) => (r.length > best.length ? r : best), []);
     if (run.length < 2) {
-      console.warn(
+      this.diag.warn(
         `[autobiographical] demand L${targetLevel} merge over ${sources.length} source(s) in ` +
           `${firstMsgId}..${lastMsgId} has no contiguous pair; nothing enqueued`,
       );
@@ -5098,7 +5106,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     if (run.length !== sources.length) {
       const left = sources.filter((s) => !run.includes(s)).map((s) => s.id);
-      console.warn(
+      this.diag.warn(
         `[autobiographical] demand L${targetLevel} merge split by a hole: enqueuing ` +
           `${run.map((s) => s.id).join(',')}; ${left.join(',')} wait for contiguous neighbours`,
       );
@@ -5207,7 +5215,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       .catch((err) => {
         // A host's withdrawal stops the drain quietly: the host asked for it.
         if (isCompressionWithdrawn(err)) return;
-        console.error('AutobiographicalStrategy: speculative-drain error:', err);
+        this.diag.error('AutobiographicalStrategy: speculative-drain error:', err);
       });
   }
 
@@ -5254,7 +5262,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.pendingCompression) return;
 
     if (!ctx.membrane) {
-      console.warn('AutobiographicalStrategy: No membrane instance for compression');
+      this.diag.warn('AutobiographicalStrategy: No membrane instance for compression');
       return;
     }
 
@@ -5457,7 +5465,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const _t0 = _diag ? Date.now() : 0;
     if (opts?.dryRun !== true) {
       this.rebuildChunks(store);
-      if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
+      if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
       // The cache-marker baseline is the last request this strategy returned.
       // A select refused after it placed its markers (assertMiddleCoverage,
       // kv-unified's marker reconcile) returns none, so its keys go back, and
@@ -5527,7 +5535,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._dryRunSelect = true;
     try {
       this.rebuildChunks(store);
-      if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
+      if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
       return this.selectPath(store, budget, opts);
     } finally {
       this._dryRunSelect = false;
@@ -5802,7 +5810,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // dry-run preview feature (fleet clones on origin/main).
     const inPreview = (this as unknown as { _previewInFlight?: boolean })._previewInFlight === true;
     if (inPreview) {
-      console.warn(
+      this.diag.warn(
         `[autobiographical] preview: ${droppedIds.length} middle message(s) would be ` +
         `dropped with no summary coverage (site=${site}, budget=${diagnostics.budget}).`,
       );
@@ -6142,10 +6150,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         divergence = { offset, suffixTokens };
       }
       const diff = describeFoldDiff(inputs, new SummaryTree(inputs), carried, next, divergence);
-      console.error(formatFoldDiff(diff));
+      this.diag.error(formatFoldDiff(diff));
       return diff;
     } catch (err) {
-      console.warn('[fold-diff] unavailable for this compile:', err);
+      this.diag.warn('[fold-diff] unavailable for this compile:', err);
       return null;
     }
   }
@@ -6204,8 +6212,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         `[plan-vs-actual] planned=${planned} actual=${actual} delta=${delta >= 0 ? '+' : ''}${delta}` +
         ` (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) budgetMet=${m?.budgetMet} exhausted=${m?.exhausted}` +
         ` moves=${m?.moves} solver=${m?.solver}`;
-      if (loud) console.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
-      else console.error(line);
+      if (loud) this.diag.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
+      else this.diag.error(line);
     }
     r.calibration = {
       multiplier: this._calibration,
@@ -6340,7 +6348,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // the recent window removes messages that no rendered summary covers,
         // so it is loss, and loss refuses the turn rather than shipping a
         // context that silently begins mid-conversation.
-        console.warn(
+        this.diag.warn(
           `[autobiographical] recent-window eviction dropped ${dropped.length} message(s) ` +
           `(budget=${maxTokens}); ${this.summaries.length === 0
             ? 'store has NO summaries — this is unrecoverable loss'
@@ -6442,13 +6450,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): void {
     if (this.config.persistMintPreimages !== true) return;
     if (!request) {
-      console.error(
+      this.diag.error(
         `[autobiographical] no authoring request retained for accepted mint ${requestHash} — ` +
           'provenance stays verifiable but unreadable',
       );
       return;
     }
-    persistMintRequestPreimage(ctx.store, request, requestHash);
+    persistMintRequestPreimage(ctx.store, request, requestHash, this.diag);
   }
 
   /**
@@ -6503,7 +6511,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //    rather than dropping. The chunk record (if any) is deliberately
     //    left uncompressed as an operator breadcrumb.
     if (chunk.messages.length > 0 && chunk.messages.every(m => coveredByL1.has(m.id))) {
-      console.warn(
+      this.diag.warn(
         `[autobiographical] dedup guard: chunk ${chunk.recordId ?? `#${chunk.index}`} ` +
         `is fully covered by existing L1s under different boundaries — dropped, not re-compressed.`,
       );
@@ -6522,7 +6530,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const key = chunk.recordId ?? chunkIdKey;
       if (!this._overlapBlocked.has(key)) {
         this._overlapBlocked.add(key);
-        console.error(
+        this.diag.error(
           `[autobiographical] OVERLAP GUARD: refusing to compress chunk ` +
           `${chunk.recordId ?? `#${chunk.index}`} — ${overlapIds.length}/${chunk.messages.length} ` +
           `of its messages are already covered by existing L1 summaries ` +
@@ -6583,7 +6591,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           summary_id: stub.id,
         },
         response: summarizeTelemetryText(stub.content),
-      });
+      }, this.ns);
       this.checkMergeThreshold();
       return;
     }
@@ -6976,7 +6984,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const chunkHasToolBlocks = cleaned.some((m) => hasToolBlocks(m.content));
     const toolsLessRefusingFamily = isToolsLessRefusingSummarizer(this.config.compressionModel ?? "");
     if ((chunkHasToolBlocks || toolsLessRefusingFamily) && !(ctx.tools && ctx.tools.length > 0)) {
-      console.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; ${chunkHasToolBlocks ? 'history contains tool blocks' : 'Fable/Mythos-family summarizer refuses tools-less requests'}) — will retry after tools are pushed`);
+      this.diag.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; ${chunkHasToolBlocks ? 'history contains tool blocks' : 'Fable/Mythos-family summarizer refuses tools-less requests'}) — will retry after tools are pushed`);
       return;
     }
 
@@ -7160,7 +7168,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           chunk_message_ids: chunk.messages.map((message) => message.id),
           canonical_request_hash: canonicalRequestHash,
         },
-      });
+      }, this.ns);
       return;
     }
 
@@ -7208,7 +7216,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // past the deferral, the quarantine skip and in-flight coalescing, and
     // before it registers as in flight, which the finally below settles.
     if (headCoveredSkipped > 0) {
-      console.warn(
+      this.diag.warn(
         `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries; ` +
           `rendering them via recall pairs (ownership wins). The token-derived head boundary ` +
           `disagrees with chunk ownership — likely store surgery or head-boundary drift.`,
@@ -7219,12 +7227,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         skipped: headCoveredSkipped,
         headStartIdx,
         headEndIdx,
-      });
+      }, this.ns);
     }
 
     if (!sourceOnly && keptSummaries.length < priorSummaries.length) {
       const dropped = priorSummaries.length - keptSummaries.length;
-      console.warn(
+      this.diag.warn(
         `autobio: compression recall-pair budget capped (${keptSummaries.length}/${priorSummaries.length} summaries kept, ` +
           `~${recallTokens} tokens, budget ${recallBudget}` +
           (pinnedRawTokens > 0 ? ` less ~${pinnedRawTokens} of pinned raw` : '') +
@@ -7238,7 +7246,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         tokens: recallTokens,
         budgetTokens: recallBudget,
         ...(pinnedRawTokens > 0 ? { pinnedRawTokens } : {}),
-      });
+      }, this.ns);
     }
 
     if (pinsOverBudget) {
@@ -7264,7 +7272,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const limit = requestTokens === undefined
         ? `exceeds compressionRecallBudgetTokens (${recallBudget})`
         : `would bring the request to ~${requestTokens} tokens, counting the line a retry adds, over compressionContextBudgetTokens (${contextBudget})`;
-      console.warn(
+      this.diag.warn(
         `autobio: L1 compression of ${chunk.messages.length} message(s) from ${chunkFirstId} recalls the summaries ` +
           `its pins override: the pinned history it would show raw (~${pinned.pinnedRawTokens} tokens in ` +
           `${pinned.pinnedRaw.length} message(s); pins: ${pins.join(', ') || 'none found'}) ${limit}. ` +
@@ -7280,7 +7288,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(requestTokens === undefined
           ? { limit: 'recall', budgetTokens: recallBudget }
           : { limit: 'context', requestTokens, budgetTokens: contextBudget }),
-      });
+      }, this.ns);
     }
 
     let settleInFlight!: (result: CompressionInFlightResult) => void;
@@ -7352,7 +7360,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (isCompressionWithdrawn(error) || !isCarrierTransportRejection(error) || !requestCarriesReasoning(attemptRequest)) {
             throw error;
           }
-          console.error(
+          this.diag.error(
             `[autobiographical] transport rejected reasoning carriers on '${curveLabel}' ` +
               `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
           );
@@ -7360,7 +7368,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             event: 'compression:carrier-transport-fallback',
             operation: 'compress_l1',
             metadata: { curveLabel, error: String(error).slice(0, 300) },
-          });
+          }, this.ns);
           // Stripping removes only blocks and the messages it empties, so the
           // prepared request stays prepared.
           acceptedRequest = stripReasoningFromRequest(attemptRequest);
@@ -7443,7 +7451,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // grown this retry). One immediate canonical retry with the no-tools
       // line, before the curve plan burns its bounded attempts.
       if (canonicalStopReason === 'tool_use') {
-        console.warn(
+        this.diag.warn(
           `[autobiographical] canonical L1 mint rejected on tool_use — retrying once with no-tools instruction`,
         );
         const retryResponse = await runAttempt(
@@ -7461,7 +7469,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         } else if (retryStopReason === 'tool_use') {
           // The span out-pulls the sentence — remove the tools param so a
           // tool call is structurally impossible (see withoutToolsParam).
-          console.warn(
+          this.diag.warn(
             `[autobiographical] no-tools retry also rejected on tool_use — escalating to tools-less request`,
           );
           const toolslessResponse = await runAttempt(
@@ -7512,7 +7520,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             : 'compression:canonical-incomplete',
           operation: 'compress_l1',
           metadata: attemptTraces[0],
-        });
+        }, this.ns);
         let fallbackResponse: NormalizedResponse | undefined;
 
         // One bounded attempt of a tool-prose-hoisted request. Same receipts
@@ -7561,7 +7569,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               admittedTokens: admission.admittedTokens,
               budgetTokens: admission.budgetTokens,
             });
-            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
+            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
             return;
           }
           try {
@@ -7581,7 +7589,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 ...(assessment.outcome === 'provider_error' ? { errorType: assessment.errorType } : {}),
               });
             }
-            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
+            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
           } catch (error) {
             // A host's withdrawal is no outcome of this rung: rethrow it.
             if (isCompressionWithdrawn(error)) throw error;
@@ -7661,7 +7669,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             });
             logCompressionCall({
               event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace,
-            });
+            }, this.ns);
             continue;
           }
           let variantResponse: unknown;
@@ -7716,7 +7724,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             });
             logCompressionCall({
               event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace,
-            });
+            }, this.ns);
             continue;
           }
           const trace = attemptTraces[attemptTraces.length - 1]!;
@@ -7726,7 +7734,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             event: 'compression:curve-attempt',
             operation: 'compress_l1',
             metadata: trace,
-          });
+          }, this.ns);
           const assessment = this.assessFallbackCompressionResponse(variantResponse);
           if (assessment.outcome === 'refusal') {
             trace.outcome = 'refusal';
@@ -7797,7 +7805,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 ...(assessment.outcome === 'provider_error' ? { errorType: assessment.errorType } : {}),
               });
             }
-            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace });
+            logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
           } catch (error) {
             // A host's withdrawal is no outcome of this rung: rethrow it.
             if (isCompressionWithdrawn(error)) throw error;
@@ -8054,13 +8062,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               curveLabel: 'split-stitch', recallIds: [], recallLevels: [], leafCoverageHash: leafHash,
               requestHash: compositeHash, messageCount: chunk.messages.length, estimatedTokens: 0, latencyMs: 0, persisted: false, outcome: 'success', stopReason: 'end_turn',
             };
-            console.error(`[autobiographical] split-stitch fold landed for chunk ${chunk.index}: ${parts.length} part(s), ${placeholders.length} placeholder(s), ${calls} call(s)`);
-            logCompressionCall({ event: 'compression:split-stitch', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, composite_hash: compositeHash, content_hash: contentHash, parts: partsMeta, placeholders, calls, attempted } });
+            this.diag.error(`[autobiographical] split-stitch fold landed for chunk ${chunk.index}: ${parts.length} part(s), ${placeholders.length} placeholder(s), ${calls} call(s)`);
+            logCompressionCall({ event: 'compression:split-stitch', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, composite_hash: compositeHash, content_hash: contentHash, parts: partsMeta, placeholders, calls, attempted } }, this.ns);
           } else {
             const reason = abortReason ?? 'refused';
             outcomes.push({ curveLabel: 'split-stitch', requestHash: leafHash, outcome: reason.startsWith('provider-error') ? 'provider_error' : 'refusal', ...(abortReason ? { errorType: abortReason } : {}) });
-            console.error(`[autobiographical] split-stitch abandoned for chunk ${chunk.index}: ${reason} after ${calls} call(s), ${parts.length} piece(s) discarded (receipts only)`);
-            logCompressionCall({ event: 'compression:split-stitch-abandoned', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, reason, calls, attempted, piecesDiscarded: parts.length } });
+            this.diag.error(`[autobiographical] split-stitch abandoned for chunk ${chunk.index}: ${reason} after ${calls} call(s), ${parts.length} piece(s) discarded (receipts only)`);
+            logCompressionCall({ event: 'compression:split-stitch-abandoned', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, reason, calls, attempted, piecesDiscarded: parts.length } }, this.ns);
           }
         }
         if (!fallbackResponse) {
@@ -8082,7 +8090,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               plan: quarantineRecord.plan,
               outcomes,
             },
-          });
+          }, this.ns);
           return;
         }
       }
@@ -8115,7 +8123,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ? successfulTrace
           : undefined;
       if (!summaryText.trim() && !sourceOnlyFinalWon && !toolProseWonTrace) {
-        console.warn(
+        this.diag.warn(
           `[autobiographical] L1 summary stripped to empty (thinking-wrapped generation) — retrying once with plain-prose instruction`,
         );
         const proseResponse = await runAttempt(
@@ -8143,7 +8151,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // an empty assistant text block → Anthropic 400 "content must be non-empty".
       // Leave the chunk raw rather than poisoning memory with an empty summary.
       if (!summaryText.trim()) {
-        console.warn(`[autobiographical] empty L1 summary for chunk of ${chunk.messages.length} msgs — quarantining (chunk stays raw)`);
+        this.diag.warn(`[autobiographical] empty L1 summary for chunk of ${chunk.messages.length} msgs — quarantining (chunk stays raw)`);
         // Durable accounting (cm #55): without it, an all-thinking chunk
         // that survived the prose retry was re-attempted on every
         // maintenance pass forever (canonical + retry per cycle). Same
@@ -8180,7 +8188,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // summary may be built from provisional content. Discard it; the chunk
       // stays uncompressed and is re-queued when the hold is released.
       if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) {
-        console.warn('[autobiographical] discarding L1: a compression hold was placed on its span mid-request');
+        this.diag.warn('[autobiographical] discarding L1: a compression hold was placed on its span mid-request');
         return;
       }
 
@@ -8272,7 +8280,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           event: 'compression:curve-succeeded',
           operation: 'compress_l1',
           metadata: successfulTrace,
-        });
+        }, this.ns);
       }
 
       this.checkMergeThreshold();
@@ -8290,7 +8298,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return;
       }
       if (!logWithdrawn) {
-        console.error('Failed to compress chunk (hierarchical):', error);
+        this.diag.error('Failed to compress chunk (hierarchical):', error);
         logError = error instanceof Error ? error.message : String(error);
       }
       inFlightError = error;
@@ -8308,7 +8316,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             model,
             ...trace,
           },
-        });
+        }, this.ns);
       }
       logCompressionCall({
         operation: 'compress_l1',
@@ -8344,7 +8352,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
         response: summarizeTelemetryText(logResponse),
         error: logError,
-      });
+      }, this.ns);
     }
   }
 
@@ -8388,7 +8396,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected warnMergeExclusion(id: string, detail: string): void {
     if (this._mergeExclusionWarned.has(id)) return;
     this._mergeExclusionWarned.add(id);
-    console.warn(`[autobiographical] merge-candidate excluded: ${detail}`);
+    this.diag.warn(`[autobiographical] merge-candidate excluded: ${detail}`);
   }
 
   protected contiguousMergeCandidates(
@@ -8585,7 +8593,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       .filter((s): s is SummaryEntry => s != null);
 
     if (sources.length !== sourceIds.length) {
-      console.warn('executeMerge: some source summaries not found, skipping');
+      this.diag.warn('executeMerge: some source summaries not found, skipping');
       return;
     }
 
@@ -8597,7 +8605,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // pass. Never mutate an already-authored parent edge.
     const alreadyParented = sources.filter((source) => getSummaryParentId(source));
     if (alreadyParented.length > 0) {
-      console.warn(
+      this.diag.warn(
         `executeMerge: ${alreadyParented.length}/${sources.length} source(s) already parented ` +
           `(${alreadyParented.map((source) => source.id).join(', ')}); skipping stale queue entry`,
       );
@@ -8750,7 +8758,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
     }
     if (headCoveredSkipped > 0) {
-      console.warn(
+      this.diag.warn(
         `autobio: ${headCoveredSkipped} head-window message(s) are covered by live summaries or ` +
           `the merge tree; rendering them via recall pairs / target expansion (ownership wins).`,
       );
@@ -8761,7 +8769,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         skipped: headCoveredSkipped,
         headStartIdx,
         headEndIdx,
-      });
+      }, this.ns);
     }
 
     // Recall budget shrinks by half per prior failed attempt on this same
@@ -8782,7 +8790,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       Math.round(configuredRecallBudget * 0.5 ** Math.min(mergeAttempts, 4)),
     );
     if (mergeRecallBudget < configuredRecallBudget) {
-      console.warn(
+      this.diag.warn(
         `[autobiographical] L${targetLevel} merge retry ${mergeAttempts}: recall budget shrunk ` +
           `${configuredRecallBudget} -> ${mergeRecallBudget} tokens (halved per failed attempt)`,
       );
@@ -8793,7 +8801,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
     if (keptPriorSummaries.length < priorSummariesAll.length) {
       const dropped = priorSummariesAll.length - keptPriorSummaries.length;
-      console.warn(
+      this.diag.warn(
         `autobio: merge recall-pair budget capped (${keptPriorSummaries.length}/${priorSummariesAll.length} summaries kept, ` +
           `~${mergeRecallTokens} tokens, budget ${mergeRecallBudget}; ${dropped} oldest dropped this merge).`,
       );
@@ -8805,7 +8813,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         total: priorSummariesAll.length,
         tokens: mergeRecallTokens,
         budgetTokens: mergeRecallBudget,
-      });
+      }, this.ns);
     }
 
     // (Leaf coverage `priorSummaryMessageIds` is computed above, before
@@ -8860,7 +8868,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       (this.mergeQueue[0]?.hadRefusal === true ||
         this.mergeQueue[0]?.lastStopReason === 'refusal');
     if (refusalFallback) {
-      console.warn(
+      this.diag.warn(
         `[autobiographical] L${targetLevel} merge retry after refusal rejection — ` +
           `source-level fallback payload (sources shown as recall pairs, no deeper expansion)`,
       );
@@ -8869,7 +8877,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         site: 'merge',
         targetLevel,
         sources: sourceIds,
-      });
+      }, this.ns);
     }
     for (const src of sources) {
       if (refusalFallback) {
@@ -8964,7 +8972,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       (this.mergeQueue[0]?.attempts ?? 0) > 0 &&
       this.mergeQueue[0]?.lastStopReason === 'tool_use';
     if (retryAfterToolUse) {
-      console.warn(
+      this.diag.warn(
         `[autobiographical] L${targetLevel} merge retry after tool_use rejection — appending no-tools instruction`,
       );
       mergeInstructionText += NO_TOOLS_RETRY_LINE;
@@ -8977,7 +8985,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       (this.mergeQueue[0]?.attempts ?? 0) > 0 &&
       this.mergeQueue[0]?.lastOutcome === 'unusable_empty';
     if (retryAfterEmpty) {
-      console.warn(
+      this.diag.warn(
         `[autobiographical] L${targetLevel} merge retry after empty generation — appending plain-prose instruction`,
       );
       mergeInstructionText += PLAIN_PROSE_RETRY_LINE;
@@ -9076,7 +9084,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       toollessEscalation ? withoutToolsParam(request) : request, `merge-l${targetLevel}`,
     );
     if (toollessEscalation) {
-      console.warn(
+      this.diag.warn(
         `[autobiographical] L${targetLevel} merge retry ${this.mergeQueue[0]?.attempts} — escalating to tools-less request`,
       );
     }
@@ -9101,7 +9109,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // the carrier blocks → retry once text-only, loudly. A host's
         // withdrawal is never a transport rejection, whatever it carries.
         if (isCompressionWithdrawn(error) || !isCarrierTransportRejection(error) || !requestCarriesReasoning(dispatchRequest)) throw error;
-        console.error(
+        this.diag.error(
           `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
             `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
         );
@@ -9109,7 +9117,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           event: 'compression:carrier-transport-fallback',
           operation: `merge_l${targetLevel}`,
           metadata: { error: String(error).slice(0, 300) },
-        });
+        }, this.ns);
         // Stripping removes only blocks and the messages it empties, so the
         // prepared request stays prepared.
         acceptedRequest = stripReasoningFromRequest(dispatchRequest);
@@ -9136,7 +9144,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (assessment.outcome !== 'valid') {
         const stopReason = 'stopReason' in assessment ? assessment.stopReason : undefined;
         const errorType = assessment.outcome === 'provider_error' ? assessment.errorType : undefined;
-        console.warn(
+        this.diag.warn(
           `[autobiographical] L${targetLevel} merge response rejected (${assessment.outcome}` +
             `${stopReason ? `, stop=${stopReason}` : ''}${errorType ? `, ${errorType}` : ''}) — ` +
             `${sources.length} sources left unmerged`,
@@ -9153,7 +9161,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             request_hash: requestHash,
             model: this.requireCompressionModel(),
           },
-        });
+        }, this.ns);
         throw new MergeDispositionRejection(
           targetLevel, assessment.outcome, requestHash, stopReason, errorType,
         );
@@ -9173,7 +9181,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // PLAIN_PROSE_RETRY_LINE). Riding the ladder gives the retry the
       // prose line, bounded attempts, and quarantine.
       if (!mergedText.trim()) {
-        console.warn(
+        this.diag.warn(
           `[autobiographical] L${targetLevel} merge generation was all <thinking> preamble — ` +
             `rejecting for retry (${sources.length} sources left unmerged)`,
         );
@@ -9244,7 +9252,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Disposition rejections already warned + receipted above — don't
       // double-log them as crashes; tick() consumes them for retry policy.
       if (!(error instanceof MergeDispositionRejection) && !isCompressionWithdrawn(error)) {
-        console.error(`Failed to merge summaries into L${targetLevel}:`, error);
+        this.diag.error(`Failed to merge summaries into L${targetLevel}:`, error);
       }
       // A withdrawal's receipt says withdrawn rather than carrying an error.
       if (isCompressionWithdrawn(error)) logWithdrawn = true;
@@ -9275,7 +9283,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
         response: summarizeTelemetryText(logResponse),
         error: logError,
-      });
+      }, this.ns);
     }
   }
 
@@ -9697,12 +9705,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.loadCalibration(store, { dryRun });
     const messages = store.getAll();
     this.refreshStoreOrder(messages);
-    if (_diag) { console.error(`[cm-cache] selectAdaptive: calibration+getAll ${Date.now() - _t}ms`); _t = Date.now(); }
+    if (_diag) { this.diag.error(`[cm-cache] selectAdaptive: calibration+getAll ${Date.now() - _t}ms`); _t = Date.now(); }
     const msgCap = this.config.maxMessageTokens;
     // Post-strip estimates (see postStripEstimates): every budgeting site in
     // this method prices a message the way the stripped render will cost it.
     const pse = this.postStripEstimates(store);
-    if (_diag) { console.error(`[cm-cache] selectAdaptive: pse ${Date.now() - _t}ms`); _t = Date.now(); }
+    if (_diag) { this.diag.error(`[cm-cache] selectAdaptive: pse ${Date.now() - _t}ms`); _t = Date.now(); }
 
     // ----- 1. Build head/tail sets and reserve the tail before emitting -----
     const headStart = this.getHeadWindowStartIndex(store);
@@ -9983,7 +9991,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // low-budget dry run could make a converging transition look prepared).
     // select() puts it back for every dry run, on ALL throw paths — do not
     // also restore it here, or the two owners will disagree.
-    if (_diag) { console.error(`[cm-cache] selectAdaptive: inputs-built ${Date.now() - _t}ms`); _t = Date.now(); }
+    if (_diag) { this.diag.error(`[cm-cache] selectAdaptive: inputs-built ${Date.now() - _t}ms`); _t = Date.now(); }
     const result = picker.run(pickerInputs, foldingBudget);
     // A picker result answers by position; a stubbed result (tests, hosts
     // that wrap the picker) may only carry the map.
@@ -10054,7 +10062,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (tree) reuse.tree = tree;
       }
     }
-    if (_diag) { console.error(`[cm-cache] selectAdaptive: picker.run ${Date.now() - _t}ms`); _t = Date.now(); }
+    if (_diag) { this.diag.error(`[cm-cache] selectAdaptive: picker.run ${Date.now() - _t}ms`); _t = Date.now(); }
     this.lastFrontierTokens = result.finalTokens;
     // PLANNER/EMITTER RECONCILIATION (2026-07-26). The picker plans against
     // estimates; the emitter then spends real tokens per entry. When the two
@@ -10119,9 +10127,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // production pick below plans the same way and renders nothing (design
     // §13.6). A dry run reports the plan it previews, as it reports an
     // override.
-    if (plan) reportOverlap(plan.overlap);
+    if (plan) reportOverlap(plan.overlap, this.diag);
     if (plan?.override) {
-      console.error(
+      this.diag.error(
         `[kv-escalation] override=${plan.override} perturbation=${plan.perturbation}` +
           ` tokens=${plan.tokens} budget=${foldingBudget.totalBudget}` +
           ` deepestPlannedLevel=L${deepestLevel}` +
@@ -10167,7 +10175,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (shadowResult.produced.length > 0) {
           this.handleProducedOps(shadowResult.produced, { speculative: true });
         } else if (shadowResult.exhausted) {
-          console.warn(
+          this.diag.warn(
             `autobio: production target ${prodBudget} unreachable even fully folded ` +
               `(${shadowResult.finalTokens} tokens); lowering the live budget to it ` +
               `would hard-fail with OverBudgetError`,
@@ -10175,7 +10183,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       } catch (err) {
         // A failing shadow pick must never break the live compile.
-        console.warn('autobio: shadow production pick failed:', err);
+        this.diag.warn('autobio: shadow production pick failed:', err);
       } finally {
         // The shadow pick is not a compile — keep §13.4 observability pointed
         // at the strategy instance behind the live pick.
@@ -10676,7 +10684,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const ratioInBand = ratio >= 0.6 && ratio <= 1.8;
     const observedInBand = observed >= 0.6 && observed <= 1.8;
     if (!ratioInBand && !observedInBand) {
-      console.error(
+      this.diag.error(
         `[estimator-calibration] REJECTED out-of-band sample real/est=${ratio.toFixed(2)} ` +
           `(est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k) — ` +
           `not a window-shaped request; multiplier stays ${this._calibration.toFixed(2)}`,
@@ -10706,7 +10714,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // A provisional multiplier confirmed within the band gets its stamp
       // now: the record it came from has none, or is the discard's.
       if (provisional) {
-        console.error(
+        this.diag.error(
           `[estimator-calibration] real/est=${ratio.toFixed(2)} confirms the provisional multiplier ` +
             `${current.toFixed(2)} (est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k); stamped`,
         );
@@ -10714,7 +10722,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       return;
     }
-    console.error(
+    this.diag.error(
       `[estimator-calibration] real/est=${ratio.toFixed(2)} ` +
         `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)}${provisional ? ' (provisional: replaced, not stepped)' : ''} ` +
         `(est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k)`,
@@ -10752,7 +10760,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     const { superseded } = this.kvUnifiedReceipts.begin({ ...args, leaves: this.kvUnifiedDraft.leaves });
     if (superseded) {
-      console.error(
+      this.diag.error(
         `[kv-unified] submission ${superseded} was never settled (no usage event before the next ` +
           `provider call); superseded by ${args.submissionId}`,
       );
@@ -11032,7 +11040,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                     `that were off by more than the clamp allows, and says nothing about this release's`
                   : `from a record with no pricing stamp (0.13.0 or earlier), in a store holding content ` +
                     `repriced since (current epoch ${current})`;
-              console.warn(
+              this.diag.warn(
                 `[estimator-calibration] DISCARDED multiplier ${saved.multiplier!.toFixed(2)} ${why}; ` +
                   `restarting from 1.00. Every token estimate changes by ${(1 / saved.multiplier!).toFixed(2)}x, ` +
                   `and the window refolds to match; the first provider sample sets the multiplier outright. ` +
@@ -11058,7 +11066,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
             this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
             if (commit) {
-              console.warn(
+              this.diag.warn(
                 `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from pricing epoch ${epoch} ` +
                   `(current ${current}): this store holds no content repriced since then; re-stamped`,
               );
@@ -11080,7 +11088,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
             this._calibrationProvisional = { fromEpoch: null };
             if (commit) {
-              console.warn(
+              this.diag.warn(
                 `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from a record with no ` +
                   `pricing stamp (0.13.0 or earlier) as provisional: the first provider sample replaces it ` +
                   `outright, and a compile it puts over budget drops it to 1.00 first. Stamped (epoch ` +
@@ -11124,7 +11132,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibrationReset = reset;
     this.applyCalibration();
     if (dryRun) return true;
-    console.warn(
+    this.diag.warn(
       `[estimator-calibration] DISCARDED provisional multiplier ${discarded.toFixed(2)} ` +
         `(${provisional.fromEpoch === null ? 'from a record with no pricing stamp' : `from pricing epoch ${provisional.fromEpoch}`}): ` +
         `the compile priced by it was refused (${err.actual} tokens against a hard budget of ${err.budget}); ` +
@@ -11466,7 +11474,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.config.foldingStrategy === 'oldest-first'
         ? new OldestFirstStrategy()
         : new FlatProfileStrategy();
-    this._adaptivePicker = new Picker(strategy);
+    this._adaptivePicker = new Picker(strategy, this.diag);
     return this._adaptivePicker;
   }
 
@@ -11489,7 +11497,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // ([picker-unrealizable] solver=flat-profile in a kv-stable agent) with
     // no way to attribute it; this line is the attribution.
     if (this.config.foldingStrategy !== this._constructedFoldingStrategy) {
-      console.error(
+      this.diag.error(
         `[picker-config-drift] foldingStrategy=${JSON.stringify(this.config.foldingStrategy)} ` +
           `differs from constructed=${JSON.stringify(this._constructedFoldingStrategy)} — ` +
           `a runtime mutation clobbered the solver choice; this compile runs the wrong solver`,
@@ -11498,6 +11506,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     if (this.config.foldingStrategy === 'kv-stable') {
       const strategy = new KvStableStrategy({
+        diagnostics: this.diag,
         reachTokens: preparedBudget === undefined
           ? this.config.kvStableReachTokens
           : this.runtimeTransitionPaceTokens ?? this.config.kvStableReachTokens,
@@ -11508,7 +11517,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         strictReach: preparedBudget !== undefined,
       });
       this._lastKvStable = strategy;
-      return new Picker(strategy);
+      return new Picker(strategy, this.diag);
     }
     if (this.config.foldingStrategy === 'kv-unified') {
       const configured = this.config.kvUnified;
@@ -11546,7 +11555,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       });
       this._lastKvUnified = strategy;
       this._lastKvStable = null;
-      return new Picker(strategy);
+      return new Picker(strategy, this.diag);
     }
     this._lastKvStable = null;
     this._lastKvUnified = null;
@@ -11571,10 +11580,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       Number.isFinite(relaxation.expiresAt) &&
       (relaxation.multiplier === 1 || relaxation.expiresAt > Date.now());
     if (!validReason || !validMultiplier || !active) {
-      console.warn('[kv-continuity-relaxation] invalid or expired input; continuity remains at 1');
+      this.diag.warn('[kv-continuity-relaxation] invalid or expired input; continuity remains at 1');
       return 1;
     }
-    console.error(
+    this.diag.error(
       `[kv-continuity-relaxation] reason=${relaxation.reason} ` +
       `multiplier=${relaxation.multiplier} expiresAt=${new Date(relaxation.expiresAt).toISOString()}`,
     );
@@ -12085,7 +12094,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         selectedIds.add(s.id);
       }
       if (l2RepairsSkipped > 0 || l3RepairsSkipped > 0) {
-        console.warn(
+        this.diag.warn(
           `[AutobiographicalStrategy] coverage-repair allowance exceeded — ` +
           `skipped ${l2RepairsSkipped} L2 and ${l3RepairsSkipped} L3 re-inclusions ` +
           `(possible causes: tight per-level budgets or overlapping summaries ` +
@@ -12947,7 +12956,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.compressionQueue = [];
       if (!this._orphanWarned) {
         this._orphanWarned = true;
-        console.error(
+        this.diag.error(
           `[autobiographical] FAIL-CLOSED: ${orphaned}/${this.chunkRecords.length} chunk ` +
           `records resolve to zero live messages (messages chain break / store ` +
           `reconciliation signature). Compression halted to prevent duplicate ` +
@@ -13361,7 +13370,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // log on every trim.
       if (!this._imageWatermarkWriteWarned) {
         this._imageWatermarkWriteWarned = true;
-        console.warn(
+        this.diag.warn(
           `[autobiographical] image watermark not persisted to ${this.imageWatermarkStateId} ` +
             `(${error instanceof Error ? error.message : String(error)}); it holds in memory until the strategy next loads its state`,
         );
@@ -13539,14 +13548,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** One line per kind of replacement, naming the request. */
   private logCompressionPreparation(counts: PreparationCounts, label: string): void {
     if (counts.serializedMediaReplacements > 0) {
-      console.error(
+      this.diag.error(
         `[autobiographical] compression prompt: replaced ${counts.serializedMediaReplacements} ` +
           `serialized data URL(s) with markers [${label}]`,
       );
     }
     if (counts.imageReplacements > 0) {
       const mib = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)}MiB`;
-      console.error(
+      this.diag.error(
         `[autobiographical] compression prompt: replaced ${counts.imageReplacements} image(s) with placeholders ` +
           `to stay under the ${mib(counts.imageBudgetBytes)} inline image budget ` +
           `(kept ${mib(counts.imageBytesKept)}, newest messages first) [${label}]`,
