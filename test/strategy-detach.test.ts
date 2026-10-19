@@ -1987,7 +1987,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       await assert.rejects(manager.resetHeadWindow('moving on'), (error: Error) => {
         assert.match(error.message, /^ContextManager\.resetHeadWindow after close\(\)/);
         assert.ok(
-          transition && error.message.endsWith(`. Its transition add finished: message ${transition} is stored, and the head window wasn't reset.`),
+          transition && error.message.endsWith(`. Its transition add finished: message ${transition} is stored, and the head window wasn't reset. A later resetHeadWindow() that goes ahead adds another transition message.`),
           `the refusal names the stored message: ${error.message}`,
         );
         return true;
@@ -2039,12 +2039,12 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
               : /^Branch or strategy changed during ContextManager\.resetHeadWindow/,
           );
           assert.ok(
-            transition && error.message.endsWith(`. Its transition add finished: message ${transition} is stored, and the head window wasn't reset.`),
+            transition && error.message.endsWith(`. Its transition add finished: message ${transition} is stored, and the head window wasn't reset. A later resetHeadWindow() that goes ahead adds another transition message.`),
             `the refusal names the stored message: ${error.message}`,
           );
-          // A retry that got past this check would store a second transition,
-          // so the refusal keeps its reason and none of the advice the same
-          // refusal before the add gives.
+          // A later call that goes ahead stores a second transition, so the
+          // refusal keeps its reason and none of the advice the same refusal
+          // before the add gives.
           assert.doesNotMatch(error.message, /retry on the intended branch|recover with/, 'the refusal advises no retry');
           return true;
         });

@@ -1181,8 +1181,9 @@ interface CompressionInFlightResult {
   error?: unknown;
   /** The producer's strategy generation moved (a detach or a
    *  reinitialization) before it settled. It may have written nothing, so a
-   *  waiter that finds no L1 hands the chunk back to its tick
-   *  (onJoinedWorkDiscarded), which starts it at its next scan. */
+   *  waiter still current that finds neither an L1 nor a quarantine of the
+   *  request family hands the chunk back to its tick (onJoinedWorkDiscarded),
+   *  to start at a later scan. */
   discarded?: boolean;
   /** The membrane the producer's failed call went through: a wait the provider stated binds that route alone. */
   membrane?: unknown;
@@ -8473,7 +8474,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     onRequestStopped?: () => void,
     // The work this compression joined was thrown away, its strategy let go
     // of, and left no L1 and no quarantine: no call was made here, and the
-    // chunk is still to do. tick puts it back at the head of its queue.
+    // chunk is still to do. tick puts it back at the head of its queue,
+    // unless a rebuild during the wait decided otherwise. An override that
+    // doesn't pass it on leaves the chunk to the next rebuild, as a return
+    // that made no call does.
     onJoinedWorkDiscarded?: () => void,
   ): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('compressChunkHierarchical');
