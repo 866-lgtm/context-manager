@@ -44,9 +44,15 @@ import type {
 } from '../folding-strategy.js';
 import type { PickerInputs } from '../picker.js';
 import { SummaryTree } from '../summary-tree.js';
+import type { Diagnostics } from '../../diagnostics.js';
 import { planControlledFrontier, type ControlPlan } from '../kv-control.js';
 
 export interface KvStableOptions {
+  /**
+   * Where its planner's `[kv-timing]` and `[kv-diag]` lines go: the
+   * strategy's diagnostics, which name its namespace (#239).
+   */
+  diagnostics?: Diagnostics;
   /** Trust region P on per-turn perturbation, in tokens the provider would
    *  re-read (exact kvCost — see design §13.4). Within it the solver adopts
    *  the relevance-ideal cut; beyond it it amortizes via suffix adoption or
@@ -151,6 +157,7 @@ export class KvStableStrategy implements FoldingSolver {
     }
 
     const plan = planControlledFrontier(inputs, tree, {
+      diagnostics: this.opts.diagnostics,
       previous: fPrev,
       // Single-path solve (design §13.4): the [targetBudget, totalBudget] band
       // is the quiet dead band; the trust region and overrides do the rest.

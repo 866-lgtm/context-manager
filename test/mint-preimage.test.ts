@@ -15,6 +15,7 @@
  *   nothing, and every test below that expects a preimage asks for one.
  */
 
+import { namespaceDiagnostics } from '../src/diagnostics.js';
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -946,6 +947,25 @@ describe('Preimage persistence never blocks the mint', () => {
     await reopened.manager.close();
   });
 
+  // The strategy reports the failure through its own diagnostics, so the line names the
+  // namespace that minted (#239). This manager has none of its own, so that's `default`.
+  it("storeBlob throws: the failure's line names the minting strategy's namespace", async (tc) => {
+    const mock = acceptingMembrane();
+    const fx = await mergeFixture(mock.membrane, { persistMintPreimages: true });
+    const reports: unknown[][] = [];
+    tc.mock.method(console, 'error', (...args: unknown[]) => { reports.push(args); });
+
+    await fx.strategy.tick({ ...ctx(fx.manager), store: storeRefusing(fx.manager.getStore(), 'storeBlob') });
+
+    assert.ok(fx.strategy.summariesView().some((s) => s.level === 2), 'setup: the merge minted');
+    const failures = reports
+      .map((args) => String(args[0]))
+      .filter((line) => line.startsWith('[mint-preimage] failed to persist request preimage '));
+    assert.ok(failures.length > 0, JSON.stringify(reports.map((args) => String(args[0]))));
+    for (const line of failures) assert.match(line, /^\[mint-preimage\] failed to persist request preimage [a-f0-9]{64}: ns=default$/);
+    await fx.manager.close();
+  });
+
   it('the envelope index refusing writes: the media-bearing mint lands anyway', async () => {
     const data = zzImageBase64(53);
     const mock = acceptingMembrane();
@@ -988,6 +1008,13 @@ describe('Mint preimage envelope registration', () => {
     assert.ok(
       reports.some(args => args.includes(failure)),
       `the report carries the registration failure: ${JSON.stringify(reports.map(args => String(args[0])))}`,
+    );
+    // Through the minting strategy's diagnostics, the report names its namespace (#239).
+    reports.length = 0;
+    persistMintRequestPreimage(store, request, requestHash, namespaceDiagnostics(() => 'agents/tern'));
+    assert.ok(
+      reports.some(args => args.includes(failure) && /^\[mint-preimage\] failed to persist request preimage [a-f0-9]{64}: ns=agents\/tern$/.test(String(args[0]))),
+      `the report names its namespace: ${JSON.stringify(reports.map(args => String(args[0])))}`,
     );
     store.close();
   });

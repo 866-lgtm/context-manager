@@ -1,3 +1,4 @@
+import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
@@ -28,6 +29,12 @@ export class ContextLog {
   private tokenEstimator: (text: string) => number;
   private stateId: string;
 
+  /**
+   * Where its stderr lines go: a log of one namespace names it; the log with
+   * no namespace names none (#239).
+   */
+  private readonly log: Diagnostics;
+
   constructor(
     private store: JsStore,
     options: {
@@ -36,6 +43,8 @@ export class ContextLog {
       namespace?: string;
     } = {}
   ) {
+    const namespace = options.namespace;
+    this.log = namespace ? namespaceDiagnostics(() => namespace) : console;
     this.stateId = ContextLog.stateIdFor(options.namespace);
     this.blobManager = new BlobManager(store);
     this.tokenEstimator = options.estimator ?? defaultTokenEstimator;
@@ -382,7 +391,7 @@ export class ContextLog {
       sourceRelation: internal.sourceRelation,
       participant: internal.participant,
       content: this.blobManager.resolveBlobs(
-        wellFormedContent(internal.content, `context entry ${internal.index}`, this.malformedLogged),
+        wellFormedContent(internal.content, `context entry ${internal.index}`, this.malformedLogged, this.log),
       ),
       cacheMarker: internal.cacheMarker,
     };
