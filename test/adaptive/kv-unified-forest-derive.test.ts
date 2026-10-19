@@ -265,6 +265,25 @@ test('derive never reuses a treeified forest after a treeified parent stops list
   assert.deepEqual(shape(derived), shape(full));
 });
 
+test('derive reuses a forest built with treeifyNonContiguousSummaries that treeified nothing', () => {
+  // The option alone doesn't send derive to a full build: a full build
+  // treeifies only the summaries a contiguity issue names.
+  const chronicle = new MockChronicle({ recallPairTokens: 55 });
+  for (let i = 0; i < 6; i++) chronicle.addChunk({ id: `t${i}`, rawTokens: 90 });
+  const l1s = [['t0', 't1'], ['t2', 't3'], ['t4', 't5']].map((ids) => chronicle.produceL1(ids));
+  chronicle.produceUpper(2, l1s.map((s) => s.id));
+  const base: PickerInputs = {
+    chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const first = new CanonicalSummaryForest(base, treeify);
+  assert.deepEqual(first.treeifiedSummaryIds, [], 'premise: nothing is treeified');
+  const next = nextCompile(base);
+  const derived = CanonicalSummaryForest.derive(first, next, treeify);
+  assert.ok(derived, 'derive reuses the forest');
+  assert.deepEqual(shape(derived), shape(new CanonicalSummaryForest(next, treeify)));
+});
+
 /** Greptile's shape, built with MockChronicle: a, b, c, d under their own L1s,
  *  P listing the L1s of a and c, R listing d's, Q listing P and R. */
 function greptileShape() {
