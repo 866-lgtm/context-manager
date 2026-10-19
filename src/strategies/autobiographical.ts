@@ -151,6 +151,16 @@ function compressionFailureClass(error: unknown): string {
   return typeof status === 'number' ? `${type}:${status}` : type;
 }
 
+/** A thrown value's message, always a string, for a health report, which mustn't throw itself. */
+function failureMessage(thrown: unknown): string {
+  try {
+    if (thrown instanceof Error && typeof thrown.message === 'string' && thrown.message) return thrown.message;
+    return String(thrown);
+  } catch {
+    return 'an error that could not be described';
+  }
+}
+
 /** A no-call refusal by the caller's provider admission: nothing failed. */
 function isAdmissionDeferral(error: unknown): boolean {
   return (error as { providerAdmission?: unknown } | null)?.providerAdmission === 'deferred';
@@ -4705,13 +4715,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.store.compactState(this.compressionRefusalQuarantineLedgerStateId);
   }
 
-  /** How many quarantine records exist, for a health read that needs only the count. Never throws. */
-  private compressionQuarantineRecordCount(): number {
-    if (!this.store) return 0;
+  /** How many quarantine records exist, for a health read that needs only the
+   *  count, or what kept the ledger from being read. Never throws. */
+  private compressionQuarantineRecordCount(): { count: number } | { error: unknown } {
+    if (!this.store) return { count: 0 };
     try {
-      return this.readCompressionQuarantineProjection().size;
-    } catch {
-      return 0;
+      return { count: this.readCompressionQuarantineProjection().size };
+    } catch (error) {
+      return { error };
     }
   }
 
@@ -5931,8 +5942,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _storeOrderSource: ReadonlyArray<{ id: MessageId }> = [];
   /** Load-time audit result (see assertStoreTopology). */
   private topologyViolations: TopologyViolation[] = [];
-  /** Merges refused by executeMerge because they would have minted a crossed node. */
-  private topologyRefusals = 0;
 
   /** `staticSalience` per position of `messages`, kept across appends (the
    *  earlier positions hold the same message objects, so the same values). */
@@ -6116,7 +6125,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  operator clears it. */
   protected refuseCrossedMerge(targetLevel: SummaryLevel, sourceIds: string[], reason: string): void {
     this.requireBranchMutation('refuseCrossedMerge');
-    this.topologyRefusals++;
     const head = this.mergeQueue[0];
     const entry = head && head.sourceIds === sourceIds ? head : { level: targetLevel, sourceIds, attempts: 0 };
     if (entry === head) this.dequeueMerge();
@@ -7462,6 +7470,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
   }
 
+  /** The failure getCompressionDebt() last logged, so one that lasts across polls logs once. */
+  private compressionDebtFailureLogged: string | null = null;
+
   /**
    * Compression-debt reduction — the single authority for "is this
    * resident's memory organ keeping up." Consumed by /healthz (fleet-watch
@@ -7477,50 +7488,61 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *                uncompressed chunk has waited > 1h.
    * - `critical` — the oldest pending chunk has waited > 6h AND there is a
    *                quarantine or a 5+ chunk backlog: the organ is not
-   *                recovering on its own; an operator is needed.
+   *                recovering on its own; an operator is needed. Also while
+   *                the load-time audit found crossed ownership, or a merge
+   *                group stands in the merge quarantine because merging it
+   *                would have minted a crossed node (`topologyRefusals`).
+   * - `unknown`  — the report couldn't read what decides its state.
+   *
+   * A report that couldn't read something says what and why in `error`, and
+   * each count it couldn't compute is `null`, never 0. When only the
+   * compression quarantine ledger can't be read, `compressionQuarantineCount`
+   * is `null` and the rest is reported. The state is then worked out twice,
+   * as if the ledger held no record and as if it held one, since the rules
+   * only ask whether there is any quarantine. Where both give the same state,
+   * that is the state, and where they differ it is `unknown`. So crossed
+   * ownership still reads `critical`, and a chunk that has waited between 1h
+   * and 6h still reads `degraded`. When anything else fails, the state is
+   * `unknown` and every count is `null`. `oldestPendingAgeMs` and
+   * `lastMintAt` are also `null` when nothing is pending or nothing has been
+   * minted; in a report that failed outright, `state` is `unknown` and they
+   * mean nothing. A failure is logged once through
+   * the strategy's diagnostics: when a report first fails, and again only
+   * after a report succeeds or the failure's text changes. The first report
+   * that reads again after a failure logs that it does.
    *
    * The OPEN frontier chunk (still accumulating messages) is not debt and
    * is excluded. Ages derive from the newest message inside the oldest
    * pending chunk — chunk records carry no timestamps of their own.
-   * Read-only, never throws (health surface contract).
+   * It changes nothing but its note of the failure it last logged, and it
+   * never throws (health surface contract).
    */
   getCompressionDebt(now: number = Date.now()): {
-    state: 'healthy' | 'degraded' | 'critical';
-    pendingChunks: number;
+    state: 'healthy' | 'degraded' | 'critical' | 'unknown';
+    /** What the report couldn't read, and why. Present whenever a count below is `null` for that reason. */
+    error?: string;
+    pendingChunks: number | null;
     oldestPendingAgeMs: number | null;
-    mergeQueueDepth: number;
-    mergeQueueMaxAttempts: number;
-    mergeQuarantineCount: number;
+    mergeQueueDepth: number | null;
+    mergeQueueMaxAttempts: number | null;
+    mergeQuarantineCount: number | null;
     /** Keys of quarantined merges (sha256 of their source ids). */
-    mergeQuarantineKeys: string[];
+    mergeQuarantineKeys: string[] | null;
     /** Operator holds (`mergeHoldSummaryIds`): deliberate, so they don't change `state`,
      *  but they constrain the scheduler and must be visible when the frontier grows. */
-    mergeHeldIds: string[];
-    compressionQuarantineCount: number;
-    unmergedFrontier: { l1: number; l2: number; l3: number };
+    mergeHeldIds: string[] | null;
+    compressionQuarantineCount: number | null;
+    unmergedFrontier: { l1: number; l2: number; l3: number } | null;
     lastMintAt: number | null;
     /** Summaries with crossed ownership found by the load-time audit (topologyPolicy 'report'). */
-    topologyViolations: number;
-    /** Merges refused this process because they would have minted a crossed node. */
-    topologyRefusals: number;
+    topologyViolations: number | null;
+    /** Merge groups standing in the merge quarantine because merging them would have minted
+     *  a crossed node. Each holds `critical` until its record goes: an operator clears it,
+     *  its group queues as a valid merge, or the sweep finds a source parented or gone. */
+    topologyRefusals: number | null;
   } {
     const DEGRADED_AFTER_MS = 60 * 60 * 1000;
     const CRITICAL_AFTER_MS = 6 * 60 * 60 * 1000;
-    const empty = {
-      state: 'healthy' as const,
-      pendingChunks: 0,
-      oldestPendingAgeMs: null,
-      mergeQueueDepth: 0,
-      mergeQueueMaxAttempts: 0,
-      mergeQuarantineCount: 0,
-      mergeQuarantineKeys: [] as string[],
-      mergeHeldIds: [] as string[],
-      compressionQuarantineCount: 0,
-      unmergedFrontier: { l1: 0, l2: 0, l3: 0 },
-      lastMintAt: null,
-      topologyViolations: 0,
-      topologyRefusals: 0,
-    };
     try {
       // Exclude the trailing open chunk: it is life, not debt.
       const closed = this.chunks.filter((c, i) => !(i === this.chunks.length - 1 && !c.compressed));
@@ -7542,30 +7564,45 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (oldestPendingAgeMs === null || age > oldestPendingAgeMs) oldestPendingAgeMs = age;
       }
       const mergeQuarantineCount = this.mergeQuarantine.size;
-      const compressionQuarantineCount = this.compressionQuarantineRecordCount();
-      const quarantines = mergeQuarantineCount + compressionQuarantineCount;
+      const ledger = this.compressionQuarantineRecordCount();
+      let topologyRefusals = 0;
+      for (const record of this.mergeQuarantine.values()) {
+        if (record.lastOutcome === 'topology_violation') topologyRefusals++;
+      }
       const mints = this.summaries
         .map((s) => s.created)
         .filter((t): t is number => typeof t === 'number');
       // Folded, not spread: Math.max(...array) overflows the call stack past
-      // about 125,000 entries, and the catch below would report it healthy.
+      // about 125,000 entries.
       const lastMintAt = mints.length ? toMs(mints.reduce((max, t) => Math.max(max, t))) : null;
 
-      let state: 'healthy' | 'degraded' | 'critical' = 'healthy';
-      const stale = oldestPendingAgeMs !== null && oldestPendingAgeMs > DEGRADED_AFTER_MS;
-      if (quarantines > 0 || stale) state = 'degraded';
-      if (
-        oldestPendingAgeMs !== null &&
-        oldestPendingAgeMs > CRITICAL_AFTER_MS &&
-        (quarantines > 0 || pending.length >= 5)
-      ) {
-        state = 'critical';
+      const stateWith = (compressionQuarantines: number): 'healthy' | 'degraded' | 'critical' => {
+        // Crossed ownership is never a matter of waiting: it is critical until
+        // an operator repairs the store, or while a refused group's record stands.
+        if (this.topologyViolations.length > 0 || topologyRefusals > 0) return 'critical';
+        const quarantines = mergeQuarantineCount + compressionQuarantines;
+        if (
+          oldestPendingAgeMs !== null &&
+          oldestPendingAgeMs > CRITICAL_AFTER_MS &&
+          (quarantines > 0 || pending.length >= 5)
+        ) {
+          return 'critical';
+        }
+        const stale = oldestPendingAgeMs !== null && oldestPendingAgeMs > DEGRADED_AFTER_MS;
+        return quarantines > 0 || stale ? 'degraded' : 'healthy';
+      };
+      let state: 'healthy' | 'degraded' | 'critical' | 'unknown';
+      let error: string | undefined;
+      if ('count' in ledger) {
+        state = stateWith(ledger.count);
+      } else {
+        error = `the compression quarantine ledger couldn't be read: ${failureMessage(ledger.error)}`;
+        const withNone = stateWith(0);
+        state = withNone === stateWith(1) ? withNone : 'unknown';
       }
-      // Crossed ownership is never a matter of waiting: it is critical until
-      // an operator repairs the store (or the refused merge group).
-      if (this.topologyViolations.length > 0 || this.topologyRefusals > 0) state = 'critical';
-      return {
+      const report = {
         state,
+        ...(error !== undefined ? { error } : {}),
         pendingChunks: pending.length,
         oldestPendingAgeMs,
         mergeQueueDepth: this.mergeQueue.length,
@@ -7573,7 +7610,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         mergeQuarantineCount,
         mergeQuarantineKeys: [...this.mergeQuarantine.keys()],
         mergeHeldIds: [...(this.config.mergeHoldSummaryIds ?? [])],
-        compressionQuarantineCount,
+        compressionQuarantineCount: 'count' in ledger ? ledger.count : null,
         unmergedFrontier: {
           l1: this.summaries.filter((s) => s.level === 1 && !s.mergedInto).length,
           l2: this.summaries.filter((s) => s.level === 2 && !s.mergedInto).length,
@@ -7581,10 +7618,56 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
         lastMintAt,
         topologyViolations: this.topologyViolations.length,
-        topologyRefusals: this.topologyRefusals,
+        topologyRefusals,
       };
+      // Noted once the report is built, so a failure while building it isn't
+      // taken for a success that re-arms the log.
+      this.noteCompressionDebtFailure(error, 'error' in ledger ? ledger.error : undefined);
+      return report;
+    } catch (thrown) {
+      const error = `the report couldn't be computed: ${failureMessage(thrown)}`;
+      this.noteCompressionDebtFailure(error, thrown);
+      return {
+        state: 'unknown',
+        error,
+        pendingChunks: null,
+        oldestPendingAgeMs: null,
+        mergeQueueDepth: null,
+        mergeQueueMaxAttempts: null,
+        mergeQuarantineCount: null,
+        mergeQuarantineKeys: null,
+        mergeHeldIds: null,
+        compressionQuarantineCount: null,
+        unmergedFrontier: null,
+        lastMintAt: null,
+        topologyViolations: null,
+        topologyRefusals: null,
+      };
+    }
+  }
+
+  /** Logs a debt report that couldn't read something, once: when one first fails,
+   *  and again when the failure's text changes or after a report reads. The
+   *  first report that reads after a failure logs that it does, once. */
+  private noteCompressionDebtFailure(error: string | undefined, thrown: unknown): void {
+    if (error === undefined) {
+      if (this.compressionDebtFailureLogged === null) return;
+      this.compressionDebtFailureLogged = null;
+      try {
+        this.diag.warn('[compression-debt] the report reads again');
+      } catch {
+        // A logger that throws mustn't turn a report that reads into `unknown`.
+      }
+      return;
+    }
+    if (error === this.compressionDebtFailureLogged) return;
+    this.compressionDebtFailureLogged = error;
+    try {
+      // The message is a format string once the thrown value follows it, so a '%' in it is doubled.
+      this.diag.error(`[compression-debt] ${error.replaceAll('%', '%%')}; ` +
+        `the report gives null for each count it couldn't compute`, thrown);
     } catch {
-      return empty;
+      // A logger that throws mustn't make the report throw or lose what it read; the report still carries `error`.
     }
   }
 

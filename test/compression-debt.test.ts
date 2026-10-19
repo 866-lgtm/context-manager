@@ -8,6 +8,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { format } from 'node:util';
 
 import { AutobiographicalStrategy } from '../src/index.js';
 import type { Chunk } from '../src/strategies/autobiographical.js';
@@ -29,6 +30,37 @@ class Probe extends AutobiographicalStrategy {
     const m = (this as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine;
     m.clear();
     for (const k of keys) m.set(k, { key: k });
+  }
+  setTopologyViolations(count: number): void {
+    (this as unknown as { topologyViolations: unknown[] }).topologyViolations = Array.from({ length: count }, (_, i) => ({ id: `L2-${i}` }));
+  }
+  /** The report reads the quarantine ledger only when there is a store, so this gives it one whose ledger read throws. */
+  breakLedger(error: unknown = new Error('ledger unreadable (test)')): void {
+    const self = this as unknown as { store: unknown; readCompressionQuarantineProjection(): unknown };
+    self.store ??= {};
+    self.readCompressionQuarantineProjection = () => { throw error; };
+  }
+  /** A store whose ledger reads, holding `records` quarantine records. */
+  ledgerHolding(records: number): void {
+    const self = this as unknown as { store: unknown; readCompressionQuarantineProjection(): unknown };
+    self.store ??= {};
+    self.readCompressionQuarantineProjection = () => new Map(Array.from({ length: records }, (_, i) => [`k${i}`, {}]));
+  }
+  mendLedger(): void {
+    this.ledgerHolding(0);
+  }
+  /** The namespace its diagnostics name, as a store gives it. */
+  setNamespace(ns: string): void {
+    this.ns = ns;
+  }
+  private heldChunks: Chunk[] = [];
+  /** Reading its chunks throws `thrown`, until mendChunks() puts them back. */
+  breakChunks(thrown: unknown): void {
+    this.heldChunks = (this as unknown as { chunks: Chunk[] }).chunks;
+    Object.defineProperty(this, 'chunks', { get() { throw thrown; }, configurable: true });
+  }
+  mendChunks(): void {
+    Object.defineProperty(this, 'chunks', { value: this.heldChunks, writable: true, configurable: true, enumerable: true });
   }
 }
 
@@ -76,6 +108,15 @@ describe('getCompressionDebt', () => {
     const d = s.getCompressionDebt(NOW);
     assert.equal(d.state, 'degraded');
     assert.ok((d.oldestPendingAgeMs ?? 0) > HOUR);
+  });
+
+  it('a merge-quarantine record with another outcome isn\'t a refused crossed merge', () => {
+    const s = fresh();
+    const m = (s as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine;
+    m.set('k', { key: 'k', sourceIds: ['a', 'b'], lastOutcome: 'refusal' });
+    const d = s.getCompressionDebt(NOW);
+    assert.equal(d.topologyRefusals, 0);
+    assert.equal(d.state, 'degraded');
   });
 
   it('any quarantine record is at least degraded', () => {
@@ -127,8 +168,8 @@ describe('getCompressionDebt', () => {
   it('reports a store with more summaries and merge groups than a call takes as spread arguments (#258)', () => {
     // A call takes about 125,000 spread arguments on node 22 and 24, so the
     // newest mint and the most merge attempts are folded, not spread; a spread
-    // here would throw, and the method's catch would report the empty, healthy
-    // state. A failure of this premise means the runtime takes more spread
+    // here would throw, and the report would come back `unknown` rather than
+    // the store's. A failure of this premise means the runtime takes more spread
     // arguments, as with a larger stack (`node --stack-size`) or a newer V8, not
     // that the method changed: raise the count until a spread throws again.
     const count = 200_000;
@@ -146,7 +187,7 @@ describe('getCompressionDebt', () => {
     // Every fifth entry has never been tried, so it carries no attempts.
     s.setMergeQueue(Array.from({ length: count }, (_, i) => (i === 77_777 ? { attempts: 9 } : i % 5 === 0 ? {} : { attempts: i % 5 })));
     const d = s.getCompressionDebt(NOW);
-    assert.equal(d.unmergedFrontier.l1, count, 'the report is the store\'s, not the empty one');
+    assert.equal(d.unmergedFrontier?.l1, count, 'the report is the store\'s, not the empty one');
     assert.equal(d.lastMintAt, NOW - HOUR);
     assert.equal(d.mergeQueueDepth, count);
     assert.equal(d.mergeQueueMaxAttempts, 9);
@@ -159,5 +200,172 @@ describe('getCompressionDebt', () => {
       sourceIds: [], sourceRange: { first: 'a', last: 'b' }, created: NOW - HOUR,
     } as SummaryEntry);
     assert.equal(s.getCompressionDebt(NOW).lastMintAt, NOW - HOUR);
+  });
+});
+
+describe('getCompressionDebt when it can\'t read what it reports', () => {
+  const NOW = 1_800_000_000_000;
+
+  /** The [compression-debt] lines console.error and console.warn get while body runs, formatted as console formats them. */
+  function logged(body: () => void): string[] {
+    const lines: string[] = [];
+    const { error, warn } = console;
+    console.error = (...args: unknown[]) => { lines.push(format(...args)); };
+    console.warn = (...args: unknown[]) => { lines.push(format(...args)); };
+    try {
+      body();
+    } finally {
+      console.error = error;
+      console.warn = warn;
+    }
+    return lines.filter((line) => line.startsWith('[compression-debt]'));
+  }
+
+  it('a quarantine ledger it can\'t read is unknown where a record would decide the state, and its count is null', () => {
+    const s = fresh();
+    s.breakLedger();
+    const d = s.getCompressionDebt(NOW);
+    assert.equal(d.state, 'unknown', 'with nothing else owed, one record would make it degraded and none healthy');
+    assert.equal(d.compressionQuarantineCount, null, 'a count it couldn\'t read is null, never 0');
+    assert.match(d.error ?? '', /quarantine ledger couldn't be read: ledger unreadable \(test\)/);
+    assert.equal(d.pendingChunks, 0, 'what it could read is still reported');
+    assert.equal(d.mergeQuarantineCount, 0);
+  });
+
+  it('a ledger that reads gives its record count, and any record makes it degraded', () => {
+    const s = fresh();
+    s.ledgerHolding(2);
+    const d = s.getCompressionDebt(NOW);
+    assert.equal(d.compressionQuarantineCount, 2);
+    assert.equal(d.state, 'degraded');
+    assert.equal(d.error, undefined);
+  });
+
+  it('a ledger it can\'t read leaves the state that the rest decides', () => {
+    const stale = fresh();
+    stale.breakLedger();
+    stale.setChunks([chunk({ compressed: false, lastMessageAt: NOW - 2 * HOUR }), chunk({ compressed: true })]);
+    const staleDebt = stale.getCompressionDebt(NOW);
+    assert.equal(staleDebt.state, 'degraded', 'waited between 1h and 6h: degraded with or without a record');
+    assert.equal(staleDebt.pendingChunks, 1, 'the pending count it could read is kept');
+
+    const merge = fresh();
+    merge.breakLedger();
+    merge.setMergeQuarantine(['abc123']);
+    const mergeDebt = merge.getCompressionDebt(NOW);
+    assert.equal(mergeDebt.state, 'degraded', 'a merge-quarantine record already makes it degraded');
+    assert.equal(mergeDebt.mergeQuarantineCount, 1, 'the merge count it could read is kept');
+
+    const crossed = fresh();
+    crossed.breakLedger();
+    crossed.setTopologyViolations(1);
+    const d = crossed.getCompressionDebt(NOW);
+    assert.equal(d.state, 'critical', 'crossed ownership is critical whatever the ledger holds');
+    assert.equal(d.compressionQuarantineCount, null);
+    assert.match(d.error ?? '', /quarantine ledger couldn't be read/, 'the error is given with a decided state too');
+
+    const old = fresh();
+    old.breakLedger();
+    old.setChunks([chunk({ compressed: false, lastMessageAt: NOW - 7 * HOUR }), chunk({ compressed: true })]);
+    assert.equal(old.getCompressionDebt(NOW).state, 'unknown', 'waited over 6h with under 5 pending: a record would make it critical');
+  });
+
+  it('a report that fails outright is unknown, and every count is null', () => {
+    const s = fresh();
+    Object.defineProperty(s, 'chunks', { get() { throw new RangeError('chunks unreadable (test)'); }, configurable: true });
+    const d = s.getCompressionDebt(NOW);
+    assert.equal(d.state, 'unknown');
+    assert.match(d.error ?? '', /couldn't be computed: chunks unreadable \(test\)/);
+    for (const [field, value] of Object.entries(d)) {
+      if (field === 'state' || field === 'error') continue;
+      assert.equal(value, null, `${field} is null, not a guess`);
+    }
+  });
+
+  it('logs a failure once, and again only after a report succeeds or the failure changes', () => {
+    assert.equal(logged(() => fresh().getCompressionDebt(NOW)).length, 0, 'a report that reads, with no failure before it, logs nothing');
+    const s = fresh();
+    s.setNamespace('agents/probe');
+    s.breakLedger();
+    assert.equal(logged(() => { s.getCompressionDebt(NOW); s.getCompressionDebt(NOW); }).length, 1, 'once across polls');
+    s.breakLedger(new Error('another failure (test)'));
+    assert.equal(logged(() => s.getCompressionDebt(NOW)).length, 1, 'a different failure logs');
+    s.mendLedger();
+    assert.deepEqual(logged(() => { s.getCompressionDebt(NOW); s.getCompressionDebt(NOW); }),
+      ['[compression-debt] the report reads again ns=agents/probe'], 'the first report that reads again says so, once, through the strategy\'s diagnostics');
+    s.breakLedger(new Error('another failure (test)'));
+    const again = logged(() => s.getCompressionDebt(NOW));
+    assert.equal(again.length, 1, 'the same failure logs again after a success');
+    assert.match(again[0]!, /another failure \(test\); the report gives null for each count it couldn't compute ns=agents\/probe/);
+  });
+
+  it('an outright failure, a partial one and a report that reads log a line each', () => {
+    const s = fresh();
+    const lines = logged(() => {
+      s.breakChunks(new Error('chunks unreadable (test)'));
+      assert.equal(s.getCompressionDebt(NOW).state, 'unknown');
+      s.mendChunks();
+      s.breakLedger();
+      assert.equal(s.getCompressionDebt(NOW).compressionQuarantineCount, null);
+      s.mendLedger();
+      assert.equal(s.getCompressionDebt(NOW).state, 'healthy');
+    });
+    assert.equal(lines.length, 3, lines.join('\n'));
+    assert.match(lines[0]!, /^\[compression-debt\] the report couldn't be computed: chunks unreadable \(test\);/);
+    assert.match(lines[1]!, /^\[compression-debt\] the compression quarantine ledger couldn't be read: ledger unreadable \(test\);/);
+    assert.equal(lines[2], '[compression-debt] the report reads again');
+  });
+
+  it('a failure while the report is being built logs once across polls', () => {
+    // A recipe's mergeHoldSummaryIds that isn't a list fails as the report is
+    // put together, after its state is worked out.
+    const s = new Probe({ hierarchical: true, autoTickOnNewMessage: false, mergeHoldSummaryIds: {} as never });
+    const lines = logged(() => {
+      assert.equal(s.getCompressionDebt(NOW).state, 'unknown');
+      assert.equal(s.getCompressionDebt(NOW).state, 'unknown');
+    });
+    assert.equal(lines.length, 1);
+  });
+
+  it('a \'%\' in a failure\'s text is logged as itself', () => {
+    const s = fresh();
+    s.breakLedger(new Error('100%s gone (test)'));
+    const [line] = logged(() => s.getCompressionDebt(NOW));
+    assert.match(line ?? '', /couldn't be read: 100%s gone \(test\); the report gives null/);
+  });
+
+  it('a thrown value that isn\'t an Error is the error\'s text', () => {
+    const s = fresh();
+    Object.defineProperty(s, 'chunks', { get() { throw 'chunks unreadable (test)'; }, configurable: true });
+    assert.equal(s.getCompressionDebt(NOW).error, "the report couldn't be computed: chunks unreadable (test)");
+  });
+
+  it('a thrown value with no text still gives the report an error', () => {
+    const s = fresh();
+    // An Error whose message isn't a string, which no template or String() can turn into text.
+    const odd = new Error('replaced');
+    Object.defineProperty(odd, 'message', { value: Symbol('no text') });
+    Object.defineProperty(s, 'chunks', { get() { throw odd; }, configurable: true });
+    const d = s.getCompressionDebt(NOW);
+    assert.equal(d.state, 'unknown');
+    assert.equal(d.error, "the report couldn't be computed: an error that could not be described");
+  });
+
+  it('a logger that throws doesn\'t make the report throw', () => {
+    const s = fresh();
+    s.breakLedger();
+    const { error, warn } = console;
+    let calls = 0;
+    console.error = () => { calls += 1; throw new Error('logger down (test)'); };
+    console.warn = () => { calls += 1; throw new Error('logger down (test)'); };
+    try {
+      assert.equal(s.getCompressionDebt(NOW).state, 'unknown');
+      s.mendLedger();
+      assert.equal(s.getCompressionDebt(NOW).state, 'healthy', 'nor when it reads again');
+    } finally {
+      console.error = error;
+      console.warn = warn;
+    }
+    assert.equal(calls, 2, 'the report tried to log the failure and the recovery');
   });
 });
