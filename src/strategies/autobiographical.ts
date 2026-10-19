@@ -107,8 +107,7 @@ function logCompressionCall(entry: Record<string, unknown>, namespace: string): 
   if (!logPath) return;
   try {
     mkdirSync(dirname(logPath), { recursive: true });
-    // Before initialize the strategy has no namespace, and names none.
-    const line = JSON.stringify({ ...entry, ...(namespace ? { namespace } : {}), timestamp: Date.now() }) + '\n';
+    const line = JSON.stringify({ ...entry, namespace, timestamp: Date.now() }) + '\n';
     appendFileSync(logPath, line);
   } catch (err) {
     namespaceDiagnostics(() => namespace).warn('compression log write failed:', err);
