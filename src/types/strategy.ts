@@ -17,6 +17,12 @@ export interface MessageStoreView {
   getAll(): StoredMessage[];
   /** Get a specific message */
   get(id: MessageId): StoredMessage | null;
+  /**
+   * A message's sequence, as `get(id)?.sequence` answers it, without reading
+   * the message (optional — MessageStore provides it; a reader without it
+   * falls back to `get`).
+   */
+  sequenceOf?(id: MessageId): number | undefined;
   /** Get messages from a specific index */
   getFrom(index: number): StoredMessage[];
   /** Get the last N messages */

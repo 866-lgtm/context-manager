@@ -7,7 +7,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
 import { attributeEntries as attributeIn, coversStoredContent, rawBodiesOf } from '../src/compile-provenance.js';
-import type { ContextEntry, StoredMessage } from '../src/index.js';
+import type { ContextEntry, ContextLogView, MessageStoreView, StoredMessage, TokenBudget } from '../src/index.js';
 
 /** Attribution over `stored`, resolving an id to its sequence among those messages, as a store's lookup does. */
 function attributeEntries(entries: readonly ContextEntry[], stored: readonly StoredMessage[]) {
@@ -416,6 +416,39 @@ describe('attribution reads what the raw entries name, not the stored history', 
       assert.deepEqual(result.rawBodies!.get(doc)!.map((m) => m.shardIndex), [0, 1]);
       cm.close();
     } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('through compile, a run of raw entries costs a sequence lookup, not a read of its message (#273)', async () => {
+    const { ContextManager, PassthroughStrategy, MessageStore } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    // Every other message renders raw, so each raw entry starts a run of its
+    // own and attribution looks up where each one sits.
+    class EveryOther extends PassthroughStrategy {
+      select(store: MessageStoreView, log: ContextLogView, budget: TokenBudget): ContextEntry[] {
+        return super.select(store, log, budget).filter((_, i) => i % 2 === 0);
+      }
+    }
+    const path = './test-attribution-lookups';
+    rmSync(path, { recursive: true, force: true });
+    const get = MessageStore.prototype.get;
+    let reads = 0;
+    try {
+      const cm = await ContextManager.open({ path, strategy: new EveryOther() });
+      for (let i = 0; i < 40; i++) cm.addMessage(i % 2 ? 'bob' : 'alice', [text(`line ${i}`)]);
+      MessageStore.prototype.get = function (this: InstanceType<typeof MessageStore>, id) {
+        reads++;
+        return get.call(this, id);
+      };
+      const result = await cm.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+      MessageStore.prototype.get = get;
+      const raw = result.provenance!.messages.map((m) => (m.kind === 'raw' ? m.bodies.map((b) => [b.messageId, b.complete]) : null));
+      assert.deepEqual(raw, cm.getAllMessages().filter((_, i) => i % 2 === 0).map((m) => [[m.id, true]]), 'each raw entry names its own complete body');
+      assert.equal(reads, 0, `compile read ${reads} stored messages one at a time`);
+      cm.close();
+    } finally {
+      MessageStore.prototype.get = get;
       rmSync(path, { recursive: true, force: true });
     }
   });

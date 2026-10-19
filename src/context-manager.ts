@@ -1173,10 +1173,14 @@ export class ContextManager {
     // body from the strategy, but the body's identity (shard 0, the id
     // addMessage returned) and its membership are the stored group's. The
     // layout stays on the filtered view the strategy rendered. Attribution
-    // reads only around the messages the raw entries name.
+    // reads only around the messages the raw entries name, and a lookup
+    // asks for a sequence, not the message (#273).
     const storedView = this.viewFilter ? this.mergedMessageView() : view;
     const storedMessages = this.viewFilter ? storedView.getAll() : viewMessages;
-    const attribution = attributeEntries(entries, storedMessages, (id) => storedView.get(id)?.sequence);
+    const sequenceOf = storedView.sequenceOf
+      ? (id: MessageId) => storedView.sequenceOf!(id)
+      : (id: MessageId) => storedView.get(id)?.sequence;
+    const attribution = attributeEntries(entries, storedMessages, sequenceOf);
 
     // Convert to NormalizedMessage[]. We split each entry individually
     // so we know the output-count per input and can re-attach cache

@@ -26,6 +26,7 @@ import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import type { MessageStore } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 const TEST_STORE_PATH = './test-message-store-sequence';
@@ -96,6 +97,37 @@ describe('MessageStore — sequence semantics', () => {
       messages[messages.length - 1].sequence,
       'get() and query() must report the same sequence for the same message',
     );
+
+    manager.close();
+  });
+
+  it('sequenceOf answers as get(id)?.sequence does, after a listing, an edit and a branch switch (#273)', async () => {
+    const strategy = new AutobiographicalStrategy({ targetChunkTokens: 300 });
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy,
+    });
+    const store = (manager as unknown as { messageStore: MessageStore }).messageStore;
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      ids.push(manager.addMessage('user', textBlock(`m${i}`)));
+    }
+    const agrees = (when: string) => {
+      for (const id of ids) {
+        assert.equal(store.sequenceOf(id), store.get(id)?.sequence, `${id} ${when}`);
+      }
+      assert.equal(store.sequenceOf('no-such-message'), undefined, `an unknown id ${when}`);
+    };
+
+    agrees('before any listing');
+    store.getAll();
+    agrees('after a listing');
+    manager.editMessage(ids[2], textBlock('edited'));
+    agrees('after an edit');
+    const branch = manager.branchAt(ids[3]);
+    await manager.switchBranch(branch);
+    assert.equal(store.sequenceOf(ids[5]), undefined, 'a message past the fork is not on the branch');
+    assert.equal(store.sequenceOf(ids[3]), store.get(ids[3])?.sequence, 'the fork point after the switch');
 
     manager.close();
   });
