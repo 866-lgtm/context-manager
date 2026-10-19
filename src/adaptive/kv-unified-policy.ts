@@ -181,11 +181,24 @@ export type ExactPolicySolveResult =
       readonly continuityFloor: number;
       readonly cacheRelevant: boolean;
       readonly enumeration: ExactCutEnumerationStats;
+    } & SharedFrameHooks;
+
+/** Both hooks or neither: an engine that scores its terminal candidates
+ * lazily supplies both (see `withBestScoreUnder`), so a consumer that has
+ * `bestScoreUnder` can take the cut from `bestUnder` instead of scoring the
+ * whole pool. */
+export type SharedFrameHooks =
+  | {
       /** Best score this pool reaches when both penalties are measured from
        * the given floors instead of the pool's own. Scores from different
        * solves are comparable only through a shared frame like this. */
-      readonly bestScoreUnder?: (cacheFloor: number, continuityFloor: number) => number;
-    };
+      readonly bestScoreUnder: (cacheFloor: number, continuityFloor: number) => number;
+      /** The candidate that reaches `bestScoreUnder`, ties broken on rendered
+       * tokens then frontier signature, as the selection breaks them. Its
+       * fields are in the pool's own frame. */
+      readonly bestUnder: (cacheFloor: number, continuityFloor: number) => ExactPolicyCandidate;
+    }
+  | { readonly bestScoreUnder?: undefined; readonly bestUnder?: undefined };
 
 export interface UnscoredCandidate {
   frontier: ReadonlyMap<ChunkId, number>;
@@ -322,10 +335,8 @@ export class ExactKvUnifiedPolicySolver {
       matching.set(result, candidate.matchesPresentation);
       return result as ExactPolicyCandidate;
     });
-    if (candidates.length > 1) {
-      const leafIds = this.orderedChunks.map((chunk) => chunk.id);
-      candidates.sort((a, b) => comparePolicyCandidates(a, b, leafIds));
-    }
+    const leafIds = this.orderedChunks.map((chunk) => chunk.id);
+    if (candidates.length > 1) candidates.sort((a, b) => comparePolicyCandidates(a, b, leafIds));
     let selected = candidates[0];
     const epsilon =
       Number.isFinite(options.adoptEpsilon) && (options.adoptEpsilon ?? 0) > 0
@@ -337,6 +348,22 @@ export class ExactKvUnifiedPolicySolver {
       );
       if (carried && carried.score <= selected.score + epsilon) selected = carried;
     }
+    // The pool's best in a caller's frame, ties broken as the selection
+    // breaks them (tokens, then signature); every candidate is scored.
+    const inFrame = (c: ExactPolicyCandidate, kf: number, cf: number): number =>
+      policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss, kf, cf, policy, continuityMultiplier);
+    const bestUnder = (kf: number, cf: number): ExactPolicyCandidate => {
+      let best = candidates[0];
+      let bestScore = inFrame(best, kf, cf);
+      for (let i = 1; i < candidates.length; i++) {
+        const c = candidates[i];
+        const value = inFrame(c, kf, cf);
+        const tie = value === bestScore && (c.renderedTokens < best.renderedTokens || (c.renderedTokens === best.renderedTokens &&
+          frontierSignature(c.frontier, leafIds).localeCompare(frontierSignature(best.frontier, leafIds)) < 0));
+        if (value < bestScore || tie) { best = c; bestScore = value; }
+      }
+      return best;
+    };
     return withBestScoreUnder({
       feasible: true,
       selected,
@@ -345,13 +372,7 @@ export class ExactKvUnifiedPolicySolver {
       continuityFloor,
       cacheRelevant,
       enumeration: stats,
-    }, (kf, cf) => {
-      let best = Infinity;
-      for (const c of unscored) {
-        best = Math.min(best, policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss, kf, cf, policy, continuityMultiplier));
-      }
-      return best;
-    });
+    }, (kf, cf) => inFrame(bestUnder(kf, cf), kf, cf), bestUnder);
   }
 
   private fidelityLoss(
@@ -626,9 +647,11 @@ export function comparePolicyCandidates(a: ExactPolicyCandidate, b: ExactPolicyC
 export function withBestScoreUnder<T extends object>(
   result: T,
   bestScoreUnder: (cacheFloor: number, continuityFloor: number) => number,
-): T & { readonly bestScoreUnder: typeof bestScoreUnder } {
+  bestUnder: (cacheFloor: number, continuityFloor: number) => ExactPolicyCandidate,
+): T & { readonly bestScoreUnder: typeof bestScoreUnder; readonly bestUnder: typeof bestUnder } {
   Object.defineProperty(result, 'bestScoreUnder', { value: bestScoreUnder, enumerable: false, writable: false, configurable: true });
-  return result as T & { readonly bestScoreUnder: typeof bestScoreUnder };
+  Object.defineProperty(result, 'bestUnder', { value: bestUnder, enumerable: false, writable: false, configurable: true });
+  return result as T & { readonly bestScoreUnder: typeof bestScoreUnder; readonly bestUnder: typeof bestUnder };
 }
 
 export function policyScore(fidelity: number, budget: number, cache: number, continuity: number,

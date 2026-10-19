@@ -1492,6 +1492,7 @@ function certifiedWhatIfFixture(o: {
   reuse?: KvUnifiedReuse; appended?: number;
   /** All three bucket sizes; 1 (the default) makes the uncertified solve exact. */
   bucket?: number;
+  mode?: 'individual' | 'joint';
 }) {
   const chronicle = new MockChronicle({ recallPairTokens: o.pairTokens });
   for (let i = 0; i < 8; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: o.raw[i] });
@@ -1521,7 +1522,7 @@ function certifiedWhatIfFixture(o: {
     tokenBucketSize: o.bucket ?? 1, continuityBucketSize: o.bucket ?? 1, fidelityBucketSize: o.bucket ?? 1,
     labelCeiling: 100_000,
     adoptEpsilon: o.adoptEpsilon, hysteresisCertificate: o.hysteresisCertificate,
-    latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 8 },
+    latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 8, ...(o.mode ? { mode: o.mode } : {}) },
     presentation: { currentSeq: 1, leaves },
     ...(o.reuse ? { reuse: o.reuse } : {}),
   });
@@ -1723,4 +1724,448 @@ test('banded continuity holds stability, reads it at doublings, and saturates re
   assert.equal(continuity(8 * halfLife, moved), continuity(64 * halfLife, moved));
   assert.notEqual(continuity(4 * halfLife, moved), continuity(8 * halfLife, moved), 'not before');
   assert.notEqual(continuity(8 * halfLife, moved, exact), continuity(16 * halfLife, moved, exact));
+});
+
+function latentFixture(): PickerInputs {
+  const chronicle = new MockChronicle({ recallPairTokens: 60, mergeThreshold: 2 });
+  for (let index = 0; index < 4; index++) {
+    const id = `latent-${index}`;
+    chronicle.addChunk({ id, rawTokens: 100 });
+    chronicle.produceL1([id]);
+  }
+  return {
+    chunks: chronicle.chunks,
+    summaries: chronicle.summaries,
+    recallPairTokens: chronicle.recallPairTokens,
+    headTokens: 0,
+    tailTokens: 0,
+    headChunkIds: new Set(),
+    tailChunkIds: new Set(),
+  };
+}
+
+const latentPolicy = (budgetHighRatio: number) => ({
+  alpha: 0, budgetLowRatio: 0, budgetHighRatio, budgetUnderLambda: 0, budgetOverLambda: 100_000,
+  cacheLambda: 0, continuityLambda: 0,
+});
+
+test('joint latent demand measures the candidate set in one solve and demands the merges its cut uses', () => {
+  // Four L1s of 60 over 100-token leaves, hard wall 300, upper hinge at 75:
+  // the all-L1 cut (240) pays the hinge, one merge (150) still does, both
+  // merges (60) clear it. One what-if solve holds both candidates; its cut
+  // uses both, so both are demanded at the set's gain.
+  const build = (mode: 'individual' | 'joint') => {
+    const strategy = new KvUnifiedStrategy({
+      policy: latentPolicy(0.25),
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode },
+    });
+    const result = strategy.solve(latentFixture(), { totalBudget: 300, targetBudget: 270, slack: 0.1 });
+    return { strategy, result };
+  };
+  const joint = build('joint');
+  const individual = build('individual');
+  assert.deepEqual(joint.result.produced, individual.result.produced);
+  assert.deepEqual(joint.result.produced.map((request) => request.level), [2, 2]);
+  assert.equal(joint.strategy.lastTimings?.demandSolves, 1, 'the set is measured once');
+  assert.equal(individual.strategy.lastTimings?.demandSolves, 2);
+  const gains = joint.strategy.lastDemandEvaluations.map((e) => e.conservativeImprovement);
+  assert.equal(gains.length, 2);
+  assert.ok(gains[0] > 0 && gains[0] === gains[1], 'both carry the gain of the cut that uses them');
+  assert.ok(joint.strategy.lastDemandEvaluations.every((e) => e.expectedImprovement === e.conservativeImprovement));
+});
+
+test('joint latent demand leaves a merge the joint cut does not use undemanded', () => {
+  // Upper hinge at 150: one merge lands the cut exactly on the hinge at a
+  // lower fidelity loss than two, so the joint cut uses one candidate. Each
+  // candidate alone clears the hinge too, so the individual ranking demands
+  // both, and the second merge would be produced and never selected.
+  const build = (mode: 'individual' | 'joint') => {
+    const strategy = new KvUnifiedStrategy({
+      policy: latentPolicy(0.5),
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode },
+    });
+    const result = strategy.solve(latentFixture(), { totalBudget: 300, targetBudget: 270, slack: 0.1 });
+    return { strategy, result };
+  };
+  const joint = build('joint');
+  const individual = build('individual');
+  assert.equal(individual.result.produced.length, 2);
+  assert.equal(joint.result.produced.length, 1);
+  assert.equal(joint.result.produced[0].level, 2);
+  const evaluations = joint.strategy.lastDemandEvaluations;
+  assert.equal(evaluations.length, 2, 'every candidate is reported');
+  const used = evaluations.filter((e) => e.conservativeImprovement > 0);
+  assert.equal(used.length, 1);
+  assert.deepEqual(used[0].request, joint.result.produced[0]);
+  assert.ok(evaluations.some((e) => e.conservativeImprovement === 0 && e.expectedImprovement === 0));
+});
+
+test('joint latent demand leaves a blocked merge out of the what-if, so the cut demands the alternative', () => {
+  // The hinge-at-150 fixture above: one merge is enough and the joint cut
+  // uses one candidate. When that merge is one the host would refuse (a
+  // quarantined source set), it never enters the what-if forest and the cut
+  // demands the other merge instead of hiding it behind a refused request.
+  const build = (blocked?: (sourceIds: readonly string[]) => boolean) => {
+    const strategy = new KvUnifiedStrategy({
+      policy: latentPolicy(0.5),
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode: 'joint', blocked },
+    });
+    const result = strategy.solve(latentFixture(), { totalBudget: 300, targetBudget: 270, slack: 0.1 });
+    return { strategy, result };
+  };
+  const open = build();
+  assert.equal(open.result.produced.length, 1, 'premise: one merge is enough');
+  const chosen = open.strategy.lastDemandEvaluations.find((e) => e.conservativeImprovement > 0)!;
+  const other = open.strategy.lastDemandEvaluations.find((e) => e.conservativeImprovement === 0)!;
+  const seen: string[][] = [];
+  const quarantined = build((sourceIds) => {
+    seen.push([...sourceIds]);
+    return sourceIds.join('+') === chosen.sourceIds.join('+');
+  });
+  assert.deepEqual(seen.map((ids) => ids.join('+')).sort(), [chosen.sourceIds.join('+'), other.sourceIds.join('+')].sort(),
+    'every candidate source set is asked');
+  assert.deepEqual(quarantined.result.produced, [other.request], 'the alternative is demanded');
+  assert.deepEqual(quarantined.strategy.lastDemandEvaluations.map((e) => e.sourceIds), [other.sourceIds],
+    'the blocked candidate is not measured');
+  assert.ok(quarantined.strategy.lastDemandEvaluations[0].conservativeImprovement > 0);
+  const none = build(() => true);
+  assert.deepEqual(none.result.produced, []);
+  assert.equal(none.strategy.lastTimings?.demandSolves, 0, 'nothing to measure, nothing solved');
+});
+
+test('joint latent demand demands nothing when the joint cut beats the live one by at most epsilon', () => {
+  // Hinge at 150 and one merge worth ~35,800: an epsilon above that gain
+  // keeps the merge undemanded while the evaluations still report it.
+  const strategy = new KvUnifiedStrategy({
+    policy: latentPolicy(0.5),
+    tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+    adoptEpsilon: 50_000,
+    latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode: 'joint' },
+  });
+  const result = strategy.solve(latentFixture(), { totalBudget: 300, targetBudget: 270, slack: 0.1 });
+  assert.deepEqual(result.produced, []);
+  assert.ok(strategy.lastDemandEvaluations.some((e) => e.conservativeImprovement > 0 && e.conservativeImprovement <= 50_000));
+});
+
+test('joint latent demand gates a certified base solve the way the individual ranking does', () => {
+  // The fixture of the certified-base test above: the carried raw layout
+  // certifies under a wide epsilon and the merge is worth less than epsilon
+  // against the unrestricted best cut. Both modes decide the same way from
+  // a certified and an unrestricted base.
+  const build = (hysteresisCertificate: boolean, mode: 'individual' | 'joint') => {
+    const chronicle = new MockChronicle({ recallPairTokens: 100 });
+    for (let i = 0; i < 4; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 100 });
+    for (const chunk of chronicle.chunks) chunk.salience = 0.2;
+    chronicle.produceL1(['c0', 'c1']);
+    chronicle.produceL1(['c2', 'c3']);
+    const inputs: PickerInputs = {
+      chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+    };
+    const leaves = new Map(chronicle.chunks.map((chunk) => [chunk.id, { level: 0, repHash: `raw:${chunk.id}`, lastChangedSeq: 1 }]));
+    const strategy = new KvUnifiedStrategy({
+      policy: {
+        alpha: 0, budgetLowRatio: 0, budgetHighRatio: 0.125, budgetUnderLambda: 0, budgetOverLambda: 1600,
+        cacheLambda: 0, continuityLambda: 0,
+      },
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      adoptEpsilon: 1300, hysteresisCertificate,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode },
+      presentation: { currentSeq: 1, leaves },
+    });
+    const result = strategy.solve(inputs, { totalBudget: 400, targetBudget: 400, slack: 0 });
+    return { strategy, result };
+  };
+  for (const certificate of [true, false]) {
+    const joint = build(certificate, 'joint');
+    const individual = build(certificate, 'individual');
+    assert.equal(Boolean(joint.strategy.lastResult?.certificate), certificate);
+    assert.deepEqual(joint.result.produced, individual.result.produced, `certificate ${certificate}`);
+    assert.deepEqual(joint.result.produced, []);
+    assert.equal(joint.strategy.lastDemandEvaluations.length, 1);
+    // One joint solve. With the certificate on, the what-if certifies the
+    // carried layout too, and its slack spans the gate: the joint solve runs
+    // again without the certificate to decide it. The gate fails either
+    // way, so the certified base is never solved unrestricted.
+    assert.equal(joint.strategy.lastTimings?.demandSolves, certificate ? 2 : 1);
+  }
+});
+
+test('joint latent demand on the default engine takes the cut from the shared-frame hook, not the candidate list', () => {
+  // The subtree engine is the default; its result carries both hooks, and
+  // the joint ranking reads the used set off `bestUnder` without refining
+  // and scoring every terminal candidate of the pool.
+  const reads: number[] = [];
+  const solve = ParetoKvUnifiedPolicySolver.prototype.solve;
+  ParetoKvUnifiedPolicySolver.prototype.solve = function (this: ParetoKvUnifiedPolicySolver, ...args) {
+    const result = solve.apply(this, args);
+    if (result.feasible) {
+      const descriptor = Object.getOwnPropertyDescriptor(result, 'candidates');
+      if (descriptor?.get) {
+        const get = descriptor.get;
+        let count = 0;
+        reads.push(0);
+        const slot = reads.length - 1;
+        Object.defineProperty(result, 'candidates', { get() { reads[slot] = ++count; return get.call(this); }, configurable: true, enumerable: true });
+      }
+      assert.equal(typeof result.bestScoreUnder, typeof result.bestUnder, 'both hooks or neither');
+    }
+    return result;
+  };
+  try {
+    const build = (engine: 'auto' | 'dag') => {
+      const strategy = new KvUnifiedStrategy({
+        policy: latentPolicy(0.5), engine,
+        tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+        latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode: 'joint' },
+      });
+      return { strategy, result: strategy.solve(latentFixture(), { totalBudget: 300, targetBudget: 270, slack: 0.1 }) };
+    };
+    const auto = build('auto');
+    assert.equal(auto.result.produced.length, 1, 'premise: one merge is enough');
+    assert.ok(reads.length >= 2, 'premise: the live solve and the joint what-if were scored lazily');
+    assert.deepEqual(reads, reads.map(() => 0), 'no result had its candidate list read');
+    const dag = build('dag');
+    assert.deepEqual(auto.result.produced, dag.result.produced);
+    assert.deepEqual(auto.strategy.lastDemandEvaluations, dag.strategy.lastDemandEvaluations);
+  } finally {
+    ParetoKvUnifiedPolicySolver.prototype.solve = solve;
+  }
+});
+
+test('a joint forest that exceeded the ceiling is not solved again while the candidate set and ceiling are unchanged', () => {
+  const fixture = (): PickerInputs => {
+    const chronicle = new MockChronicle({ recallPairTokens: 60, mergeThreshold: 2 });
+    const raw = [90, 130, 70, 160, 110, 140];
+    const recall = [40, 75, 55, 90, 65, 80];
+    for (let index = 0; index < 6; index++) {
+      const id = `latent-${index}`;
+      chronicle.addChunk({ id, rawTokens: raw[index] });
+      chronicle.chunks[index].salience = 0.4 + 0.1 * index;
+      const l1 = chronicle.produceL1([id]);
+      chronicle.recallPairTokens.set(l1.id, recall[index]);
+    }
+    return {
+      chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+    };
+  };
+  const build = (mode: 'individual' | 'joint', labelCeiling: number, reuse: KvUnifiedReuse) => {
+    const strategy = new KvUnifiedStrategy({
+      policy: { alpha: 0.7, budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0, budgetOverLambda: 100_000, cacheLambda: 0, continuityLambda: 0 },
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling, reuse,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode },
+    });
+    const result = strategy.solve(fixture(), { totalBudget: 500, targetBudget: 450, slack: 0.1 });
+    return { strategy, result };
+  };
+  const individual = build('individual', 40, {});
+  const reuse: KvUnifiedReuse = {};
+  const first = build('joint', 40, reuse);
+  assert.equal(first.strategy.lastTimings?.demandSolves, individual.strategy.lastTimings!.demandSolves + 1, 'premise: the joint attempt failed');
+  const holders = [...reuse.whatIf!.values()].filter((holder) => holder.jointFailure !== undefined);
+  assert.equal(holders.length, 1, 'the joint holder remembers the failure');
+  const second = build('joint', 40, reuse);
+  assert.deepEqual(second.result.produced, first.result.produced);
+  assert.equal(second.strategy.lastTimings?.demandSolves, individual.strategy.lastTimings!.demandSolves, 'no joint attempt');
+  assert.ok([...reuse.whatIf!.values()].some((holder) => holder.jointFailure !== undefined), 'and still remembers it');
+  // A different ceiling is a new question.
+  const roomy = build('joint', 10_000, reuse);
+  assert.equal(roomy.strategy.lastTimings?.demandSolves, 1, 'measured once with room');
+});
+
+test('a remembered joint ceiling failure is forgotten when the wall changes', () => {
+  // The six-leaf fixture over a ceiling of 40 at a wall of 500; at 405 the
+  // joint forest fits. A holder carried from the failed compile must not
+  // keep the ranking individual at the new wall.
+  const fixture = (): PickerInputs => {
+    const chronicle = new MockChronicle({ recallPairTokens: 60, mergeThreshold: 2 });
+    const raw = [90, 130, 70, 160, 110, 140];
+    const recall = [40, 75, 55, 90, 65, 80];
+    for (let index = 0; index < 6; index++) {
+      const id = `latent-${index}`;
+      chronicle.addChunk({ id, rawTokens: raw[index] });
+      chronicle.chunks[index].salience = 0.4 + 0.1 * index;
+      const l1 = chronicle.produceL1([id]);
+      chronicle.recallPairTokens.set(l1.id, recall[index]);
+    }
+    return {
+      chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+    };
+  };
+  const build = (budget: number, reuse: KvUnifiedReuse) => {
+    const strategy = new KvUnifiedStrategy({
+      policy: { alpha: 0.7, budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0, budgetOverLambda: 100_000, cacheLambda: 0, continuityLambda: 0 },
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 40, adoptEpsilon: 90_000, reuse,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode: 'joint' },
+    });
+    const result = strategy.solve(fixture(), { totalBudget: budget, targetBudget: budget * 0.9, slack: 0.1 });
+    return { strategy, result };
+  };
+  const reuse: KvUnifiedReuse = {};
+  const wide = build(500, reuse);
+  assert.ok([...reuse.whatIf!.values()].some((holder) => holder.jointFailure !== undefined), 'premise: the joint solve failed at 500');
+  assert.ok(wide.strategy.lastTimings!.demandSolves > 1, 'premise: the individual ranking ran');
+  const fresh = build(405, {});
+  assert.equal(fresh.strategy.lastTimings?.demandSolves, 1, 'premise: at 405 the joint forest fits');
+  assert.ok(fresh.result.produced.length > 0, 'premise: and the set is demanded');
+  const carried = build(405, reuse);
+  assert.equal(carried.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again at the new wall');
+  assert.deepEqual(carried.result.produced, fresh.result.produced);
+  // A pin, a head window, a level bound that only touches the level a
+  // candidate would add, or a leaf's size: the signature digests every
+  // input the solve reads, so each is a new question.
+  const pinned = (budget: number, holder: KvUnifiedReuse, how: 'pin' | 'head' | 'max' | 'tokens' = 'pin') => {
+    const inputs = fixture();
+    if (how === 'head') { inputs.headChunkIds = new Set(['latent-0']); inputs.headTokens = 90; }
+    else if (how === 'max') for (const chunk of inputs.chunks) chunk.pinMaxLevel = 1;
+    else if (how === 'tokens') for (const chunk of inputs.chunks) chunk.rawTokens *= 2;
+    else inputs.chunks[1].pinned = true;
+    const strategy = new KvUnifiedStrategy({
+      policy: { alpha: 0.7, budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0, budgetOverLambda: 100_000, cacheLambda: 0, continuityLambda: 0 },
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 40, adoptEpsilon: 90_000, reuse: holder,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode: 'joint' },
+    });
+    return { strategy, result: strategy.solve(inputs, { totalBudget: budget, targetBudget: budget * 0.9, slack: 0.1 }) };
+  };
+  const again: KvUnifiedReuse = {};
+  const failed = build(500, again);
+  assert.ok(failed.strategy.lastTimings!.demandSolves > 1, 'premise: failed at 500');
+  const freshPinned = pinned(500, {});
+  assert.equal(freshPinned.strategy.lastTimings?.demandSolves, 1, 'premise: with a leaf pinned the joint forest fits at 500');
+  const carriedPinned = pinned(500, again);
+  assert.equal(carriedPinned.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again after the pins');
+  assert.deepEqual(carriedPinned.result.produced, freshPinned.result.produced);
+  const once: KvUnifiedReuse = {};
+  build(500, once);
+  const freshHead = pinned(500, {}, 'head');
+  assert.equal(freshHead.strategy.lastTimings?.demandSolves, 1, 'premise: with a head leaf the joint forest fits at 500');
+  const carriedHead = pinned(500, once, 'head');
+  assert.equal(carriedHead.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again after the head window');
+  assert.deepEqual(carriedHead.result.produced, freshHead.result.produced);
+  const bounded: KvUnifiedReuse = {};
+  build(500, bounded);
+  const freshMax = pinned(500, {}, 'max');
+  assert.equal(freshMax.strategy.lastTimings?.demandSolves, 1, 'premise: with every leaf bounded at L1 the joint forest fits at 500');
+  const carriedMax = pinned(500, bounded, 'max');
+  assert.equal(carriedMax.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again after a bound on the proposed level');
+  assert.deepEqual(carriedMax.result.produced, freshMax.result.produced);
+  // So does a leaf's token estimate.
+  const resized: KvUnifiedReuse = {};
+  build(500, resized);
+  const freshTokens = pinned(500, {}, 'tokens');
+  assert.equal(freshTokens.strategy.lastTimings?.demandSolves, 1, 'premise: with the leaves twice the size the joint forest fits at 500');
+  const carriedTokens = pinned(500, resized, 'tokens');
+  assert.equal(carriedTokens.strategy.lastTimings?.demandSolves, 1, 'the joint solve is tried again after the estimates moved');
+  assert.deepEqual(carriedTokens.result.produced, freshTokens.result.produced);
+});
+
+test('a root the forest treeified away from a crossed parent is not a merge candidate', () => {
+  // Six leaves under one L1 each and a stored L2 over c0 and c2 alone: the
+  // forest removes the crossed L2, so the L1s of c0 and c2 are roots in it,
+  // but their stored entries still name the parent and the merge queue
+  // skips a source with one. The candidate runs break at those two (c1
+  // alone, then c3..c5), so the only merge demanded is one the queue can
+  // build, c3..c4, where before c0..c1 and c2..c3 were demanded and never
+  // queued.
+  const build = (mode: 'individual' | 'joint') => {
+    const chronicle = new MockChronicle({ recallPairTokens: 60, mergeThreshold: 2 });
+    const l1s = [];
+    for (let i = 0; i < 6; i++) {
+      chronicle.addChunk({ id: `c${i}`, rawTokens: 100 });
+      l1s.push(chronicle.produceL1([`c${i}`]));
+    }
+    const crossed = chronicle.produceUpper(2, [l1s[0].id, l1s[2].id]);
+    assert.ok(chronicle.summaries.get(l1s[0].id)?.parentId === crossed.id, 'premise: the stored L1 names the parent');
+    const inputs: PickerInputs = {
+      chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+    };
+    const strategy = new KvUnifiedStrategy({
+      policy: latentPolicy(0.25), treeifyNonContiguousSummaries: true,
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling: 10_000,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode },
+    });
+    return strategy.solve(inputs, { totalBudget: 400, targetBudget: 360, slack: 0.1 });
+  };
+  for (const mode of ['joint', 'individual'] as const) {
+    const result = build(mode);
+    assert.deepEqual(result.produced.map((request) => [request.level, request.range.firstChunkId, request.range.lastChunkId]),
+      [[2, 'c3', 'c4']], mode);
+  }
+});
+
+test('joint latent demand what-if solves reuse their forests across compiles without changing the ranking', () => {
+  const base = {
+    raw: [50, 50, 200, 100, 100, 200, 50, 200], salience: [0.2, 0.5, 1, 1, 0.5, 1, 0.5, 1],
+    pairTokens: 150, seenL2: [10, 20, 30, 40], covered: 2, budget: 800, adoptEpsilon: 200, hysteresisCertificate: true,
+    mode: 'joint' as const,
+  };
+  const describe = (r: ReturnType<typeof certifiedWhatIfFixture>) => ({
+    produced: r.result.produced,
+    evaluations: r.strategy.lastDemandEvaluations.map((e) => [e.request, e.conservativeImprovement, e.expectedImprovement]),
+    frontier: [...r.result.frontier],
+  });
+  const reuse: KvUnifiedReuse = {};
+  let previousKey: string | undefined;
+  for (const appended of [0, 0, 1, 2]) {
+    const before = new Map(reuse.whatIf ?? []);
+    const held = certifiedWhatIfFixture({ ...base, appended, reuse });
+    assert.deepEqual(describe(held), describe(certifiedWhatIfFixture({ ...base, appended })), `appended=${appended}`);
+    assert.ok(held.result.produced.length > 0, `appended=${appended}: premise, the set is demanded`);
+    assert.equal(reuse.whatIf?.size, 1, 'one joint holder for the whole set');
+    const [key, holder] = [...reuse.whatIf!.entries()][0];
+    if (previousKey !== undefined) assert.equal(key, previousKey, 'the same set keys the same holder');
+    previousKey = key;
+    if (before.size > 0) {
+      assert.equal(before.get(key), holder, `appended=${appended}: the holder is carried`);
+      assert.equal(holder.forest?.derived, true, `appended=${appended}: and its forest derived`);
+    }
+    assert.notEqual(holder.forest, reuse.forest);
+  }
+  // A candidate gone from the set (its merge exists) keys a different holder.
+  const merged = certifiedWhatIfFixture({ ...base, appended: 2, reuse, seenL2: [10, 20, 30, 40] });
+  assert.ok(merged.result.produced.length > 0);
+});
+
+test('joint latent demand falls back to the individual ranking when the joint forest exceeds the label ceiling', () => {
+  // Six L1s of varied size and cost under a ceiling of 40 labels: each
+  // what-if fits on its own and the joint forest, which holds every
+  // candidate at once, does not. The demand is optional, so the compile
+  // goes on with the candidates one at a time instead of failing.
+  const fixture = (): PickerInputs => {
+    const chronicle = new MockChronicle({ recallPairTokens: 60, mergeThreshold: 2 });
+    const raw = [90, 130, 70, 160, 110, 140];
+    const recall = [40, 75, 55, 90, 65, 80];
+    for (let index = 0; index < 6; index++) {
+      const id = `latent-${index}`;
+      chronicle.addChunk({ id, rawTokens: raw[index] });
+      chronicle.chunks[index].salience = 0.4 + 0.1 * index;
+      const l1 = chronicle.produceL1([id]);
+      chronicle.recallPairTokens.set(l1.id, recall[index]);
+    }
+    return {
+      chunks: chronicle.chunks, summaries: chronicle.summaries, recallPairTokens: chronicle.recallPairTokens,
+      headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+    };
+  };
+  const build = (mode: 'individual' | 'joint', labelCeiling: number) => {
+    const strategy = new KvUnifiedStrategy({
+      policy: { alpha: 0.7, budgetLowRatio: 0, budgetHighRatio: 0.5, budgetUnderLambda: 0, budgetOverLambda: 100_000, cacheLambda: 0, continuityLambda: 0 },
+      tokenBucketSize: 10, continuityBucketSize: 10, fidelityBucketSize: 10, labelCeiling,
+      latentDemand: { mergeThreshold: 2, fallbackRecallTokens: 30, maxCandidates: 4, mode },
+    });
+    const result = strategy.solve(fixture(), { totalBudget: 500, targetBudget: 450, slack: 0.1 });
+    return { strategy, result };
+  };
+  const individual = build('individual', 40);
+  const joint = build('joint', 40);
+  assert.ok(individual.result.produced.length > 0);
+  assert.deepEqual(joint.result.produced, individual.result.produced, 'the fallback is the individual ranking');
+  assert.equal(joint.strategy.lastTimings?.demandSolves, individual.strategy.lastTimings!.demandSolves + 1, 'the joint attempt, then the individual solves');
+  assert.equal(build('joint', 10_000).strategy.lastTimings?.demandSolves, 1, 'with room, the set is measured once');
 });

@@ -6,14 +6,14 @@ import type {
   ChunkId,
 } from '../folding-strategy.js';
 import type { PickerInputs } from '../picker.js';
-import { CanonicalSummaryForest } from '../kv-unified.js';
-import type { SummaryEntry } from '../../types/strategy.js';
+import { CanonicalSummaryForest, SparseLabelCeilingError } from '../kv-unified.js';
+import { getSummaryParentId, type SummaryEntry } from '../../types/strategy.js';
 import {
   ParetoKvUnifiedPolicySolver,
   type ParetoPolicySolveResult,
   type ParetoSolveOptions,
 } from '../kv-unified-pareto.js';
-import { normalizeContinuityMultiplier, normalizePolicy, policyScore } from '../kv-unified-policy.js';
+import { frontierSignature, normalizeContinuityMultiplier, normalizePolicy, policyScore, type KvUnifiedWelfarePolicy } from '../kv-unified-policy.js';
 
 import type { KvUnifiedReuse } from '../kv-unified-reuse.js';
 import type { SubtreeSolveStats } from '../kv-unified-subtree.js';
@@ -28,6 +28,26 @@ export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> 
     mergeThreshold: number;
     fallbackRecallTokens: number;
     maxCandidates: number;
+    /** How producible merges are measured against the live cut.
+     * `individual` (absent): one conservative what-if solve per candidate,
+     * each gain measured on its own, plus an expected-cost solve to order
+     * the demanded ones (the v1 marginal rule of `unified-solve-design.md`
+     * §8). `joint`: one what-if solve with every candidate present at its
+     * conservative cost; the merges the pool's best cut in the shared frame
+     * uses are demanded when that cut beats the live one by more than
+     * `adoptEpsilon`, in the order of their estimated token reduction (the
+     * hysteresis selection may be the carried layout kept within epsilon of
+     * that cut, and is not the cut read). A compile with a merge backlog
+     * then pays one extra solve instead of two per candidate, and the gain
+     * is the set's, measured once, instead of per-candidate differences at
+     * the approximation's noise floor. The strategy built from a recipe
+     * fills in `joint` unless `latentDemandMode` says otherwise. */
+    mode?: 'individual' | 'joint';
+    /** Source sets whose merge the host would refuse to build (a merge in
+     * its quarantine). Such a candidate never enters a what-if forest: a
+     * cut that used it would attribute its gain to a merge that cannot be
+     * made, and in joint mode hide the alternative the cut left out. */
+    blocked?: (sourceIds: readonly string[]) => boolean;
   };
 }
 
@@ -170,6 +190,30 @@ export class KvUnifiedStrategy implements FoldingSolver {
     if (live) live.whatIf = whatIf.kept;
     const candidates = latentHigherLevelCandidates(inputs, forest, config)
       .slice(0, Math.max(0, Math.floor(config.maxCandidates)));
+    const policy = normalizePolicy(this.options.policy);
+    const multiplier = normalizeContinuityMultiplier(this.options.continuityMultiplier);
+    // Merges worth less than adoptEpsilon are not demanded; that is the
+    // hysteresis policy's own tolerance, applied here to best-vs-best.
+    const epsilon = Number.isFinite(this.options.adoptEpsilon) && (this.options.adoptEpsilon ?? 0) > 0
+      ? this.options.adoptEpsilon!
+      : 0;
+    const args = [inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier] as const;
+    return config.mode === 'joint' ? this.rankJointLatentDemand(...args) : this.rankIndividualLatentDemand(...args);
+  }
+
+  /** One what-if solve per candidate (two with the expected cost), each
+   * gated and ordered on its own gain against the base. */
+  private rankIndividualLatentDemand(
+    inputs: PickerInputs,
+    whatIf: WhatIfReuse,
+    solver: ParetoKvUnifiedPolicySolver,
+    baseline: Extract<ParetoPolicySolveResult, { feasible: true }>,
+    budget: FoldingBudget,
+    candidates: readonly LatentCandidate[],
+    epsilon: number,
+    policy: KvUnifiedWelfarePolicy,
+    multiplier: number,
+  ): ProduceRequest[] {
     // Pass 1: one conservative (p80 recall-cost) what-if solve per candidate.
     const solved = candidates.flatMap((candidate) => {
       const conservative = solveWithLatentCandidate(
@@ -178,16 +222,9 @@ export class KvUnifiedStrategy implements FoldingSolver {
       this.demandSolves++;
       return conservative.feasible ? [{ candidate, conservative }] : [];
     });
-    const policy = normalizePolicy(this.options.policy);
-    const multiplier = normalizeContinuityMultiplier(this.options.continuityMultiplier);
     // Certified entries whose uncertified re-solve scored worse than the
     // certified pool: they stand at the gain that pool proves.
     const proven = new Set<object>();
-    // Merges worth less than adoptEpsilon are not demanded; that is the
-    // hysteresis policy's own tolerance, applied here to best-vs-best.
-    const epsilon = Number.isFinite(this.options.adoptEpsilon) && (this.options.adoptEpsilon ?? 0) > 0
-      ? this.options.adoptEpsilon!
-      : 0;
     const rank = (base: Extract<ParetoPolicySolveResult, { feasible: true }>, withExpected: boolean): LatentDemandEvaluation[] => {
       // One frame for the whole compile. Each solve measures its penalties
       // from its own pool's floors, so raw scores from two solves are not
@@ -322,6 +359,175 @@ export class KvUnifiedStrategy implements FoldingSolver {
       .filter((evaluation) => evaluation.conservativeImprovement > epsilon)
       .map((evaluation) => evaluation.request);
   }
+
+  /** `latentDemand.mode: 'joint'`: every candidate enters one what-if forest
+   * at its conservative cost, and one solve measures the set. The candidates
+   * the pool's best cut in the shared frame uses are demanded when that cut beats the live one by
+   * more than epsilon. The gain is scored in the frame both pools share, as
+   * the individual ranking does, and the same certificate rules apply: a
+   * certified what-if that cannot decide the gate is solved again without
+   * the certificate, and a certified base whose gate passes is replaced by
+   * the unrestricted base solve before the gate is final. */
+  private rankJointLatentDemand(
+    inputs: PickerInputs,
+    whatIf: WhatIfReuse,
+    solver: ParetoKvUnifiedPolicySolver,
+    baseline: Extract<ParetoPolicySolveResult, { feasible: true }>,
+    budget: FoldingBudget,
+    candidates: readonly LatentCandidate[],
+    epsilon: number,
+    policy: KvUnifiedWelfarePolicy,
+    multiplier: number,
+  ): ProduceRequest[] {
+    this.demandEvaluations = [];
+    if (candidates.length === 0) return [];
+    const conservative = candidates.map((candidate) => ({ candidate, recallTokens: candidate.conservativeRecallTokens }));
+    const solveJoint = (options: KvUnifiedOptions): ParetoPolicySolveResult => {
+      this.demandSolves++;
+      return solveWithLatentCandidates(inputs, whatIf, conservative, options, budget.totalBudget);
+    };
+    // A joint forest that exceeded the ceiling last compile, with the same
+    // candidate set and the same inputs that decide the label count, would
+    // exceed it again: its holder says so, and is kept so that it still
+    // says so next compile.
+    const key = whatIfKey(conservative);
+    const failure = jointFailureSignature(inputs, this.options, budget.totalBudget, policy, multiplier);
+    const remembered = whatIf.carried?.get(key);
+    if (remembered?.jointFailure === failure) {
+      whatIf.kept?.set(key, remembered);
+      return this.rankIndividualLatentDemand(inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier);
+    }
+    try {
+      return this.rankJointPool(inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier, solveJoint);
+    } catch (error) {
+      // The joint forest holds every candidate at once and can need more
+      // labels than the live solve or any single what-if; the demand is
+      // optional, so the compile goes on with the candidates one at a time
+      // rather than failing on its account.
+      if (!(error instanceof SparseLabelCeilingError)) throw error;
+      const holder = whatIf.kept?.get(key);
+      if (holder) holder.jointFailure = failure;
+      return this.rankIndividualLatentDemand(inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier);
+    }
+  }
+
+  private rankJointPool(
+    inputs: PickerInputs,
+    whatIf: WhatIfReuse,
+    solver: ParetoKvUnifiedPolicySolver,
+    baseline: Extract<ParetoPolicySolveResult, { feasible: true }>,
+    budget: FoldingBudget,
+    candidates: readonly LatentCandidate[],
+    epsilon: number,
+    policy: KvUnifiedWelfarePolicy,
+    multiplier: number,
+    solveJoint: (options: KvUnifiedOptions) => ParetoPolicySolveResult,
+  ): ProduceRequest[] {
+    type Feasible = Extract<ParetoPolicySolveResult, { feasible: true }>;
+    const initial = solveJoint(this.options);
+    if (!initial.feasible) return [];
+    let joint: Feasible = initial;
+    const best = (result: Feasible, cacheFloor: number, continuityFloor: number): number => {
+      if (result.bestScoreUnder) return result.bestScoreUnder(cacheFloor, continuityFloor);
+      let score = Infinity;
+      for (const c of result.candidates) {
+        score = Math.min(score, policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss,
+          cacheFloor, continuityFloor, policy, multiplier));
+      }
+      return score;
+    };
+    // One frame for the whole ranking, as the individual ranking has: the
+    // lowest floors any pool reached. A certified pool's floors are zero,
+    // and a frame that rose when such a pool was replaced would score the
+    // remaining pools from higher floors and report a smaller gain than the
+    // one the replacement was decided on.
+    let cacheFloor = Math.min(baseline.cacheFloor, joint.cacheFloor);
+    let continuityFloor = Math.min(baseline.continuityFloor, joint.continuityFloor);
+    const widen = (pool: Feasible): void => {
+      cacheFloor = Math.min(cacheFloor, pool.cacheFloor);
+      continuityFloor = Math.min(continuityFloor, pool.continuityFloor);
+    };
+    let base = baseline;
+    const gainOf = (): number => best(base, cacheFloor, continuityFloor) - best(joint, cacheFloor, continuityFloor);
+    let gain = gainOf();
+    // A certified what-if understates the gain by up to its maxImprovement.
+    // When that interval spans the gate, solve again without the certificate
+    // and keep the better pool (the certified pool is a real layout, so its
+    // gain is a floor; the uncertified solve prunes and can come back worse).
+    const settle = (): void => {
+      const slack = joint.certificate?.maxImprovement ?? 0;
+      if (joint.certificate && gain <= epsilon && gain + slack > epsilon) {
+        const full = solveJoint({ ...this.options, hysteresisCertificate: false });
+        if (full.feasible) {
+          // The two pools are compared in the shared frame, which the new
+          // pool may lower; the frame never rises again.
+          widen(full);
+          if (best(full, cacheFloor, continuityFloor) <= best(joint, cacheFloor, continuityFloor)) joint = full;
+        }
+        gain = gainOf();
+      }
+    };
+    settle();
+    // A certified base exposes only the carried layout and its extensions,
+    // scored up to epsilon above the best cut; a passing gain is decided
+    // against the unrestricted base instead. The joint pool is not
+    // certified here: a certified pool's best is within its slack (at most
+    // epsilon) of the carried layout, which the certified base scores the
+    // same, so its gain cannot have passed the gate. Nothing is left to
+    // settle after the base moves.
+    if (gain > epsilon && baseline.certificate) {
+      this.demandSolves++;
+      const unrestricted = solver.solve({ ...this.options, maxTokens: budget.totalBudget, hysteresisCertificate: false });
+      if (unrestricted.feasible) {
+        widen(unrestricted);
+        base = unrestricted;
+        gain = gainOf();
+      }
+    }
+    // The merges demanded are the ones the cut that supplies the gain uses:
+    // the pool's best cut in the shared frame, not the hysteresis selection,
+    // which may be the carried layout kept within epsilon of it. A candidate
+    // is the only summary at its level over its leaves in the what-if
+    // forest, so a cut uses it exactly when it renders some leaf of its
+    // sources at that level (a pinned or locked leaf under it is a hole the
+    // cut renders through the children).
+    const leafIds = inputs.chunks.map((chunk) => chunk.id);
+    const frontier = (joint.bestUnder
+      ? joint.bestUnder(cacheFloor, continuityFloor)
+      : joint.candidates.reduce((winner, c) => {
+          const value = policyScore(c.fidelityLoss, c.budgetPenalty, c.cacheChurn, c.continuityLoss, cacheFloor, continuityFloor, policy, multiplier);
+          if (value > winner.score) return winner;
+          if (value < winner.score) return { score: value, candidate: c };
+          // A tie breaks as the selection breaks one: tokens, then signature.
+          const tokens = c.renderedTokens - winner.candidate.renderedTokens;
+          const after = tokens > 0 || (tokens === 0 &&
+            frontierSignature(c.frontier, leafIds).localeCompare(frontierSignature(winner.candidate.frontier, leafIds)) >= 0);
+          return after ? winner : { score: value, candidate: c };
+        }, { score: Infinity, candidate: joint.selected }).candidate
+    ).frontier;
+    const used = new Set(candidates.filter((candidate) => candidate.sourceIds.some((sourceId) =>
+      whatIf.base.summary(sourceId)?.leafIds.some((leafId) => frontier.get(leafId) === candidate.level))));
+    const approximate = Boolean(
+      joint.propagation &&
+      (!joint.propagation.approximationBounded || joint.propagation.approximationScoreErrorBound > 0),
+    );
+    const evaluations: LatentDemandEvaluation[] = candidates.map((candidate) => ({
+      request: candidate.request,
+      sourceIds: candidate.sourceIds,
+      expectedRecallTokens: candidate.expectedRecallTokens,
+      conservativeRecallTokens: candidate.conservativeRecallTokens,
+      // The gain belongs to the set the cut uses; a candidate it leaves out
+      // contributed nothing at its conservative cost.
+      expectedImprovement: used.has(candidate) ? gain : 0,
+      conservativeImprovement: used.has(candidate) ? gain : 0,
+      approximate,
+    }));
+    this.demandEvaluations = evaluations;
+    if (gain <= epsilon) return [];
+    return evaluations
+      .filter((evaluation) => evaluation.conservativeImprovement > epsilon)
+      .map((evaluation) => evaluation.request);
+  }
 }
 
 interface LatentCandidate {
@@ -347,6 +553,11 @@ function latentHigherLevelCandidates(
     if (root.kind !== 'summary') { flush(); continue; }
     const summary = forest.summary(root.id);
     if (!summary) { flush(); continue; }
+    // A root whose stored entry still names a parent is one the forest
+    // treeified away from a crossed parent; the merge queue skips a source
+    // with a parent, so a merge over it would be demanded and never built.
+    const stored = inputs.summaries.get(summary.id);
+    if (stored && getSummaryParentId(stored)) { flush(); continue; }
     const previous = run.at(-1);
     if (
       previous &&
@@ -378,6 +589,7 @@ function latentHigherLevelCandidates(
       );
       const childTokens = sources.reduce((sum, source) => sum + source.recallTokens, 0);
       const sourceIds = sources.map((source) => source.id);
+      if (config.blocked?.(sourceIds)) continue;
       const firstLeaf = forest.leaf(sources[0]!.leafIds[0]!);
       const lastLeaf = forest.leaf(sources.at(-1)!.leafIds.at(-1)!);
       if (!firstLeaf || !lastLeaf) continue;
@@ -404,6 +616,67 @@ function latentHigherLevelCandidates(
     );
 }
 
+/** A digest of everything a joint what-if solve reads besides the candidate
+ * set (the holder's key): the leaves (sizes, salience, levels, pins, locks,
+ * head and tail membership), the summaries (levels, costs, ranges, parents),
+ * the presentation and receipt (every cached unit's identity, size and
+ * offset, and the markers), the ceiling, the wall,
+ * the grid, the engine, the forest options, the policy and the multiplier.
+ * Any of them can change how many labels the solve
+ * creates, so a remembered ceiling failure is valid only while all hold;
+ * a changed input is a new question. One pass over the inputs. */
+function jointFailureSignature(inputs: PickerInputs, options: KvUnifiedOptions, maxTokens: number, policy: KvUnifiedWelfarePolicy, multiplier: number): string {
+  let a = 0x811c9dc5, b = 0x9e3779b9;
+  const num = (value: number | undefined): void => {
+    const v = value === undefined ? -1.5 : value;
+    a = Math.imul(a ^ (v | 0), 16777619) ^ Math.imul((v * 1024) | 0, 0x85ebca6b);
+    b = Math.imul(b ^ Math.imul((v * 1024) | 0, 0xc2b2ae35), 0x27d4eb2f) ^ (v | 0);
+  };
+  const str = (value: string | null | undefined): void => {
+    const text = value ?? '';
+    num(text.length);
+    for (let i = 0; i < text.length; i++) { const c = text.charCodeAt(i); a = Math.imul(a ^ c, 16777619); b = Math.imul(b ^ c, 0x01000193 ^ 0x3b) + 1; }
+  };
+  num(options.labelCeiling); num(maxTokens);
+  num(options.tokenBucketSize); num(options.continuityBucketSize); num(options.fidelityBucketSize);
+  num(options.adoptEpsilon); num(options.hysteresisCertificate ? 1 : 0); num(multiplier);
+  str(options.engine); str(options.storage); str(options.terminalEvaluation);
+  num(options.treeifyNonContiguousSummaries ? 1 : 0); num(options.preserveGapBearingSummaries ? 1 : 0);
+  for (const key of Object.keys(policy).sort()) num((policy as unknown as Record<string, number>)[key]);
+  num(inputs.headTokens); num(inputs.tailTokens);
+  for (let i = 0; i < inputs.chunks.length; i++) {
+    const chunk = inputs.chunks[i];
+    str(chunk.id); num(chunk.sequence); num(chunk.rawTokens); num(chunk.salience); num(chunk.currentResolution);
+    num((chunk.pinned ? 1 : 0) | (chunk.lockedByAgent ? 2 : 0) | (inputs.headChunkIds.has(chunk.id) ? 4 : 0) | (inputs.tailChunkIds.has(chunk.id) ? 8 : 0));
+    num(chunk.pinLevel); num(chunk.pinMaxLevel);
+  }
+  for (const summary of inputs.summaries.values()) {
+    str(summary.id); num(summary.level); num(summary.tokens); num(inputs.recallPairTokens?.get(summary.id));
+    str(getSummaryParentId(summary)); str(summary.sourceRange.first); str(summary.sourceRange.last); num(summary.sourceLevel);
+    num(summary.sourceIds.length);
+    for (const sourceId of summary.sourceIds) str(sourceId);
+  }
+  const presentation = options.presentation;
+  num(presentation ? 1 : 0);
+  if (presentation) {
+    num(presentation.currentSeq);
+    for (const [id, leaf] of presentation.leaves) { str(id); num(leaf.level); num(leaf.lastChangedSeq); str(leaf.repHash); }
+  }
+  const cache = options.cache;
+  num(cache ? cache.markers.length : -1); str(cache?.immutablePrefixHash); str(options.currentImmutablePrefixHash);
+  if (cache) {
+    num(cache.layout.units.length); num(cache.layout.totalTokens);
+    for (const unit of cache.layout.units) { str(unit.kind); str(unit.key); num(unit.tokens); num(unit.offset); }
+    for (const marker of cache.markers) { num(marker.unitIndex); num(marker.offset); }
+  }
+  return `${(a >>> 0).toString(16)}:${(b >>> 0).toString(16)}`;
+}
+
+/** The holder key of a what-if over these candidates at these costs. */
+function whatIfKey(candidates: readonly { candidate: LatentCandidate; recallTokens: number }[]): string {
+  return candidates.map(({ candidate, recallTokens }) => `${candidate.id}\0${recallTokens}`).join('\n');
+}
+
 /** What a what-if solve may reuse: the live forest it extends, the holders
  * last compile's what-ifs left (`carried`) and the ones this compile keeps. */
 interface WhatIfReuse {
@@ -421,42 +694,59 @@ function solveWithLatentCandidate(
   options: KvUnifiedOptions,
   maxTokens: number,
 ): ParetoPolicySolveResult {
+  return solveWithLatentCandidates(inputs, whatIf, [{ candidate, recallTokens }], options, maxTokens);
+}
+
+/** Solve the base inputs with every given candidate present as a summary
+ * at the given recall cost. Candidates are disjoint runs of root summaries
+ * (see `latentHigherLevelCandidates`), so each re-parents only its own
+ * sources. */
+function solveWithLatentCandidates(
+  inputs: PickerInputs,
+  whatIf: WhatIfReuse,
+  candidates: readonly { candidate: LatentCandidate; recallTokens: number }[],
+  options: KvUnifiedOptions,
+  maxTokens: number,
+): ParetoPolicySolveResult {
   const summaries = new Map(inputs.summaries);
-  const sourceEntries = candidate.sourceIds.map((id) => summaries.get(id)!);
-  for (const source of sourceEntries) {
-    summaries.set(source.id, { ...source, parentId: candidate.id, mergedInto: undefined });
-  }
-  summaries.set(candidate.id, {
-    id: candidate.id,
-    level: candidate.level,
-    content: '[latent summary candidate]',
-    tokens: recallTokens,
-    sourceLevel: candidate.level - 1,
-    sourceIds: [...candidate.sourceIds],
-    sourceRange: {
-      first: sourceEntries[0]!.sourceRange.first,
-      last: sourceEntries.at(-1)!.sourceRange.last,
-    },
-    created: 0,
-  });
   const recallPairTokens = new Map(inputs.recallPairTokens ?? []);
-  recallPairTokens.set(candidate.id, recallTokens);
+  for (const { candidate, recallTokens } of candidates) {
+    const sourceEntries = candidate.sourceIds.map((id) => summaries.get(id)!);
+    for (const source of sourceEntries) {
+      summaries.set(source.id, { ...source, parentId: candidate.id, mergedInto: undefined });
+    }
+    summaries.set(candidate.id, {
+      id: candidate.id,
+      level: candidate.level,
+      content: '[latent summary candidate]',
+      tokens: recallTokens,
+      sourceLevel: candidate.level - 1,
+      sourceIds: [...candidate.sourceIds],
+      sourceRange: {
+        first: sourceEntries[0]!.sourceRange.first,
+        last: sourceEntries.at(-1)!.sourceRange.last,
+      },
+      created: 0,
+    });
+    recallPairTokens.set(candidate.id, recallTokens);
+  }
   const candidateInputs: PickerInputs = { ...inputs, summaries, recallPairTokens };
-  // The what-if forest is the base forest plus one parent over existing
-  // summaries, which is what a merge arriving between compiles looks like:
+  // The what-if forest is the base forest plus parents over existing
+  // summaries, which is what merges arriving between compiles look like:
   // derive it the same way instead of building every leaf again.
   const forestOptions = {
     treeifyNonContiguousSummaries: options.treeifyNonContiguousSummaries,
     preserveGapBearingSummaries: options.preserveGapBearingSummaries,
   };
-  // The same candidate comes back on every compile until its merge exists,
-  // so its forest and certificate graph are kept like the live ones: derived
-  // from last compile's what-if when only leaves were appended since. The
-  // first what-if borrows unchanged nodes from the live certificate graph.
-  const key = `${candidate.id}\0${recallTokens}`;
+  // The same candidates come back on every compile until their merges
+  // exist, so the forest and certificate graph are kept like the live ones:
+  // derived from last compile's what-if when only leaves were appended
+  // since. The first what-if borrows unchanged nodes from the live
+  // certificate graph.
+  const key = whatIfKey(candidates);
   // The what-if starts from a copy of the live memo: it reads the live
-  // subtrees' sets and keeps its own candidate's, and its copy goes with
-  // the holder when the candidate is gone, instead of leaving every merge
+  // subtrees' sets and keeps its own candidates', and its copy goes with
+  // the holder when the candidates are gone, instead of leaving every merge
   // ever considered in the live map.
   const kept = whatIf.kept?.get(key);
   const carried = kept ?? whatIf.carried?.get(key);
@@ -466,7 +756,7 @@ function solveWithLatentCandidate(
     // A holder from last compile still points at the entries the live map
     // has since replaced; those would fail validation and be computed again
     // inside the what-if. It starts from the live map as it is now and keeps
-    // only its own ids (the candidate's).
+    // only its own ids (the candidates').
     const seeded = new Map(whatIf.live.subtree);
     if (holder.subtree) for (const [id, entry] of holder.subtree) if (!seeded.has(id)) seeded.set(id, entry);
     holder.subtree = seeded;

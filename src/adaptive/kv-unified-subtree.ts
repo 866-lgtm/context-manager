@@ -487,7 +487,7 @@ export class SubtreeMemoSolver {
         approximationCacheErrorBound: approximation.cache,
       },
     };
-    return scored.bestScoreUnder ? withBestScoreUnder(out, scored.bestScoreUnder) : out;
+    return scored.bestScoreUnder ? withBestScoreUnder(out, scored.bestScoreUnder, scored.bestUnder) : out;
   }
 
   // ---- composition ----

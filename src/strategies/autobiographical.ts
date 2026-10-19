@@ -13836,6 +13836,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           mergeThreshold: this.config.mergeThreshold ?? 6,
           fallbackRecallTokens: Math.max(1, (this.config.summaryTargetTokens ?? 2_000) + 20),
           maxCandidates: 16,
+          // One what-if solve for the whole candidate set unless the recipe
+          // asks for the per-candidate ranking; the solver treats an absent
+          // mode as individual.
+          mode: configured.latentDemandMode ?? 'joint',
+          // A quarantined merge is refused at the queue (enqueueMerge), so
+          // it is not a candidate: measured, it could carry the gain and,
+          // in joint mode, hide the merge the cut would otherwise use.
+          blocked: (sourceIds) => this.mergeQuarantine.has(sha256Json(sourceIds)),
         },
         ...(this.kvUnifiedReceipts.head
           ? {

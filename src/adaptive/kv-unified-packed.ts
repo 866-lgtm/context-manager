@@ -482,6 +482,6 @@ export class PackedDagSolver {
       enumeration: result.enumeration, propagation,
       get candidates() { return result.candidates; },
     };
-    return result.bestScoreUnder ? withBestScoreUnder(out, result.bestScoreUnder) : out;
+    return result.bestScoreUnder ? withBestScoreUnder(out, result.bestScoreUnder, result.bestUnder) : out;
   }
 }

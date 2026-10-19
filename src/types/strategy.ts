@@ -844,6 +844,17 @@ export interface KvUnifiedConfig {
    * subtree engine exceeds the label ceiling. `subtree` and `dag` pin one.
    */
   engine?: 'auto' | 'subtree' | 'dag';
+  /**
+   * How producible merges are measured against the live cut (see
+   * `KvUnifiedOptions.latentDemand.mode`). `joint` unless set to
+   * `individual`: one what-if solve with every candidate present, instead of
+   * two solves per candidate. The gain gating a demand is then the set's,
+   * measured once, and a compile with a merge backlog pays one extra solve.
+   * In either mode a merge in the merge quarantine is not a candidate: its
+   * request would be refused, and a joint cut that used it would hide the
+   * merge it would otherwise demand.
+   */
+  latentDemandMode?: 'individual' | 'joint';
 }
 
 export interface AutobiographicalConfig {
