@@ -455,6 +455,84 @@ describe('attribution reads what the raw entries name, not the stored history', 
       rmSync(path, { recursive: true, force: true });
     }
   });
+
+  it('under a view filter, after a write, a compile reads no stored message to place the runs the filter breaks (#273)', async () => {
+    const { ContextManager, PassthroughStrategy, MessageStore } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    // Hiding every other message starts a run at each shown one. Attribution
+    // then reads the merged view before the filter, and a resident writes
+    // before each compile.
+    const path = './test-attribution-lookups-filtered';
+    rmSync(path, { recursive: true, force: true });
+    const proto = MessageStore.prototype as unknown as { getInternal(index: number): unknown };
+    const getInternal = proto.getInternal;
+    let reads = 0;
+    try {
+      const cm = await ContextManager.open({ path, strategy: new PassthroughStrategy(), viewFilter: (m) => !m.metadata?.tuneOut });
+      const turn = (i: number) => {
+        cm.addMessage('bob', [text(`hidden ${i}`)], { tuneOut: { epochId: `e${i}` } });
+        return cm.addMessage('alice', [text(`shown ${i}`)]);
+      };
+      const shown = Array.from({ length: 20 }, (_, i) => turn(i));
+      await cm.compile();
+      shown.push(turn(20));
+      proto.getInternal = function (this: unknown, index: number) {
+        reads++;
+        return getInternal.call(this, index);
+      };
+      const result = await cm.compile();
+      proto.getInternal = getInternal;
+      const raw = result.provenance!.messages.map((m) => (m.kind === 'raw' ? m.bodies.map((b) => [b.messageId, b.complete]) : null));
+      assert.deepEqual(raw, shown.map((id) => [[id, true]]), 'each shown message is its own complete body');
+      assert.equal(reads, 0, `compile read ${reads} stored messages one at a time`);
+      cm.close();
+    } finally {
+      proto.getInternal = getInternal;
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('a raw run from an auxiliary slot is placed without reading its message (#273)', async () => {
+    const { ContextManager, PassthroughStrategy, MessageStore } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    // The hidden message breaks the run, so the second shown one, which only
+    // the auxiliary slot holds, is placed by its sequence.
+    const path = './test-attribution-lookups-auxiliary';
+    rmSync(path, { recursive: true, force: true });
+    const proto = MessageStore.prototype as unknown as { getInternal(index: number): unknown };
+    const getInternal = proto.getInternal;
+    let reads = 0;
+    try {
+      const main = await ContextManager.open({ path, strategy: new PassthroughStrategy() });
+      const side = await ContextManager.open({
+        store: main.getStore(),
+        namespace: 'subconscious/reader',
+        isolate: true,
+        strategy: new PassthroughStrategy(),
+        auxiliaryMessageViews: [{}],
+        viewFilter: (m) => !m.metadata?.tuneOut,
+      });
+      const first = main.addMessage('alice', [text('first')]);
+      main.addMessage('bob', [text('hidden')], { tuneOut: { epochId: 'e1' } });
+      const second = main.addMessage('alice', [text('second')]);
+      // The first compile reads the writer's appends into the reader's listing.
+      await side.compile();
+      proto.getInternal = function (this: unknown, index: number) {
+        reads++;
+        return getInternal.call(this, index);
+      };
+      const result = await side.compile();
+      proto.getInternal = getInternal;
+      const raw = result.provenance!.messages.map((m) => (m.kind === 'raw' ? m.bodies.map((b) => [b.messageId, b.complete]) : null));
+      assert.deepEqual(raw, [[[first, true]], [[second, true]]]);
+      assert.equal(reads, 0, `compile read ${reads} stored messages one at a time`);
+      side.close();
+      main.close();
+    } finally {
+      proto.getInternal = getInternal;
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('a tool result moved by repair is still carried', () => {
