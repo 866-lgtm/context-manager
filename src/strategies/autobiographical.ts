@@ -11123,8 +11123,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * repair stubs `enforceToolPairing` generated, for a head that ends in a
    * tool_use whose result isn't next. Such an entry renders the same on every
    * compile while the head ends in that call and no genuine result for it is
-   * within `enforceToolPairing`'s look-ahead, so the band behind it is a
-   * prefix nothing arrives to change. Once a genuine result comes within
+   * within `enforceToolPairing`'s look-ahead, so the band behind it stands as
+   * one right after the head would. Once a genuine result comes within
    * reach, `enforceToolPairing` moves it into that place, so the entry after
    * the head is no longer stubs alone. It is no recall pair either, so there
    * is no band and the first slot falls back to the head. Only generated
@@ -11138,7 +11138,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * front of a deeper summary, the window is not in the canonical
    * oldest-is-deepest shape — the older content is the part the solver has
    * left shallower, so it is the part a merge or re-cut is still due to
-   * change — and the leading run is not a prefix nothing arrives to change.
+   * change — and a run due to be rewritten is no band.
    * Then there is no band and the first slot falls back to the head, which
    * is never worse than before the band.
    */
@@ -11350,11 +11350,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // The deep band: the leading run of recall pairs after the head (and after
     // any repair stubs there), rendered at the deepest level this compile
-    // emitted. Nothing ARRIVES to change it — a new max-level summary lands
-    // after the run; a merge one level up is the rare exception (one event per
-    // mergeThreshold landings at that level). The solver can still re-cut the
-    // band's youngest group to a shallower level when the budget no longer
-    // needs it (kv-stable's ideal cut; #156 reduces those re-cuts), and
+    // emitted. Nothing that arrives rewrites it: a new max-level summary lands
+    // after the run, and a merge one level up is the rare exception (one event
+    // per mergeThreshold landings at that level). A deeper summary landing
+    // after it ends the band without changing a byte of it, and the measured
+    // slot below then keeps the previous request's furthest unchanged mark.
+    // The solver can still re-cut the band's youngest group to a shallower
+    // level when the budget no longer needs it (kv-stable's ideal cut; #156
+    // reduces those re-cuts), and
     // `Picker.run` applies whatever the solver returns — so this is the
     // cheapest stable prefix after system+tools, not an immutable one. It is
     // what the head marker was standing in for: on Fable (2026-10-06) the head

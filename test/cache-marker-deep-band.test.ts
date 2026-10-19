@@ -3,8 +3,8 @@
  * kv-unified keeps its thirds).
  *
  * The first message-level marker sits at the end of the leading run of
- * recall pairs rendered at the deepest emitted level (the band nothing can
- * arrive to change), not at the last head message. Properties:
+ * recall pairs rendered at the deepest emitted level (the band, which nothing
+ * that arrives rewrites), not at the last head message. Properties:
  *  - no summaries → placement byte-identical to the legacy {head, …} layout;
  *  - band present → first marker at the band's last answer entry; ≤3
  *    markers; the end marker unchanged, and the measured one too except as
@@ -247,6 +247,37 @@ test('legacy: a genuine result moved next to its call ends the stub pass, so the
   assert.equal((es[2]!.content[0] as { content?: unknown }).content, 'file contents', 'fixture: the genuine result moved up next to its call');
   s.place(es, new Set(['h0', 'h1']), new Set(['t0']));
   assert.deepEqual(marksOf(es), [1, 8, 9]); // no band: head, historyEnd (first compile), end
+});
+
+test('legacy: an entry holding a moved genuine result beside a generated stub ends the stub pass, so there is no band', () => {
+  const s = new Exposed({}).withSummaries(LEVELS);
+  // The head ends in two parallel calls: c1's result arrives a few entries down, within
+  // enforceToolPairing's look-ahead, and c2's never does. Repair puts both answers into the one
+  // entry after the head: c1's genuine result, moved up, and a generated stub for c2.
+  const twoCalls = {
+    sourceMessageId: 'h1', participant: 'agent',
+    content: [
+      { type: 'tool_use', id: 'c1', name: 'read', input: {} },
+      { type: 'tool_use', id: 'c2', name: 'read', input: {} },
+    ],
+  } as unknown as ContextEntry;
+  const result = {
+    sourceMessageId: 'r1', participant: 'user',
+    content: [{ type: 'tool_result', toolUseId: 'c1', content: 'file contents' }],
+  } as unknown as ContextEntry;
+  const es = [
+    raw('h0'), twoCalls,
+    question(), answer('L3-a'), question(), answer('L3-b'),
+    result, raw('m2'), raw('t0'),
+  ];
+  s.repair(es);
+  const answers = es[2]!.content as { toolUseId?: string; content?: unknown }[];
+  assert.deepEqual(answers.map((b) => b.toolUseId), ['c1', 'c2'], 'fixture: both answers in the entry after the head');
+  assert.equal(answers[0]!.content, 'file contents', 'fixture: c1\'s genuine result moved up');
+  assert.notEqual(answers[1]!.content, 'file contents', 'fixture: c2 answered by a stub');
+  s.place(es, new Set(['h0', 'h1']), new Set(['t0']));
+  // Not stubs alone, so the entry's bytes changed when the result moved in: no band, head first.
+  assert.deepEqual(marksOf(es), [1, 8, 9]); // head, historyEnd (first compile), end
 });
 
 test('legacy: a raw entry right before a deepest answer ends the run', () => {

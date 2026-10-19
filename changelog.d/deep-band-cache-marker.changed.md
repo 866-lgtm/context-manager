@@ -4,9 +4,12 @@
   rendered at the deepest level the compile emitted, instead of at the
   last head message. The level is the deepest over the whole middle, so a
   shallower leading run in front of a deeper summary leaves no band, and
-  the head marker stays. Nothing *arrives* to change the band, since a new
-  max-level summary lands after it and a merge one level up is the rare
-  exception, though the solver can still re-cut its youngest group to a
+  the head marker stays. Nothing that arrives rewrites the band: a new
+  max-level summary lands after it, and a merge one level up is the rare
+  exception. A deeper summary landing after it ends the band without
+  changing a byte of it, and that turn marks the furthest entry the
+  previous request marked that is still unchanged: the old band end, or a
+  later mark. The solver can also re-cut the band's youngest group to a
   shallower level. Measured on a long-lived resident (2026-10-06), the
   head marker cached 244 tokens of bootstrap messages while 14 complete L3
   pairs (~73k tokens) sat unmarked behind it, and 24 of 51 large rewrites
