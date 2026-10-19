@@ -344,6 +344,14 @@ Releases up to and including 0.6.2 predate this file; for their contents see
   windowed strategy, ten-odd for the autobiographical one), and the strategy's
   listing-keyed memos (post-strip estimates, the chunk index) never hit over
   a merged view because each read returned a new array (#45).
+- An `AutobiographicalStrategy` instance set again while its merge's call was
+  still out, as by `setStrategy()` with the same instance or by a new manager
+  opened with it after `close()`, no longer writes two summaries over the same
+  sources. When the earlier call settled, it cleared the mark of the new
+  generation's merge, so the next tick started a second merge of the same
+  sources while that one was still out. Both wrote, and `compile()` returned
+  both summaries. A tick now clears only its own mark, so nothing starts beside
+  the new generation's merge (#138).
 
 ## 0.16.0 — 2026-10-19
 
