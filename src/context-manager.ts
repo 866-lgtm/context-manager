@@ -1762,13 +1762,16 @@ export class ContextManager {
     ]);
     // A listener of that add may have closed the manager, set a strategy or
     // moved the store's branch. The add stands and the strategy isn't told,
-    // and the refusal says the message is stored.
+    // and the refusal says the message is stored. It gives the reason without
+    // the advice to retry or to recover, since a retry would store a second
+    // transition.
     try {
-      this.requireInitialized('resetHeadWindow', attempt);
+      this.requireInitialized('resetHeadWindow', attempt, false);
     } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
       throw new Error(
-        `${error instanceof Error ? error.message : String(error)} ` +
-          `(during the transition add: message ${msgId} is stored, and the head window wasn't reset)`,
+        `${reason.endsWith('.') ? reason : `${reason}.`} Its transition add finished: message ${msgId} is ` +
+          "stored, and the head window wasn't reset, so a retry would store a second transition.",
       );
     }
 
@@ -1855,8 +1858,12 @@ export class ContextManager {
     throw new Error(`ContextManager.${operation} after close()`);
   }
 
-  /** Fence failed/pending attempts; optionally pin a manager-owned operation across an await. */
-  private requireInitialized(operation: string, expected?: InitializationStamp): InitializationStamp {
+  /**
+   * Fence failed/pending attempts; optionally pin a manager-owned operation
+   * across an await. `advise` false leaves out the refusal's advice on what
+   * to do next, for a caller that says what to do itself.
+   */
+  private requireInitialized(operation: string, expected?: InitializationStamp, advise = true): InitializationStamp {
     this.requireOpen(operation);
     const current: InitializationStamp = {
       ...observeStoreBranch(this.store),
@@ -1865,8 +1872,8 @@ export class ContextManager {
     };
     if (this.initializedAttempt !== current.attempt) {
       throw new Error(
-        `ContextManager.${operation} requires successful strategy initialization (selected branch ${current.name}). ` +
-        'Inspect currentBranch() and recover with switchBranch() or setStrategy().',
+        `ContextManager.${operation} requires successful strategy initialization (selected branch ${current.name}).` +
+        (advise ? ' Inspect currentBranch() and recover with switchBranch() or setStrategy().' : ''),
       );
     }
     if (expected && (
@@ -1874,7 +1881,7 @@ export class ContextManager {
       expected.name !== current.name || expected.generation !== current.generation ||
       expected.id !== current.id
     )) {
-      throw new Error(`Branch or strategy changed during ContextManager.${operation}; retry on the intended branch.`);
+      throw new Error(`Branch or strategy changed during ContextManager.${operation}${advise ? '; retry on the intended branch' : ''}.`);
     }
     return current;
   }

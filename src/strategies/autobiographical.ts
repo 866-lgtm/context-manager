@@ -8594,6 +8594,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
         response: summarizeTelemetryText(stub.content),
       }, this.ns);
+      // As after a written L1: a strategy let go of, or loaded again, while
+      // the clear above waited leaves the merge check to the strategy that
+      // holds the branch now.
+      if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       this.checkMergeThreshold();
       return;
     }
@@ -9225,11 +9229,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // ledger holds no quarantine of its request family. The waiter takes
       // the chunk over by compressing it afresh, through this method's own
       // checks: the quarantine skip, and this coalescing, which waits on a
-      // waiter that took it over first. The tick's hold and cap gates passed
-      // when it started this compression. Nothing awaits from a
-      // compression's start to registering below, so only one waiter takes it.
-      if (result.discarded) return this.compressChunkHierarchical(chunk, ctx, onQuarantineSkip, onRequestStopped);
-      return;
+      // waiter that took it over first. A hold placed on the chunk's span
+      // while it waited stops it first, as tick's gate would have before
+      // this compression started: the rebuild after the release queues the
+      // chunk again. Nothing awaits from a compression's start to
+      // registering below, so only one waiter takes it.
+      if (!result.discarded) return;
+      if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) return;
+      return this.compressChunkHierarchical(chunk, ctx, onQuarantineSkip, onRequestStopped);
     }
 
     // The warnings for the layout sent: section 1's ownership, the recall
@@ -11160,10 +11167,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Resolves true when it wrote the merged parent. It resolves false, having
    * written nothing, when it skips the entry with no call (a source missing,
-   * already parented or held out of merges, or a crossed merge refused) or
-   * its branch went stale during the call. tick drops a skipped
-   * entry from the queue unless the skip dropped it already, as a refused
-   * crossed merge and an entry holding a held source do. Any answer
+   * already parented or held out of merges, or a crossed merge refused), when
+   * its branch went stale during the call, or when its sources were parented
+   * while the call was out. tick drops a skipped entry from the queue unless
+   * the skip dropped it already, as a refused crossed merge and an entry
+   * holding a held source do, or replaced the queue with the store's, as one
+   * that took up another instance's state does: a later tick then drops
+   * the entry from that queue, if it holds it. Any answer
    * from the provider resumes the lane, a refusal included, but only a
    * written merge is a landing (noteCompressionLanded). A hold placed on the
    * span during the call keeps a valid answer out (MergeHoldDiscard).
