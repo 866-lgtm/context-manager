@@ -677,6 +677,32 @@ export interface RenderStats {
      *  'flat-profile'). Surfaces the policy actually in force — a config
      *  clobber that silently downgrades the solver is invisible without it. */
     solver?: string;
+    /** Messages in the strategy's view of the branch this compile read (after
+     *  the view filter, auxiliary slots included), before any folding. Logged
+     *  as `messages=`, so a compile time can be read against the history size
+     *  it covered. The new fields here are optional so a custom strategy's
+     *  stats still type-check. */
+    messages?: number;
+    /** Time in the base `AutobiographicalStrategy.select()` up to the
+     *  `[plan-vs-actual]` line, in whole ms: chunk rebuild, planning (the fold
+     *  solver) and emission. It excludes a subclass's own `select()` override
+     *  and the `ContextManager` work around the call; a host that wants the
+     *  whole compile times `compile()` itself. It includes a
+     *  `productionBudgetTokens` shadow pick, whose solve `solveMs` leaves out,
+     *  and after a provisional-calibration retry the refused first attempt.
+     *  Logged as `compileMs=`. */
+    compileMs?: number;
+    /** Under `foldingStrategy: 'kv-unified'` only: the forest build, solve and
+     *  latent-demand ranking of the compile's final pick inside `compileMs`,
+     *  in whole ms (`solveMs=`). */
+    solveMs?: number;
+    /** Set on a dry run or preview (`dryRun: true`, `previewContext`), which
+     *  skips work a live compile does; logged as `dryRun=true`. Absent on a
+     *  live compile. A caller reads a dry pass's stats only from
+     *  `previewContext(..., { render: true })`'s `stats`: `compile()` returns
+     *  no stats, and a dry pass leaves `getRenderStats()` describing the last
+     *  live compile. */
+    dryRun?: true;
     /** Which chunks moved between which levels, and where this request's
      *  entries first differ from those of the last request the strategy
      *  returned, past which no cached prefix reaches. Present only when a
@@ -709,8 +735,53 @@ export function isRenderStatsCapable(s: ContextStrategy): s is RenderStatsCapabl
  * Public quarantine status shape (health surfaces + the repeating alarm).
  */
 export interface CompressionQuarantineStatus {
+  /** Quarantine records: one per request shape a span exhausted, so a span can hold several. */
   count: number;
+  /** The records' keys, as `clearCompressionRefusalQuarantine()` takes them. */
   keys: string[];
+  /** The quarantined spans, each once however many records it holds, the longest waiting first. */
+  spans: CompressionQuarantineSpan[];
+}
+
+/** One quarantined span: a chunk's messages, which stay raw while it's quarantined. */
+export interface CompressionQuarantineSpan {
+  /** The span's identity: the hash of its chunk's message ids. */
+  chunkSourceHash: string;
+  /** Its first and last message ids; null when no current chunk has this span. */
+  firstMessageId: string | null;
+  lastMessageId: string | null;
+  /**
+   * How long since its chunk closed, from the newest of its messages'
+   * timestamps: how long it has stayed raw. Null when unknown.
+   */
+  closedAgeMs: number | null;
+  /**
+   * When its earliest record was made (ms since the epoch): how long it has
+   * been refused, where `closedAgeMs` is how long it has stayed raw. The
+   * alarm line shows it as "refusing since". A re-cut chunk's records start
+   * over.
+   */
+  quarantinedAt: number;
+  /** Its quarantine records, one per request shape it exhausted. */
+  records: number;
+  /**
+   * Requests a provider answered for those records, none giving a summary:
+   * the canonical request and its no-tools and tools-less retries, and each
+   * fallback after them. A recall variant planned over the compression's
+   * context budget, recorded as `admission_rejected` and never sent, isn't
+   * counted, and neither is a rung its failures decided
+   * (`provider_error:persistent-<class>`), which no provider gave as an answer.
+   * A record an earlier version wrote holds one outcome for the whole
+   * canonical stage, so it counts that stage once.
+   */
+  answeredAttempts: number;
+  /**
+   * The newest record's last outcome, with its error type after a colon when
+   * it carries one (`refusal`, `incomplete`, `provider_error:invalid_request`,
+   * `admission_rejected`, or `provider_error:persistent-<class>` for a rung its
+   * failures decided); null when that record holds none.
+   */
+  latestOutcome: string | null;
 }
 
 /** Delimiter convention applied to recall answer content. See `recallEnvelope`. */
@@ -1357,11 +1428,19 @@ export interface AutobiographicalConfig {
   toolUseInputMaxTokens?: number;
 
   /**
-   * Cap on the number of speculative L1 summaries the strategy will hold
-   * (queued + unmerged). When `count(unmerged L1s) + count(queued chunks)`
-   * exceeds this cap, `onNewMessage`'s auto-tick is held back. Chunks
-   * still form and queue, but compression is deferred until a manual
-   * `tick()` or `compile()` triggers it.
+   * Cap on the number of produced, unmerged L1 summaries. Past it, while an
+   * L1→L2 merge is queued and `hierarchical` is on, `tick` takes no chunk
+   * to compress into an L1, whether the background drain or a manual
+   * `tick()` calls it, and runs the merge, which brings the count back down.
+   * Production waits for that merge as long as the merge waits, such as on
+   * a compression hold over its sources. Chunks still form and queue, and
+   * queued chunks don't count toward the cap.
+   *
+   * With no L1 merge queued, the cap holds nothing. No merge forms below
+   * `mergeThreshold` unmerged L1s, so a cap below `mergeThreshold - 1` lets
+   * them rise to the threshold. Unmerged L1s that can never merge count
+   * toward the cap without holding production. Under `hierarchical: false`
+   * tick runs no merge, so the cap holds nothing.
    *
    * Default: undefined (no cap; compression fires eagerly on every
    * new message when `autoTickOnNewMessage` is true).

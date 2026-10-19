@@ -351,7 +351,8 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
     assert.strictEqual(of('kv-overlap').length, 1, logged.join('\n'));
     assert.match(of('kv-overlap')[0]!, new RegExp(`sample=${y} ns=agents/tern$`));
     assert.strictEqual(of('plan-vs-actual').length, 1, logged.join('\n'));
-    assert.match(of('plan-vs-actual')[0]!, / solver=\S+ ns=agents\/tern$/);
+    // After its fields, solver= and those that follow it.
+    assert.match(of('plan-vs-actual')[0]!, / solver=\S+(?: \w+=\S+)* ns=agents\/tern$/);
     assert.ok(of('kv-timing').length > 0, logged.join('\n'));
     for (const line of of('kv-timing')) assert.match(line, / ns=agents\/tern$/);
     manager.close();

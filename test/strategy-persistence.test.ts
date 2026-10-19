@@ -1905,7 +1905,7 @@ describe('AutobiographicalStrategy — persistence', () => {
         _level: SummaryLevel,
         _sourceIds: string[],
         _ctx: import('../src/types/index.js').StrategyContext,
-      ): Promise<void> {
+      ): Promise<boolean> {
         throw this.executeMergeError;
       }
     }
