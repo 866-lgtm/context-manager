@@ -302,8 +302,18 @@ describe('WindowedPassthroughStrategy: branch-scoped anchor', () => {
     await manager.close();
 
     const strategy2 = new WindowedPassthroughStrategy({ anchorStateId });
-    const manager2 = await ContextManager.open({ path, strategy: strategy2 });
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+    let manager2: ContextManager;
+    try {
+      manager2 = await ContextManager.open({ path, strategy: strategy2, namespace: 'agents/tern' });
+    } finally {
+      console.warn = warn;
+    }
     assert.equal(strategy2.getAnchor(), 0);
+    // The reset is said, naming the strategy's namespace (#239).
+    assert.ok(warned.some((w) => w.startsWith('[windowed-passthrough] persisted anchor 1000000 is past the branch head') && w.endsWith(' ns=agents/tern')), warned.join('\n'));
     assert.deepEqual(texts(await manager2.compile()), ['a', 'b']);
     await manager2.close();
   });

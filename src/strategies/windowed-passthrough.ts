@@ -1,3 +1,4 @@
+import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import type {
   ContextStrategy,
   StrategyContext,
@@ -135,6 +136,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   private anchor: Sequence = 0;
   private store: JsStore | null = null;
   private stateId: string | null = null;
+  /** Its namespace, set in initialize(), which its stderr lines name (#239). */
+  private ns = '';
+  private readonly diag: Diagnostics = namespaceDiagnostics(() => this.ns);
   /** The branch (name + generation) the in-memory state was loaded from. */
   private loadedBranch: StoreBranchGeneration | null = null;
   /** Content identity of the previous committed compile's entries. */
@@ -158,6 +162,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
 
   async initialize(ctx: StrategyContext): Promise<void> {
     this.store = ctx.store;
+    this.ns = ctx.namespace;
     this.stateId = this.anchorStateIdOverride ?? `${ctx.namespace}/windowed:anchor`;
     registerStateIfAbsent(this.store, { id: this.stateId, strategy: 'snapshot' });
     this.loadBranchState();
@@ -213,7 +218,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       // Cannot name a position on this branch. A stale value here would make
       // every select() return an empty window — and the next re-anchor would
       // persist the stale-derived value into this branch.
-      console.warn(
+      this.diag.warn(
         `[windowed-passthrough] persisted anchor ${value} is past the branch head ${head} ` +
         `(${this.store.currentBranch().name}); resetting to 0`,
       );

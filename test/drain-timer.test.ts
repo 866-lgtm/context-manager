@@ -100,7 +100,7 @@ describe('the speculative drain\'s timer lets no error out', () => {
     const strategy = new BreakingPreflight(options);
     const { held, logged } = await drainWithNextTickHeld(t, strategy);
     assert.doesNotThrow(() => held[0]!());
-    assert.deepEqual(logged, ['AutobiographicalStrategy: speculative-drain error: Error: preflight broke']);
+    assert.deepEqual(logged, ['AutobiographicalStrategy: speculative-drain error: Error: preflight broke ns=default']);
     assert.equal(held.length, 1, 'the drain scheduled nothing more');
   });
 });

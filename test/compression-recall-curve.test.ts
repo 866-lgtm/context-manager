@@ -2965,7 +2965,7 @@ describe('compression refusal recall curves', () => {
     first.manager.close();
   });
 
-  it('distinct namespaces run concurrent exhaustion independently and quarantine both', async () => {
+  it('distinct namespaces run concurrent exhaustion independently and quarantine both', async (t) => {
     const calls: RecordedCall[] = [];
     const membrane = {
       complete: async (request: NormalizedRequest) => {
@@ -2995,6 +2995,14 @@ describe('compression refusal recall curves', () => {
       compressed: false,
     };
 
+    // Each alert's line names the namespace it alerts for (#239).
+    const alerts: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => {
+      const line = String(args[0]);
+      if (line.startsWith('{') && line.includes('"compression:quarantine-alert"')) {
+        alerts.push(String((JSON.parse(line) as { namespace?: unknown }).namespace));
+      }
+    });
     await Promise.all([
       first.strategy.run(first.target, managerContext(first.manager)),
       second.run(secondChunk, secondCtx),
@@ -3005,6 +3013,7 @@ describe('compression refusal recall curves', () => {
       assert.equal(events.filter((event) => event.kind === 'exhausted').length, 1);
       assert.equal(events.filter((event) => event.kind === 'alert_sent').length, 1);
     }
+    assert.deepEqual(alerts.sort(), ['beta', 'default']);
     assert.equal(first.strategy.quarantineKeysView().length, 1);
     assert.equal(second.quarantineKeysView().length, 1);
     secondManager.close();
@@ -3651,7 +3660,8 @@ describe('prepared recall expansions: what is logged', () => {
       const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
       assert.equal(sentWithMarker.length, 1, `${location}: one sent request carried the data URL`);
       assert.equal(lines.length, 1, `${location}: one line, for the request that was sent`);
-      assert.equal(lines[0]!.endsWith('[canonical]'), location === 'parent', `${location}: ${lines[0]}`);
+      // The request's label ends the line's fields, before the namespace it was logged for (#239).
+      assert.equal(lines[0]!.endsWith('[canonical] ns=default'), location === 'parent', `${location}: ${lines[0]}`);
       fx.manager.close();
     }
   });
@@ -3677,7 +3687,7 @@ describe('prepared requests are logged when they are sent', () => {
       } finally { console.error = original; }
       assert.equal(mock.calls.length, sent ? 2 : 1);
       const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
-      assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), sent ? ['[canonical]', '[source-only-final]'] : ['[canonical]']);
+      assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), sent ? ['[canonical] ns=default', '[source-only-final] ns=default'] : ['[canonical] ns=default']);
       fx.manager.close();
     }
   });
@@ -3726,7 +3736,7 @@ describe('prepared requests are logged when they are sent', () => {
         assert.ok(!JSON.stringify(mock.calls[1]!.request).includes('private-'), 'the retry was stripped of it');
       }
       const lines = logs.filter((line) => line.includes('serialized data URL(s) with markers'));
-      assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), ['[canonical]'], `${name}: ${JSON.stringify(lines)}`);
+      assert.deepEqual(lines.map((line) => line.slice(line.lastIndexOf('['))), ['[canonical] ns=default'], `${name}: ${JSON.stringify(lines)}`);
       fx.manager.close();
     }
   });
