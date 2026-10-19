@@ -798,6 +798,30 @@ describe('AutobiographicalStrategy: a quarantined merge leaves a hole, and merge
     manager.close();
   });
 
+  it('takes no group across an operator-held L1 whose first message was removed, in a merge the picker asks for', async () => {
+    const { membrane } = provider([]);
+    const strategy = lane({ mergeThreshold: 99 }); // no merge forms by itself
+    const manager = await ContextManager.open({ path: PATH, strategy, membrane: membrane as never });
+    const ids = await arrive(manager, 12);
+    const l1s = inOrder(strategy, manager);
+    assert.ok(l1s.length >= 9, `premise: enough L1s (${l1s.length})`);
+    const held = strategy.all.find((s) => s.id === l1s[4])!;
+    strategy.holdForReview([held.id]);
+    manager.removeMessage(held.sourceRange.first);
+    await compile(manager);
+    assert.equal(manager.getMessage(held.sourceRange.first), null, 'premise: its first message is gone');
+    assert.notEqual(manager.getMessage(held.sourceRange.last), null, 'premise: its last remains');
+    assert.ok(strategy.heldIds().has(held.id), 'premise: the hold holds it');
+
+    strategy.produceMerge(2, ids[0]!, ids[ids.length - 1]!);
+    const queued = strategy.queue.filter((m) => m.level === 2);
+    assert.equal(queued.length, 1, 'the produce op queues one merge');
+    const at = l1s.indexOf(held.id);
+    const places = queued[0]!.sourceIds.map((id) => l1s.indexOf(id));
+    assert.ok(places.every((p) => p > at) || places.every((p) => p >= 0 && p < at), 'over a run on one side of the held L1, not across it');
+    manager.close();
+  });
+
   it('leaves quarantined L1s out of a merge the picker asks for over their range', async () => {
     const { membrane } = provider([1]);
     const strategy = lane({ mergeThreshold: 99 }); // no merge forms by itself
