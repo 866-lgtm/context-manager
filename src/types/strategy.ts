@@ -677,6 +677,32 @@ export interface RenderStats {
      *  'flat-profile'). Surfaces the policy actually in force — a config
      *  clobber that silently downgrades the solver is invisible without it. */
     solver?: string;
+    /** Messages in the strategy's view of the branch this compile read (after
+     *  the view filter, auxiliary slots included), before any folding. Logged
+     *  as `messages=`, so a compile time can be read against the history size
+     *  it covered. The new fields here are optional so a custom strategy's
+     *  stats still type-check. */
+    messages?: number;
+    /** Time in the base `AutobiographicalStrategy.select()` up to the
+     *  `[plan-vs-actual]` line, in whole ms: chunk rebuild, planning (the fold
+     *  solver) and emission. It excludes a subclass's own `select()` override
+     *  and the `ContextManager` work around the call; a host that wants the
+     *  whole compile times `compile()` itself. It includes a
+     *  `productionBudgetTokens` shadow pick, whose solve `solveMs` leaves out,
+     *  and after a provisional-calibration retry the refused first attempt.
+     *  Logged as `compileMs=`. */
+    compileMs?: number;
+    /** Under `foldingStrategy: 'kv-unified'` only: the forest build, solve and
+     *  latent-demand ranking of the compile's final pick inside `compileMs`,
+     *  in whole ms (`solveMs=`). */
+    solveMs?: number;
+    /** Set on a dry run or preview (`dryRun: true`, `previewContext`), which
+     *  skips work a live compile does; logged as `dryRun=true`. Absent on a
+     *  live compile. A caller reads a dry pass's stats only from
+     *  `previewContext(..., { render: true })`'s `stats`: `compile()` returns
+     *  no stats, and a dry pass leaves `getRenderStats()` describing the last
+     *  live compile. */
+    dryRun?: true;
     /** Which chunks moved between which levels, and where this request's
      *  entries first differ from those of the last request the strategy
      *  returned, past which no cached prefix reaches. Present only when a

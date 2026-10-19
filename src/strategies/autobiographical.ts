@@ -6787,6 +6787,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     opts?: SelectOptions
   ): ContextEntry[] {
     this.requireLoadedBranch('select');
+    this._selectStartedAt = performance.now();
+    this._selectMessages = store.length();
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     const _t0 = _diag ? Date.now() : 0;
     if (opts?.dryRun !== true) {
@@ -7448,6 +7450,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** The picker's projected total for this compile (planner side). */
   private _plannedTokens: number | null = null;
   private _plannedMeta: { budgetMet: boolean; exhausted: boolean; moves: number; solver: string } | null = null;
+  /** `performance.now()` at the top of the current `select()`; rsEnd() stamps
+   *  the base `select()`'s elapsed time on the plan-vs-actual line from it. */
+  private _selectStartedAt = 0;
+  /** Length of the strategy's view of the branch at the top of `select()`,
+   *  whichever chunker runs; rsEnd() logs it as `messages=`. */
+  private _selectMessages = 0;
+
   /** Fold diff of THIS compile, for `planVsActual`: reset with the other
    *  figures of the pass (`rsBegin`, dry runs included) and set only when a
    *  compile that changed at least one saved level commits. It describes the
@@ -7526,14 +7535,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // projected after folding; `actual` is what the emitter committed. They
     // should agree — a persistent gap means the plan is written in units the
     // emitter doesn't spend in, and the difference is silently absorbed by
-    // whatever renders last (the recent window). Logged on every compile so
-    // the drift is observable before it becomes an eviction.
+    // whatever renders last (the recent window). Logged on every adaptive
+    // compile that returns, so the drift is observable before it becomes an
+    // eviction.
     if (this._plannedTokens !== null) {
       const actual = r.total.tokens;
       const planned = this._plannedTokens;
       const delta = actual - planned;
       const pct = planned > 0 ? (delta / planned) * 100 : 0;
       const m = this._plannedMeta;
+      // Whole ms: the journal line stays greppable and a before/after across
+      // versions needs no parsing of fractions.
+      const compileMs = Math.round(performance.now() - this._selectStartedAt);
+      // kv-unified's certificate time is spent inside baseSolveMs, so it is
+      // not added again here.
+      const kt = m?.solver === 'kv-unified' ? this._lastKvUnified?.lastTimings : null;
+      const solveMs = kt ? Math.round(kt.forestMs + kt.baseSolveMs + kt.demandMs) : undefined;
+      const messages = this._selectMessages;
+      // Dry runs and previews log the line too, and skip work a live compile
+      // does, so a journal reader must be able to drop them.
+      const dryRun = this._dryRunSelect;
       r.planVsActual = {
         planned,
         actual,
@@ -7542,6 +7563,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         exhausted: m?.exhausted ?? false,
         moves: m?.moves ?? 0,
         ...(m?.solver !== undefined ? { solver: m.solver } : {}),
+        messages,
+        compileMs,
+        ...(solveMs !== undefined ? { solveMs } : {}),
+        ...(dryRun ? { dryRun: true as const } : {}),
         ...(this._lastFoldDiff ? { foldDiff: this._lastFoldDiff } : {}),
       };
       // Loud only when the emitter OVERRUNS the plan — that is the direction
@@ -7550,7 +7575,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const line =
         `[plan-vs-actual] planned=${planned} actual=${actual} delta=${delta >= 0 ? '+' : ''}${delta}` +
         ` (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) budgetMet=${m?.budgetMet} exhausted=${m?.exhausted}` +
-        ` moves=${m?.moves} solver=${m?.solver}`;
+        ` moves=${m?.moves} solver=${m?.solver} messages=${messages} compileMs=${compileMs}` +
+        (solveMs !== undefined ? ` solveMs=${solveMs}` : '') +
+        (dryRun ? ' dryRun=true' : '');
       if (loud) console.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
       else console.error(line);
     }
@@ -12062,6 +12089,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const prodBudget = this.config.productionBudgetTokens;
     if (!dryRun && prodBudget !== undefined && prodBudget > 0 && prodBudget < totalBudget) {
       const liveKvStable = this._lastKvStable;
+      const liveKvUnified = this._lastKvUnified;
       try {
         const shadowResult = this.buildPicker(pickerInputs).run(pickerInputs, {
           totalBudget: prodBudget,
@@ -12081,9 +12109,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // A failing shadow pick must never break the live compile.
         console.warn('autobio: shadow production pick failed:', err);
       } finally {
-        // The shadow pick is not a compile — keep §13.4 observability pointed
-        // at the strategy instance behind the live pick.
+        // The shadow pick is not a compile. Put back the strategy instances
+        // behind the live pick: _lastKvStable for §13.4 observability, and
+        // _lastKvUnified for the live solve's timings on [plan-vs-actual].
         this._lastKvStable = liveKvStable;
+        this._lastKvUnified = liveKvUnified;
       }
     }
 
