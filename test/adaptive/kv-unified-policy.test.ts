@@ -1628,7 +1628,12 @@ test('bandedAge reads an age at the lower edge of its geometric band', () => {
   for (let power = 0; power < 20; power++) {
     const age = 2 ** power;
     assert.equal(bandedAge(age, steps), age, 'an age on a doubling is its own edge');
-    if (power > 0) assert.equal(bandedAge(age - 1e-9, steps), age / ratio, 'just below a doubling is the band under it');
+    if (power > 0) {
+      // 2^p / 2^(1/4) and 2^(p-1) * 2^(3/4) name the same edge but land an
+      // ulp apart under some Math.pow implementations (node 24 vs 22).
+      const below = bandedAge(age - 1e-9, steps);
+      assert.ok(Math.abs(below - age / ratio) <= 4 * Number.EPSILON * age, `just below ${age} is the band under it, got ${below}`);
+    }
   }
   assert.equal(bandedAge(2 ** 0.75 * 1.0000001, 4), 2 ** 0.75, 'just above an edge is that edge');
 });
