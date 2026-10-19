@@ -48,6 +48,7 @@ import { isStateExistsFor } from './state-registration.js';
 import type { RenderStats } from './types/index.js';
 import { MessageStore, MessageStoreEvent, MessageStoreListener, MessageWindow, MessageWindowOptions } from './message-store.js';
 import { ContextLog } from './context-log.js';
+import { MalformedContentError, contentForWrite, malformedContentPlaces } from './well-formed-content.js';
 import { filterMessageStoreView, mergeMessageStoreViews } from './message-view.js';
 import { PassthroughStrategy } from './strategies/passthrough.js';
 import { splitMixedToolMessages } from './normalize-tool-messages.js';
@@ -504,6 +505,13 @@ export class ContextManager {
     causedBy?: MessageId[],
     options?: AddMessageOptions
   ): MessageId {
+    // First, so a message refused here changes nothing: no hold expires, no
+    // hold is placed, and the strategy's ingress chunking never reads it.
+    // What a write mends is mended here, so the strategy chunks what is
+    // stored (well-formed-content.ts). A shard of that chunking is checked
+    // later (appendMessage), once expired holds have been released, as at
+    // any add.
+    content = contentForWrite(content, 'Message refused');
     this.expireCompressionHolds();
     if (!options?.holdCompression) {
       return this.appendMessage(participant, content, metadata, causedBy);
@@ -558,6 +566,16 @@ export class ContextManager {
         // Shards are written in index order, so the id returned (the first
         // written) is shard 0's: the body's identity in compile provenance.
         const ordered = [...decision.shards].sort((a, b) => a.shardIndex - b.shardIndex);
+        // A shard that doesn't match is refused before any shard is stored,
+        // as the message was: the store's own refusal would meet it only once
+        // the shards before it were stored. The error names the shard, since
+        // the message as given was refused by nothing.
+        for (const shard of decision.shards) {
+          const places = malformedContentPlaces(shard.content);
+          if (places.length > 0) {
+            throw new MalformedContentError(`Shard ${shard.shardIndex} of the message, as the strategy chunked it, refused`, places);
+          }
+        }
         let firstId: MessageId | null = null;
         const lengthBefore = this.messageStore.length();
         // These appends must stay synchronous: one body's shards in one loop, in
@@ -1102,8 +1120,10 @@ export class ContextManager {
    * Accepts optional context injections (e.g., from MCPL servers) and merges
    * them into the compiled output by position:
    * - "system": returned separately in `systemInjections` (caller appends to system prompt)
-   * - "beforeUser": inserted before the last user message
-   * - "afterUser": inserted after the last user message
+   * - "beforeUser": inserted before the last user message, or, when the
+   *   messages hold none, at the end, ahead of any "afterUser" injections
+   * - "afterUser": inserted after the last user message, or at the end when
+   *   the messages hold none
    *
    * May block if strategy has pending work.
    */
@@ -1151,9 +1171,11 @@ export class ContextManager {
     // Raw bodies are judged as stored: the view filter can hide a shard of a
     // body from the strategy, but the body's identity (shard 0, the id
     // addMessage returned) and its membership are the stored group's. The
-    // layout stays on the filtered view the strategy rendered.
-    const storedMessages = this.viewFilter ? this.mergedMessageView().getAll() : viewMessages;
-    const attribution = attributeEntries(entries, storedMessages);
+    // layout stays on the filtered view the strategy rendered. Attribution
+    // reads only around the messages the raw entries name.
+    const storedView = this.viewFilter ? this.mergedMessageView() : view;
+    const storedMessages = this.viewFilter ? storedView.getAll() : viewMessages;
+    const attribution = attributeEntries(entries, storedMessages, (id) => storedView.get(id)?.sequence);
 
     // Convert to NormalizedMessage[]. We split each entry individually
     // so we know the output-count per input and can re-attach cache
@@ -1238,20 +1260,24 @@ export class ContextManager {
     const injectionSources = (list: ContextInjection[]): CompiledMessageSources[] =>
       list.map((inj) => ({ kind: 'injection', namespace: inj.namespace }));
 
-    // Insert beforeUser injections before last user message
-    if (beforeUser.length > 0 && lastUserIdx >= 0) {
+    // Insert beforeUser injections before the last user message. Messages
+    // with none take them at the end, as afterUser's fallback below does, so
+    // afterUser's land after them.
+    if (beforeUser.length > 0) {
+      const insertIdx = lastUserIdx >= 0 ? lastUserIdx : messages.length;
       const injectedMessages: NormalizedMessage[] = beforeUser.map((inj) => ({
         participant: `system_context:${inj.namespace}`,
         content: inj.content,
       }));
-      messages.splice(lastUserIdx, 0, ...injectedMessages);
-      messageSources.splice(lastUserIdx, 0, ...injectionSources(beforeUser));
+      messages.splice(insertIdx, 0, ...injectedMessages);
+      messageSources.splice(insertIdx, 0, ...injectionSources(beforeUser));
       injectedContent.push(...beforeUser.map((inj) => inj.content));
       // Adjust lastUserIdx to account for inserted messages
-      lastUserIdx += injectedMessages.length;
+      if (lastUserIdx >= 0) lastUserIdx += injectedMessages.length;
     }
 
-    // Insert afterUser injections after last user message
+    // Insert afterUser injections after the last user message. Messages with
+    // none take them at the end, after the beforeUser injections placed there.
     if (afterUser.length > 0) {
       const insertIdx = lastUserIdx >= 0 ? lastUserIdx + 1 : messages.length;
       const injectedMessages: NormalizedMessage[] = afterUser.map((inj) => ({
@@ -1349,8 +1375,12 @@ export class ContextManager {
    * after an uncertain failure learns the outcome, and a receipt can come
    * back again (key on its id and compileId: a receipt lost to Chronicle's
    * rot exception can have its id go to a later receipt). A provenance of
-   * another namespace is refused with an error: accept a compile on the
-   * manager that compiled it.
+   * another namespace is refused with an error, and so is one whose branch
+   * this store doesn't know, live or recorded in this namespace, such as
+   * another store's: accept a compile on the manager that compiled it. So is
+   * a layout whose shape changed after compile returned it: members out of
+   * order, unit counts that aren't positive whole numbers adding up to the
+   * members, or not one id for each member.
    */
   acceptRound(args: {
     provenance: CompileProvenance;
@@ -1556,8 +1586,11 @@ export class ContextManager {
   }
 
   /**
-   * V2 dynamic pin-at-level-k: fix a range to render at EXACTLY fold level
-   * `level` (0 = raw) — the frontier cut passes through that L_k node. Honored
+   * V2 dynamic pin-at-level-k: fix a range to render at fold level `level`
+   * (0 = raw) — the frontier cut passes through that L_k node. Under
+   * kv-stable, a chunk whose summaries stop below `level` renders at the
+   * deepest it has, and one whose own-lineage summary at `level` doesn't list
+   * it renders where one does, or raw (`ProtectedRange.level`). Honored
    * by `foldingStrategy: 'kv-stable'` and `'kv-unified'` with adaptive
    * resolution; under any other selector the range is raw, in the live view
    * and in the canonical L1 compression prompt where its budgets allow (see

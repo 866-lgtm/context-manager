@@ -106,10 +106,21 @@ tools, instruction, system/provider fields), a per-message formatter-envelope
 allowance, and the output reserve. After canonical refusal reports complete
 provider input usage, v2 admission uses `provider total input + positive
 serialized expansion delta + output reserve`; the complete-request bound
-remains the fail-closed path when usage is absent, zero/partial, or from an
-unknown accounting contract. Provider adapters whose cache counters are
-disjoint (Anthropic/Bedrock) include cache-write/read totals; adapters whose
-cache-read count is a subset use their positive total `inputTokens` once.
+remains the fail-closed path when usage is absent, has no input count, or
+totals zero. Through `complete()`, which compression calls, membrane's
+Anthropic and Bedrock adapters pass the provider's input count through, so
+a missing one arrives as missing. Its other adapters report an omitted
+count as zero, so a cache-only report reads as a full cache hit, which a
+response can't tell from an omitted count. The
+provider total is `inputTokens +
+cacheCreationTokens + cacheReadTokens` for every provider: membrane (0.6.0
+and later, in the host's instance) states the counts as disjoint wherever it
+knows the convention, subtracting the cached span from `inputTokens` for
+providers that report it inside, such as OpenAI and Gemini. A usage whose
+convention membrane can't establish keeps its provider's counts: in 0.6.0
+that's openai-compatible's and openai-completions', which never report cache
+reads, and an OpenRouter response with no cache field. So its total is its
+input count.
 Physical request-byte enforcement remains a separate provider/transport
 constraint. A positive complete provider total is authoritative even when it is
 smaller than the deterministic byte bound: canonical refusal proves that exact

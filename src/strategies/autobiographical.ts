@@ -52,6 +52,7 @@ import { createHash } from 'node:crypto';
 import { Picker, OverBudgetError, UncoveredDropError, type OverBudgetClearedBy, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
+import { reportOverlap } from '../adaptive/kv-control.js';
 import { KvUnifiedStrategy, type KvUnifiedReuse } from '../adaptive/strategies/kv-unified.js';
 import { SummaryTree } from '../adaptive/summary-tree.js';
 import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
@@ -74,6 +75,7 @@ import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
+import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 
@@ -125,7 +127,7 @@ const COMPRESSION_MARKER =
 /**
  * The interstitial text between two summaries in the legacy combined recall
  * answer (`positionedRecallPairs: false`). Hoisted out of
- * `combinedRecallAnswerContent` because the shared-budget path must PRICE it
+ * `renderCombinedRecallAnswer` because the shared-budget path must PRICE it
  * before deciding whether the next summary can be admitted, and the tests that
  * pin that arithmetic derive their caps from this same string: one source of
  * truth for the separator's bytes, and therefore for its cost.
@@ -420,19 +422,6 @@ function formatReadingMergeInstruction(
     `~${targetTokens} tokens. Output only the body of your consolidation — ` +
     `no preamble.`
   );
-}
-
-/**
- * Surrogate-safe string slice. Avoids cutting between a UTF-16 surrogate pair
- * which would produce invalid JSON ("no low surrogate in string" API errors).
- */
-function safeSlice(str: string, start: number, end: number): string {
-  if (end >= str.length) return str.slice(start);
-  const code = str.charCodeAt(end);
-  if (code >= 0xDC00 && code <= 0xDFFF) {
-    return str.slice(start, end - 1);
-  }
-  return str.slice(start, end);
 }
 
 /**
@@ -797,6 +786,21 @@ interface CompressionAttemptTrace {
 
 function sha256Json(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
+}
+
+/**
+ * JSON with each object's keys in one order whatever order they were set in
+ * (sorted, though integer-like keys come first, ascending, as in any object),
+ * and each array's items in their own order, so two values that differ only
+ * in the order their keys were set give the same text. An object the store
+ * keeps comes back with its keys sorted, while one built here keeps the order
+ * it was built in.
+ */
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_key, inner: unknown) => {
+    if (inner === null || typeof inner !== 'object' || Array.isArray(inner)) return inner;
+    return Object.fromEntries(Object.keys(inner).sort().map((key) => [key, (inner as Record<string, unknown>)[key]]));
+  });
 }
 
 /**
@@ -2666,8 +2670,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * V2 dynamic pin-at-level-k convenience: fix a range to render at EXACTLY
-   * fold level `level` (0 = raw). Honored by `foldingStrategy: 'kv-stable'`
+   * V2 dynamic pin-at-level-k convenience: fix a range to render at fold
+   * level `level` (0 = raw). Under kv-stable, a chunk whose summaries stop
+   * below `level` renders at the deepest it has, and one whose own-lineage
+   * summary at `level` doesn't list it renders where one does, or raw
+   * (`ProtectedRange.level`). Honored by `foldingStrategy: 'kv-stable'`
    * and `'kv-unified'` with adaptive resolution; under any other selector the
    * range is raw (`resolvedPinBounds`), in the live view and in the canonical
    * L1 compression prompt where its budgets allow (see
@@ -3284,10 +3291,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private compressionResponseInputTokens(response: unknown): number | undefined {
     if (!response || typeof response !== 'object') return undefined;
-    const typed = response as {
-      usage?: unknown;
-      details?: { usage?: unknown; model?: { provider?: unknown } };
-    };
+    const typed = response as { usage?: unknown; details?: { usage?: unknown } };
     const detailed = typed.details?.usage;
     const usage = detailed && typeof detailed === 'object' ? detailed : typed.usage;
     if (!usage || typeof usage !== 'object') return undefined;
@@ -3295,22 +3299,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const value = (usage as Record<string, unknown>)[key];
       return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
     };
+    // membrane 0.6.0 and later states usage with uncached input, cache writes
+    // and cache reads as disjoint counts wherever it knows the convention,
+    // Gemini's included, so the prompt's total is their sum whatever the
+    // provider, and a full cache hit is a zero input count beside a positive
+    // cache read. The usage comes from the host's instance (ctx.membrane),
+    // which this package's range doesn't bind: a host on an older membrane
+    // passes Gemini's counts raw, and before 0.5.81 OpenAI's too, with the
+    // cached span inside the input count, so the sum counts that span twice
+    // and admission is stricter. A usage whose convention membrane can't
+    // establish keeps the counts its provider gives: in 0.6.0 that's
+    // openai-compatible's and openai-completions', which never report cache
+    // reads, and an OpenRouter response with no cache field, so the sum is
+    // its input count.
     const input = read('inputTokens');
-    const provider = typeof typed.details?.model?.provider === 'string'
-      ? typed.details.model.provider.toLowerCase()
-      : undefined;
-    // Anthropic and Bedrock report uncached, cache-write, and cache-read input
-    // as disjoint counters. OpenAI/Gemini/OpenRouter report cache reads as a
-    // subset of inputTokens, so summing there would double-count.
-    if (provider === 'anthropic' || provider === 'bedrock') {
-      if (input === undefined) return undefined;
-      const total = input + (read('cacheCreationTokens') ?? 0) + (read('cacheReadTokens') ?? 0);
-      return total > 0 ? total : undefined;
-    }
-    // Unknown/other providers are authoritative only when they report a
-    // positive total input count. Zero/partial usage falls back to the
-    // complete normalized request bound rather than admitting blindly.
-    return input !== undefined && input > 0 ? input : undefined;
+    // Usage without an input count, or with a zero total, is no observation
+    // of the prompt: the complete normalized request bound stands instead.
+    // Through complete(), which compression calls, membrane's Anthropic and
+    // Bedrock adapters pass the provider's input count through, so a missing
+    // one arrives as missing, as from a caller outside membrane. Its other
+    // adapters report an omitted count as zero, so a zero beside cache counts
+    // reads as a full cache hit: a response can't tell a provider's omitted
+    // count from one, and membrane flags an omitted count only in a streamed
+    // round's report (unreportedUsage).
+    if (input === undefined) return undefined;
+    const total = input + (read('cacheCreationTokens') ?? 0) + (read('cacheReadTokens') ?? 0);
+    return total > 0 ? total : undefined;
   }
 
   private fallbackContentBlockError(block: unknown, seen = new Set<object>()): string | undefined {
@@ -6362,7 +6376,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const accepted: number[] = [];
     let acceptedTokens = 0;
     for (let i = messages.length - 1; i >= recentStart; i--) {
-      const tokens = msgCap > 0 ? Math.min(est(i), msgCap + 50) : est(i);
+      const tokens = est(i) + this.cappedForSend(store, messages[i], msgCap).extra;
       if (this.isOverBudget(totalTokensBefore + acceptedTokens + tokens, maxTokens)) {
         // Newest-first eviction: everything from recentStart..i is being
         // dropped. These live in the RECENT window, so by definition no
@@ -6410,8 +6424,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let emittedTokens = 0;
     for (const i of accepted) {
       const msg = messages[i];
-      const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-      const tokens = msgCap > 0 ? Math.min(est(i), msgCap + 50) : est(i);
+      const { content, extra } = this.cappedForSend(store, msg, msgCap);
+      const tokens = est(i) + extra;
       entries.push({
         index: entries.length,
         sourceMessageId: msg.id,
@@ -6602,6 +6616,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         sourceRange: { first: messageIds[0], last: messageIds[messageIds.length - 1] },
         created: Date.now(),
         phaseType: chunk.phaseType,
+        // Stamped as an L1 of the same chunk would be, so a merge of
+        // inherited summaries that includes a quiet stretch stays witnessed.
+        ...(this.chunkIsWitnessed(chunk) ? { witnessed: true } : {}),
       };
       this.pushSummary(stub);
       chunk.compressed = true;
@@ -7177,9 +7194,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       active.record.normalizedConfig?.sourceOnlyFallbackRequestHash ===
         quarantineRecord.normalizedConfig.sourceOnlyFallbackRequestHash &&
       // Same rule for the tool-prose rung: enabling or re-pointing it is a
-      // request-family change (sha of undefined-vs-options differs).
-      sha256Json(active.record.normalizedConfig?.toolProseFallback ?? null) ===
-        sha256Json(quarantineRecord.normalizedConfig.toolProseFallback ?? null),
+      // request-family change (no options and some options differ). The
+      // options are compared as canonicalJson gives them, since a record read
+      // back from the store has their keys in another order than
+      // toolProseHoistOptions builds them in.
+      canonicalJson(active.record.normalizedConfig?.toolProseFallback ?? null) ===
+        canonicalJson(quarantineRecord.normalizedConfig.toolProseFallback ?? null),
     );
     const durableActive = durableQuarantine.get(quarantineRecord.key)
       ?? sameRegime.find((active) => active.record.familyKey === quarantineRecord.familyKey)
@@ -9792,14 +9812,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // every head and tail message has been accounted for.
     for (let i = headStart; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
-      const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+      const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       headMessageIds.add(msg.id);
       headTokens += tokens;
     }
     const effectiveRecentStart = Math.max(recentStart, headEnd);
     for (let i = effectiveRecentStart; i < messages.length; i++) {
       const msg = messages[i];
-      const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+      const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       tailMessageIds.add(msg.id);
       tailTokens += tokens;
     }
@@ -9833,7 +9853,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           : messages.length - 1;
         const floorStart = Math.min(newestTurn, this.holdBoundary(store));
         for (let i = floorStart; i < messages.length; i++) {
-          floorTokens += msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+          floorTokens += pse[i] + this.cappedForSend(store, messages[i], msgCap).extra;
         }
       }
       throw this.overBudgetError(budget, {
@@ -9857,11 +9877,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const prefixBudget = rejectionBudget - tailTokens;
     let totalTokens = 0;
 
-    // Emit the already-reserved head entries verbatim.
+    // Emit the already-reserved head entries raw, each cut at the cap as any
+    // raw message is.
     for (let i = headStart; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
-      const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-      const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+      const { content, extra } = this.cappedForSend(store, msg, msgCap);
+      const tokens = pse[i] + extra;
       entries.push({
         index: entries.length,
         sourceMessageId: msg.id,
@@ -9937,9 +9958,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = segStart; i < segEnd && i < messages.length; i++) {
       const msg = messages[i];
       const ch = chunkAtPosition ? chunkAtPosition[i] : chunksByMessageId.get(msg.id);
-      const tokens = msgCap > 0
-        ? Math.min(pse[i], msgCap + 50)
-        : pse[i];
+      // This is the chunk's raw price. The shard path in step 5 sends a run
+      // of a body's raw shards as one entry, their text joined and uncut, so
+      // a shard takes no extra here. (That entry is one text block, which the
+      // store prices at the rate its first 2,000 characters set, and it
+      // leaves out a shard's other blocks, so it can still differ from these
+      // prices, cap or no cap.) A shard the plan folds is priced as its
+      // summary. The head and recent windows cut a shard as they emit it.
+      const tokens = msg.bodyGroupId ? pse[i] : pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       const bound = pinBounds.size > 0 ? pinBounds.get(i) : undefined;
       const l1Id = ch?.summaryId ?? l1ByMessage.get(msg.id);
       pickerChunks.push({
@@ -9960,9 +9986,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // — but mark them as in-head/in-tail so the picker won't fold them.
     for (let i = headStart; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
-      const tokens = msgCap > 0
-        ? Math.min(pse[i], msgCap + 50)
-        : pse[i];
+      const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       pickerChunks.push({
         id: msg.id,
         sequence: i,
@@ -9975,9 +9999,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     for (let i = effectiveRecentStart; i < messages.length; i++) {
       const msg = messages[i];
-      const tokens = msgCap > 0
-        ? Math.min(pse[i], msgCap + 50)
-        : pse[i];
+      const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       pickerChunks.push({
         id: msg.id,
         sequence: i,
@@ -10185,6 +10207,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       moves: pendingResolutionChanges.length,
       solver: picker.solverName,
     };
+    // This compile's own plan reports the leaves its summaries disagree with
+    // here, beside [kv-escalation], rather than in the planner: the shadow
+    // production pick below plans the same way and renders nothing (design
+    // §13.6). A dry run reports the plan it previews, as it reports an
+    // override.
+    if (plan) reportOverlap(plan.overlap);
     if (plan?.override) {
       console.error(
         `[kv-escalation] override=${plan.override} perturbation=${plan.perturbation}` +
@@ -10494,8 +10522,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Non-shard path: existing behavior.
       const resolution = levelAt(i, msg.id);
       if (resolution === 0) {
-        const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-        const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+        const { content, extra } = this.cappedForSend(store, msg, msgCap);
+        const tokens = pse[i] + extra;
         if (totalTokens + tokens > prefixBudget) {
           throw emissionOverBudget(totalTokens + tokens);
         }
@@ -10513,8 +10541,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId, summariesById, l1ByMessage, ancestorMemo,
           chunkAtPosition ? chunkAtPosition[i] ?? null : undefined);
         if (!ancestor) {
-          const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-          const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
+          const { content, extra } = this.cappedForSend(store, msg, msgCap);
+          const tokens = pse[i] + extra;
           if (totalTokens + tokens > prefixBudget) {
             throw emissionOverBudget(totalTokens + tokens);
           }
@@ -10935,6 +10963,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *   1: signed thinking priced by signature length (0.11.0 on)
    *   2: membrane's XML-history carriers (tool_attempt, tool_notice) priced as
    *      the markup they replay as, where they had estimated as 0
+   *   3: a raw message `maxMessageTokens` cuts priced as it renders, at its
+   *      uncapped price plus what the cut changes (cappedPriceExtra), and one
+   *      it leaves whole at its uncapped price, where each was priced at no
+   *      more than the cap plus 50. The calibration sample compares provider
+   *      usage with the render stats, which counted those prices, so a store
+   *      holding capped content learned a multiplier that made up for them.
    *
    * A record without a stamp was written by 0.13.0 or earlier: by 0.11.0 to
    * 0.13.0 under epoch 1's pricing, or by a release before 0.11.0, under
@@ -10962,18 +10996,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (reportRealInputTokens); rolling forward again treats that as an older
    * record.
    */
-  static readonly CALIBRATION_PRICING_EPOCH = 2;
+  static readonly CALIBRATION_PRICING_EPOCH = 3;
 
   /**
    * For each pricing epoch, the content it repriced: a predicate over the
-   * store that is true when the store holds any. A multiplier from an older
+   * store that is true when the store holds any, given the strategy whose
+   * config can decide it (epoch 3 reads the cap). A multiplier from an older
    * epoch is discarded only if some epoch since then repriced content this
    * store actually holds. Otherwise its residual still means what it meant
    * (e.g. a store on another provider's tokenizer, which never carries
    * signed thinking), and it is re-stamped instead. An epoch without an
    * entry here counts as repricing everything (discard, as before).
    */
-  static readonly CALIBRATION_EPOCH_REPRICES: Readonly<Record<number, (messages: readonly StoredMessage[]) => boolean>> = {
+  static readonly CALIBRATION_EPOCH_REPRICES: Readonly<Record<number, (
+    messages: readonly StoredMessage[],
+    strategy: AutobiographicalStrategy,
+    store: MessageStoreView,
+  ) => boolean>> = {
     // 1: signed thinking priced by signature length, not a flat 600. A block
     // with a numeric `tokenEstimate` is priced by that stamp in both epochs
     // (MessageStore and ContextLog read it first), so it wasn't repriced.
@@ -10985,13 +11024,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // 2: XML-history carriers, which estimated as 0 before (an unknown block)
     // and are now priced by MessageStore.xmlHistoryCarrierTokens.
     2: (messages) => messages.some((m) => m.content.some((b) => MessageStore.xmlHistoryCarrierTokens(b) > 0)),
+    // 3: a raw message the cap cuts, or one it leaves whole whose price the
+    // cap plus 50 had limited, under the host's cap. Whether the cap looks is
+    // the cut's own estimate passing it. Whether the old price limited a
+    // message depends on the multiplier it was priced under, so this asks
+    // whether its estimate could have passed the cap plus 50 at the clamp's
+    // ceiling, from the estimate at a multiplier of 1. That over-counts, and
+    // a store it counts in wrongly restarts from 1, which one sample sets.
+    3: (messages, strategy, store) => {
+      const cap = strategy.config.maxMessageTokens;
+      if (!(typeof cap === 'number' && cap > 0)) return false;
+      const applied = store.getTokenCalibration?.() ?? 1;
+      const factor = Number.isFinite(applied) && applied > 0 ? applied : 1;
+      return messages.some((m) =>
+        strategy.estimateTextOnlyTokens(m) > cap || (store.estimateTokens(m) / factor) * 1.8 > cap + 50);
+    },
   };
 
   /** Whether any epoch in (fromEpoch, CALIBRATION_PRICING_EPOCH] repriced content in this store. */
-  protected calibrationRepricedSince(fromEpoch: number, messages: readonly StoredMessage[]): boolean {
+  protected calibrationRepricedSince(fromEpoch: number, messages: readonly StoredMessage[], store: MessageStoreView): boolean {
     for (let e = fromEpoch + 1; e <= AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH; e++) {
       const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[e];
-      if (!reprices || reprices(messages)) return true;
+      if (!reprices || reprices(messages, this, store)) return true;
     }
     return false;
   }
@@ -11033,7 +11087,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const epoch = stamped ? saved.pricing! : 1;
           const fromEpoch = stamped ? epoch : null;
           const pinned = saved.multiplier! >= 1.8 || saved.multiplier! <= 0.6;
-          const repriced = epoch < current && this.calibrationRepricedSince(epoch, store.getAll());
+          const repriced = epoch < current && this.calibrationRepricedSince(epoch, store.getAll(), store);
           if (epoch === current) {
             this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
             this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
@@ -11607,7 +11661,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /** The kv-stable strategy instance behind the most recent compile — kept for
-   *  `[kv-escalation]` observability (design §13.4: every override is loud). */
+   *  `[kv-escalation]` and `[kv-overlap]` observability (design §13.4: every
+   *  override is loud; §13.6). */
   private _lastKvStable: KvStableStrategy | null = null;
   private _lastKvUnified: KvUnifiedStrategy | null = null;
   /** Structures kv-unified may derive from across compiles (validated on use). */
@@ -11945,21 +12000,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     let totalTokens = 0;
 
-    // Phase 0: Head window — preserved verbatim (from headStart, not necessarily 0)
+    // Phase 0: Head window — every message sent raw, each cut at the cap as
+    // any raw message is (from headStart, not necessarily 0)
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     for (let i = headStart; i < headEnd && i < messages.length; i++) {
       const msg = messages[i];
-      const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-      const tokens = msgCap > 0 ? Math.min(store.estimateTokens(msg), msgCap + 50) : store.estimateTokens(msg);
-      // The head is verbatim by definition — truncating it mid-window drops
+      const { content, extra } = this.cappedForSend(store, msg, msgCap);
+      const tokens = store.estimateTokens(msg) + extra;
+      // The head is sent whole by definition: stopping it mid-window drops
       // messages no summary covers. Refuse honestly beyond grace.
       if (totalTokens + tokens > graceLimit) {
         throw this.overBudgetError(budget, {
           stage: 'Hierarchical emission overran the budget',
           budget: graceLimit,
           actual: totalTokens + tokens,
-          // The head is verbatim by definition, and its size is cold
+          // The head is sent whole by definition, and its size is cold
           // configuration (headWindowTokens isn't a hot setting). Besides a
           // larger budget, a head-window reset clears it, which starts a new
           // topic and isn't a lever the list names (OverBudgetClearedBy).
@@ -12323,10 +12379,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             this.rsSummary(summary.level, pairTokens, summary.id);
           } else {
             const msg = item.msg;
-            const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-            const tokens = msgCap > 0
-              ? Math.min(store.estimateTokens(msg), msgCap + 50)
-              : store.estimateTokens(msg);
+            const { content, extra } = this.cappedForSend(store, msg, msgCap);
+            const tokens = store.estimateTokens(msg) + extra;
             if (totalTokens + tokens > graceLimit) {
               throw this.overBudgetError(budget, {
                 stage: 'Hierarchical emission overran the budget',
@@ -12401,10 +12455,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const middleRawSorted = [...middleRaw].sort((a, b) => a.position - b.position);
         for (let mi = 0; mi < middleRawSorted.length; mi++) {
           const { msg } = middleRawSorted[mi]!;
-          const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
-          const tokens = msgCap > 0
-            ? Math.min(store.estimateTokens(msg), msgCap + 50)
-            : store.estimateTokens(msg);
+          const { content, extra } = this.cappedForSend(store, msg, msgCap);
+          const tokens = store.estimateTokens(msg) + extra;
           if (totalTokens + tokens > graceLimit) {
             // These messages are the UNCOMPRESSED middle — no summary covers
             // them (see the middleRaw construction above). Dropping them
@@ -12476,8 +12528,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * As-of perspective pin: true when the chunk's messages are all strictly
    * before the agent's first own turn (witnessedBeforeSequence) — inherited
    * record, not lived experience. Drives both the L1 instruction and the
-   * `witnessed` stamp on the minted summary (which merge consolidation
-   * honors and propagates upward).
+   * `witnessed` stamp on the minted summary or quiet-stretch stub (which
+   * merge consolidation honors and propagates upward).
    */
   protected chunkIsWitnessed(chunk: Chunk): boolean {
     const pin = this.config.witnessedBeforeSequence;
@@ -14000,7 +14052,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Index of the first message AFTER the head window.
-   * Messages [headStart, headEnd) are preserved verbatim.
+   * Messages [headStart, headEnd) are sent raw, never summarized.
    *
    * The token-derived boundary is priced with the live calibration multiplier,
    * so it moves whenever calibration does. Moving it DOWN used to be a ratchet:
@@ -14606,9 +14658,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Truncate a message's content blocks to fit within maxMessageTokens.
-   */
-  /**
    * Build the assistant-turn content for a replayed summary. When the
    * entry carries verbatim `responseContent` (signed thinking /
    * redacted_thinking + text in provider order), replay it unmutated —
@@ -14692,46 +14741,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * `summaryAnswerContent` under a `maxMessageTokens` cap: the cap is spent on
-   * the PROSE, and the envelope is applied to what survives.
-   *
-   * Ordering is the whole point. Truncating an enveloped answer retains a
-   * prefix and appends the truncator's own marker, which drops the closing
-   * tag and — under a cap smaller than the opener — emits a half-written one:
-   * a delimiter convention that sometimes lies is worse than no convention,
-   * because the reader learns to distrust the tags that ARE intact. Wrapping
-   * last makes opener and closer survive every cap by construction.
-   *
-   * The envelope is therefore NOT charged against `maxMessageTokens`; a
-   * capped enveloped answer runs over the cap by its own tag text. That is
-   * the same soft-cap overshoot the truncator already takes for granted — it
-   * appends its `[truncated — original was N tokens]` marker AFTER spending
-   * the budget — and the envelope is priced where the accounting is load
-   * bearing, in `capRecallPairs`. At a cap smaller than the envelope overhead
-   * the render is opener + whatever prose the cap bought + marker + closer:
-   * never an empty envelope, never a torn one.
-   */
-  protected summaryAnswerContentCapped(summary: SummaryEntry, maxTokens: number): ContentBlock[] {
-    const prose = this.liveWindowAnswerProse(summary);
-    const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
-    return wrapRecallAnswerContent(capped, summary, this.config.recallEnvelope);
-  }
-
-  /**
    * The legacy combined recall answer (`positionedRecallPairs: false`): every
    * selected summary concatenated into one assistant turn with `---`
    * separators, under a single `maxMessageTokens` cap.
    *
-   * With the envelope off this is the pre-existing expression, byte for byte:
-   * concatenate, then truncate the whole turn. Those bytes are a
-   * compatibility promise and the flat truncation is what produces them.
+   * With the envelope off this is the pre-existing expression: concatenate,
+   * then truncate the whole turn, so its bytes are exactly what the flat
+   * truncator writes. That is the compatibility promise. The truncator now
+   * writes an omission marker where it drops text, so a capped answer differs
+   * from earlier versions' by that one block.
    *
    * With the envelope on the cap is spent summary by summary instead, each
    * summary's prose truncated against what the earlier ones left and then
    * enveloped intact. The emission shape matches the flat truncator's —
-   * whole summaries until the budget runs out, a truncation marker on the one
-   * that straddles it, nothing after — but a summary that would have been cut
-   * in half is dropped whole rather than emitted with a torn envelope.
+   * whole summaries until the budget runs out, the one that straddles it
+   * with its prose cut inside an intact envelope (a truncation suffix on the
+   * block the cap crosses, or the omission marker where the cap ends on a
+   * block boundary), then one omission marker for what the cap left out,
+   * unless that answer's own cut already wrote it. The answer ends at the
+   * summary where the cap ended, whatever budget the blocks the cap left out
+   * didn't spend, and a summary isn't admitted where the cap reaches it and
+   * leaves nothing of it that holds anything, as for a prose that holds
+   * nothing. An answer the cap admits no summary to is the marker alone.
+   * Before the cap ends, a summary is left out
+   * whole only where the budget can't pay for the separator in front of it
+   * and a token of its prose, below.
    *
    * The drop-whole boundary sits at the SEPARATOR: a summary is admitted only
    * when the remaining budget can pay for the separator in front of it AND buy
@@ -14740,18 +14774,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * spends past the cap by the separator's own width plus whatever prose the
    * exhausted budget still bought, which is how one shared cap stops being
    * shared.
-   */
-  protected combinedRecallAnswerContent(
-    summaries: SummaryEntry[],
-    maxTokens: number,
-  ): ContentBlock[] {
-    return this.renderCombinedRecallAnswer(summaries, maxTokens).content;
-  }
-
-  /**
-   * The combined recall answer together with what of it survived the cap:
-   * each summary whose prose reached the answer, marked `partial` when its
-   * prose was cut. A summary the cap dropped entirely is not listed, so the
+   *
+   * Returns the answer together with what of it survived the cap: each
+   * summary whose prose reached the answer, marked `partial` when the cap
+   * took something of it that held anything. A summary the cap dropped
+   * entirely is not listed, nor one that lost something that held anything
+   * while only text blocks of it that hold nothing reached the answer, so the
    * rendered layout never claims history is represented by a summary the
    * resident was not shown.
    */
@@ -14787,35 +14815,67 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return { content: out, refs: summaries.map((s) => ({ id: s.id, level: s.level })) };
       }
       // truncateContent keeps blocks in order: text until the budget runs
-      // out (the straddling block cut, later text dropped), and every
-      // non-text block (a tool_result possibly shortened). Align the two
-      // arrays: an unchanged block is the same object, a cut or shortened one
-      // is a new block of the same type in the same position, and a dropped
-      // one has no counterpart. A summary is whole when all its blocks
-      // survived unchanged, partial when any of them survived at all —
-      // including a retained thinking block whose text was dropped — and
-      // absent otherwise.
-      const kept = new Map<number, { whole: number; touched: number; total: number }>();
+      // out (the straddling block cut), the omission marker where the first
+      // dropped text block that held anything was, a text block that holds
+      // nothing (isEmptyTextBlock) only before the cap, as it was or as a
+      // copy that gave up a raw form, and every
+      // non-text block, before the cap or past it (a tool_result possibly
+      // shortened). Align the two arrays: an unchanged block is the same
+      // object, and a cut, shortened or copied one (a copy that gave up a
+      // raw form) is a new block of the same type in the same position. A
+      // block that holds nothing loses nothing either way: kept, it may be
+      // such a copy, which holds nothing too, and left out across or past
+      // the cap, it has no counterpart. It's kept only where every block
+      // before it was kept, as it was or as a copy, since across the cap the
+      // cap ends there, so a counterpart that holds nothing is never a later
+      // block's. The marker shows none of the block it replaces, and any
+      // other dropped block has no counterpart. A text block that holds
+      // nothing shows the resident nothing, so it counts as neither shown nor
+      // lost. A block that holds anything is lost unless it reached the
+      // answer as it was: a cut, or a copy that gave up its raw form and so no
+      // longer replays as its item, loses something. A summary is listed whole
+      // when it lost nothing and some block of it reached the answer, so one
+      // that holds nothing is listed whole before the cap and absent once the
+      // cap left it out. It's listed partial when it lost something and a
+      // block of it that holds anything reached the answer, as it was, cut or
+      // as a copy, including a retained thinking block whose text was
+      // dropped. Otherwise it's absent: one the marker alone replaced, or of
+      // which only blocks that hold nothing came before the marker, shows the
+      // resident none of its history. The marker is told apart by identity
+      // (isCapMarker), so a block whose text equals it, a copy included,
+      // counts as the block it is.
+      const kept = new Map<number, { whole: number; reached: number; shown: number; total: number }>();
       let j = 0;
       content.forEach((block, i) => {
         const owner = owners[i]!;
-        const tally = owner >= 0 ? (kept.get(owner) ?? { whole: 0, touched: 0, total: 0 }) : null;
+        const tally = owner >= 0 ? (kept.get(owner) ?? { whole: 0, reached: 0, shown: 0, total: 0 }) : null;
         if (tally) tally.total++;
         const counterpart = out[j];
+        const blank = isEmptyTextBlock(block);
         if (counterpart === block) {
           j++;
-          if (tally) { tally.whole++; tally.touched++; }
+          if (tally) { tally.whole++; tally.reached++; if (!blank) tally.shown++; }
+        } else if (blank) {
+          if (counterpart && isEmptyTextBlock(counterpart)) {
+            j++;
+            if (tally) tally.reached++;
+          }
+          if (tally) tally.whole++;
         } else if (counterpart && counterpart.type === block.type) {
           j++;
-          if (tally) tally.touched++;
+          if (tally && !isCapMarker(counterpart)) { tally.reached++; tally.shown++; }
         }
         if (tally) kept.set(owner, tally);
       });
       const refs: Array<{ id: string; level: number; partial?: true }> = [];
       summaries.forEach((s, idx) => {
         const tally = kept.get(idx);
-        if (!tally || tally.touched === 0) return;
-        refs.push(tally.whole === tally.total ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
+        if (!tally) return;
+        if (tally.whole === tally.total) {
+          if (tally.reached > 0) refs.push({ id: s.id, level: s.level });
+        } else if (tally.shown > 0) {
+          refs.push({ id: s.id, level: s.level, partial: true });
+        }
       });
       return { content: out, refs };
     }
@@ -14826,24 +14886,82 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       { content: [{ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT }] } as StoredMessage,
     );
     let remainingTokens = maxTokens;
+    let admitted = 0;
+    let omissionMarked = false;
     for (const [idx, s] of summaries.entries()) {
       const separatorTokens = idx > 0 ? separatorCost : 0;
       const proseBudget = remainingTokens - separatorTokens;
       if (maxTokens > 0 && proseBudget <= 0) break;
       const prose = this.liveWindowAnswerProse(s);
       const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
+      // The cap reached this summary and left nothing of it that shows: every
+      // block that survived holds nothing, besides the truncator's marker.
+      // That's so for a prose that holds nothing, which comes back as the
+      // marker alone, and for one whose only blocks before the cap hold
+      // nothing. It isn't admitted, and the answer ends at it.
+      if (capped !== prose && capped.every((b) => isEmptyTextBlock(b) || isCapMarker(b))) break;
+      // Whether this answer, so far the last, carries the truncator's own
+      // marker, told apart by identity from a block of the prose whose text
+      // equals it (isCapMarker).
+      omissionMarked = capped.some(isCapMarker);
       if (idx > 0) content = separated(content);
       content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
-      refs.push(capped === prose ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
+      refs.push(cappedWhole(prose, capped) ? { id: s.id, level: s.level } : { id: s.id, level: s.level, partial: true });
+      admitted++;
+      // The cap ended inside this answer, where it cut, dropped or left out a
+      // block, so the answer ends with it: no later summary is admitted,
+      // whatever budget the blocks it left out didn't spend.
+      if (capped !== prose) break;
       if (maxTokens > 0) {
         remainingTokens -=
           this.estimateTextOnlyTokens({ content: capped } as StoredMessage) + separatorTokens;
       }
     }
+    // Summaries the cap left out are said once, as the flat truncator says
+    // what it drops: after the last answer, whose trailing reasoning gives up
+    // its id first, as it does before a separator. Not again if the last
+    // answer's own prose already carries the marker, and not for summaries
+    // whose prose held nothing, which a store can still keep from before
+    // empty summaries were refused.
+    const leftOutContent = summaries.slice(admitted)
+      .some((s) => this.liveWindowAnswerProse(s).some((b) => !isEmptyTextBlock(b)));
+    if (leftOutContent && !omissionMarked) {
+      content = [...releaseTrailingReasoning(content), { type: 'text', text: CAP_OMISSION_TEXT }];
+    }
+    // The cap admitted no summary: nothing of the first that holds anything
+    // survived it, and the cap ended there. The answer is the marker alone, as
+    // the truncator gives content that holds nothing, so it's never empty, and
+    // it lists none.
+    if (admitted === 0 && summaries.length > 0) content = [{ type: 'text', text: CAP_OMISSION_TEXT }];
     return { content, refs };
   }
 
-  /** A single recall answer under the cap, with its layout reference. */
+  /**
+   * A single recall answer for the live window, with its layout reference:
+   * `liveWindowAnswerProse` cut to a `maxMessageTokens` cap, then wrapped in
+   * the recall envelope. The cap is spent on the PROSE, and the envelope is
+   * applied to what survives.
+   *
+   * Ordering is the whole point. Truncating an enveloped answer retains a
+   * prefix and appends the truncator's own marker, which drops the closing
+   * tag and — under a cap smaller than the opener — emits a half-written one:
+   * a delimiter convention that sometimes lies is worse than no convention,
+   * because the reader learns to distrust the tags that ARE intact. Wrapping
+   * last makes opener and closer survive every cap by construction.
+   *
+   * The envelope is therefore NOT charged against `maxMessageTokens`; a
+   * capped enveloped answer runs over the cap by its own tag text, and the
+   * legacy combined answer under `recallEnvelope: 'xml'` also by the omission
+   * marker it writes after its last envelope when summaries that hold anything
+   * are left out, unless that answer's own cut already wrote it inside its
+   * envelope. That is
+   * the same soft-cap overshoot the truncator already takes for granted — it
+   * appends its `[truncated — original was N tokens]` marker AFTER spending
+   * the budget — and the envelope is priced where the accounting is load
+   * bearing, in `capRecallPairs`. At a cap smaller than the envelope overhead
+   * the render is opener + whatever prose the cap bought + marker + closer:
+   * never an empty envelope, never a torn one.
+   */
   protected renderSummaryAnswer(
     summary: SummaryEntry,
     maxTokens: number,
@@ -14852,7 +14970,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const capped = maxTokens > 0 ? this.truncateContent(prose, maxTokens) : prose;
     return {
       content: wrapRecallAnswerContent(capped, summary, this.config.recallEnvelope),
-      refs: [capped === prose ? { id: summary.id, level: summary.level } : { id: summary.id, level: summary.level, partial: true }],
+      refs: [cappedWhole(prose, capped) ? { id: summary.id, level: summary.level } : { id: summary.id, level: summary.level, partial: true }],
     };
   }
 
@@ -14894,63 +15012,52 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Cut a message's text and string tool-result content to `maxTokens`. A cut
-   * or dropped block gives up its raw replay form, along with every block
-   * sharing it, so the cut reaches the wire (see raw-forms.ts).
+   * Cut a message's text and string tool-result content to `maxTokens`, with
+   * the cap both strategies share (`capContent`, message-cap.ts). Whether it
+   * looks is decided by `estimateTextOnlyTokens`, which counts thinking and
+   * tool input too, so a thinking block alone can make it look. `estimate`,
+   * when given, is that estimate for `content` as it stands, such as a stored
+   * message's cached one (cappedForSend). This is the strategy's one cut: raw
+   * messages and summaries alike go through it, so an override changes both,
+   * and the price of a raw message follows what the override sends.
    */
-  protected truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
-    if (maxTokens <= 0) return content;
-    const est = this.estimateTextOnlyTokens({ content } as StoredMessage);
-    if (est <= maxTokens) return content;
+  protected truncateContent(
+    content: ContentBlock[],
+    maxTokens: number,
+    estimate?: (content: ContentBlock[]) => number,
+  ): ContentBlock[] {
+    return capContent(content, maxTokens, estimate ?? ((blocks) => this.estimateTextOnlyTokens({ content: blocks } as StoredMessage)));
+  }
 
-    const maxChars = maxTokens * 4;
-    const result: ContentBlock[] = [];
-    let remaining = maxChars;
-
-    for (const block of content) {
-      if (block.type === 'text') {
-        if (remaining <= 0) continue;
-        if (block.text.length <= remaining) {
-          result.push(block);
-          remaining -= block.text.length;
-        } else {
-          result.push({
-            type: 'text',
-            text: safeSlice(block.text, 0, remaining) + '\n\n[truncated — original was ' +
-              Math.ceil(block.text.length / 4) + ' tokens]',
-          });
-          remaining = 0;
-        }
-      } else if (block.type === 'tool_result') {
-        // tool_result blocks MUST always be included — the Anthropic API requires
-        // every tool_use to have a matching tool_result.  Dropping one causes a 400.
-        if (typeof block.content === 'string') {
-          const text = block.content;
-          if (remaining <= 0) {
-            // Budget exhausted — include with minimal content to preserve pairing
-            result.push({
-              ...block,
-              content: '[content omitted: this message reached its token limit before this result]',
-            });
-          } else if (text.length > remaining) {
-            result.push({
-              ...block,
-              content: safeSlice(text, 0, remaining) + '\n\n[truncated — original was ' +
-                Math.ceil(text.length / 4) + ' tokens]',
-            });
-            remaining = 0;
-          } else {
-            result.push(block);
-            remaining -= text.length;
-          }
-        } else {
-          result.push(block);
-        }
-      } else {
-        result.push(block);
-      }
-    }
-
-    return releaseEditedRawForms(content, result);
+  /**
+   * A stored message as this strategy sends it under `maxMessageTokens`
+   * (`msgCap`), cut by `truncateContent`, and what sending that adds
+   * to the message's price (`cappedPriceExtra`). Each site that prices a raw
+   * message as part of what a compile sends adds `extra` to the price it
+   * gives an uncapped one, so the cut is priced as it renders: the plan's
+   * chunks, the head and tail reservations, the refusal's floor, the
+   * emission checks, the recent window's eviction walk and the render stats.
+   * The adaptive middle's shard path sends a body's raw shards' text uncut,
+   * so their chunks' raw prices take no extra.
+   * A site that emits the message sends `content`. The head and recent
+   * windows' sizes and the image strip's depth are measured before the cap
+   * (getHeadWindowEnd, getUnheldRecentWindowStart, getImageStripStart), in
+   * the stored history that compression summarizes. Whether the cap cuts is
+   * decided, unless `truncateContent` is overridden, by
+   * `estimateTextOnlyTokens(msg)`, the cut's own estimate, which counts
+   * thinking and tool calls too and is cached on the message, so a message
+   * under the cap costs each site a lookup.
+   */
+  protected cappedForSend(
+    store: MessageStoreView,
+    msg: StoredMessage,
+    msgCap: number,
+  ): { content: ContentBlock[]; extra: number } {
+    // The default cut, capContent, reads a cap that isn't a positive number
+    // as no cap, such as a caller's explicit `maxMessageTokens: undefined`,
+    // which stays in the config, and returns the content itself, so the
+    // extra is 0. The estimate given is of the content cut, msg.content.
+    const content = this.truncateContent(msg.content, msgCap, () => this.estimateTextOnlyTokens(msg));
+    return { content, extra: cappedPriceExtra(store, msg, content) };
   }
 }

@@ -140,7 +140,8 @@ export interface ContextStrategy {
 
   /** Maximum tokens per individual message. Used by the framework to truncate
    *  tool results in-flight (yielding stream) and at storage time.
-   *  0 or undefined = no limit. */
+   *  A value that isn't a positive number, such as 0, undefined, a negative
+   *  or NaN, means no limit. */
   readonly maxMessageTokens?: number;
 
   /**
@@ -952,7 +953,8 @@ export interface AutobiographicalConfig {
    */
   compressionMaxTokens?: number;
   /** Maximum tokens per individual message in compiled output. Messages exceeding
-   *  this limit have their text/tool_result content truncated. 0 = no limit. */
+   *  this limit have their text/tool_result content truncated. A value that
+   *  isn't a positive number, such as 0 or NaN, means no limit. */
   maxMessageTokens: number;
 
   /**
@@ -1583,8 +1585,9 @@ export interface SummaryEntry {
   parentId?: string;
   /**
    * The slice this summarizes is inherited/witnessed record, not the agent's
-   * lived experience (witnessedBeforeSequence pin). Stamped at L1 mint;
-   * merges of all-witnessed sources keep the witnessed voice AND the flag —
+   * lived experience (witnessedBeforeSequence pin). Stamped at L1 mint, and
+   * on a quiet-stretch stub as on an L1 of its chunk; merges of all-witnessed
+   * sources keep the witnessed voice AND the flag —
    * without propagation the consolidation instruction re-first-persons
    * others' lives one level up (observed 2026-07-27: an L3 opening "I
    * remember the full arc of my relationship with Tavy" — another
@@ -1693,10 +1696,13 @@ export interface ProtectedRange {
   created: number;
   /**
    * Pin-AT-level-k (V2 dynamic pins, `docs/best-fit-frontier-resolution.md` §7).
-   * Fix the covered chunks to render at EXACTLY this fold level (0 = raw): the
+   * Fix the covered chunks to render at this fold level (0 = raw): the
    * frontier cut passes through the L_k node — neither folded deeper nor
-   * un-folded shallower. Takes precedence over `maxLevel`. Omitted → not a
-   * fixed-level pin.
+   * un-folded shallower. Under kv-stable, a chunk with no summary at k (its
+   * summaries stop below k, its lineage skips k with a parent more than one
+   * level up, or its own-lineage summary at k doesn't list it) renders at the
+   * next level down where it has one, or raw. Takes precedence over
+   * `maxLevel`. Omitted → not a fixed-level pin.
    *
    * Honored by the folding strategies that read level bounds
    * (`foldingStrategy: 'kv-stable'` and `'kv-unified'`, with
@@ -1728,7 +1734,9 @@ export interface ProtectedRange {
 /** Optional fold-depth bounds for a V2 dynamic pin (see `ProtectedRange`). */
 export interface PinLevelOptions {
   name?: string;
-  /** Pin AT exactly this level (0 = raw). Fixes the cut through the L_k node. */
+  /** Pin at this level (0 = raw): fixes the cut through the L_k node, with
+   *  kv-stable's exceptions for a chunk its summaries don't reach there
+   *  (`ProtectedRange.level`). */
   level?: number;
   /** Fold no deeper than this level (hard cap; `0` ≡ classic pin-raw). */
   maxLevel?: number;
