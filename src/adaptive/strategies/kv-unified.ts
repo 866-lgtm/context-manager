@@ -458,8 +458,19 @@ function solveWithLatentCandidate(
   // subtrees' sets and keeps its own candidate's, and its copy goes with
   // the holder when the candidate is gone, instead of leaving every merge
   // ever considered in the live map.
-  const holder: KvUnifiedReuse = whatIf.kept?.get(key) ?? whatIf.carried?.get(key) ??
+  const kept = whatIf.kept?.get(key);
+  const carried = kept ?? whatIf.carried?.get(key);
+  const holder: KvUnifiedReuse = carried ??
     { certificate: whatIf.live?.certificate, subtree: whatIf.live?.subtree && new Map(whatIf.live.subtree) };
+  if (carried && !kept && whatIf.live?.subtree) {
+    // A holder from last compile still points at the entries the live map
+    // has since replaced; those would fail validation and be computed again
+    // inside the what-if. It starts from the live map as it is now and keeps
+    // only its own ids (the candidate's).
+    const seeded = new Map(whatIf.live.subtree);
+    if (holder.subtree) for (const [id, entry] of holder.subtree) if (!seeded.has(id)) seeded.set(id, entry);
+    holder.subtree = seeded;
+  }
   whatIf.kept?.set(key, holder);
   const forest = (holder.forest ? CanonicalSummaryForest.derive(holder.forest, candidateInputs, forestOptions) : null) ??
     CanonicalSummaryForest.derive(whatIf.base, candidateInputs, forestOptions) ??

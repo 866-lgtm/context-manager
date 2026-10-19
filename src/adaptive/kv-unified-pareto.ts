@@ -177,9 +177,19 @@ export class ParetoKvUnifiedPolicySolver {
         const bound = (error: ApproximationEnvelope) => this.approximationBound(options, normalizePolicy(options.policy), error);
         if (options.engine !== 'dag') {
           const subtree = new SubtreeMemoSolver(this.inputs, this.forest, options, buffered, bound, feasibility);
-          const result = subtree.solve();
-          this.lastSubtreeStats = subtree.lastStats;
-          return result;
+          try {
+            const result = subtree.solve();
+            this.lastSubtreeStats = subtree.lastStats;
+            return result;
+          } catch (error) {
+            // A subtree's sets are pruned against the wall from the subtree's
+            // own origin, so a forest whose prefix fills most of the wall can
+            // need more labels than the ceiling where the packed engine,
+            // pruning from the absolute prefix, needs few. Asked for no engine
+            // in particular, the solve runs once more on the packed engine.
+            if (!(error instanceof SparseLabelCeilingError) || options.engine === 'subtree') throw error;
+            this.lastSubtreeStats = { ...subtree.lastStats, ceilingFallback: true };
+          }
         }
         return new PackedDagSolver(this.inputs, this.forest, options, buffered, bound, feasibility).solve();
       }

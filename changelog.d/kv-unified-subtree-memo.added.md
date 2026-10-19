@@ -1,6 +1,7 @@
 - kv-unified solves every forest with a subtree-memoized engine
   (`engine: 'subtree'`, the `auto` default; `engine: 'dag'` asks for the
-  packed DAG engine). What a summary subtree contributes to a label is a
+  packed DAG engine; `auto` runs a solve the subtree engine cannot fit under
+  the label ceiling once more on the packed engine). What a summary subtree contributes to a label is a
   set of deltas pruned on the same grid as before, computed once per
   summary and kept in the solve's reuse holder (by summary id, across full
   forest builds) while nothing under it changed: its leaves' weights,

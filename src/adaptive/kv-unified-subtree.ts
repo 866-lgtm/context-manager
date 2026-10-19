@@ -121,8 +121,11 @@ interface MemoEntry {
    * object with the same structure rebinds the entry (a full forest build
    * makes new objects for unchanged summaries). */
   summary: CanonicalSummary;
-  /** The subtree's structure: this summary's own and every descendant's. */
-  readonly structure: number;
+  /** The subtree's structure, two independent lanes: this summary's own
+   * and every descendant's. A rebind also compares the summary's own
+   * level, recall cost and child count exactly. */
+  readonly structureA: number;
+  readonly structureB: number;
   readonly solveKey: string;
   readonly hashA: number;
   readonly hashB: number;
@@ -163,6 +166,9 @@ export interface SubtreeSolveStats {
   readonly summariesSolved: number;
   /** Delta sets this solve read that an earlier solve computed. */
   readonly summariesReused: number;
+  /** True when the subtree engine exceeded the label ceiling and the solve
+   * ran again on the packed DAG engine (see kv-unified-pareto.ts). */
+  readonly ceilingFallback?: boolean;
 }
 
 const ZERO_APPROXIMATION: ApproximationEnvelope = Object.freeze({ token: 0, continuity: 0, fidelity: 0, cache: 0 });
@@ -216,7 +222,7 @@ export class SubtreeMemoSolver {
   /** The largest label set since the delta computation in progress began. */
   private peak = 0;
   /** Subtree structures for this forest, computed once per summary. */
-  private readonly structures = new Map<CanonicalSummary, number>();
+  private readonly structures = new Map<CanonicalSummary, readonly [number, number]>();
   /** KVU_SUBTREE_DIAG=1: per-level counts of sets computed, their labels,
    * compositions and time, printed at the end of the solve. */
   private readonly diag = typeof process !== 'undefined' && !!process.env?.KVU_SUBTREE_DIAG
@@ -423,6 +429,9 @@ export class SubtreeMemoSolver {
       : scoreBoundedCandidates(
           terminal.map((candidate) => evaluator.estimate(candidate.trace, candidate.tokens)), options, stats, this.cacheRelevant, evaluator.orderedLeafIds);
     this.lastStats = { summariesSolved: this.summariesSolved, summariesReused: this.summariesReused };
+    // An id that left the forest (store surgery, a rebuild that replaced it)
+    // would otherwise keep its two delta arrays until the holder is reset.
+    if (this.memo) for (const id of this.memo.keys()) if (!forest.summary(id)) this.memo.delete(id);
     if (this.diag) {
       const rows = [...this.diag].sort((a, b) => a[0] - b[0]).map(([level, d]) =>
         `L${level}: solved=${d.solved} reused=${d.reused} labels=${d.labels} pairs=${d.pairs} ms=${d.ms.toFixed(0)}`);
@@ -514,16 +523,21 @@ export class SubtreeMemoSolver {
     // The structure covers the descendants too: a child whose recall cost
     // changed is a new object under a parent that may not be, and the
     // parent's sets were composed from the child's old ones.
-    const structure = this.structure(summary);
+    const [structureA, structureB] = this.structure(summary);
     if (entry && entry.summary !== summary) {
       // A new object for this id: the same summary after a full build, or a
-      // changed one.
-      if (entry.structure === structure) entry.summary = summary;
+      // changed one. Its own level, recall cost and child count are compared
+      // exactly; the two hash lanes cover the rest and the descendants.
+      const previous = entry.summary;
+      if (entry.structureA === structureA && entry.structureB === structureB &&
+          previous.level === summary.level && previous.recallTokens === summary.recallTokens &&
+          previous.childSummaryIds.length === summary.childSummaryIds.length) entry.summary = summary;
       else entry = undefined;
     }
-    if (!entry || entry.structure !== structure || entry.solveKey !== this.solveKey || entry.hashA !== hashA || entry.hashB !== hashB) {
+    if (!entry || entry.structureA !== structureA || entry.structureB !== structureB ||
+        entry.solveKey !== this.solveKey || entry.hashA !== hashA || entry.hashB !== hashB) {
       entry = {
-        summary, structure, solveKey: this.solveKey, hashA, hashB,
+        summary, structureA, structureB, solveKey: this.solveKey, hashA, hashB,
         broken: null, intact: null, brokenBy: null, intactBy: null, brokenWork: null, intactWork: null,
       };
       if (this.memo) this.memo.set(summary.id, entry); else unheld.set(summary, entry);
@@ -531,14 +545,18 @@ export class SubtreeMemoSolver {
     return entry;
   }
 
-  private structure(summary: CanonicalSummary): number {
+  private structure(summary: CanonicalSummary): readonly [number, number] {
     let value = this.structures.get(summary);
     if (value === undefined) {
-      value = ownStructure(summary);
+      let [a, b] = ownStructure(summary);
       for (const id of summary.childSummaryIds) {
         const child = this.forest.summary(id);
-        if (child) value = mix(value, this.structure(child));
+        if (!child) continue;
+        const [childA, childB] = this.structure(child);
+        a = mix(a, childA);
+        b = mixB(b, childB);
       }
+      value = [a, b];
       this.structures.set(summary, value);
     }
     return value;
@@ -883,18 +901,27 @@ export class SubtreeMemoSolver {
  * level, recall cost, which leaves and children it owns. Leaf changes are
  * the span hash's; a summary object is immutable, so this is kept per
  * object, and the subtree structure composes it with the children's. */
-const ownStructures = new WeakMap<CanonicalSummary, number>();
-function ownStructure(summary: CanonicalSummary): number {
+const ownStructures = new WeakMap<CanonicalSummary, readonly [number, number]>();
+/** Two independent 32-bit lanes over a summary's own structure. The recall
+ * cost's float words enter each lane whole, in different orders, so two
+ * costs agree on both lanes only by a 2^-64 accident (one lane with the
+ * words xored let a re-priced summary rebind its old sets). */
+function ownStructure(summary: CanonicalSummary): readonly [number, number] {
   let value = ownStructures.get(summary);
   if (value !== undefined) return value;
   const view = new DataView(new ArrayBuffer(8));
   view.setFloat64(0, summary.recallTokens);
-  value = mix(summary.level + 1, view.getUint32(0) ^ view.getUint32(4));
-  value = mix(value, summary.leafIds.length);
-  for (const id of summary.leafIds) value = mix(value, hashString(id));
-  for (const id of summary.childSummaryIds) value = mix(value, hashString(id) ^ 0x5bd1e995);
-  for (const id of summary.directLeafIds) value = mix(value, hashString(id) ^ 0x1b873593);
-  value = mix(value, hashString(summary.parentId ?? ''));
+  const hi = view.getUint32(0), lo = view.getUint32(4);
+  let a = mix(mix(summary.level + 1, hi), lo);
+  let b = mixB(mixB(summary.level + 1, lo), hi);
+  a = mix(a, summary.leafIds.length);
+  b = mixB(b, summary.leafIds.length);
+  for (const id of summary.leafIds) { a = mix(a, hashString(id)); b = mixB(b, hashStringB(id)); }
+  for (const id of summary.childSummaryIds) { a = mix(a, hashString(id) ^ 0x5bd1e995); b = mixB(b, hashStringB(id) ^ 0x27d4eb2f); }
+  for (const id of summary.directLeafIds) { a = mix(a, hashString(id) ^ 0x1b873593); b = mixB(b, hashStringB(id) ^ 0x165667b1); }
+  a = mix(a, hashString(summary.parentId ?? ''));
+  b = mixB(b, hashStringB(summary.parentId ?? ''));
+  value = [a, b];
   ownStructures.set(summary, value);
   return value;
 }
@@ -902,6 +929,13 @@ function ownStructure(summary: CanonicalSummary): number {
 function hashString(value: string): number {
   let h = 2166136261;
   for (let i = 0; i < value.length; i++) h = Math.imul(h ^ value.charCodeAt(i), 16777619);
+  return h >>> 0;
+}
+
+/** A second string hash, independent of `hashString` (other seed and prime). */
+function hashStringB(value: string): number {
+  let h = 0x811c9dc5 ^ 0x5bd1e995;
+  for (let i = 0; i < value.length; i++) h = Math.imul(h ^ (value.charCodeAt(i) + 0x9e37), 0x01000193 ^ 0x3b);
   return h >>> 0;
 }
 
@@ -1044,5 +1078,13 @@ function mix(a: number, b: number): number {
   let h = (a ^ Math.imul(b, 0x9e3779b1)) >>> 0;
   h = Math.imul(h ^ (h >>> 15), 0x85ebca6b) >>> 0;
   h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35) >>> 0;
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+/** The second structure lane's mixer, with its own constants and shifts. */
+function mixB(a: number, b: number): number {
+  let h = (a ^ Math.imul(b, 0x85ebca77)) >>> 0;
+  h = Math.imul(h ^ (h >>> 16), 0x7feb352d) >>> 0;
+  h = Math.imul(h ^ (h >>> 15), 0x846ca68b) >>> 0;
   return (h ^ (h >>> 16)) >>> 0;
 }

@@ -378,6 +378,91 @@ test('an exact search whose one step expands past any argument list still comple
     'the ceiling, not the call, bounds the step');
 });
 
+test('a re-priced summary whose cost collides with the old one on the xor of its float words is not rebound', () => {
+  // 30 and 300.00000028591603 have the same xor of their float words, so a
+  // structure that folded the cost that way rebound the old sets after a
+  // rebuild: the warm cut was both L1s at a claimed 60 tokens under a 130
+  // wall, while a cold solve selects the L2. The structure is two lanes
+  // with the words whole, and a rebind compares the cost exactly.
+  const words = (value: number) => { const view = new DataView(new ArrayBuffer(8)); view.setFloat64(0, value); return [view.getUint32(0), view.getUint32(4)]; };
+  const [oldHi, oldLo] = words(30), [newHi, newLo] = words(300.00000028591603);
+  assert.equal(oldHi ^ oldLo, newHi ^ newLo, 'premise: the costs collide on the xor of their words');
+  const build = (cost: number) => {
+    const chronicle = new MockChronicle({ recallPairTokens: 30 });
+    for (let i = 0; i < 4; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 50 });
+    const a = chronicle.produceL1(['c0', 'c1']);
+    const b = chronicle.produceL1(['c2', 'c3']);
+    chronicle.produceUpper(2, [a.id, b.id]);
+    chronicle.recallPairTokens.set(b.id, cost);
+    const inputs = inputsOf(chronicle);
+    return { inputs, forest: new CanonicalSummaryForest(inputs) };
+  };
+  const options: ParetoSolveOptions = { maxTokens: 130, labelCeiling: 100_000, policy: { alpha: 0 } };
+  const reuse: KvUnifiedReuse = {};
+  const first = build(30);
+  const before = new ParetoKvUnifiedPolicySolver(first.inputs, first.forest).solve({ ...options, engine: 'subtree', reuse });
+  assert.ok(before.feasible);
+  assert.equal(before.selected.renderedTokens, 60, 'premise: both L1s fit at 30 each');
+  const second = build(300.00000028591603);
+  const warm = new ParetoKvUnifiedPolicySolver(second.inputs, second.forest).solve({ ...options, engine: 'subtree', reuse });
+  const cold = new ParetoKvUnifiedPolicySolver(second.inputs, second.forest).solve({ ...options, storage: 'objects' });
+  assert.ok(warm.feasible && cold.feasible);
+  assert.deepEqual(warm.selected.frontier, cold.selected.frontier);
+  assert.equal(warm.selected.score, cold.selected.score);
+  assert.equal(warm.selected.renderedTokens, 30, 'the L2: both L1s no longer fit');
+  assert.deepEqual(metrics(warm.candidates), metrics(cold.candidates));
+});
+
+test('a subtree pruned from its own origin that exceeds the ceiling runs again on the packed engine', () => {
+  // Twelve L1 pairs (leaves 100+2^i and 100), every L1 and their L2 at 40,
+  // a 9,950-token head under a 10,000 wall, no grid: the packed engine
+  // prunes against the absolute prefix and peaks at one label, the subtree
+  // engine prunes each set from zero and passes a ceiling of 1,000. Asked
+  // for no engine in particular, the solve finishes on the packed engine;
+  // asked for the subtree engine, it reports the ceiling.
+  const chronicle = new MockChronicle({ recallPairTokens: 40 });
+  const l1s = [];
+  for (let i = 0; i < 12; i++) {
+    chronicle.addChunk({ id: `a${i}`, rawTokens: 100 + 2 ** i });
+    chronicle.addChunk({ id: `b${i}`, rawTokens: 100 });
+    l1s.push(chronicle.produceL1([`a${i}`, `b${i}`]));
+  }
+  chronicle.produceUpper(2, l1s.map((summary) => summary.id));
+  const inputs = inputsOf(chronicle, { headTokens: 9_950 });
+  const forest = new CanonicalSummaryForest(inputs);
+  const options: ParetoSolveOptions = { maxTokens: 10_000, labelCeiling: 1_000, policy: { alpha: 0 } };
+  const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
+  const packed = solver.solve({ ...options, engine: 'dag' });
+  assert.ok(packed.feasible);
+  assert.throws(() => solver.solve({ ...options, engine: 'subtree' }), SparseLabelCeilingError, 'premise');
+  const auto = solver.solve({ ...options });
+  assert.ok(auto.feasible);
+  assert.equal(solver.lastSubtreeStats?.ceilingFallback, true, 'the stats say the packed engine finished the solve');
+  assert.deepEqual(auto.selected.frontier, packed.selected.frontier);
+  assert.equal(auto.selected.score, packed.selected.score);
+});
+
+test('the memo drops the ids of summaries that left the forest', () => {
+  const build = (withParent: boolean) => {
+    const chronicle = new MockChronicle({ recallPairTokens: 30 });
+    for (let i = 0; i < 4; i++) chronicle.addChunk({ id: `c${i}`, rawTokens: 50 });
+    const a = chronicle.produceL1(['c0', 'c1']);
+    const b = chronicle.produceL1(['c2', 'c3']);
+    const parent = withParent ? chronicle.produceUpper(2, [a.id, b.id]) : null;
+    const inputs = inputsOf(chronicle);
+    return { inputs, forest: new CanonicalSummaryForest(inputs), parent };
+  };
+  const options: ParetoSolveOptions = { maxTokens: 400, labelCeiling: 100_000, policy: { alpha: 0 } };
+  const reuse: KvUnifiedReuse = {};
+  const first = build(true);
+  new ParetoKvUnifiedPolicySolver(first.inputs, first.forest).solve({ ...options, engine: 'subtree', reuse });
+  assert.ok(reuse.subtree?.has(first.parent!.id), 'premise: the L2 has an entry');
+  const second = build(false);
+  new ParetoKvUnifiedPolicySolver(second.inputs, second.forest).solve({ ...options, engine: 'subtree', reuse });
+  assert.equal(reuse.subtree?.has(first.parent!.id), false, 'gone with the summary');
+  assert.ok(reuse.subtree?.size === 2, 'the two L1s remain');
+});
+
 test('a presentation appearing elsewhere invalidates the sets of a subtree it does not cover', () => {
   // Whether a presentation exists decides what new material is: with none,
   // nothing is an extension; with one that covers other leaves, this

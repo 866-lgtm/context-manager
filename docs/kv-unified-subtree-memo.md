@@ -95,18 +95,36 @@ forest with gap-bearing ownership is rebuilt on every summary arrival). A
 solve without a holder uses a module-level `WeakMap` keyed by the summary
 object instead. A latent-demand what-if starts from a copy of the live
 holder's map and keeps its own, which goes with its holder when the
-candidate is gone. An entry is valid while its *structure* (the summary's
+candidate is gone; a holder carried to the next compile starts again from
+the live map as it is then, so it never recomputes a subtree the live solve
+just did. An entry is valid while its *structure* (the summary's
 level, recall cost, owned leaves and children, composed with every
 descendant's, since a parent's sets are built from its children's), its
 *solve key* (policy terms that enter propagation, the grid, the wall,
 cache relevance, whether a presentation exists) and the *span hash* match; a reused set whose computation
 needed more labels than the solve's ceiling allows is refused the way a
-fresh computation would be. The span hash is two 32-bit
+fresh computation would be. The structure is two independent 32-bit lanes
+with the recall cost's float words entering each whole, and an entry
+rebound to a new summary object after a full build also compares the
+summary's own level, recall cost and child count exactly. The span hash is two 32-bit
 lanes of a position-mixed hash over everything a delta reads from a leaf
 (fidelity and continuity bases, accepted level and whether it still matches,
-the allowed-level list, zone, raw tokens), kept as xor prefix arrays so a span's
+the allowed-level list, raw tokens, and the zone through what it sets: the
+allowed-level list and the externally-accounted flag), kept as xor prefix arrays so a span's
 hash is O(1); the per-solve preparation that fills them is one O(N) pass
-with a small constant (~0.4 µs per leaf).
+with a small constant (~0.4 µs per leaf). At the end of a solve the memo
+drops the ids of summaries no longer in the forest.
+
+**Ceiling.** A subtree's sets are pruned against the wall from the
+subtree's own origin, so a forest whose prefix fills most of the wall can
+need more labels than the ceiling where the packed engine, pruning from
+the absolute prefix, needs few (twelve L1 pairs under a 9,950-token head
+and a 10,000 wall, no grid: the packed engine peaks at one label, the
+subtree engine passes 1,000). With `engine: 'auto'` (the default) such a
+solve runs once more on the packed engine and the stats say so
+(`ceilingFallback`); `engine: 'subtree'` reports the ceiling instead.
+Production grids keep the per-origin cell count small, and the real-store
+replay never came near it.
 
 **Stats.** `ParetoKvUnifiedPolicySolver.lastSubtreeStats` and
 `KvUnifiedTimings.subtree` report the delta sets a solve computed and the
