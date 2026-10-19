@@ -3272,10 +3272,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private compressionResponseInputTokens(response: unknown): number | undefined {
     if (!response || typeof response !== 'object') return undefined;
-    const typed = response as {
-      usage?: unknown;
-      details?: { usage?: unknown; model?: { provider?: unknown } };
-    };
+    const typed = response as { usage?: unknown; details?: { usage?: unknown } };
     const detailed = typed.details?.usage;
     const usage = detailed && typeof detailed === 'object' ? detailed : typed.usage;
     if (!usage || typeof usage !== 'object') return undefined;
@@ -3283,22 +3280,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const value = (usage as Record<string, unknown>)[key];
       return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
     };
+    // membrane 0.6.0 and later states usage with uncached input, cache writes
+    // and cache reads as disjoint counts wherever it knows the convention,
+    // Gemini's included, so the prompt's total is their sum whatever the
+    // provider, and a full cache hit is a zero input count beside a positive
+    // cache read. The usage comes from the host's instance (ctx.membrane),
+    // which this package's range doesn't bind: a host on an older membrane
+    // passes Gemini's counts raw, and before 0.5.81 OpenAI's too, with the
+    // cached span inside the input count, so the sum counts that span twice
+    // and admission is stricter. A usage whose convention membrane can't
+    // establish keeps the counts its provider gives: in 0.6.0 that's
+    // openai-compatible's and openai-completions', which never report cache
+    // reads, and an OpenRouter response with no cache field, so the sum is
+    // its input count.
     const input = read('inputTokens');
-    const provider = typeof typed.details?.model?.provider === 'string'
-      ? typed.details.model.provider.toLowerCase()
-      : undefined;
-    // Anthropic and Bedrock report uncached, cache-write, and cache-read input
-    // as disjoint counters. OpenAI/Gemini/OpenRouter report cache reads as a
-    // subset of inputTokens, so summing there would double-count.
-    if (provider === 'anthropic' || provider === 'bedrock') {
-      if (input === undefined) return undefined;
-      const total = input + (read('cacheCreationTokens') ?? 0) + (read('cacheReadTokens') ?? 0);
-      return total > 0 ? total : undefined;
-    }
-    // Unknown/other providers are authoritative only when they report a
-    // positive total input count. Zero/partial usage falls back to the
-    // complete normalized request bound rather than admitting blindly.
-    return input !== undefined && input > 0 ? input : undefined;
+    // Usage without an input count, or with a zero total, is no observation
+    // of the prompt: the complete normalized request bound stands instead.
+    // Through complete(), which compression calls, membrane's Anthropic and
+    // Bedrock adapters pass the provider's input count through, so a missing
+    // one arrives as missing, as from a caller outside membrane. Its other
+    // adapters report an omitted count as zero, so a zero beside cache counts
+    // reads as a full cache hit: a response can't tell a provider's omitted
+    // count from one, and membrane flags an omitted count only in a streamed
+    // round's report (unreportedUsage).
+    if (input === undefined) return undefined;
+    const total = input + (read('cacheCreationTokens') ?? 0) + (read('cacheReadTokens') ?? 0);
+    return total > 0 ? total : undefined;
   }
 
   private fallbackContentBlockError(block: unknown, seen = new Set<object>()): string | undefined {
