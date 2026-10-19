@@ -13,7 +13,7 @@ import {
   type ParetoPolicySolveResult,
   type ParetoSolveOptions,
 } from '../kv-unified-pareto.js';
-import { frontierSignature, normalizeContinuityMultiplier, normalizePolicy, policyScore, type KvUnifiedWelfarePolicy } from '../kv-unified-policy.js';
+import { ExactKvUnifiedPolicySolver, frontierSignature, normalizeContinuityMultiplier, normalizePolicy, policyScore, type KvUnifiedWelfarePolicy } from '../kv-unified-policy.js';
 
 import type { KvUnifiedReuse } from '../kv-unified-reuse.js';
 import type { SubtreeSolveStats } from '../kv-unified-subtree.js';
@@ -49,6 +49,10 @@ export interface KvUnifiedOptions extends Omit<ParetoSolveOptions, 'maxTokens'> 
      * made, and in joint mode hide the alternative the cut left out. */
     blocked?: (sourceIds: readonly string[]) => boolean;
   };
+  /** Called when the live solve exceeds the label ceiling and the compile
+   * takes the minimum-token cut instead (#252), so a host can tell whoever
+   * sets the recipe. */
+  onCeilingFallback?: (hit: KvUnifiedCeilingHit) => void;
 }
 
 export interface KvUnifiedTimings {
@@ -61,6 +65,42 @@ export interface KvUnifiedTimings {
   /** Delta sets the base solve computed and reused, when the subtree
    * engine ran it (see kv-unified-subtree.ts). */
   readonly subtree?: SubtreeSolveStats;
+  /** What the label ceiling stopped in this compile, when it stopped
+   * anything (#252). */
+  readonly ceiling?: KvUnifiedCeilingReport;
+}
+
+/** A search the label ceiling stopped: the ceiling, the labels it had made
+ * when it stopped (at one state, or in all for the `leaf` engine), and the
+ * engine whose search that was. Asked for no engine, the solve runs the
+ * subtree engine and, past the ceiling, the packed one, so a hit there is
+ * the packed engine's: `packed, after subtree`. */
+export interface KvUnifiedCeilingHit {
+  readonly ceiling: number;
+  readonly labels: number;
+  readonly engine: string;
+}
+
+/** What the label ceiling stopped in one compile. The ceiling bounds a
+ * search; it doesn't fail the compile. */
+export interface KvUnifiedCeilingReport {
+  /** The live solve exceeded it, so the compile took the minimum-token cut
+   * and demanded nothing. */
+  readonly live?: KvUnifiedCeilingHit;
+  /** Individual latent-demand what-ifs it stopped, in this compile or, under
+   * the same inputs, an earlier one. A stopped conservative what-if leaves
+   * its candidate undemanded; a stopped re-solve without the certificate
+   * leaves the certified gain standing, and a stopped expected-cost solve
+   * leaves the conservative gain to order the request. */
+  readonly whatIfs: number;
+  /** The base solve without the certificate exceeded it, so no merge was
+   * demanded: a gate that passes against the certified base is decided
+   * against that solve. */
+  readonly gate: boolean;
+  /** The joint latent-demand forest's solve exceeded it, in this compile or,
+   * under the same inputs, an earlier one, so the candidates were ranked one
+   * at a time. */
+  readonly joint: boolean;
 }
 
 export interface LatentDemandEvaluation {
@@ -83,6 +123,10 @@ export class KvUnifiedStrategy implements FoldingSolver {
   private timings: KvUnifiedTimings | null = null;
   private requests: ProduceRequest[] = [];
   private demandSolves = 0;
+  private ceilingWhatIfs = 0;
+  private ceilingGate = false;
+  private ceilingJoint = false;
+  private signature: string | undefined;
 
   constructor(private readonly options: KvUnifiedOptions = {}) {}
 
@@ -116,18 +160,35 @@ export class KvUnifiedStrategy implements FoldingSolver {
     if (reuse) reuse.forest = forest;
     const t1 = performance.now();
     const solver = new ParetoKvUnifiedPolicySolver(inputs, forest);
-    const result = solver.solve({
-      ...this.options,
-      maxTokens: budget.totalBudget,
-    });
+    const options = { ...this.options, maxTokens: budget.totalBudget };
+    let result: ParetoPolicySolveResult;
+    let live: KvUnifiedCeilingHit | undefined;
+    try {
+      result = solver.solve(options);
+    } catch (error) {
+      // The ceiling bounds the search, not the compile (#252). Past it, the
+      // compile takes the cut with the fewest tokens, which the solve's
+      // feasibility check computes before any search: it fits whenever the
+      // wall can be met. It becomes the carried layout, which the next
+      // compile's certificate or search judges as any other.
+      if (!(error instanceof SparseLabelCeilingError)) throw error;
+      live = { ceiling: error.ceiling, labels: error.labelsCreated, engine: engineOf(options) };
+      result = minimumTokenCut(inputs, forest, options);
+      this.options.onCeilingFallback?.(live);
+    }
     const t2 = performance.now();
     this.last = result;
     this.demandEvaluations = [];
     this.requests = [];
     this.demandSolves = 0;
+    this.ceilingWhatIfs = 0;
+    this.ceilingGate = false;
+    this.ceilingJoint = false;
+    this.signature = undefined;
     this.timings = {
       forestMs: t1 - t0, forestDerived: forest.derived, certificateMs: solver.lastCertificateMs, baseSolveMs: t2 - t1,
       demandMs: 0, demandSolves: 0, ...(solver.lastSubtreeStats ? { subtree: solver.lastSubtreeStats } : {}),
+      ...(live ? { ceiling: { live, whatIfs: 0, gate: false, joint: false } } : {}),
     };
     if (!result.feasible) {
       if (result.feasibility.frontier) {
@@ -147,11 +208,17 @@ export class KvUnifiedStrategy implements FoldingSolver {
           `: ${result.feasibility.certificate.suggestion}`,
       );
     }
-    const produced = this.options.latentDemand
+    // Demand is gated against the policy's best cut, which a fallback isn't.
+    const produced = this.options.latentDemand && !live
       ? this.rankLatentDemand(inputs, forest, solver, result, budget)
       : [];
     this.requests = produced;
-    this.timings = { ...this.timings, demandMs: performance.now() - t2, demandSolves: this.demandSolves };
+    this.timings = {
+      ...this.timings, demandMs: performance.now() - t2, demandSolves: this.demandSolves,
+      ...(this.ceilingWhatIfs > 0 || this.ceilingGate || this.ceilingJoint
+        ? { ceiling: { whatIfs: this.ceilingWhatIfs, gate: this.ceilingGate, joint: this.ceilingJoint } }
+        : {}),
+    };
     // The selected cut as a level per leaf; the forest's leaf order is by
     // sequence, so when the sequences are dense (0..n-1) the array is
     // indexed by sequence. The frontier map is built only if someone reads it.
@@ -214,16 +281,17 @@ export class KvUnifiedStrategy implements FoldingSolver {
     policy: KvUnifiedWelfarePolicy,
     multiplier: number,
   ): ProduceRequest[] {
+    const failure = this.failureUnder(inputs, budget, policy, multiplier);
     // Pass 1: one conservative (p80 recall-cost) what-if solve per candidate.
     const solved = candidates.flatMap((candidate) => {
-      const conservative = solveWithLatentCandidate(
-        inputs, whatIf, candidate, candidate.conservativeRecallTokens, this.options, budget.totalBudget,
+      const conservative = this.measure(
+        inputs, whatIf, candidate, candidate.conservativeRecallTokens, this.options, budget.totalBudget, failure,
       );
-      this.demandSolves++;
-      return conservative.feasible ? [{ candidate, conservative }] : [];
+      return conservative?.feasible ? [{ candidate, conservative }] : [];
     });
     // Certified entries whose uncertified re-solve scored worse than the
-    // certified pool: they stand at the gain that pool proves.
+    // certified pool, or was stopped by the label ceiling: they stand at the
+    // gain that pool proves.
     const proven = new Set<object>();
     const rank = (base: Extract<ParetoPolicySolveResult, { feasible: true }>, withExpected: boolean): LatentDemandEvaluation[] => {
       // One frame for the whole compile. Each solve measures its penalties
@@ -265,7 +333,9 @@ export class KvUnifiedStrategy implements FoldingSolver {
       // the gate and another passing candidate's interval overlaps it.
       // The requests are then ordered by proven gains. That is the order of
       // an exact uncertified solve; a pruned one can score below a
-      // certified pool and order differently.
+      // certified pool and order differently. A re-solve the label ceiling
+      // stops leaves the interval undecided, and the certified gain, a floor,
+      // then decides the gate and the order (#252).
       const gain = (entry: (typeof solved)[number]) => baseBest - best(entry.conservative);
       const slack = (entry: (typeof solved)[number]) =>
         proven.has(entry) ? 0 : entry.conservative.certificate?.maxImprovement ?? 0;
@@ -279,14 +349,15 @@ export class KvUnifiedStrategy implements FoldingSolver {
       });
       if (undecided.length > 0) {
         for (const entry of undecided) {
-          const full = solveWithLatentCandidate(
+          const full = this.measure(
             inputs, whatIf, entry.candidate, entry.candidate.conservativeRecallTokens,
-            { ...this.options, hysteresisCertificate: false }, budget.totalBudget,
+            { ...this.options, hysteresisCertificate: false }, budget.totalBudget, failure,
           );
-          this.demandSolves++;
           // The certified pool is a real layout, so its gain is a floor. The
           // uncertified solve prunes and can come back worse: keep the better.
-          if (!full.feasible) solved.splice(solved.indexOf(entry), 1);
+          // One the label ceiling stopped leaves the floor standing too (#252).
+          if (full === null) proven.add(entry);
+          else if (!full.feasible) solved.splice(solved.indexOf(entry), 1);
           else if (best(full) <= best(entry.conservative)) entry.conservative = full;
           else proven.add(entry);
         }
@@ -307,13 +378,16 @@ export class KvUnifiedStrategy implements FoldingSolver {
         if (withExpected && conservativeImprovement > epsilon &&
             candidate.expectedRecallTokens !== candidate.conservativeRecallTokens) {
           const tied = passing.some((other) => other !== entry && gain(other) === conservativeImprovement);
-          const expected = solveWithLatentCandidate(
+          const expected = this.measure(
             inputs, whatIf, candidate, candidate.expectedRecallTokens,
-            tied ? { ...this.options, hysteresisCertificate: false } : this.options, budget.totalBudget,
+            tied ? { ...this.options, hysteresisCertificate: false } : this.options, budget.totalBudget, failure,
           );
-          this.demandSolves++;
-          if (!expected.feasible) continue;
-          expectedImprovement = baseBest - best(expected);
+          // One the label ceiling stopped leaves the conservative gain to
+          // order the request, as when the two costs are the same (#252).
+          if (expected !== null) {
+            if (!expected.feasible) continue;
+            expectedImprovement = baseBest - best(expected);
+          }
         }
         evaluations.push({
           request: candidate.request,
@@ -349,8 +423,8 @@ export class KvUnifiedStrategy implements FoldingSolver {
     // the unrestricted base solve; it runs only when a merge would otherwise
     // be requested, which is followed by a summarizer call anyway.
     if (baseline.certificate && rank(baseline, false).some((evaluation) => evaluation.conservativeImprovement > epsilon)) {
-      const unrestricted = solver.solve({ ...this.options, maxTokens: budget.totalBudget, hysteresisCertificate: false });
-      this.demandSolves++;
+      const unrestricted = this.unrestrictedBase(solver, budget);
+      if (unrestricted === null) return [];
       if (unrestricted.feasible) base = unrestricted;
     }
     const evaluations = rank(base, true);
@@ -382,19 +456,35 @@ export class KvUnifiedStrategy implements FoldingSolver {
     this.demandEvaluations = [];
     if (candidates.length === 0) return [];
     const conservative = candidates.map((candidate) => ({ candidate, recallTokens: candidate.conservativeRecallTokens }));
+    const key = whatIfKey(conservative);
+    const failure = this.failureUnder(inputs, budget, policy, multiplier);
+    // The joint holder remembers which of its solves the ceiling stopped:
+    // the first one, or the settling one without the certificate.
     const solveJoint = (options: KvUnifiedOptions): ParetoPolicySolveResult => {
       this.demandSolves++;
-      return solveWithLatentCandidates(inputs, whatIf, conservative, options, budget.totalBudget);
+      try {
+        return solveWithLatentCandidates(inputs, whatIf, conservative, options, budget.totalBudget);
+      } catch (error) {
+        if (error instanceof SparseLabelCeilingError) {
+          const holder = whatIf.kept?.get(key);
+          if (holder) holder.ceilingFailure = failure(options);
+        }
+        throw error;
+      }
     };
-    // A joint forest that exceeded the ceiling last compile, with the same
-    // candidate set and the same inputs that decide the label count, would
-    // exceed it again: its holder says so, and is kept so that it still
-    // says so next compile.
-    const key = whatIfKey(conservative);
-    const failure = jointFailureSignature(inputs, this.options, budget.totalBudget, policy, multiplier);
+    // A joint forest that exceeded the ceiling last compile, at either of its
+    // solves, with the same candidate set and the same inputs that decide the
+    // label count, would exceed it again: its holder says so, and is kept so
+    // that it still says so next compile. The digest holds whether the
+    // compile uses the certificate, so a stamp without it is the first
+    // search's where the compile has none, and the settling search's where
+    // it has one.
     const remembered = whatIf.carried?.get(key);
-    if (remembered?.jointFailure === failure) {
-      whatIf.kept?.set(key, remembered);
+    const stopped = remembered?.ceilingFailure;
+    if (stopped !== undefined &&
+        (stopped === failure(this.options) || stopped === failure({ ...this.options, hysteresisCertificate: false }))) {
+      whatIf.kept?.set(key, remembered!);
+      this.ceilingJoint = true;
       return this.rankIndividualLatentDemand(inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier);
     }
     try {
@@ -405,9 +495,74 @@ export class KvUnifiedStrategy implements FoldingSolver {
       // optional, so the compile goes on with the candidates one at a time
       // rather than failing on its account.
       if (!(error instanceof SparseLabelCeilingError)) throw error;
-      const holder = whatIf.kept?.get(key);
-      if (holder) holder.jointFailure = failure;
+      this.ceilingJoint = true;
       return this.rankIndividualLatentDemand(inputs, whatIf, solver, baseline, budget, candidates, epsilon, policy, multiplier);
+    }
+  }
+
+  /** The stamp a ceiling failure is remembered under in this compile: the
+   * digest of its inputs (ceilingFailureSignature), made the first time a
+   * failure is read or written, so a compile that meets no remembered or
+   * new failure doesn't hash its inputs, and whether the stopped solve used
+   * the certificate, since a holder's certified solve and its re-solve
+   * without the certificate are different searches. */
+  private failureUnder(
+    inputs: PickerInputs, budget: FoldingBudget, policy: KvUnifiedWelfarePolicy, multiplier: number,
+  ): (options: KvUnifiedOptions) => string {
+    return (options) => {
+      this.signature ??= ceilingFailureSignature(inputs, this.options, budget.totalBudget, policy, multiplier);
+      return `${this.signature}:${options.hysteresisCertificate ? 'certified' : 'uncertified'}`;
+    };
+  }
+
+  /** One candidate's what-if solve, or null where the label ceiling stopped
+   * it, in this compile or under the same inputs (`failure`) an earlier one
+   * remembered (#252). The demand is optional, so the compile goes on
+   * without that measurement, and each caller says what stands instead: no
+   * gain at all, or the one it already has. The failure is remembered for
+   * this solve: the candidate at its recall cost, with or without the
+   * certificate. */
+  private measure(
+    inputs: PickerInputs,
+    whatIf: WhatIfReuse,
+    candidate: LatentCandidate,
+    recallTokens: number,
+    options: KvUnifiedOptions,
+    maxTokens: number,
+    failure: (options: KvUnifiedOptions) => string,
+  ): ParetoPolicySolveResult | null {
+    const key = whatIfKey([{ candidate, recallTokens }]);
+    // This compile's holder first: a joint set of one candidate is this
+    // same solve, and may have just failed.
+    const remembered = whatIf.kept?.get(key) ?? whatIf.carried?.get(key);
+    if (remembered?.ceilingFailure !== undefined && remembered.ceilingFailure === failure(options)) {
+      whatIf.kept?.set(key, remembered);
+      this.ceilingWhatIfs++;
+      return null;
+    }
+    this.demandSolves++;
+    try {
+      return solveWithLatentCandidate(inputs, whatIf, candidate, recallTokens, options, maxTokens);
+    } catch (error) {
+      if (!(error instanceof SparseLabelCeilingError)) throw error;
+      const holder = whatIf.kept?.get(key);
+      if (holder) holder.ceilingFailure = failure(options);
+      this.ceilingWhatIfs++;
+      return null;
+    }
+  }
+
+  /** The base solved without the certificate, which a gate that passes
+   * against the certified base is decided against; null where the label
+   * ceiling stopped it, and then nothing is demanded this compile (#252). */
+  private unrestrictedBase(solver: ParetoKvUnifiedPolicySolver, budget: FoldingBudget): ParetoPolicySolveResult | null {
+    this.demandSolves++;
+    try {
+      return solver.solve({ ...this.options, maxTokens: budget.totalBudget, hysteresisCertificate: false });
+    } catch (error) {
+      if (!(error instanceof SparseLabelCeilingError)) throw error;
+      this.ceilingGate = true;
+      return null;
     }
   }
 
@@ -476,8 +631,8 @@ export class KvUnifiedStrategy implements FoldingSolver {
     // same, so its gain cannot have passed the gate. Nothing is left to
     // settle after the base moves.
     if (gain > epsilon && baseline.certificate) {
-      this.demandSolves++;
-      const unrestricted = solver.solve({ ...this.options, maxTokens: budget.totalBudget, hysteresisCertificate: false });
+      const unrestricted = this.unrestrictedBase(solver, budget);
+      if (unrestricted === null) return [];
       if (unrestricted.feasible) {
         widen(unrestricted);
         base = unrestricted;
@@ -616,21 +771,27 @@ function latentHigherLevelCandidates(
     );
 }
 
-/** A digest of everything a joint what-if solve reads besides the candidate
- * set (the holder's key): the leaves (sizes, salience, levels, pins, locks,
- * head and tail membership), the summaries (levels, costs, ranges, parents),
- * the presentation and receipt (every cached unit's identity, size and
- * offset, and the markers), the ceiling, the wall,
- * the grid, the engine, the forest options, the policy and the multiplier.
- * Any of them can change how many labels the solve
- * creates, so a remembered ceiling failure is valid only while all hold;
- * a changed input is a new question. One pass over the inputs. */
-function jointFailureSignature(inputs: PickerInputs, options: KvUnifiedOptions, maxTokens: number, policy: KvUnifiedWelfarePolicy, multiplier: number): string {
+/** A digest of everything a what-if solve reads besides its candidates (the
+ * holder's key) and whether that one search uses the certificate (the
+ * stamp's suffix): the leaves (sizes, salience, levels, owning L1s, pins,
+ * locks, head and tail membership), the summaries (levels, costs, ranges,
+ * parents), the presentation and receipt (every cached unit's identity,
+ * size and offset, and the markers), the ceiling, the wall, the grid,
+ * adoptEpsilon, whether the compile uses the certificate (which decides
+ * whether a joint settling search runs at all), the engine, the forest
+ * options, the policy and the multiplier. Any of them can change how many
+ * labels the solve creates, so a remembered ceiling failure is valid only
+ * while all hold; a changed input is a new question, so numbers are
+ * digested whole (both words of the double). One pass over the inputs. */
+function ceilingFailureSignature(inputs: PickerInputs, options: KvUnifiedOptions, maxTokens: number, policy: KvUnifiedWelfarePolicy, multiplier: number): string {
   let a = 0x811c9dc5, b = 0x9e3779b9;
+  const double = new Float64Array(1);
+  const words = new Int32Array(double.buffer);
   const num = (value: number | undefined): void => {
-    const v = value === undefined ? -1.5 : value;
-    a = Math.imul(a ^ (v | 0), 16777619) ^ Math.imul((v * 1024) | 0, 0x85ebca6b);
-    b = Math.imul(b ^ Math.imul((v * 1024) | 0, 0xc2b2ae35), 0x27d4eb2f) ^ (v | 0);
+    double[0] = value === undefined ? -1.5 : value;
+    const low = words[0]!, high = words[1]!;
+    a = Math.imul(a ^ low, 16777619) ^ Math.imul(high, 0x85ebca6b);
+    b = Math.imul(b ^ Math.imul(high, 0xc2b2ae35), 0x27d4eb2f) ^ low;
   };
   const str = (value: string | null | undefined): void => {
     const text = value ?? '';
@@ -646,7 +807,7 @@ function jointFailureSignature(inputs: PickerInputs, options: KvUnifiedOptions, 
   num(inputs.headTokens); num(inputs.tailTokens);
   for (let i = 0; i < inputs.chunks.length; i++) {
     const chunk = inputs.chunks[i];
-    str(chunk.id); num(chunk.sequence); num(chunk.rawTokens); num(chunk.salience); num(chunk.currentResolution);
+    str(chunk.id); num(chunk.sequence); num(chunk.rawTokens); num(chunk.salience); num(chunk.currentResolution); str(chunk.l1Id);
     num((chunk.pinned ? 1 : 0) | (chunk.lockedByAgent ? 2 : 0) | (inputs.headChunkIds.has(chunk.id) ? 4 : 0) | (inputs.tailChunkIds.has(chunk.id) ? 8 : 0));
     num(chunk.pinLevel); num(chunk.pinMaxLevel);
   }
@@ -779,6 +940,47 @@ function solveWithLatentCandidates(
     maxTokens,
     reuse: whatIf.kept ? holder : undefined,
   });
+}
+
+/** The cut with the fewest tokens, scored as any cut is: what a compile
+ * takes when the live solve exceeds the label ceiling (#252). */
+function minimumTokenCut(
+  inputs: PickerInputs,
+  forest: CanonicalSummaryForest,
+  options: ParetoSolveOptions,
+): ParetoPolicySolveResult {
+  const feasibility = forest.minimumTokens(options.maxTokens);
+  if (!feasibility.feasible) return { feasible: false, feasibility };
+  const stats = { statesVisited: 0, candidatesGenerated: 1, maxCandidatesAtState: 1, terminalCandidates: 1 };
+  return new ExactKvUnifiedPolicySolver(inputs, forest).scoreCandidates(
+    [{ frontier: feasibility.frontier, renderedTokens: forest.tokensForFrontier(feasibility.frontier) }],
+    options, stats, feasibility,
+  );
+}
+
+/** The engine whose search the ceiling stopped, as the solve's options
+ * choose it (kv-unified-pareto.ts): asked for none, the subtree engine runs
+ * and, past the ceiling, the packed one, whose error reaches the strategy. */
+function engineOf(options: ParetoSolveOptions): string {
+  if (options.engine === 'leaf') return 'leaf';
+  if (options.storage === 'objects') return 'objects';
+  if (options.engine === 'dag') return 'packed';
+  if (options.engine === 'subtree') return 'subtree';
+  return 'packed, after subtree';
+}
+
+/** The `ceiling=` mark of a compile's `[plan-vs-actual]` line and stats:
+ * what the label ceiling stopped (`live`, `joint`, `gate`, `whatIfs:N`),
+ * joined by `+`, or undefined where it stopped nothing. */
+export function ceilingMark(report: KvUnifiedCeilingReport | undefined): string | undefined {
+  if (!report) return undefined;
+  const parts = [
+    report.live ? 'live' : '',
+    report.joint ? 'joint' : '',
+    report.gate ? 'gate' : '',
+    report.whatIfs > 0 ? `whatIfs:${report.whatIfs}` : '',
+  ].filter((part) => part !== '');
+  return parts.length > 0 ? parts.join('+') : undefined;
 }
 
 function quantile(values: readonly number[], q: number, fallback: number): number {

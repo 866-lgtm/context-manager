@@ -54,7 +54,7 @@ import { Picker, OverBudgetError, UncoveredDropError, type OverBudgetClearedBy, 
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { reportOverlap } from '../adaptive/kv-control.js';
-import { KvUnifiedStrategy, type KvUnifiedReuse } from '../adaptive/strategies/kv-unified.js';
+import { KvUnifiedStrategy, ceilingMark, type KvUnifiedReuse } from '../adaptive/strategies/kv-unified.js';
 import { SummaryTree } from '../adaptive/summary-tree.js';
 import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
 import { describeFoldDiff, formatFoldDiff, type FoldDiff, type RequestDivergence } from '../adaptive/fold-diff.js';
@@ -8065,6 +8065,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // not added again here.
       const kt = m?.solver === 'kv-unified' ? this._lastKvUnified?.lastTimings : null;
       const solveMs = kt ? Math.round(kt.forestMs + kt.baseSolveMs + kt.demandMs) : undefined;
+      // What the label ceiling stopped in that solve (#252).
+      const ceiling = ceilingMark(kt?.ceiling);
       const messages = this._selectMessages;
       // Dry runs and previews log the line too, and skip work a live compile
       // does, so a journal reader must be able to drop them.
@@ -8080,6 +8082,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         messages,
         compileMs,
         ...(solveMs !== undefined ? { solveMs } : {}),
+        ...(ceiling ? { ceiling } : {}),
         ...(dryRun ? { dryRun: true as const } : {}),
         ...(this._lastFoldDiff ? { foldDiff: this._lastFoldDiff } : {}),
       };
@@ -8091,6 +8094,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ` (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) budgetMet=${m?.budgetMet} exhausted=${m?.exhausted}` +
         ` moves=${m?.moves} solver=${m?.solver} messages=${messages} compileMs=${compileMs}` +
         (solveMs !== undefined ? ` solveMs=${solveMs}` : '') +
+        (ceiling ? ` ceiling=${ceiling}` : '') +
         (dryRun ? ' dryRun=true' : '');
       if (loud) this.diag.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
       else this.diag.error(line);
@@ -14575,6 +14579,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(this.kvUnifiedSolveCache ? { cache: this.kvUnifiedSolveCache } : {}),
         ...(immutablePrefixHash ? { currentImmutablePrefixHash: immutablePrefixHash } : {}),
         requireExplicitPolicy: true,
+        // A solve past the label ceiling takes the minimum-token cut (#252),
+        // in any pick: the live one, a dry run's, a production-budget shadow
+        // pick or an attempt a retry replaces. The recipe's ceiling or grid is
+        // the remedy in the operator's hands, so the first such solve in this
+        // strategy's life is said where the operator reads, whichever pick it
+        // was in; [plan-vs-actual] marks each compile whose own pick took it.
+        onCeilingFallback: (hit) => {
+          if (this.kvUnifiedCeilingWarned) return;
+          this.kvUnifiedCeilingWarned = true;
+          this.diag.warn(
+            `[kv-unified] labelCeiling ${hit.ceiling} exceeded at ${hit.labels} labels (engine: ${hit.engine}); ` +
+              `that solve took the minimum-token cut, as each one that exceeds it will. A high enough labelCeiling ` +
+              `lets this forest's search fit, and larger bucket sizes may (said once; [plan-vs-actual] shows ` +
+              `ceiling=live for each compile whose own solve did)`,
+          );
+        },
       });
       this._lastKvUnified = strategy;
       this._lastKvStable = null;
@@ -14618,6 +14638,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  override is loud; §13.6). */
   private _lastKvStable: KvStableStrategy | null = null;
   private _lastKvUnified: KvUnifiedStrategy | null = null;
+  /** Whether a kv-unified solve, in any pick, has exceeded its label ceiling
+   *  yet in this strategy's life: the first one is warned of (#252). */
+  private kvUnifiedCeilingWarned = false;
   /** Structures kv-unified may derive from across compiles (validated on use). */
   private readonly kvUnifiedReuse: KvUnifiedReuse = {};
 
