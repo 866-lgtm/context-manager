@@ -33,6 +33,30 @@ export interface ProviderCacheReference {
   readonly immutablePrefixHash: string;
   readonly layout: RenderLayout;
   readonly markers: readonly CacheMarker[];
+  /** Per marker, which entry it sat on and a hash of the request's entries up
+   *  to it, as the strategy emitted them, so a later compile can tell a
+   *  prefix that changed in place under the same unit keys. Absent on a
+   *  reference an earlier version wrote. */
+  readonly render?: CacheRenderRecord;
+}
+
+/**
+ * What an accepted request's prefixes were, byte for byte, as the strategy
+ * emitted them, where a later compile can change them under the same unit
+ * keys. A unit's key is its message id, or `head`, or a summary id. What
+ * renders under a key can still change: an edit rewrites a message, an image
+ * is stripped, last-N replaces a tool result, pairing repair moves or stubs
+ * one, the cap cuts a message or a recall answer, a recall's envelope or
+ * label changes. A provider serves a marker's prefix only while every byte
+ * before it is unchanged, so a marker whose prefix no longer matches is left
+ * out of the reference the solver gets. The context manager's message-position
+ * injections, which it adds after the strategy's selection, aren't in it.
+ */
+export interface CacheRenderRecord {
+  /** Per marker, parallel to `markers`: the identity of the entry the marker
+   *  sat on (the message it ends on, or its layout key), and a hash of every
+   *  entry up to it, by participant and whole content. */
+  readonly prefixes: readonly { readonly through: string; readonly hash: string }[];
 }
 
 export interface KvUnifiedWelfarePolicy {

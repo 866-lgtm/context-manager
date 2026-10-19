@@ -62,7 +62,7 @@ import {
   KvUnifiedReceiptChain,
   type SerializedReceiptChain,
 } from '../adaptive/kv-unified-receipts.js';
-import type { PresentedLeaf, ProviderCacheReference } from '../adaptive/kv-unified-policy.js';
+import type { CacheRenderRecord, PresentedLeaf, ProviderCacheReference } from '../adaptive/kv-unified-policy.js';
 import { OldestFirstStrategy } from '../adaptive/strategies/oldest-first.js';
 import type {
   FoldingSolver,
@@ -1190,6 +1190,16 @@ interface CompressionAttemptTrace {
   budgetTokens?: number;
 }
 
+/** What kv-unified's cache check rebuilt at a compile's solve, for the
+ *  compile's record to compare against what it sent (kvUnifiedSelfCheck):
+ *  the reference's layout, the identities its markers end on, and each one's
+ *  prefix hash in the rebuild. */
+interface KvUnifiedRebuilt {
+  layout: RenderLayout;
+  wanted: Set<string>;
+  hashes: Map<string, string>;
+}
+
 function sha256Json(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
 }
@@ -1812,10 +1822,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     layout: RenderLayout;
     immutablePrefixHash?: string;
     markerUnitIndices: number[];
+    render?: CacheRenderRecord;
   } | null = null;
   private kvUnifiedPendingLayout: RenderLayout | null = null;
   private kvUnifiedPendingMarkerUnitIndices: number[] = [];
   private kvUnifiedPendingImmutablePrefixHash: string | null = null;
+  private kvUnifiedPendingRender: CacheRenderRecord | null = null;
+  /** The accepted cache reference as this compile's solver gets it: the
+   *  markers whose prefix has changed in place since it was accepted are left
+   *  out (kvUnifiedCacheForSolve). Set by selectAdaptive before buildPicker. */
+  private kvUnifiedSolveCache: ProviderCacheReference | null = null;
+  /** Content arrays' and blocks' hashes (kvUnifiedEntryFingerprint), by the
+   *  object: the store and the passes replace one rather than change it. It
+   *  keeps what this compile and the one before fingerprinted, so it follows
+   *  the raw population rather than every message the store holds. */
+  private kvUnifiedHashes = { current: new Map<object, string>(), previous: new Map<object, string>() };
+  /** Whether the check has said once that it couldn't render a recall pair. */
+  private kvUnifiedRecallRenderWarned = false;
+  /** Whether the self-check has said once that the rebuild differed from what was sent. */
+  private kvUnifiedSelfCheckWarned = false;
   /** Set once this strategy has said that an accepted request's cache markers
    * didn't match its compile's (reportKvUnifiedAccepted), so a mismatch that
    * repeats every turn is said once. */
@@ -3037,6 +3062,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.kvUnifiedPendingLayout = null;
         this.kvUnifiedPendingMarkerUnitIndices = [];
         this.kvUnifiedPendingImmutablePrefixHash = null;
+        this.kvUnifiedPendingRender = null;
       }
     } else {
       // A presentation receipt is kv-unified's record of the LAST accepted
@@ -12068,6 +12094,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const preparedTotal = this.preparedWindowTokens === undefined
       ? undefined
       : Math.min(totalBudget, this.preparedWindowTokens);
+    if (this.config.foldingStrategy === 'kv-unified') {
+      this.kvUnifiedHashes = { current: new Map(), previous: this.kvUnifiedHashes.current };
+    }
+    const kvUnifiedCheck = this.config.foldingStrategy === 'kv-unified'
+      ? this.kvUnifiedCacheForSolve(store, messages, { headStart, headEnd, recentStart: effectiveRecentStart, msgCap })
+      : null;
+    this.kvUnifiedSolveCache = kvUnifiedCheck?.cache ?? null;
     const picker = this.buildPicker(
       pickerInputs,
       preparedTotal === undefined
@@ -12365,8 +12398,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //    one continuous user message instead of N turns.
     //  - bodyGroupId absent: emit normally (raw L0 message, or Q+A summary pair).
     const emittedAncestors = new Set<SummaryId>();
-    const summaryLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
-    const summaryParticipant = this.config.summaryParticipant ?? 'Claude';
 
     // Emission-overflow refusal: the picker planned this layout to fit, so an
     // overrun here is estimator drift. The grace window (prefixBudget derives
@@ -12457,22 +12488,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const ancestor = currentRun.ancestor;
             if (!emittedAncestors.has(ancestor.id)) {
               emittedAncestors.add(ancestor.id);
-              const rendered = this.renderSummaryAnswer(ancestor, msgCap);
-              const questionEntry: ContextEntry = {
-                index: entries.length,
-                participant: 'Context Manager',
-                content: [{ type: 'text', text: summaryLabel }],
-                sourceRelation: 'derived',
-                summaries: rendered.refs,
-              };
-              const answerEntry: ContextEntry = {
-                index: entries.length + 1,
-                participant: summaryParticipant,
-                content: rendered.content,
-                sourceRelation: 'derived',
-                cacheLayoutKey: ancestor.id,
-                summaries: rendered.refs,
-              };
+              const [questionEntry, answerEntry] = this.recallPairEntries(ancestor, msgCap, entries.length);
               // Price the same pair the planner selected. responseContent may
               // carry signed-empty thinking whose exact generation cost is in
               // summary.tokens; re-estimating the rendered blocks here would
@@ -12576,22 +12592,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           continue;
         }
         emittedAncestors.add(ancestor.id);
-        const rendered = this.renderSummaryAnswer(ancestor, msgCap);
-        const questionEntry: ContextEntry = {
-          index: entries.length,
-          participant: 'Context Manager',
-          content: [{ type: 'text', text: summaryLabel }],
-          sourceRelation: 'derived',
-          summaries: rendered.refs,
-        };
-        const answerEntry: ContextEntry = {
-          index: entries.length + 1,
-          participant: summaryParticipant,
-          content: rendered.content,
-          sourceRelation: 'derived',
-          cacheLayoutKey: ancestor.id,
-          summaries: rendered.refs,
-        };
+        const [questionEntry, answerEntry] = this.recallPairEntries(ancestor, msgCap, entries.length);
         const pairTokens = this.recallPairCost(ancestor);
         if (totalTokens + pairTokens > prefixBudget) {
           throw emissionOverBudget(totalTokens + pairTokens);
@@ -12697,6 +12698,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.kvUnifiedDraft.markerUnitIndices = this.reconcileKvUnifiedMarkerIndices(
         merged, this.kvUnifiedDraft.layout, headMessageIds, tailMessageIds,
       );
+      // Acceptance keeps no reference without the immutable prefix hash.
+      if (this.kvUnifiedDraft.immutablePrefixHash !== undefined) {
+        this.kvUnifiedDraft.render = this.kvUnifiedRenderRecord(merged, this.kvUnifiedDraft.layout, kvUnifiedCheck?.rebuilt ?? null);
+      }
     }
     this.assertMiddleCoverage();
 
@@ -12866,6 +12871,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.kvUnifiedPendingLayout = this.kvUnifiedDraft.layout;
     this.kvUnifiedPendingMarkerUnitIndices = [...this.kvUnifiedDraft.markerUnitIndices];
     this.kvUnifiedPendingImmutablePrefixHash = this.kvUnifiedDraft.immutablePrefixHash ?? null;
+    this.kvUnifiedPendingRender = this.kvUnifiedDraft.render ?? null;
   }
 
   isKvUnifiedEnabled(): boolean {
@@ -12898,6 +12904,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               ? this.kvUnifiedPendingLayout!.totalTokens
               : this.kvUnifiedPendingLayout!.units[unitIndex].offset,
         })),
+        ...(this.kvUnifiedPendingRender ? { render: this.kvUnifiedPendingRender } : {}),
       };
     } else if (
       args.wireReceipt &&
@@ -12932,6 +12939,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.kvUnifiedPendingLayout = null;
     this.kvUnifiedPendingMarkerUnitIndices = [];
     this.kvUnifiedPendingImmutablePrefixHash = null;
+    this.kvUnifiedPendingRender = null;
     this.persistKvUnifiedReceipts();
   }
 
@@ -12962,6 +12970,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.kvUnifiedPendingLayout = null;
     this.kvUnifiedPendingMarkerUnitIndices = [];
     this.kvUnifiedPendingImmutablePrefixHash = null;
+    this.kvUnifiedPendingRender = null;
   }
 
   private _calibrationArmed = false;
@@ -13655,6 +13664,306 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return indices;
   }
 
+  /** The draft's render record (CacheRenderRecord), from the entries this
+   *  compile emits: for each marked entry, in order, its identity and the hash
+   *  of every entry up to it. Reconcile refuses a marked entry with no
+   *  identity, and acceptance keeps a reference only when the wire carried one
+   *  marker per reconciled unit, while it carries one per marked entry. So an
+   *  accepted reference's prefixes run parallel to its markers, and the check
+   *  credits one whose don't as it is. */
+  private kvUnifiedRenderRecord(
+    entries: readonly ContextEntry[],
+    layout: RenderLayout,
+    rebuilt: KvUnifiedRebuilt | null,
+  ): CacheRenderRecord {
+    const compare = rebuilt && !this.kvUnifiedSelfCheckWarned && this.kvUnifiedKeepsPresentation(layout, rebuilt.layout)
+      ? rebuilt
+      : null;
+    const marked: { through: string; hash: string }[] = [];
+    const sent = new Map<string, string>();
+    for (const prefix of this.kvUnifiedPrefixHashes(entries, (entry) =>
+      entry.cacheMarker === true || (compare?.wanted.has(this.kvUnifiedIdentity(entry)!) ?? false))) {
+      if (prefix.entry.cacheMarker === true) marked.push({ through: prefix.through, hash: prefix.hash });
+      if (compare?.wanted.has(prefix.through)) sent.set(prefix.through, prefix.hash);
+    }
+    if (compare) this.kvUnifiedSelfCheck(compare, sent);
+    return { prefixes: marked };
+  }
+
+  /** Whether a layout keeps the reference's presentation: the reference's
+   *  units, by kind and key, or the first of them where the newest messages
+   *  were removed, then a raw unit for each newer chunk. A newer chunk shown
+   *  folded doesn't keep it: the rebuild renders newer messages raw, and
+   *  those can strip or replace an earlier image or tool result that the
+   *  emission, folding them, leaves as it was. */
+  private kvUnifiedKeepsPresentation(layout: RenderLayout, kept: RenderLayout): boolean {
+    return layout.units.every((unit, i) =>
+      i < kept.units.length
+        ? unit.kind === kept.units[i]!.kind && unit.key === kept.units[i]!.key
+        : unit.kind === 'raw');
+  }
+
+  /** The check's rebuild renders the continuation that keeps the
+   *  reference's presentation, so where this compile kept it, the rebuild
+   *  must hash each marked prefix as this compile sent it. A difference is
+   *  the rebuild's: one that renders a message differently drops markers the
+   *  provider would serve, and one that misses a change the emission made,
+   *  such as a pass it lacks, credits a prefix that changed. Said once per
+   *  instance, naming where they first differ, after which the instance
+   *  stops comparing. */
+  private kvUnifiedSelfCheck(rebuilt: KvUnifiedRebuilt, sent: Map<string, string>): void {
+    const through = [...rebuilt.wanted].find((id) => rebuilt.hashes.get(id) !== sent.get(id));
+    if (through === undefined) return;
+    this.kvUnifiedSelfCheckWarned = true;
+    this.diag.warn(
+      `[kv-unified] the cache check rebuilt the prefix through ${through} differently from what this compile ` +
+        `sent with the accepted presentation kept, so its credit can be wrong until the rebuild ` +
+        `(kvUnifiedKeepEntries) matches the emission`,
+    );
+  }
+
+  /** The accepted cache reference as this compile's solver should credit it.
+   *  What renders under an unchanged unit key can differ from the request
+   *  that cached it: an edit, an image stripped, a tool result replaced by
+   *  last-N or moved by pairing repair, a message or a recall answer cut, a
+   *  recall's envelope or label. A provider serves a marker's prefix only
+   *  while every byte before it is unchanged. So this rebuilds the entries of
+   *  the continuation that keeps the reference's presentation, with what its
+   *  recall units don't cover raw (kvUnifiedKeepEntries), and
+   *  leaves out each marker whose prefix there no longer hashes as it was
+   *  sent, or whose entry it can't find. The record comes from what was sent
+   *  and only the check rebuilds, so a rebuild that renders a message
+   *  differently at every compile drops markers rather than crediting them,
+   *  while one that misses a change the emission makes, such as a pass it
+   *  lacks, credits the changed prefix. Where a compile keeps the reference's
+   *  presentation, its record compares the two (kvUnifiedSelfCheck). A
+   *  candidate that folds a newer image's or result's message
+   *  can render an earlier one as the reference had it, and is credited less
+   *  than the provider serves; one that renders raw a chunk the reference
+   *  showed folded can tip a newest-first count, and is credited as before
+   *  this check. A reference without a record that describes its markers,
+   *  such as one an earlier version wrote, is credited as it is. A marker on
+   *  the reference's head unit stands for the head's end, so it holds only
+   *  while its message ends this compile's head window. */
+  private kvUnifiedCacheForSolve(
+    store: MessageStoreView,
+    messages: readonly StoredMessage[],
+    window: { headStart: number; headEnd: number; recentStart: number; msgCap: number },
+  ): { cache: ProviderCacheReference | null; rebuilt: KvUnifiedRebuilt | null } {
+    const cache = this.kvUnifiedReceipts.cache;
+    const prefixes = cache?.render?.prefixes;
+    // No marker to leave out, or no record that describes the markers.
+    if (
+      !cache || cache.markers.length === 0 || !Array.isArray(prefixes) || prefixes.length !== cache.markers.length ||
+      !prefixes.every((prefix) => typeof prefix?.through === 'string' && typeof prefix.hash === 'string')
+    ) return { cache, rebuilt: null };
+    const entries = this.kvUnifiedKeepEntries(store, messages, cache, window);
+    const wanted = new Set(prefixes.map((prefix) => prefix.through));
+    const now = new Map(
+      this.kvUnifiedPrefixHashes(entries, (entry) => wanted.has(this.kvUnifiedIdentity(entry)!))
+        .map((prefix) => [prefix.through, prefix.hash]),
+    );
+
+    const headLast = window.headEnd > window.headStart ? messages[window.headEnd - 1]?.id : undefined;
+    const markers = cache.markers.filter((marker, i) => {
+      const { through, hash } = prefixes[i]!;
+      if (cache.layout.units[marker.unitIndex - 1]?.kind === 'head' && through !== headLast) return false;
+      return now.get(through) === hash;
+    });
+    return {
+      cache: markers.length === cache.markers.length
+        ? cache
+        : { immutablePrefixHash: cache.immutablePrefixHash, layout: cache.layout, markers },
+      rebuilt: { layout: cache.layout, wanted, hashes: now },
+    };
+  }
+
+  /** Adds to `into` the messages a summary covers, through its sources down
+   *  to the L1s, whose sources (sourceLevel 0) are messages. `seen` walks
+   *  each summary once; a summary that no longer exists covers nothing. */
+  private kvUnifiedLeaves(id: string, into: Set<string>, seen: Set<string>): void {
+    if (seen.has(id)) return;
+    seen.add(id);
+    const summary = this.summaryById(id);
+    if (!summary) return;
+    for (const source of summary.sourceIds) {
+      if (summary.sourceLevel === 0) into.add(source);
+      else this.kvUnifiedLeaves(source, into, seen);
+    }
+  }
+
+  /** The entries the continuation that keeps the reference's presentation
+   *  would emit, as selectAdaptive emits them, after the passes that run on
+   *  them before markers are placed. The windows are this compile's.
+   *  Outside the head window, a message renders folded when one of the
+   *  reference's recall units covers it (kvUnifiedLeaves) and it wasn't a
+   *  raw unit, and raw otherwise: the reference's raw units, and what no
+   *  recall unit of it covers, which is what came after it or has left the
+   *  head window since. Membership rather than position decides, so
+   *  removing messages, newest ones included, leaves the rest classed as
+   *  the reference had them. Where a run of folded messages starts, the
+   *  emission puts the run's recall pairs, so the rebuild puts there the
+   *  recall pair of each recall unit the reference's layout has after the
+   *  raw unit before it and with a message still present, as the emission
+   *  renders it (recallPairEntries). Raw messages are cut by cappedForSend;
+   *  a body's raw shards in the middle join their text into one entry, as
+   *  the middle's shard path does, and shards in the head and recent
+   *  windows join through mergeAdjacentBodyGroupRaw. */
+  private kvUnifiedKeepEntries(
+    store: MessageStoreView,
+    messages: readonly StoredMessage[],
+    cache: ProviderCacheReference,
+    window: { headStart: number; headEnd: number; recentStart: number; msgCap: number },
+  ): ContextEntry[] {
+    const keptRaw = new Set<string>();
+    const folded = new Set<string>();
+    // A recall unit none of whose messages remain renders nowhere, in the
+    // emission as here.
+    const present = new Set(messages.map((m) => m.id));
+    const rendered = new Set<string>();
+    for (const unit of cache.layout.units) {
+      if (unit.kind === 'raw') keptRaw.add(unit.key);
+      else if (unit.kind === 'recall') {
+        const leaves = new Set<string>();
+        this.kvUnifiedLeaves(unit.key, leaves, new Set());
+        for (const id of leaves) {
+          folded.add(id);
+          if (present.has(id)) rendered.add(unit.key);
+        }
+      }
+    }
+    const raw = (i: number): boolean => keptRaw.has(messages[i]!.id) || !folded.has(messages[i]!.id);
+    // Each recall unit, under the raw unit before it in the layout ('' for none).
+    const recallAfter = new Map<string, string[]>();
+    let anchor = '';
+    for (const unit of cache.layout.units) {
+      if (unit.kind === 'raw') anchor = unit.key;
+      else if (unit.kind === 'recall' && rendered.has(unit.key)) {
+        const keys = recallAfter.get(anchor);
+        if (keys) keys.push(unit.key);
+        else recallAfter.set(anchor, [unit.key]);
+      }
+    }
+    const entries: ContextEntry[] = [];
+    const pushRaw = (msg: StoredMessage): void => {
+      entries.push({
+        index: entries.length, sourceMessageId: msg.id, sourceRelation: 'copy', participant: msg.participant,
+        content: this.cappedForSend(store, msg, window.msgCap).content,
+      });
+    };
+    let pending: readonly string[] = recallAfter.get('') ?? [];
+    const afterRaw = (id: string): void => {
+      pending = recallAfter.get(id) ?? [];
+    };
+    const pushFolded = (): void => {
+      for (const key of pending) {
+        // Pending holds only recall units with a message present, so the summary exists.
+        const summary = this.summaryById(key)!;
+        // A pair this can't render is left out, so the markers past it don't
+        // match and are dropped, rather than the check refusing the compile.
+        try {
+          entries.push(...this.recallPairEntries(summary, window.msgCap, entries.length));
+        } catch (error) {
+          if (!this.kvUnifiedRecallRenderWarned) {
+            this.kvUnifiedRecallRenderWarned = true;
+            this.diag.warn(
+              `[kv-unified] the cache check couldn't render recall ${summary.id} ` +
+                `(${error instanceof Error ? error.message : String(error)}); the markers past it aren't credited`,
+            );
+          }
+        }
+      }
+      pending = [];
+    };
+    for (let i = window.headStart; i < window.headEnd && i < messages.length; i++) pushRaw(messages[i]!);
+    const segments: ReadonlyArray<readonly [number, number]> = window.headStart > 0
+      ? [[0, window.headStart], [window.headEnd, window.recentStart]]
+      : [[window.headEnd, window.recentStart]];
+    for (const [segStart, segEnd] of segments) {
+      let i = segStart;
+      while (i < segEnd && i < messages.length) {
+        const msg = messages[i]!;
+        if (msg.bodyGroupId) {
+          const groupStart = i;
+          i = bodyEnd(Math.min(segEnd, messages.length), (k) => messages[k]!, groupStart) + 1;
+          let run: { parts: string[]; ids: string[] } | null = null;
+          const flush = (): void => {
+            if (!run) return;
+            entries.push({
+              index: entries.length, sourceMessageIds: run.ids, cacheLayoutKey: run.ids.at(-1),
+              sourceRelation: 'copy', participant: msg.participant, content: [{ type: 'text', text: run.parts.join('') }],
+            });
+            run = null;
+          };
+          for (let k = groupStart; k < i; k++) {
+            const shard = messages[k]!;
+            if (!raw(k)) {
+              flush();
+              pushFolded();
+              continue;
+            }
+            run ??= { parts: [], ids: [] };
+            run.ids.push(shard.id);
+            for (const block of shard.content) if (block.type === 'text') run.parts.push(block.text);
+            afterRaw(shard.id);
+          }
+          flush();
+          continue;
+        }
+        if (raw(i)) {
+          pushRaw(msg);
+          afterRaw(msg.id);
+        } else pushFolded();
+        i++;
+      }
+    }
+    for (let i = Math.max(window.recentStart, window.headEnd); i < messages.length; i++) pushRaw(messages[i]!);
+    const merged = this.mergeAdjacentBodyGroupRaw(entries, store, messages as StoredMessage[]);
+    this.postProcessToolEntries(merged);
+    this.applyImageStripping(merged, store);
+    return merged;
+  }
+
+  /** The identity of an entry a marker can sit on: the message it ends on,
+   *  or its layout key, as reconcileKvUnifiedMarkerIndices reads it. */
+  private kvUnifiedIdentity(entry: ContextEntry): string | undefined {
+    return lastSourceOf(entry) ?? entry.cacheLayoutKey;
+  }
+
+  /** For each entry `marks` picks, in order, its identity and the hash of
+   *  every entry up to it, each by its participant and whole content, raw
+   *  replay forms included. */
+  private kvUnifiedPrefixHashes(
+    entries: readonly ContextEntry[],
+    marks: (entry: ContextEntry) => boolean,
+  ): { through: string; hash: string; entry: ContextEntry }[] {
+    const prefixes: { through: string; hash: string; entry: ContextEntry }[] = [];
+    const sent = createHash('sha256');
+    for (const entry of entries) {
+      sent.update(`${this.kvUnifiedEntryFingerprint(entry)}\n`);
+      const through = this.kvUnifiedIdentity(entry);
+      if (through !== undefined && marks(entry)) prefixes.push({ through, hash: sent.copy().digest('hex'), entry });
+    }
+    return prefixes;
+  }
+
+  /** An entry's fingerprint: its participant and its content's hash. An
+   *  entry whose content is its message's own, as most are, costs a lookup. */
+  private kvUnifiedEntryFingerprint(entry: ContextEntry): string {
+    const content = this.kvUnifiedHash(entry.content, () =>
+      sha256Json(entry.content.map((block) => this.kvUnifiedHash(block, () => sha256Json(block)))));
+    return `${JSON.stringify(entry.participant)}:${content}`;
+  }
+
+  private kvUnifiedHash(object: object, compute: () => string): string {
+    let hash = this.kvUnifiedHashes.current.get(object);
+    if (hash === undefined) {
+      hash = this.kvUnifiedHashes.previous.get(object) ?? compute();
+      this.kvUnifiedHashes.current.set(object, hash);
+    }
+    return hash;
+  }
+
   /**
    * Walk an entries array; for every run of consecutive entries that
    *  (a) have sourceRelation: 'copy' (raw, not a synthesized recall pair)
@@ -13853,7 +14162,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               },
             }
           : {}),
-        ...(this.kvUnifiedReceipts.cache ? { cache: this.kvUnifiedReceipts.cache } : {}),
+        ...(this.kvUnifiedSolveCache ? { cache: this.kvUnifiedSolveCache } : {}),
         ...(immutablePrefixHash ? { currentImmutablePrefixHash: immutablePrefixHash } : {}),
         requireExplicitPolicy: true,
       });
@@ -17175,6 +17484,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // it lists none.
     if (admitted === 0 && summaries.length > 0) content = [{ type: 'text', text: CAP_OMISSION_TEXT }];
     return { content, refs };
+  }
+
+  /** The recall pair the adaptive middle emits for a folded run: the
+   *  summary label's question, and the summary's answer rendered under the
+   *  message cap, which ends the pair's layout unit. */
+  private recallPairEntries(summary: SummaryEntry, msgCap: number, index: number): [ContextEntry, ContextEntry] {
+    const rendered = this.renderSummaryAnswer(summary, msgCap);
+    return [
+      {
+        index,
+        participant: 'Context Manager',
+        content: [{ type: 'text', text: this.config.summaryContextLabel ?? 'What do you remember from earlier?' }],
+        sourceRelation: 'derived',
+        summaries: rendered.refs,
+      },
+      {
+        index: index + 1,
+        participant: this.config.summaryParticipant ?? 'Claude',
+        content: rendered.content,
+        sourceRelation: 'derived',
+        cacheLayoutKey: summary.id,
+        summaries: rendered.refs,
+      },
+    ];
   }
 
   /**
