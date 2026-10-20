@@ -15,7 +15,8 @@ import assert from 'node:assert';
 import { rmSync, existsSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { JsStore } from '@animalabs/chronicle';
-import { ContextManager, AutobiographicalStrategy, PassthroughStrategy } from '../src/index.js';
+import { Membrane, MembraneError, MockAdapter, abortError } from '@animalabs/membrane';
+import { ContextManager, AutobiographicalStrategy, PassthroughStrategy, CompressionWithdrawn } from '../src/index.js';
 
 const TEST_STORE_PATH = './test-strategy-detach';
 const SUMMARIES = 'default/autobio:summaries';
@@ -46,6 +47,35 @@ function heldMembrane() {
     },
   };
 }
+
+/** Membrane's cancellation: what `complete()` rejects with once the caller's
+ *  signal fires. */
+const cancellation = () => abortError();
+
+/** heldMembrane, honouring the signal each call carries as membrane does: a
+ *  call whose signal is aborted rejects at once with a cancellation. */
+function signalledMembrane() {
+  const calls: Array<{ request: unknown; signal: AbortSignal | undefined; release: (content?: unknown[], stopReason?: string) => void; fail: (error: unknown) => void }> = [];
+  return {
+    calls,
+    membrane: {
+      complete: (request: unknown, options?: { signal?: AbortSignal }) => new Promise((resolve, reject) => {
+        const n = calls.length + 1;
+        const signal = options?.signal;
+        signal?.addEventListener('abort', () => reject(cancellation()), { once: true });
+        calls.push({
+          request,
+          signal,
+          release: (content = [{ type: 'text', text: `Summary #${n}` }], stopReason = 'end_turn') => resolve({ stopReason, content }),
+          fail: reject,
+        });
+      }),
+    },
+  };
+}
+
+/** A provider error that says nothing about the request. */
+const serverError = () => Object.assign(new Error('zz server error'), { type: 'server', retryable: true, httpStatus: 500 });
 
 function newStrategy(
   autoTickOnNewMessage = false,
@@ -552,7 +582,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
 
       assert.strictEqual(calls.length, 2, `the replaced strategy retried the call ${calls.length - 2} time(s)`);
       assert.ok(ended, 'the tick ended');
-      assert.deepStrictEqual(discardPhases(records), ['canonical:before_call'], 'the discard is logged as before the retry');
+      assert.deepStrictEqual(discardPhases(records), ['canonical:error'], 'the discard is logged at the failed call');
     } finally {
       for (const call of calls.slice(2)) call.release();
       manager.close();
@@ -1000,9 +1030,9 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
 
       assert.strictEqual(calls.length, 6, `the replaced strategy retried the merge ${calls.length - 6} time(s)`);
       assert.deepStrictEqual(merges, [false], 'the merge resolved as one that wrote nothing, so no landing is counted');
-      // A merge that found the call's failure no carrier rejection would
-      // rethrow it and fail the tick: resolving is the check before the retry.
-      assert.strictEqual(merged.outcome, 'resolved', 'the tick ended at the check before the retry');
+      // The failure reached a merge whose strategy was let go of, which
+      // discards it as it would the call's result.
+      assert.strictEqual(merged.outcome, 'resolved', 'the tick ended quietly');
     } finally {
       for (const call of calls.slice(6)) call.release();
       manager.close();
@@ -2201,5 +2231,565 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     } finally {
       store.close();
     }
+  });
+});
+
+describe('a strategy let go of ends the provider calls its work has out (#241)', () => {
+  beforeEach(() => cleanup());
+  after(() => cleanup());
+
+  it("close() cancels a compression's call that is out, and the compression ends quietly, writing nothing", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = signalledMembrane();
+    const manager = await ContextManager.open({ store, strategy: newStrategy(), membrane: membrane as never });
+    try {
+      seed(manager);
+      await manager.compile();
+      const ticking = manager.tick();
+      const ended = outcomeOf(ticking);
+      await waitFor(() => calls.length === 1);
+      const statesBefore = strategyStates(store);
+      const errors = await errorsDuring(async () => {
+        manager.close();
+        await settlesWithin(ticking);
+      });
+      assert.strictEqual(calls[0].signal?.aborted, true, "the compression's call was cancelled");
+      assert.strictEqual(ended.outcome, 'resolved', 'the tick ended quietly');
+      assert.deepStrictEqual(errors, [], 'nothing was logged as an error');
+      assertNothingWritten(store, statesBefore, 'after the close');
+    } finally {
+      manager.close();
+      store.close();
+    }
+  });
+
+  it("setting the same instance again cancels its compression's call that is out, and the new generation compresses the chunk", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = signalledMembrane();
+    const strategy = newStrategy();
+    const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+    try {
+      seed(manager);
+      await manager.compile();
+      const detachedTick = manager.tick();
+      const detached = outcomeOf(detachedTick);
+      await waitFor(() => calls.length === 1);
+      await manager.setStrategy(strategy);
+      assert.strictEqual(calls[0].signal?.aborted, true, "the earlier generation's call was cancelled");
+      await settlesWithin(detachedTick);
+      assert.strictEqual(detached.outcome, 'resolved', "the earlier generation's tick ended quietly");
+      const tick = manager.tick();
+      await waitFor(() => calls.length === 2);
+      assert.strictEqual(calls[1].signal?.aborted, false, "the new generation's call is out");
+      calls[1].release();
+      await tick;
+      assert.strictEqual(persisted(store, SUMMARIES).length, 1, 'the new generation wrote its summary');
+    } finally {
+      for (const call of calls) call.release();
+      manager.close();
+      store.close();
+    }
+  });
+
+  it("close() cancels a merge's call that is out, and the merge ends quietly, still queued", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = signalledMembrane();
+    // Two L1s are a merge, and with two unmerged a tick merges before it
+    // compresses another chunk.
+    const strategy = newStrategy(false, { mergeThreshold: 2, maxSpeculativeL1s: 1 });
+    const work = watchWork(strategy);
+    const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+    try {
+      seed(manager, 24);
+      await manager.compile();
+      for (let n = 1; n <= 2; n++) {
+        const tick = manager.tick();
+        await waitFor(() => calls.length === n);
+        calls[n - 1].release();
+        await tick;
+      }
+      const merging = manager.tick();
+      const merged = outcomeOf(merging);
+      await waitFor(() => calls.length === 3);
+      assert.strictEqual(work.merges, 1, 'the third call is the merge');
+      const queued = persisted(store, MERGE_QUEUE);
+      const errors = await errorsDuring(async () => {
+        manager.close();
+        await settlesWithin(merging);
+      });
+      assert.strictEqual(calls[2].signal?.aborted, true, "the merge's call was cancelled");
+      assert.strictEqual(merged.outcome, 'resolved', 'the tick ended quietly');
+      assert.deepStrictEqual(errors, [], 'nothing was logged as an error');
+      assert.deepStrictEqual(persisted(store, MERGE_QUEUE), queued, 'the merge is still queued');
+      assert.deepStrictEqual((persisted(store, SUMMARIES) as Array<{ level: number }>).filter((s) => s.level === 2), [], 'no L2 written');
+    } finally {
+      manager.close();
+      store.close();
+    }
+  });
+
+  it("a merge whose call fails after its strategy was let go of logs no failure", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = heldMembrane();
+    const strategy = newStrategy(false, { mergeThreshold: 2, maxSpeculativeL1s: 1 });
+    const work = watchWork(strategy);
+    const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+    try {
+      seed(manager, 24);
+      await manager.compile();
+      for (let n = 1; n <= 2; n++) {
+        const tick = manager.tick();
+        await waitFor(() => calls.length === n);
+        calls[n - 1].release();
+        await tick;
+      }
+      const merging = manager.tick();
+      const merged = outcomeOf(merging);
+      await waitFor(() => calls.length === 3);
+      assert.strictEqual(work.merges, 1, 'the third call is the merge');
+      const errors = await errorsDuring(async () => {
+        manager.close();
+        calls[2].fail(serverError());
+        await settlesWithin(merging);
+      });
+      assert.strictEqual(merged.outcome, 'resolved', 'the tick ended quietly');
+      assert.deepStrictEqual(errors, [], 'nothing was logged as an error');
+    } finally {
+      manager.close();
+      store.close();
+    }
+  });
+
+  it("a compression's stripped retry that is out at the swap is cancelled, and discarded at that call", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = signalledMembrane();
+    const manager = await ContextManager.open({ store, strategy: newStrategy(), membrane: membrane as never });
+    try {
+      seed(manager);
+      await manager.compile();
+      // The first summary keeps its reasoning, so the next request's recall
+      // pair carries it, and a carrier rejection takes the text-only retry.
+      const first = manager.tick();
+      await waitFor(() => calls.length === 1);
+      calls[0].release([
+        { type: 'thinking', thinking: 'reasoning', signature: 'signature' },
+        { type: 'text', text: 'Summary #1' },
+      ]);
+      await first;
+      const second = manager.tick();
+      await waitFor(() => calls.length === 2);
+      let ended = false;
+      const records = await compressionLogDuring(async () => {
+        calls[1].fail(carrierRejection());
+        await waitFor(() => calls.length === 3);
+        await manager.setStrategy(new PassthroughStrategy());
+        ended = await settlesWithin(second);
+      });
+      assert.strictEqual(calls[2].signal?.aborted, true, 'the stripped retry was cancelled');
+      assert.ok(ended, 'the tick ended');
+      assert.deepStrictEqual(discardPhases(records), ['canonical:error'], 'the discard is logged at the retry');
+    } finally {
+      for (const call of calls.slice(3)) call.release();
+      manager.close();
+      store.close();
+    }
+  });
+
+  it("a merge's stripped retry that is out when its strategy is let go of is cancelled, and logs no failure", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = signalledMembrane();
+    const strategy = newStrategy(false, { mergeThreshold: 2, maxSpeculativeL1s: 1 });
+    const work = watchWork(strategy);
+    const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+    try {
+      seed(manager, 24);
+      await manager.compile();
+      // As in the carrier test above: the second merge's request carries
+      // earlier summaries' reasoning, so a carrier rejection takes the
+      // text-only retry.
+      for (let n = 1; n <= 5; n++) {
+        const tick = manager.tick();
+        await waitFor(() => calls.length === n);
+        calls[n - 1].release([
+          { type: 'thinking', thinking: 'reasoning', signature: 'signature' },
+          { type: 'text', text: `Summary #${n}` },
+        ]);
+        await tick;
+      }
+      const merging = manager.tick();
+      const merged = outcomeOf(merging);
+      await waitFor(() => calls.length === 6);
+      assert.deepStrictEqual(work, { compressions: 4, compressionsSettled: 4, merges: 2 }, 'the sixth call is the second merge');
+      calls[5].fail(carrierRejection());
+      await waitFor(() => calls.length === 7);
+      const errors = await errorsDuring(async () => {
+        manager.close();
+        await settlesWithin(merging);
+      });
+      assert.strictEqual(calls[6].signal?.aborted, true, 'the stripped retry was cancelled');
+      assert.strictEqual(merged.outcome, 'resolved', 'the tick ended quietly');
+      assert.deepStrictEqual(errors, [], 'nothing was logged as an error');
+    } finally {
+      for (const call of calls.slice(7)) call.release();
+      manager.close();
+      store.close();
+    }
+  });
+
+  it("close() during a call's wait before membrane retries it ends the call there", async () => {
+    // A real membrane over an adapter that fails retryably, so membrane
+    // waits a minute before its retry.
+    let attempts = 0;
+    class FailingAdapter extends MockAdapter {
+      override async complete(): Promise<never> {
+        attempts++;
+        throw new MembraneError({ type: 'server', message: 'zz server error', retryable: true, httpStatus: 500, rawError: undefined });
+      }
+    }
+    const WAIT_MS = 60_000;
+    const membrane = new Membrane(new FailingAdapter(), { retry: { maxRetries: 3, retryDelayMs: WAIT_MS, backoffMultiplier: 1, maxRetryDelayMs: WAIT_MS } });
+    // Membrane's wait is a timer of that length: count it as it is armed.
+    const realSetTimeout = globalThis.setTimeout;
+    let waits = 0;
+    globalThis.setTimeout = ((fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+      if (ms === WAIT_MS) waits++;
+      return realSetTimeout(fn, ms, ...args);
+    }) as typeof setTimeout;
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const manager = await ContextManager.open({ store, strategy: newStrategy(), membrane });
+    try {
+      seed(manager);
+      await manager.compile();
+      const ticking = manager.tick();
+      const ended = outcomeOf(ticking);
+      await waitFor(() => waits === 1);
+      assert.strictEqual(attempts, 1, 'membrane waits after the first attempt');
+      manager.close();
+      assert.ok(await settlesWithin(ticking, 5_000), 'the tick ended without waiting for the retry');
+      assert.strictEqual(ended.outcome, 'resolved', 'the tick ended quietly');
+      assert.strictEqual(attempts, 1, 'no further attempt');
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      manager.close();
+      store.close();
+    }
+  });
+
+  it('calls that settled before their strategy was let go of, answered or failed, keep their signals unaborted', async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = signalledMembrane();
+    const manager = await ContextManager.open({ store, strategy: newStrategy(), membrane: membrane as never });
+    try {
+      seed(manager);
+      await manager.compile();
+      const tick = manager.tick();
+      await waitFor(() => calls.length === 1);
+      calls[0].release();
+      await tick;
+      await errorsDuring(async () => {
+        const failing = manager.tick();
+        await waitFor(() => calls.length === 2);
+        calls[1].fail(serverError());
+        await failing.catch(() => {});
+      });
+      manager.close();
+      assert.deepStrictEqual(calls.map((call) => call.signal?.aborted), [false, false], "the settled calls' signals were left alone");
+    } finally {
+      manager.close();
+      store.close();
+    }
+  });
+
+  it("close() during a transition summary's call cancels it, and resetHeadWindow() refuses with the generation's end, the cancellation its cause", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = signalledMembrane();
+    const manager = await ContextManager.open({ store, strategy: newStrategy(), membrane: membrane as never });
+    try {
+      seed(manager);
+      await manager.compile();
+      const resetting = manager.resetHeadWindow();
+      await waitFor(() => calls.length === 1);
+      manager.close();
+      assert.strictEqual(calls[0].signal?.aborted, true, "the transition summary's call was cancelled");
+      assert.ok(await settlesWithin(resetting), 'resetHeadWindow() ended');
+      await assert.rejects(resetting, (error: Error) => {
+        assert.match(error.message, /^Transition summary crossed a branch generation/);
+        assert.strictEqual((error.cause as { type?: unknown } | undefined)?.type, 'abort', 'the cancellation is its cause');
+        return true;
+      });
+    } finally {
+      manager.close();
+      store.close();
+    }
+  });
+
+  it("a merge whose call the host withdraws after its strategy was let go of rethrows the withdrawal", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = heldMembrane();
+    const strategy = newStrategy(false, { mergeThreshold: 2, maxSpeculativeL1s: 1 });
+    const work = watchWork(strategy);
+    const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+    try {
+      seed(manager, 24);
+      await manager.compile();
+      for (let n = 1; n <= 2; n++) {
+        const tick = manager.tick();
+        await waitFor(() => calls.length === n);
+        calls[n - 1].release();
+        await tick;
+      }
+      const merging = manager.tick();
+      await waitFor(() => calls.length === 3);
+      assert.strictEqual(work.merges, 1, 'the third call is the merge');
+      const withdrawn = new CompressionWithdrawn();
+      manager.close();
+      calls[2].fail(withdrawn);
+      await assert.rejects(merging, (error) => error === withdrawn, 'the withdrawal is rethrown unchanged');
+    } finally {
+      manager.close();
+      store.close();
+    }
+  });
+
+  it("resetHeadWindow() whose transition summary's call the host withdraws after close() rethrows the withdrawal", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = heldMembrane();
+    const manager = await ContextManager.open({ store, strategy: newStrategy(), membrane: membrane as never });
+    try {
+      seed(manager);
+      await manager.compile();
+      const resetting = manager.resetHeadWindow();
+      await waitFor(() => calls.length === 1);
+      const withdrawn = new CompressionWithdrawn();
+      manager.close();
+      calls[0].fail(withdrawn);
+      await assert.rejects(resetting, (error) => error === withdrawn, 'the withdrawal is rethrown unchanged');
+    } finally {
+      manager.close();
+      store.close();
+    }
+  });
+  it('close() cancels every call its strategy has out, each by a signal of its own', async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = signalledMembrane();
+    const manager = await ContextManager.open({ store, strategy: newStrategy(), membrane: membrane as never });
+    try {
+      seed(manager);
+      await manager.compile();
+      const ticking = manager.tick();
+      await waitFor(() => calls.length === 1);
+      const resetting = manager.resetHeadWindow();
+      await waitFor(() => calls.length === 2);
+      assert.notStrictEqual(calls[0].signal, calls[1].signal, 'each call has a signal of its own');
+      manager.close();
+      assert.deepStrictEqual(calls.map((call) => call.signal?.aborted), [true, true], 'both calls were cancelled');
+      assert.ok(await settlesWithin(ticking), "the compression's tick ended");
+      assert.ok(await settlesWithin(resetting), 'resetHeadWindow() ended');
+      await resetting.catch(() => {});
+    } finally {
+      manager.close();
+      store.close();
+    }
+  });
+
+  it("a transition summary whose call fails after close() refuses with the generation's end, the failure its cause", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = heldMembrane();
+    const manager = await ContextManager.open({ store, strategy: newStrategy(), membrane: membrane as never });
+    try {
+      seed(manager);
+      await manager.compile();
+      const resetting = manager.resetHeadWindow();
+      await waitFor(() => calls.length === 1);
+      manager.close();
+      const failure = serverError();
+      calls[0].fail(failure);
+      await assert.rejects(resetting, (error: Error) => {
+        assert.match(error.message, /^Transition summary crossed a branch generation/);
+        assert.strictEqual(error.cause, failure, 'the failure is its cause');
+        return true;
+      });
+    } finally {
+      manager.close();
+      store.close();
+    }
+  });
+
+  it('a transition summary whose call fails while its strategy is current rethrows the failure', async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = heldMembrane();
+    const manager = await ContextManager.open({ store, strategy: newStrategy(), membrane: membrane as never });
+    try {
+      seed(manager);
+      await manager.compile();
+      const resetting = manager.resetHeadWindow();
+      await waitFor(() => calls.length === 1);
+      const failure = serverError();
+      calls[0].fail(failure);
+      await assert.rejects(resetting, (error) => error === failure, 'the failure is rethrown as itself');
+    } finally {
+      manager.close();
+      store.close();
+    }
+  });
+
+  it("a transition summary whose call the host cancels while its strategy is current rethrows the cancellation as itself", async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = heldMembrane();
+    const manager = await ContextManager.open({ store, strategy: newStrategy(), membrane: membrane as never });
+    try {
+      seed(manager);
+      await manager.compile();
+      const resetting = manager.resetHeadWindow();
+      await waitFor(() => calls.length === 1);
+      // As membrane rejects a call whose signal a host combined with the
+      // strategy's and aborted.
+      const cancelled = abortError();
+      calls[0].fail(cancelled);
+      await assert.rejects(resetting, (error) => error === cancelled, 'the cancellation is rethrown as itself');
+    } finally {
+      manager.close();
+      store.close();
+    }
+  });
+
+  it('a merge whose strategy is let go of while its request is prepared makes no call', async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = heldMembrane();
+    // Two L1s are a merge, and with two unmerged a tick merges before it
+    // compresses another chunk.
+    const strategy = newStrategy(false, { mergeThreshold: 2, maxSpeculativeL1s: 1 });
+    const work = watchWork(strategy);
+    const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+    try {
+      seed(manager, 24);
+      await manager.compile();
+      for (let n = 1; n <= 2; n++) {
+        const tick = manager.tick();
+        await waitFor(() => calls.length === n);
+        calls[n - 1].release();
+        await tick;
+      }
+      // The swap lands as the merge's request is prepared, after the merge's
+      // check at its start.
+      const internals = strategy as unknown as { prepareCompressionCandidate: (request: unknown, label: string) => unknown };
+      const prepare = internals.prepareCompressionCandidate.bind(strategy);
+      let swapping: Promise<void> | undefined;
+      internals.prepareCompressionCandidate = (request, label) => {
+        if (label.startsWith('merge-') && !swapping) swapping = manager.setStrategy(new PassthroughStrategy());
+        return prepare(request, label);
+      };
+      const merging = manager.tick();
+      const merged = outcomeOf(merging);
+      await settlesWithin(merging);
+      if (swapping) await settlesWithin(swapping);
+      assert.ok(swapping, "the merge's request was prepared");
+      assert.strictEqual(work.merges, 1, 'the tick started the merge');
+      assert.strictEqual(calls.length, 2, `the replaced strategy's merge made ${calls.length - 2} call(s)`);
+      assert.strictEqual(merged.outcome, 'resolved', 'the tick ended quietly');
+    } finally {
+      for (const call of calls.slice(2)) call.release();
+      manager.close();
+      store.close();
+    }
+  });
+
+  it('a transition summary whose strategy is let go of while its request is prepared makes no call', async () => {
+    const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+    const { calls, membrane } = heldMembrane();
+    const strategy = newStrategy();
+    const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+    try {
+      seed(manager);
+      await manager.compile();
+      const internals = strategy as unknown as { prepareCompressionRequest: (request: unknown) => unknown };
+      const prepare = internals.prepareCompressionRequest.bind(strategy);
+      internals.prepareCompressionRequest = (request) => {
+        manager.close();
+        return prepare(request);
+      };
+      const resetting = manager.resetHeadWindow();
+      assert.strictEqual(calls.length, 0, `the transition summary made ${calls.length} call(s)`);
+      assert.ok(await settlesWithin(resetting), 'resetHeadWindow() ended');
+      await assert.rejects(resetting, /Transition summary crossed a branch generation/);
+    } finally {
+      for (const call of calls) call.release();
+      manager.close();
+      store.close();
+    }
+  });
+
+  // takeUpStoreState() replaces the instance's merge queue with the store's,
+  // which another instance may have written without a merge this one queued;
+  // its threshold pass queues that merge again, whichever take-up it is.
+  describe("a take-up of another instance's L1 queues again a merge the store's queue lacks", () => {
+    const setUp = async () => {
+      const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
+      const { calls, membrane } = heldMembrane();
+      // Below its cap an instance compresses rather than merges, queueing a
+      // merge for each two L1s.
+      const strategy = newStrategy(false, { mergeThreshold: 2, maxSpeculativeL1s: 5 });
+      const manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
+      const queued = () => (strategy as unknown as { mergeQueue: Array<{ sourceIds: string[] }> }).mergeQueue.map((m) => m.sourceIds.join('+'));
+      seed(manager, 24);
+      await manager.compile();
+      const compress = async (m: ContextManager) => {
+        const before = calls.length;
+        const tick = m.tick();
+        await waitFor(() => calls.length === before + 1);
+        calls[before].release();
+        await tick;
+      };
+      for (let n = 0; n < 4; n++) await compress(manager);
+      assert.deepStrictEqual(queued(), ['L1-0+L1-1', 'L1-2+L1-3'], 'this instance queued both merges');
+      const other = await ContextManager.open({ store, strategy: newStrategy(false, { mergeThreshold: 2, maxSpeculativeL1s: 5 }), membrane: membrane as never });
+      await other.compile();
+      // The store's queue as an instance that never held L1-2+L1-3 writes it.
+      const dropMerge = () => store.setStateJson(
+        MERGE_QUEUE,
+        (persisted(store, MERGE_QUEUE) as Array<{ sourceIds: string[] }>).filter((m) => m.sourceIds.join('+') !== 'L1-2+L1-3'),
+      );
+      return { store, calls, strategy, manager, other, queued, compress, dropMerge };
+    };
+
+    it("when the instance finds the other's L1 of its chunk", async () => {
+      const { store, calls, manager, other, queued, compress, dropMerge } = await setUp();
+      try {
+        await compress(other);
+        dropMerge();
+        const before = calls.length;
+        await manager.tick();
+        assert.strictEqual(calls.length, before, "this instance took up the other's L1 rather than compressing the chunk");
+        assert.deepStrictEqual(queued(), ['L1-0+L1-1', 'L1-2+L1-3'], "the merge the store's queue lacked is queued again");
+      } finally {
+        for (const call of calls) call.release();
+        other.close();
+        manager.close();
+        store.close();
+      }
+    });
+
+    it("when the instance waited on the other's compression of its chunk", async () => {
+      const { store, calls, strategy, manager, other, queued, dropMerge } = await setUp();
+      try {
+        const work = watchWork(strategy);
+        const otherTick = other.tick();
+        await waitFor(() => calls.length === 5);
+        const tick = manager.tick();
+        assert.ok(await reaches(() => work.compressions === 1), 'this instance started compressing the chunk');
+        assert.strictEqual(calls.length, 5, "it waits on the other instance's call for the same chunk");
+        dropMerge();
+        calls[4].release();
+        await otherTick;
+        await tick;
+        assert.strictEqual(calls.length, 5, 'it made no call of its own');
+        assert.deepStrictEqual(queued(), ['L1-0+L1-1', 'L1-2+L1-3'], "the merge the store's queue lacked is queued again");
+      } finally {
+        for (const call of calls) call.release();
+        other.close();
+        manager.close();
+        store.close();
+      }
+    });
   });
 });
