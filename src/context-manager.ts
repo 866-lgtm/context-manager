@@ -56,7 +56,7 @@ import { markStoreBranchSwitch, observeStoreBranch } from './branch-generation.j
 import type { StoreBranchGeneration } from './branch-generation.js';
 import { randomUUID } from 'node:crypto';
 import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
-import { FoldJournal, branchRefOf } from './fold-journal.js';
+import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
 import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
 import type { FoldQuery, FoldQueryResult, FoldReceipt, Presentation, ReceiptSource, RoundUsage } from './fold-journal.js';
@@ -234,6 +234,12 @@ export class ContextManager {
   private initializedAttempt: number | null = null;
   /** Whether we own the store (created it) vs app owns it (passed in) */
   private ownsStore: boolean;
+  /** close() has run: the strategy is detached, and the manager refuses its operations (requireOpen). */
+  private closed = false;
+  /** Writes running (write()): their listeners can call close(). */
+  private writeDepth = 0;
+  /** A close() came from inside a write: the owned store closes when that write returns. */
+  private storeCloseAfterWrite = false;
   private debugLogContext: boolean;
   /** Namespace passed to strategies for scoping their persistent state slots. */
   private strategyNamespace: string;
@@ -479,7 +485,14 @@ export class ContextManager {
     );
     if (config.now) manager.now = config.now;
 
-    await manager.initializeStrategy();
+    try {
+      await manager.initializeStrategy();
+    } catch (error) {
+      // open() fails with the manager unreturned, so nothing could close()
+      // it: the strategy is let go of here, as close() would.
+      manager.detachStrategy(manager.strategy);
+      throw error;
+    }
     return manager;
   }
 
@@ -507,6 +520,9 @@ export class ContextManager {
     causedBy?: MessageId[],
     options?: AddMessageOptions
   ): MessageId {
+    // A closed manager refuses the add by name, before its content or hold
+    // options are read.
+    this.requireOpen('addMessage');
     // First, so a message refused here changes nothing: no hold expires, no
     // hold is placed, and the strategy's ingress chunking never reads it.
     // What a write mends is mended here, so the strategy chunks what is
@@ -514,26 +530,28 @@ export class ContextManager {
     // later (appendMessage), once expired holds have been released, as at
     // any add.
     content = contentForWrite(content, 'Message refused');
-    this.expireCompressionHolds();
-    if (!options?.holdCompression) {
-      return this.appendMessage(participant, content, metadata, causedBy);
-    }
-    const holdOptions = options.holdCompression === true ? {} : options.holdCompression;
-    this.validateHoldOptions(holdOptions);
-    const held: MessageId[] = [];
-    this.holdingAdds = held;
-    this.holdingAddOptions = holdOptions;
-    // One clock read per add: every shard shares heldAt and expiresAt.
-    this.holdingAddAt = this.now();
-    let id: MessageId;
-    try {
-      id = this.appendMessage(participant, content, metadata, causedBy);
-    } finally {
-      this.holdingAdds = null;
-      this.holdingAddOptions = undefined;
-    }
-    if (held.length > 1) this.compressionHoldGroups.set(id, held);
-    return id;
+    return this.write(() => {
+      this.expireCompressionHolds();
+      if (!options?.holdCompression) {
+        return this.appendMessage(participant, content, metadata, causedBy);
+      }
+      const holdOptions = options.holdCompression === true ? {} : options.holdCompression;
+      this.validateHoldOptions(holdOptions);
+      const held: MessageId[] = [];
+      this.holdingAdds = held;
+      this.holdingAddOptions = holdOptions;
+      // One clock read per add: every shard shares heldAt and expiresAt.
+      this.holdingAddAt = this.now();
+      let id: MessageId;
+      try {
+        id = this.appendMessage(participant, content, metadata, causedBy);
+      } finally {
+        this.holdingAdds = null;
+        this.holdingAddOptions = undefined;
+      }
+      if (held.length > 1) this.compressionHoldGroups.set(id, held);
+      return id;
+    });
   }
 
   private appendMessage(
@@ -643,7 +661,7 @@ export class ContextManager {
    */
   editMessage(messageId: MessageId, content: ContentBlock[]): void {
     this.requireInitialized('editMessage');
-    this.messageStore.edit(messageId, content);
+    this.write(() => this.messageStore.edit(messageId, content));
     // Propagation handled by event listener
   }
 
@@ -775,7 +793,7 @@ export class ContextManager {
    * ready rather than dropped.
    */
   private notifyHoldsReleased(): void {
-    if (!this.strategy.onCompressionHoldsReleased) return;
+    if (!this.strategy.onCompressionHoldsReleased || this.closed) return;
     if (this.initializedAttempt !== this.initializationAttempt) {
       this.holdReleaseNotifyPending = true;
       return;
@@ -815,7 +833,7 @@ export class ContextManager {
    */
   removeMessage(messageId: MessageId): void {
     this.requireInitialized('removeMessage');
-    this.messageStore.remove(messageId);
+    this.write(() => this.messageStore.remove(messageId));
     // Propagation handled by event listener
   }
 
@@ -824,7 +842,7 @@ export class ContextManager {
    */
   removeMessages(fromId: MessageId, toId: MessageId): void {
     this.requireInitialized('removeMessages');
-    this.messageStore.removeRange(fromId, toId);
+    this.write(() => this.messageStore.removeRange(fromId, toId));
     // Propagation handled by event listener
   }
 
@@ -876,8 +894,9 @@ export class ContextManager {
    * would land between a body's shards and split the body (body-runs.ts).
    * Add it after the call returns (a microtask or later) instead. A listener
    * that throws is logged, naming the message it missed, and the write it
-   * heard stands: the throw doesn't reach the caller. Each call registers
-   * its own listener and returns its own unsubscribe, so a function
+   * heard stands: the throw doesn't reach the caller. A listener that calls
+   * close() lets the write that ran it finish (see close()). Each call
+   * registers its own listener and returns its own unsubscribe, so a function
    * registered twice hears each event twice.
    */
   onMessage(listener: MessageStoreListener): () => void {
@@ -1020,6 +1039,7 @@ export class ContextManager {
    * InitializationSupersededError naming the branch it selected.
    */
   async switchBranch(branchId: string): Promise<void> {
+    this.requireOpen('switchBranch');
     await this.selectBranch(branchId, false);
   }
 
@@ -1393,7 +1413,8 @@ export class ContextManager {
     usage?: RoundUsage;
     presentation?: Presentation;
   }): FoldReceipt | null {
-    return this.foldJournal.accept(args.provenance, args.acceptedAt ?? Date.now(), args.usage, args.presentation);
+    this.requireOpen('acceptRound');
+    return this.write(() => this.foldJournal.accept(args.provenance, args.acceptedAt ?? Date.now(), args.usage, args.presentation));
   }
 
   /**
@@ -1412,7 +1433,9 @@ export class ContextManager {
    * (one whose write reported a failure, one another manager on the store
    * wrote, or one from before a reopen). So a listener can hear a receipt
    * again, and needn't hear every receipt: key on `receipt.id`, and read
-   * `listFoldReceipts` for the whole record. Returns a detacher.
+   * `listFoldReceipts` for the whole record. A listener that calls close()
+   * lets the acceptance that announced to it commit its receipt (see
+   * close()). Returns a detacher.
    */
   onFoldReceipt(listener: (receipt: FoldReceipt) => void): () => void {
     return this.foldJournal.onReceipt(listener);
@@ -1423,8 +1446,18 @@ export class ContextManager {
     this.foldJournal.setSource(source);
   }
 
-  /** The store's id, minted once per store on first use. */
+  /**
+   * The store's id, minted once per store on first use. After close() it is
+   * never minted, since minting writes the store's identity record: it is
+   * answered when it was read before, or, while the store is open, read from
+   * that record. Otherwise it refuses by name: on a store that has none, and
+   * on a closed store with none read before.
+   */
   getStoreId(): string {
+    if (this.closed) {
+      const id = this.store.isClosed() ? cachedStoreIdentity(this.store) : existingStoreIdentity(this.store);
+      return id ?? this.refuseAfterClose('getStoreId');
+    }
     return this.foldJournal.storeId();
   }
 
@@ -1480,12 +1513,34 @@ export class ContextManager {
 
   /**
    * Set the context management strategy and initialize it on the selected branch.
-   * Also recovers a manager after failed initialization. A failure leaves work
-   * fenced until another successful initialization; it does not restore the old strategy.
+   * The strategy it replaces is detached first (ContextStrategy.detach).
+   * Also recovers a manager after failed initialization. A failure leaves the
+   * manager's operations fenced until another successful initialization, with
+   * the strategy still held; it does not restore the old strategy.
    */
   async setStrategy(strategy: ContextStrategy): Promise<void> {
+    this.requireOpen('setStrategy');
+    if (strategy !== this.strategy) this.detachStrategy(this.strategy);
     this.strategy = strategy;
     await this.initializeStrategy();
+  }
+
+  /** Tell a strategy the manager is done with it (ContextStrategy.detach). */
+  private detachStrategy(strategy: ContextStrategy): void {
+    // The manager lets go either way: a replacement still initializes and
+    // close() still closes the store.
+    const failed = (err: unknown) => console.error('Strategy detach failed:', strategy.name, err);
+    try {
+      // detach() is synchronous by contract. A promise or other thenable one
+      // returns anyway isn't awaited, and its rejection is logged rather than
+      // left unhandled.
+      const returned = strategy.detach?.() as unknown;
+      if (typeof (returned as PromiseLike<unknown> | null | undefined)?.then === 'function') {
+        Promise.resolve(returned as PromiseLike<unknown>).catch(failed);
+      }
+    } catch (err) {
+      failed(err);
+    }
   }
 
   /**
@@ -1580,6 +1635,7 @@ export class ContextManager {
    * `compressionRecallBudgetTokens`). Returns the new pin id.
    */
   pinAtLevel(firstMessageId: MessageId, lastMessageId: MessageId, level: number, opts?: { name?: string }): string {
+    this.requireOpen('pinAtLevel');
     return this.pinRange(firstMessageId, lastMessageId, { name: opts?.name, level });
   }
 
@@ -1688,7 +1744,9 @@ export class ContextManager {
    * If transitionText is provided, it's used as the transition summary.
    * If omitted, an LLM call auto-generates a transition summary.
    *
-   * Returns the transition summary text used.
+   * Returns the transition summary text used. A close() from a listener of
+   * the transition message's add lets the add finish, and the call then
+   * rejects, naming the stored message, without resetting the head window.
    */
   async resetHeadWindow(transitionText?: string): Promise<string> {
     const attempt = this.requireInitialized('resetHeadWindow');
@@ -1706,6 +1764,22 @@ export class ContextManager {
     const msgId = this.addMessage('Context Manager', [
       { type: 'text', text: `[Topic Transition]\n\n${summary}` },
     ]);
+    // A listener of that add may have closed the manager, set a strategy or
+    // moved the store's branch. The add stands and the strategy isn't told,
+    // and the refusal says the message is stored. It gives the reason without
+    // the advice to retry or to recover, and says instead what a later call
+    // that goes ahead does: it stores a second transition. After a close(), or
+    // while a strategy initializes, a later call refuses at once.
+    try {
+      this.requireInitialized('resetHeadWindow', attempt, false);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `${reason.endsWith('.') ? reason : `${reason}.`} Its transition add finished: message ${msgId} is ` +
+          "stored, and the head window wasn't reset. A later resetHeadWindow() that goes ahead adds " +
+          'another transition message.',
+      );
+    }
 
     // Reset head window to start from this message
     this.strategy.resetHeadWindow(msgId);
@@ -1739,9 +1813,29 @@ export class ContextManager {
     expectedBranch ??= observeStoreBranch(this.store);
     const branchId = this.store.currentBranch().id;
     if (strategy.initialize) {
-      await strategy.initialize(this.createStrategyContext());
+      try {
+        await strategy.initialize(this.createStrategyContext());
+      } catch (error) {
+        // An initialize() that rejects after close() or a replacement let go
+        // of the strategy is detached again too, as below; its own error is
+        // the one the caller sees.
+        if (this.closed || strategy !== this.strategy) this.detachStrategy(strategy);
+        throw error;
+      }
+    }
+    // close() ran while the strategy initialized: the call that started this
+    // fails rather than leave a closed manager's strategy marked initialized.
+    // close() detached the strategy before its initialize() finished, so it
+    // is detached again here, for work it started after that.
+    if (this.closed) {
+      this.detachStrategy(strategy);
+      throw new Error('ContextManager closed during strategy initialization');
     }
     if (attempt !== this.initializationAttempt || strategy !== this.strategy) {
+      // A setStrategy() that replaced it while it initialized detached it
+      // then; detach it again, for work it started after that. A newer
+      // initialization of the same instance is left alone.
+      if (strategy !== this.strategy) this.detachStrategy(strategy);
       throw new InitializationSupersededError(selection);
     }
     const current = observeStoreBranch(this.store);
@@ -1761,8 +1855,22 @@ export class ContextManager {
     if (this.holdReleaseNotifyPending) this.notifyHoldsReleased();
   }
 
-  /** Fence failed/pending attempts; optionally pin a manager-owned operation across an await. */
-  private requireInitialized(operation: string, expected?: InitializationStamp): InitializationStamp {
+  /** Refuse an operation on a closed manager, naming it. */
+  private requireOpen(operation: string): void {
+    if (this.closed) this.refuseAfterClose(operation);
+  }
+
+  private refuseAfterClose(operation: string): never {
+    throw new Error(`ContextManager.${operation} after close()`);
+  }
+
+  /**
+   * Fence failed/pending attempts; optionally pin a manager-owned operation
+   * across an await. `advise` false leaves out the refusal's advice on what
+   * to do next, for a caller whose own words say what a later call would do.
+   */
+  private requireInitialized(operation: string, expected?: InitializationStamp, advise = true): InitializationStamp {
+    this.requireOpen(operation);
     const current: InitializationStamp = {
       ...observeStoreBranch(this.store),
       id: this.store.currentBranch().id,
@@ -1770,8 +1878,8 @@ export class ContextManager {
     };
     if (this.initializedAttempt !== current.attempt) {
       throw new Error(
-        `ContextManager.${operation} requires successful strategy initialization (selected branch ${current.name}). ` +
-        'Inspect currentBranch() and recover with switchBranch() or setStrategy().',
+        `ContextManager.${operation} requires successful strategy initialization (selected branch ${current.name}).` +
+        (advise ? ' Inspect currentBranch() and recover with switchBranch() or setStrategy().' : ''),
       );
     }
     if (expected && (
@@ -1779,7 +1887,7 @@ export class ContextManager {
       expected.name !== current.name || expected.generation !== current.generation ||
       expected.id !== current.id
     )) {
-      throw new Error(`Branch or strategy changed during ContextManager.${operation}; retry on the intended branch.`);
+      throw new Error(`Branch or strategy changed during ContextManager.${operation}${advise ? '; retry on the intended branch' : ''}.`);
     }
     return current;
   }
@@ -1881,8 +1989,10 @@ export class ContextManager {
       this.holdingAdds.push(message.id);
       this.placeHold(message.id, this.holdingAddOptions, this.holdingAddAt);
     }
-    // Notify strategy of new message
-    if (this.strategy.onNewMessage) {
+    // Notify strategy of new message. After close() nothing reaches the
+    // strategy: a close() from a listener lets the write it interrupted
+    // finish, and that write's remaining shards are stored unheard.
+    if (this.strategy.onNewMessage && !this.closed) {
       // Fire and forget - don't block on strategy processing
       this.strategy.onNewMessage(message, this.createStrategyContext()).catch((err) => {
         this.diag.error('Strategy onNewMessage failed:', err);
@@ -1970,23 +2080,76 @@ export class ContextManager {
   }
 
   /**
-   * Close the context manager.
+   * Close the context manager. This is final, whoever owns the store.
    *
+   * The strategy is detached first (ContextStrategy.detach). The manager's
+   * mutations and strategy operations then stay blocked, with no recovery:
+   * each throws "ContextManager.<operation> after close()", the reads that
+   * go through the strategy, such as getSummary() and isReady(), included,
+   * and a setStrategy(), switchBranch() or fork() still initializing the
+   * strategy when close() runs rejects. Inspection of messages, branches and
+   * receipts reads the store, so it answers while the store is open: after
+   * close() with an app-owned store, not with one the manager owned, which
+   * close() closes. describeRenderedForms(), which reads the strategy's
+   * declared forms, and the manager's own setters, such as
+   * setSystemPrompt(), still answer, and releaseCompression() still doesn't
+   * throw. close() throws the store's own error when closing a store the
+   * manager owns fails at its final sync; the store is closed all the same.
+   * A second close() does nothing. A close() from inside a listener (onMessage,
+   * onFoldReceipt) lets the write it interrupted finish and starts nothing
+   * new: the write's remaining shards are stored and its receipt committed,
+   * nothing after the close() reaches the strategy, and a store the manager
+   * owns closes once that write returns, a failure of that close logged
+   * rather than thrown.
    * If the manager owns the store (created via path config), this closes the store.
-   * If the app owns the store (passed via store config), this is a no-op;
-   * the app is responsible for closing the store when done.
+   * If the app owns the store (passed via store config), the store stays open;
+   * the app is responsible for closing it when done.
    */
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.detachStrategy(this.strategy);
     if (this.ownsStore) {
-      this.store.close();
+      // From a listener inside a write: the write finishes on the open
+      // store, and write() closes it when the write returns.
+      if (this.writeDepth > 0) this.storeCloseAfterWrite = true;
+      else this.store.close();
     }
   }
 
   /**
-   * Check if the store has been closed.
+   * Run one write that calls a host's listeners: an add, whose shards' events
+   * each run them, a round's acceptance, which announces a branch's earlier
+   * receipt before it commits its own, or an edit or a removal, whose one
+   * event runs them once its change is stored. A close() from one of those
+   * listeners lets the write finish, since a write is the unit the store
+   * stays whole in, and a store the manager owns closes when the outermost
+   * write returns, so the listeners after the one that closed still find it
+   * open. A failure of that close is logged: the close() that asked for it
+   * has returned, and the write it followed stands.
+   */
+  private write<T>(run: () => T): T {
+    this.writeDepth++;
+    try {
+      return run();
+    } finally {
+      this.writeDepth--;
+      if (this.writeDepth === 0 && this.storeCloseAfterWrite) {
+        this.storeCloseAfterWrite = false;
+        try {
+          this.store.close();
+        } catch (error) {
+          logThrown('[context-manager] closing the store after a close() from a listener failed; the store is closed all the same:', error);
+        }
+      }
+    }
+  }
+
+  /**
+   * Whether close() has run, or the store has been closed.
    */
   isClosed(): boolean {
-    return this.store.isClosed();
+    return this.closed || this.store.isClosed();
   }
 
   /**
