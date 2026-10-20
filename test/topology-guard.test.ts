@@ -116,7 +116,7 @@ function l1r(id: string, src: string[], level = 1): SummaryEntry {
 }
 const STORES = ['./test-topology-guard-demand', './test-topology-guard-refuse', './test-topology-guard-pass', './test-topology-guard-store',
   './test-topology-guard-cleared', './test-topology-guard-restart', './test-topology-guard-paid-off',
-  './test-topology-guard-gone', './test-topology-guard-damaged'];
+  './test-topology-guard-gone', './test-topology-guard-damaged', './test-topology-guard-empty-group'];
 const wipe = () => { for (const s of STORES) if (existsSync(s)) rmSync(s, { recursive: true, force: true }); };
 
 describe('demand-path merges respect holes (issue #95)', () => {
@@ -230,15 +230,35 @@ describe('a crossed merge is refused at mint time', () => {
       console.warn = warn;
     }
     try {
-      const named = warned.filter((line) => line.includes('[merge-quarantine]') && line.includes('non-empty list of ids'));
+      const named = warned.filter((line) => line.includes('[merge-quarantine]') && line.includes("can't read"));
       assert.equal(named.length, 1, `one line names the damaged record: ${JSON.stringify(warned)}`);
-      assert.match(named[0], /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 1 record whose key isn't a string or whose sourceIds isn't a non-empty list of ids, so the merge quarantine leaves it out: its group is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\), and the next write of the quarantine erases it/);
+      assert.match(named[0], /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 1 entry the load can't read as a record \(it needs a string key and a non-empty sourceIds list of non-empty string ids\), so the load leaves it out and writes the quarantine back without it: whatever group it held is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\)/);
       assert.equal(again.quarantine().size, 1, 'the standing record loaded');
       const debt = again.getCompressionDebt();
       assert.equal(debt.topologyRefusals, 1, 'only the standing record counts');
       assert.equal(debt.state, 'critical');
     } finally {
       reopened?.close();
+    }
+  });
+
+  test('a refused merge of no sources, as mergeThreshold 0 queues one, never stands as a refusal, and the sweep removes it', async () => {
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'merged' }] }) };
+    const { manager, p, ids: all, ctx } = await openProbe(STORES[9], membrane);
+    const s = real(all);
+    p.setChunks([s(0, 9), s(10, 19)]);
+    p.setSummaries([l1r('a', s(0, 9)), l1r('b', s(10, 19))]);
+    p.setQueue([{ level: 2, sourceIds: [] }]);
+    await p.merge(2, [], ctx);
+    try {
+      assert.deepEqual([...p.quarantine().values()].map((r) => r.lastOutcome), ['topology_violation'], 'setup: refused and recorded');
+      const debt = p.getCompressionDebt();
+      assert.equal(debt.topologyRefusals, 0, 'a record whose sources identify nothing stands as no refusal');
+      assert.notEqual(debt.state, 'critical');
+      (p as unknown as { sweepPaidOffMergeQuarantine(): void }).sweepPaidOffMergeQuarantine();
+      assert.equal(p.quarantine().size, 0, 'the sweep removes it');
+    } finally {
+      manager.close();
     }
   });
 
