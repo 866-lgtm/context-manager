@@ -1529,7 +1529,7 @@ export class ContextManager {
   private detachStrategy(strategy: ContextStrategy): void {
     // The manager lets go either way: a replacement still initializes and
     // close() still closes the store.
-    const failed = (err: unknown) => console.error('Strategy detach failed:', strategy.name, err);
+    const failed = (err: unknown) => this.diag.error('Strategy detach failed:', strategy.name, err);
     try {
       // detach() is synchronous by contract. A promise or other thenable one
       // returns anyway isn't awaited, and its rejection is logged rather than
@@ -2172,7 +2172,7 @@ export class ContextManager {
         try {
           this.store.close();
         } catch (error) {
-          logThrown('[context-manager] closing the store after a close() from a listener failed; the store is closed all the same:', error);
+          logThrown('[context-manager] closing the store after a close() from a listener failed; the store is closed all the same:', error, this.diag);
         }
       }
     }
