@@ -114,7 +114,9 @@ function l1r(id: string, src: string[], level = 1): SummaryEntry {
   return { id, level, content: `s ${id}`, tokens: 100, sourceLevel: level - 1, sourceIds: src,
     sourceRange: { first: src[0], last: src[src.length - 1] }, created: 1 } as SummaryEntry;
 }
-const STORES = ['./test-topology-guard-demand', './test-topology-guard-refuse', './test-topology-guard-pass', './test-topology-guard-store'];
+const STORES = ['./test-topology-guard-demand', './test-topology-guard-refuse', './test-topology-guard-pass', './test-topology-guard-store',
+  './test-topology-guard-cleared', './test-topology-guard-restart', './test-topology-guard-paid-off',
+  './test-topology-guard-gone'];
 const wipe = () => { for (const s of STORES) if (existsSync(s)) rmSync(s, { recursive: true, force: true }); };
 
 describe('demand-path merges respect holes (issue #95)', () => {
@@ -159,6 +161,78 @@ describe('a crossed merge is refused at mint time', () => {
     assert.equal(debt.topologyRefusals, 1);
     assert.equal(debt.state, 'critical');
     assert.equal(p.allSummaries().filter((x) => x.level === 2).length, 0, 'nothing was minted');
+    manager.close();
+  });
+
+  /** A refused crossed merge over L1s a, b, c and d, which the store also holds, so a restart loads them.
+   *  With `both`, the crossed group b+d is refused too. */
+  async function refusedCrossedMerge(path: string, both = false) {
+    const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'merged' }] }) };
+    const { manager, p, ids: all, ctx } = await openProbe(path, membrane);
+    const s = real(all);
+    p.setChunks([s(0, 9), s(10, 19), s(20, 29), s(30, 39)]);
+    const summaries = [l1r('a', s(0, 9)), l1r('b', s(10, 19)), l1r('c', s(20, 29)), l1r('d', s(30, 39))];
+    p.setSummaries(summaries);
+    const internals = p as unknown as { store: { setStateJson(id: string, v: unknown): void }; summariesStateId: string };
+    internals.store.setStateJson(internals.summariesStateId, summaries);
+    for (const group of both ? [['a', 'c'], ['b', 'd']] : [['a', 'c']]) {
+      p.setQueue([{ level: 2, sourceIds: group }]);
+      await p.merge(2, group, ctx);
+    }
+    assert.equal(p.getCompressionDebt().state, 'critical', 'setup: the refusal is critical');
+    return { manager, p, membrane };
+  }
+
+  test('each refused group counts, and critical lifts once an operator has cleared them all', async () => {
+    const { manager, p } = await refusedCrossedMerge(STORES[4], true);
+    assert.equal(p.getCompressionDebt().topologyRefusals, 2);
+    const [first, second] = [...p.quarantine().keys()];
+    p.clearMergeQuarantine(first);
+    let debt = p.getCompressionDebt();
+    assert.equal(debt.topologyRefusals, 1);
+    assert.equal(debt.state, 'critical', 'one refused group still stands');
+    p.clearMergeQuarantine(second);
+    debt = p.getCompressionDebt();
+    assert.equal(debt.topologyRefusals, 0);
+    assert.notEqual(debt.state, 'critical', 'nothing crossed is left standing');
+    manager.close();
+  });
+
+  test('a restart keeps critical while the refused group\'s record stands', async () => {
+    const { manager, membrane } = await refusedCrossedMerge(STORES[5]);
+    manager.close();
+    const again = new Probe({ adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, mergeThreshold: 6, compressionModel: 'test-compression-model' });
+    const reopened = await ContextManager.open({ path: STORES[5], strategy: again, membrane: membrane as never });
+    try {
+      assert.deepEqual([...again.quarantine().values()].map((r) => r.lastOutcome), ['topology_violation'], 'setup: the record survived the restart');
+      const debt = again.getCompressionDebt();
+      assert.equal(debt.topologyRefusals, 1);
+      assert.equal(debt.state, 'critical');
+    } finally {
+      reopened.close();
+    }
+  });
+
+  test('a refused group paid off since reads as paid off before a sweep removes its record', async () => {
+    const { manager, p } = await refusedCrossedMerge(STORES[6]);
+    // a merges validly with b afterwards, which parents a source of the refused group a+c.
+    for (const summary of p.allSummaries()) if (summary.id === 'a' || summary.id === 'b') summary.mergedInto = 'ab';
+    const debt = p.getCompressionDebt();
+    assert.equal(p.quarantine().size, 1, 'setup: no sweep has removed the record');
+    assert.equal(debt.topologyRefusals, 0, 'the record no longer stands as a refusal');
+    assert.notEqual(debt.state, 'critical');
+    manager.close();
+  });
+
+  test('a refused group whose source is gone counts no refusal before a sweep removes its record', async () => {
+    const { manager, p } = await refusedCrossedMerge(STORES[7]);
+    // c leaves the summaries, as a repair at load can drop one.
+    const self = p as unknown as { summaries: SummaryEntry[] };
+    self.summaries = self.summaries.filter((summary) => summary.id !== 'c');
+    const debt = p.getCompressionDebt();
+    assert.equal(p.quarantine().size, 1, 'setup: no sweep has removed the record');
+    assert.equal(debt.topologyRefusals, 0, 'a group with a source gone no longer stands as a refusal');
+    assert.notEqual(debt.state, 'critical');
     manager.close();
   });
 
