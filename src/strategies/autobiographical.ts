@@ -905,6 +905,28 @@ function isContentFilterError(error: unknown): boolean {
 }
 
 /**
+ * [local patch] Azure's streaming output filter cuts a completion mid-token
+ * and splices a canned refusal onto the partial text, then reports
+ * finish_reason "length" with zero usage (VoidAI → Azure, 2026-10-20: six L1
+ * mints quarantined as max_tokens "incomplete", never reaching the refusal
+ * escalation). A memory ending in that sentence is a refusal whatever the
+ * stop reason says.
+ */
+const SPLICED_REFUSAL_TAIL = /I['’]?m sorry,? but I can(?:not|['’]t) (?:assist|help) with that(?: request)?\.?\s*$/i;
+
+function endsWithSplicedRefusal(response: object): boolean {
+  const content = (response as { content?: unknown }).content;
+  if (!Array.isArray(content)) return false;
+  for (let i = content.length - 1; i >= 0; i--) {
+    const block = content[i] as { type?: unknown; text?: unknown };
+    if (block?.type !== 'text' || typeof block.text !== 'string') continue;
+    if (!block.text.trim()) continue;
+    return SPLICED_REFUSAL_TAIL.test(block.text.slice(-200));
+  }
+  return false;
+}
+
+/**
  * A provider failure that is transient at ACCOUNT scale: a rate limit, or
  * credit/quota exhaustion (402 `insufficient_credits` from VoidAI/OpenRouter,
  * 429 `insufficient_quota` from OpenAI). The identical request succeeds once
@@ -2798,7 +2820,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private compressionResponseStopReason(response: unknown): string | undefined {
     if (!response || typeof response !== 'object') return undefined;
     const stopReason = (response as { stopReason?: unknown }).stopReason;
-    return typeof stopReason === 'string' ? stopReason : undefined;
+    if (typeof stopReason !== 'string') return undefined;
+    if (stopReason !== 'refusal' && endsWithSplicedRefusal(response)) return 'refusal';
+    return stopReason;
   }
 
   private compressionResponseInputTokens(response: unknown): number | undefined {
