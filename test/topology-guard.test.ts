@@ -116,7 +116,7 @@ function l1r(id: string, src: string[], level = 1): SummaryEntry {
 }
 const STORES = ['./test-topology-guard-demand', './test-topology-guard-refuse', './test-topology-guard-pass', './test-topology-guard-store',
   './test-topology-guard-cleared', './test-topology-guard-restart', './test-topology-guard-paid-off',
-  './test-topology-guard-gone'];
+  './test-topology-guard-gone', './test-topology-guard-damaged'];
 const wipe = () => { for (const s of STORES) if (existsSync(s)) rmSync(s, { recursive: true, force: true }); };
 
 describe('demand-path merges respect holes (issue #95)', () => {
@@ -210,6 +210,35 @@ describe('a crossed merge is refused at mint time', () => {
       assert.equal(debt.state, 'critical');
     } finally {
       reopened.close();
+    }
+  });
+
+  test('a restart leaves out a damaged record beside a standing one, says so, and reads critical from the one that stands', async () => {
+    const { manager, p, membrane } = await refusedCrossedMerge(STORES[8], true);
+    const internals = p as unknown as { store: { setStateJson(id: string, v: unknown): void }; mergeQuarantineStateId: string };
+    const [standing, damaged] = [...p.quarantine().values()] as Array<Record<string, unknown>>;
+    internals.store.setStateJson(internals.mergeQuarantineStateId, [standing, { ...damaged, sourceIds: undefined }]);
+    manager.close();
+    const again = new Probe({ adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, mergeThreshold: 6, compressionModel: 'test-compression-model' });
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+    let reopened: ContextManager | undefined;
+    try {
+      reopened = await ContextManager.open({ path: STORES[8], strategy: again, membrane: membrane as never });
+    } finally {
+      console.warn = warn;
+    }
+    try {
+      const named = warned.filter((line) => line.includes('[merge-quarantine]') && line.includes('without a string key'));
+      assert.equal(named.length, 1, `one line names the damaged record: ${JSON.stringify(warned)}`);
+      assert.match(named[0], /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 1 record without a string key or a list of sourceIds, so the merge quarantine leaves it out: its group is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\), and the next write of the quarantine erases it/);
+      assert.equal(again.quarantine().size, 1, 'the standing record loaded');
+      const debt = again.getCompressionDebt();
+      assert.equal(debt.topologyRefusals, 1, 'only the standing record counts');
+      assert.equal(debt.state, 'critical');
+    } finally {
+      reopened?.close();
     }
   });
 

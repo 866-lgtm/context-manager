@@ -3326,11 +3326,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ? (queue as Array<{ level: SummaryLevel; sourceIds: string[]; attempts?: number; lastStopReason?: string; lastOutcome?: string; hadRefusal?: boolean }>)
       : [];
     const mergeQuarantine = this.store.getStateJson(this.mergeQuarantineStateId);
-    this.mergeQuarantine = new Map(
-      (Array.isArray(mergeQuarantine) ? (mergeQuarantine as MergeQuarantineRecord[]) : [])
-        .filter((r) => r && typeof r.key === 'string' && Array.isArray(r.sourceIds))
-        .map((r) => [r.key, r]),
-    );
+    const storedMergeRecords = Array.isArray(mergeQuarantine) ? (mergeQuarantine as MergeQuarantineRecord[]) : [];
+    const loadedMergeRecords = storedMergeRecords.filter((r) => r && typeof r.key === 'string' && Array.isArray(r.sourceIds));
+    this.mergeQuarantine = new Map(loadedMergeRecords.map((r) => [r.key, r]));
+    // What the load can't read is named, as the merge queue's load below names
+    // what it removes. Every record this writes has a string key and a list of
+    // sourceIds, so one without them, or a stored value that holds no list, is
+    // damage or another writer's. What's left out holds nothing back and counts
+    // nowhere, and persistMergeQuarantine writes the map back without it.
+    const mergeQuarantineAt = `[merge-quarantine] on branch '${this.store.currentBranch().name}', ${this.mergeQuarantineStateId}`;
+    const leftOutMergeRecords = storedMergeRecords.length - loadedMergeRecords.length;
+    if (mergeQuarantine != null && !Array.isArray(mergeQuarantine)) {
+      this.diag.warn(
+        `${mergeQuarantineAt} holds no list, so the merge quarantine reads no record from it and has lost whatever it held; ` +
+          'the next write of the quarantine replaces it',
+      );
+    } else if (leftOutMergeRecords > 0) {
+      const one = leftOutMergeRecords === 1;
+      this.diag.warn(
+        `${mergeQuarantineAt} holds ${leftOutMergeRecords} record${one ? '' : 's'} without a string key or a list of sourceIds, ` +
+          `so the merge quarantine leaves ${one ? 'it' : 'them'} out: ${one ? 'its group is' : 'their groups are'} no longer held ` +
+          `out of merges or counted by the merge-quarantine alarm or getCompressionDebt(), and the next write of the quarantine ` +
+          `erases ${one ? 'it' : 'them'}`,
+      );
+    }
     // A queued merge is kept only while it is an entry whose sources are kept
     // summaries, as for a summary above L1.
     const validMergeQueue = this.mergeQueue.filter(
