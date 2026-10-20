@@ -86,7 +86,7 @@ describe('compression while the quarantine ledger cannot be read', () => {
     }
   });
 
-  it("logs a failure again on a branch it switches to, and no recovery for a branch that never failed", async () => {
+  it("logs a failure again on a branch it switches to, and a new load logs no recovery from a failure it didn't meet", async () => {
     const strategy = new AutobiographicalStrategy({ autoTickOnNewMessage: false, quarantineAlarmIntervalMs: 0 } as never);
     const path = `${BASE}-branches-${process.pid}`;
     paths.push(path);
@@ -102,6 +102,7 @@ describe('compression while the quarantine ledger cannot be read', () => {
     };
     try {
       const ids = [0, 1, 2, 3].map((i) => manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i}`)]));
+      const first = manager.currentBranch().name;
       const internals = strategy as unknown as {
         store: { getStateJson(id: string): unknown };
         compressionRefusalQuarantineLedgerStateId: string;
@@ -126,6 +127,8 @@ describe('compression while the quarantine ledger cannot be read', () => {
       broken = false;
       await manager.switchBranch(manager.branchAt(ids[3]!, 'third'));
       assert.deepEqual(logged(() => strategy.getCompressionDebt()), [], 'a branch that never failed logs no recovery');
+      await manager.switchBranch(first);
+      assert.deepEqual(logged(() => strategy.getCompressionDebt()), [], 'back on the first branch, a new load logs no recovery from a failure an earlier load met');
     } finally {
       console.error = realError;
       console.warn = realWarn;

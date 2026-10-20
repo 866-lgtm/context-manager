@@ -359,6 +359,39 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
     assert.equal(error.split('\n')[1], "Cause: the store couldn't read this agent's compression quarantine ledger (first part second part (test)).");
   });
 
+  it('an outright failure\'s cause with line breaks stays on its Cause line', () => {
+    const s = fresh();
+    Object.defineProperty(s, 'chunks', { get() { throw new Error('first part\n  second part (test)'); }, configurable: true });
+    const error = s.getCompressionDebt(NOW).error ?? '';
+    assert.equal(error.split('\n').length, 4, error);
+    assert.equal(error.split('\n')[1], 'Cause: first part second part (test)');
+  });
+
+  it('a long cause is cut, so each message stays under 500 and keeps its Fix line', () => {
+    const long = new Error(`${'x'.repeat(170)} end of a long path (test) ${'y'.repeat(100)}`);
+    const s = fresh();
+    s.breakLedger(long);
+    const ledger = (s.getCompressionDebt(NOW).error ?? '').split('\n');
+    assert.ok(ledger.join('\n').length < 500, `${ledger.join('\n').length} characters`);
+    assert.equal(ledger.length, 4);
+    assert.equal(ledger[1], `Cause: the store couldn't read this agent's compression quarantine ledger (${'x'.repeat(170)} end of a…).`);
+    assert.equal(ledger[3], 'Fix: fix what the cause names; compression then resumes by itself.');
+    const t = fresh();
+    Object.defineProperty(t, 'chunks', { get() { throw long; }, configurable: true });
+    const outright = (t.getCompressionDebt(NOW).error ?? '').split('\n');
+    assert.ok(outright.join('\n').length < 500, `${outright.join('\n').length} characters`);
+    assert.equal(outright[1], `Cause: ${'x'.repeat(170)} end of a…`);
+    assert.equal(outright[3], 'Fix: this points to a fault in context-manager or in the options it was given. Report it.');
+  });
+
+  it('a cut cause never parts a surrogate pair', () => {
+    const s = fresh();
+    s.breakLedger(new Error(`${'a'.repeat(178)}\u{1F600}\u{1F600}\u{1F600}`));
+    const cause = (s.getCompressionDebt(NOW).error ?? '').split('\n')[1] ?? '';
+    assert.doesNotMatch(cause, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+    assert.ok(cause.endsWith(`${'a'.repeat(178)}…).`), cause);
+  });
+
   it('a thrown value that isn\'t an Error is the error\'s text', () => {
     const s = fresh();
     Object.defineProperty(s, 'chunks', { get() { throw 'chunks unreadable (test)'; }, configurable: true });
