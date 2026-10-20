@@ -187,14 +187,14 @@ function compressionQuarantineUnreadableMessage(cause: unknown): string {
  * What an operator reads when the debt report itself fails. Outside the
  * ledger it reads only the strategy's own state and the options it was
  * given, so a throw there is a fault in context-manager or in those options.
- * Where to report it is the host's to say.
+ * How to report it is the host's to say.
  */
 function compressionDebtReportFailedMessage(cause: unknown): string {
   return [
     'The compression debt report failed.',
     `Cause: ${oneLine(failureMessage(cause))}`,
     "Effect: the report can't say whether compression is keeping up. Compression itself may be running normally.",
-    'Fix: this points to a fault in context-manager or in the options it was given. Report it, with this text.',
+    'Fix: this points to a fault in context-manager or in the options it was given. Report it.',
   ].join('\n');
 }
 

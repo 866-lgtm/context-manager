@@ -51,6 +51,12 @@ describe('compression while the quarantine ledger cannot be read', () => {
       const read = store.getStateJson.bind(store);
       const ledger = new Set([internals.compressionRefusalQuarantineLedgerStateId, internals.compressionRefusalQuarantineStateId]);
       const cause = new Error('EACCES: permission denied (test)');
+      const message = [
+        'Compression of new conversation has stalled.',
+        "Cause: the store couldn't read this agent's compression quarantine ledger (EACCES: permission denied (test)).",
+        'Effect: chunks that need the model go unsummarized, so in time its context fills and its turns fail until compression catches up.',
+        'Fix: fix what the cause names; compression then resumes by itself.',
+      ].join('\n');
       store.getStateJson = (id: string) => {
         if (ledger.has(id)) throw cause;
         return read(id);
@@ -58,12 +64,7 @@ describe('compression while the quarantine ledger cannot be read', () => {
       for (let tick = 1; tick <= 2; tick++) {
         await assert.rejects(manager.tick(), (error: Error) => {
           assert.equal(error.name, 'CompressionQuarantineUnreadableError');
-          assert.equal(error.message, [
-            'Compression of new conversation has stalled.',
-            "Cause: the store couldn't read this agent's compression quarantine ledger (EACCES: permission denied (test)).",
-            'Effect: chunks that need the model go unsummarized, so in time its context fills and its turns fail until compression catches up.',
-            'Fix: fix what the cause names; compression then resumes by itself.',
-          ].join('\n'));
+          assert.equal(error.message, message);
           assert.equal(error.cause, cause, "the store's own error is its cause");
           return true;
         });
@@ -72,7 +73,7 @@ describe('compression while the quarantine ledger cannot be read', () => {
       assert.equal(strategy.getStats().l1, 0, 'nothing was summarized');
       const debt = strategy.getCompressionDebt();
       assert.equal(debt.failure, 'quarantine-ledger');
-      assert.equal(debt.error?.split('\n')[0], 'Compression of new conversation has stalled.', 'the report and the attempt say the same');
+      assert.equal(debt.error, message, 'the report and the attempt say the same');
       assert.equal(internals.compressionPause, null, 'a failed read pauses nothing, so the next tick after it reads compresses');
 
       store.getStateJson = read;

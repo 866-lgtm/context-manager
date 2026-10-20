@@ -287,7 +287,7 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
       'The compression debt report failed.',
       'Cause: chunks unreadable (test)',
       "Effect: the report can't say whether compression is keeping up. Compression itself may be running normally.",
-      'Fix: this points to a fault in context-manager or in the options it was given. Report it, with this text.',
+      'Fix: this points to a fault in context-manager or in the options it was given. Report it.',
     ].join('\n'));
     assert.equal(d.failure, 'report');
     for (const [field, value] of Object.entries(d)) {
@@ -326,7 +326,7 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
       assert.equal(s.getCompressionDebt(NOW).state, 'healthy');
     });
     assert.equal(lines.length, 3, lines.join('\n'));
-    assert.match(lines[0]!, /^\[compression-debt\] The compression debt report failed\. Cause: chunks unreadable \(test\) Effect: [^\n]+ Fix: [^\n]+ Report it, with this text\. Error: chunks unreadable \(test\)\n/);
+    assert.match(lines[0]!, /^\[compression-debt\] The compression debt report failed\. Cause: chunks unreadable \(test\) Effect: [^\n]+ Fix: [^\n]+ Report it\. Error: chunks unreadable \(test\)\n/);
     assert.match(lines[1]!, /^\[compression-debt\] Compression of new conversation has stalled\. Cause: the store couldn't read this agent's compression quarantine ledger \(ledger unreadable \(test\)\)\. Effect: /);
     assert.equal(lines[2], '[compression-debt] the report reads again');
   });
