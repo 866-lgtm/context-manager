@@ -120,7 +120,14 @@ describe('the scripts on a store whose compression quarantine ledger can\'t be r
   it('the audit prints the report\'s error, and exits 0 with no topology violations', () => {
     const r = run(AUDIT, [pending, '--namespace', 'probe'], UNREADABLE_LEDGER);
     assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /compression debt unknown\n  Compression can't run\.\n  Cause: the store couldn't read a record compression needs, this agent's compression quarantine ledger \(ledger unreadable \(test\)\)\.\n  Effect: [^\n]+\n  Fix: [^\n]+\n/,
+    assert.match(r.stdout, /compression debt unknown\n  Compression of new conversation has stalled\.\n  Cause: the store couldn't read this agent's compression quarantine ledger \(ledger unreadable \(test\)\)\.\n  Effect: [^\n]+\n  Fix: [^\n]+\n/,
       'the summary, then the error a line each');
+  });
+
+  it('the audit prints no error on a store it can read, and exits 0', () => {
+    const r = run(AUDIT, [pending, '--namespace', 'probe']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /compression debt (healthy|degraded|critical)\n/, r.stdout);
+    assert.doesNotMatch(r.stdout, /Cause:|Effect:|Fix:/);
   });
 });

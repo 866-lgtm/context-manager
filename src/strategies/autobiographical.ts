@@ -161,38 +161,49 @@ function failureMessage(thrown: unknown): string {
   }
 }
 
+/** A thrown value's text on one line, so a line that quotes it stays one line. */
+function oneLine(text: string): string {
+  return text.replace(/\s*[\r\n]+\s*/g, ' ');
+}
+
 /**
  * What an operator reads when the store can't read the compression quarantine
- * ledger: the debt report's `error`, and the error a compression attempt stops
- * with, since each attempt reads the ledger before it calls the model. A line
- * saying what can't happen, then its cause, its effect and its fix, so a
- * surface that shows it whole breaks it where a reader looks.
+ * ledger: the debt report's `error`, and the error an attempt that would call
+ * the model stops with, since it reads the ledger first. A line saying what
+ * happened, then its cause, its effect and its fix, so a surface that shows it
+ * whole breaks it where a reader looks. Short enough that a cause of 180
+ * characters keeps it under 500, where alerts are often cut.
  */
 function compressionQuarantineUnreadableMessage(cause: unknown): string {
   return [
-    "Compression can't run.",
-    `Cause: the store couldn't read a record compression needs, this agent's compression quarantine ledger (${failureMessage(cause)}).`,
-    "Effect: no new conversation is summarized while this lasts. Once the conversation it hasn't summarized no longer fits in its context budget, its turns fail until compression catches up.",
-    'Fix: fix what the cause names. Compression resumes by itself once the ledger reads.',
+    'Compression of new conversation has stalled.',
+    `Cause: the store couldn't read this agent's compression quarantine ledger (${oneLine(failureMessage(cause))}).`,
+    'Effect: chunks that need the model go unsummarized, so in time its context fills and its turns fail until compression catches up.',
+    'Fix: fix what the cause names; compression then resumes by itself.',
   ].join('\n');
 }
 
-/** What an operator reads when the debt report itself fails: only a fault in context-manager does that, since outside the ledger it reads the strategy's own state. */
+/**
+ * What an operator reads when the debt report itself fails. Outside the
+ * ledger it reads only the strategy's own state and the options it was
+ * given, so a throw there is a fault in context-manager or in those options.
+ * Where to report it is the host's to say.
+ */
 function compressionDebtReportFailedMessage(cause: unknown): string {
   return [
     'The compression debt report failed.',
-    `Cause: ${failureMessage(cause)}`,
+    `Cause: ${oneLine(failureMessage(cause))}`,
     "Effect: the report can't say whether compression is keeping up. Compression itself may be running normally.",
-    'Fix: this points to a fault in context-manager. Report it to its maintainers with this text.',
+    'Fix: this points to a fault in context-manager or in the options it was given. Report it, with this text.',
   ].join('\n');
 }
 
 /**
  * A compression attempt that couldn't read the compression quarantine ledger.
- * Every attempt reads it before calling the model, so while it can't be read
- * compression stops there, and the error says so in the words a host's
- * report of a failed tick shows an operator. The read's own failure is its
- * `cause`.
+ * An attempt that would call the model reads it first, so while it can't be
+ * read each such attempt stops there, and the error says so in the words a
+ * host's report of a failed tick shows an operator. The read's own failure is
+ * its `cause`.
  */
 class CompressionQuarantineUnreadableError extends Error {
   constructor(cause: unknown) {
@@ -7536,7 +7547,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * A report that couldn't read something says in `error` what happened,
    * what it means and what to do, for the operator who reads it: a line
-   * saying what can't happen, then `Cause:`, `Effect:` and `Fix:` lines.
+   * saying what happened, then `Cause:`, `Effect:` and `Fix:` lines.
    * `failure` names which read failed, and each count it couldn't compute is
    * `null`, never 0.
    *
@@ -7547,20 +7558,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * any quarantine. Where both give the same state, that is the state, and
    * where they differ it is `unknown`. So crossed ownership still reads
    * `critical`, and a chunk that has waited between 1h and 6h still reads
-   * `degraded`. Compression can't run then either: each attempt reads the
-   * ledger before calling the model, and stops there with the same words.
+   * `degraded`. Compression of new conversation stalls then too: each
+   * attempt that would call the model reads the ledger first, and stops
+   * there with the same words.
    *
    * When anything else fails (`failure` `report`), the state is `unknown` and
    * every count is `null`. Outside the ledger the report reads only the
-   * strategy's own state, so that's a fault in context-manager, and
-   * compression itself may be running normally.
+   * strategy's own state and the options it was given, so that's a fault in
+   * context-manager or in those options, and compression itself may be
+   * running normally.
    *
    * `oldestPendingAgeMs` and `lastMintAt` are also `null` when nothing is
    * pending or nothing has been minted; in a report that failed outright,
    * `state` is `unknown` and they mean nothing. A failure is logged once
-   * through the strategy's diagnostics: when a report first fails, and again
-   * only after a report succeeds or the failure's text changes. The first
-   * report that reads again after a failure logs that it does.
+   * through the strategy's diagnostics, its lines joined into one: when a
+   * report first fails, and again only after a report succeeds or the
+   * failure's text changes. The first report that reads again after a
+   * failure logs that it does.
    *
    * The OPEN frontier chunk (still accumulating messages) is not debt and
    * is excluded. Ages derive from the newest message inside the oldest
@@ -7572,11 +7586,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     state: 'healthy' | 'degraded' | 'critical' | 'unknown';
     /**
      * What happened, what it means and what to do, for an operator: a line saying what
-     * can't happen, then `Cause:`, `Effect:` and `Fix:` lines. Present whenever a count
+     * happened, then `Cause:`, `Effect:` and `Fix:` lines. Present whenever a count
      * below is `null` for that reason.
      */
     error?: string;
-    /** Which read failed, whenever `error` is present: the compression quarantine ledger, which compression can't run without, or the report itself. */
+    /** Which read failed, whenever `error` is present: the compression quarantine ledger, which compression needs, or the report itself. */
     failure?: 'quarantine-ledger' | 'report';
     pendingChunks: number | null;
     oldestPendingAgeMs: number | null;
@@ -7721,8 +7735,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (error === this.compressionDebtFailureLogged) return;
     this.compressionDebtFailureLogged = error;
     try {
-      // The message is a format string once the thrown value follows it, so a '%' in it is doubled.
-      this.diag.error(`[compression-debt] ${error.replaceAll('%', '%%')}`, thrown);
+      // One line, so the namespace the diagnostics add to a message's first
+      // line tags all of it. The message is a format string once the thrown
+      // value follows it, so a '%' in it is doubled.
+      this.diag.error(`[compression-debt] ${oneLine(error).replaceAll('%', '%%')}`, thrown);
     } catch {
       // A logger that throws mustn't make the report throw or lose what it read; the report still carries `error`.
     }
@@ -9175,10 +9191,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     );
     const runSubject = chunkRunSubject(quarantineRecord.chunkSourceHash, chunk.messages);
     // The attempt's first read of the ledger, before any model call: while
-    // the ledger can't be read, every attempt stops here, so the error says
-    // what that means for the agent. Later reads in the attempt come after
-    // this one, and load, the sweep and an operator's clear meet the failure
-    // in their own terms.
+    // the ledger can't be read, every attempt that would call the model
+    // stops here, so the error says what that means for the agent. A chunk
+    // adopted, covered or stubbed above needs no model and has returned
+    // before this; the attempt's later reads come after this one; and load,
+    // the sweep and an operator's clear meet the failure in their own terms.
     let durableQuarantine: Map<string, ActiveCompressionQuarantine>;
     try {
       durableQuarantine = this.readCompressionQuarantineProjection();

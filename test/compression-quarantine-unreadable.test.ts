@@ -1,10 +1,10 @@
 /**
  * A compression attempt while the store can't read the compression quarantine
- * ledger. Each attempt reads it before calling the model, so while it can't be
- * read compression stops there, and the attempt's error says so in the words
- * the debt report gives an operator: a host that reports a failed tick, as
- * agent-framework's maintenance does, shows them. Once the ledger reads again,
- * compression resumes by itself.
+ * ledger. An attempt that would call the model reads it first, so while it
+ * can't be read each such attempt stops there, and its error says so in the
+ * words the debt report gives an operator: a host that reports a failed tick,
+ * as agent-framework's maintenance does, shows them. A failed read pauses
+ * nothing, so once the ledger reads again, compression resumes by itself.
  */
 
 import { after, describe, it } from 'node:test';
@@ -59,21 +59,21 @@ describe('compression while the quarantine ledger cannot be read', () => {
         await assert.rejects(manager.tick(), (error: Error) => {
           assert.equal(error.name, 'CompressionQuarantineUnreadableError');
           assert.equal(error.message, [
-            "Compression can't run.",
-            "Cause: the store couldn't read a record compression needs, this agent's compression quarantine ledger (EACCES: permission denied (test)).",
-            "Effect: no new conversation is summarized while this lasts. Once the conversation it hasn't summarized no longer fits in its context budget, its turns fail until compression catches up.",
-            'Fix: fix what the cause names. Compression resumes by itself once the ledger reads.',
+            'Compression of new conversation has stalled.',
+            "Cause: the store couldn't read this agent's compression quarantine ledger (EACCES: permission denied (test)).",
+            'Effect: chunks that need the model go unsummarized, so in time its context fills and its turns fail until compression catches up.',
+            'Fix: fix what the cause names; compression then resumes by itself.',
           ].join('\n'));
           assert.equal(error.cause, cause, "the store's own error is its cause");
           return true;
         });
-        internals.compressionPause = null;
       }
       assert.equal(calls.length, 0, 'no attempt reached the model');
       assert.equal(strategy.getStats().l1, 0, 'nothing was summarized');
       const debt = strategy.getCompressionDebt();
       assert.equal(debt.failure, 'quarantine-ledger');
-      assert.equal(debt.error?.split('\n')[0], "Compression can't run.", "the report and the attempt say the same");
+      assert.equal(debt.error?.split('\n')[0], 'Compression of new conversation has stalled.', 'the report and the attempt say the same');
+      assert.equal(internals.compressionPause, null, 'a failed read pauses nothing, so the next tick after it reads compresses');
 
       store.getStateJson = read;
       await manager.tick();

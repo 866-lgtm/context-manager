@@ -228,10 +228,10 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
     assert.equal(d.state, 'unknown', 'with nothing else owed, one record would make it degraded and none healthy');
     assert.equal(d.compressionQuarantineCount, null, 'a count it couldn\'t read is null, never 0');
     assert.equal(d.error, [
-      "Compression can't run.",
-      "Cause: the store couldn't read a record compression needs, this agent's compression quarantine ledger (ledger unreadable (test)).",
-      "Effect: no new conversation is summarized while this lasts. Once the conversation it hasn't summarized no longer fits in its context budget, its turns fail until compression catches up.",
-      'Fix: fix what the cause names. Compression resumes by itself once the ledger reads.',
+      'Compression of new conversation has stalled.',
+      "Cause: the store couldn't read this agent's compression quarantine ledger (ledger unreadable (test)).",
+      'Effect: chunks that need the model go unsummarized, so in time its context fills and its turns fail until compression catches up.',
+      'Fix: fix what the cause names; compression then resumes by itself.',
     ].join('\n'), 'what happened, what it means and what to do, a line each');
     assert.equal(d.failure, 'quarantine-ledger');
     assert.equal(d.pendingChunks, 0, 'what it could read is still reported');
@@ -269,7 +269,7 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
     const d = crossed.getCompressionDebt(NOW);
     assert.equal(d.state, 'critical', 'crossed ownership is critical whatever the ledger holds');
     assert.equal(d.compressionQuarantineCount, null);
-    assert.match(d.error ?? '', /^Compression can't run\.\nCause: the store couldn't read a record compression needs, this agent's compression quarantine ledger \(/, 'the error is given with a decided state too');
+    assert.match(d.error ?? '', /^Compression of new conversation has stalled\.\nCause: the store couldn't read this agent's compression quarantine ledger \(/, 'the error is given with a decided state too');
     assert.equal(d.failure, 'quarantine-ledger');
 
     const old = fresh();
@@ -287,7 +287,7 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
       'The compression debt report failed.',
       'Cause: chunks unreadable (test)',
       "Effect: the report can't say whether compression is keeping up. Compression itself may be running normally.",
-      'Fix: this points to a fault in context-manager. Report it to its maintainers with this text.',
+      'Fix: this points to a fault in context-manager or in the options it was given. Report it, with this text.',
     ].join('\n'));
     assert.equal(d.failure, 'report');
     for (const [field, value] of Object.entries(d)) {
@@ -310,8 +310,8 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
     s.breakLedger(new Error('another failure (test)'));
     const again = logged(() => s.getCompressionDebt(NOW));
     assert.equal(again.length, 1, 'the same failure logs again after a success');
-    assert.match(again[0]!, /^\[compression-debt\] Compression can't run\. ns=agents\/probe\nCause: [^\n]*\(another failure \(test\)\)\.\nEffect: [^\n]+\nFix: fix what the cause names\. Compression resumes by itself once the ledger reads\.\s/,
-      'the error whole, the namespace on its first line, and nothing after it but the thrown value');
+    assert.match(again[0]!, /^\[compression-debt\] Compression of new conversation has stalled\. Cause: [^\n]*\(another failure \(test\)\)\. Effect: [^\n]+ Fix: fix what the cause names; compression then resumes by itself\. ns=agents\/probe Error: another failure \(test\)\n/,
+      'the error whole on one line, the namespace at its end, then the thrown value');
   });
 
   it('an outright failure, a partial one and a report that reads log a line each', () => {
@@ -326,8 +326,8 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
       assert.equal(s.getCompressionDebt(NOW).state, 'healthy');
     });
     assert.equal(lines.length, 3, lines.join('\n'));
-    assert.match(lines[0]!, /^\[compression-debt\] The compression debt report failed\.\nCause: chunks unreadable \(test\)\n/);
-    assert.match(lines[1]!, /^\[compression-debt\] Compression can't run\.\nCause: the store couldn't read a record compression needs, this agent's compression quarantine ledger \(ledger unreadable \(test\)\)\.\n/);
+    assert.match(lines[0]!, /^\[compression-debt\] The compression debt report failed\. Cause: chunks unreadable \(test\) Effect: [^\n]+ Fix: [^\n]+ Report it, with this text\. Error: chunks unreadable \(test\)\n/);
+    assert.match(lines[1]!, /^\[compression-debt\] Compression of new conversation has stalled\. Cause: the store couldn't read this agent's compression quarantine ledger \(ledger unreadable \(test\)\)\. Effect: /);
     assert.equal(lines[2], '[compression-debt] the report reads again');
   });
 
@@ -346,7 +346,15 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
     const s = fresh();
     s.breakLedger(new Error('100%s gone (test)'));
     const [line] = logged(() => s.getCompressionDebt(NOW));
-    assert.match(line ?? '', /compression quarantine ledger \(100%s gone \(test\)\)\.\n/);
+    assert.match(line ?? '', /compression quarantine ledger \(100%s gone \(test\)\)\. Effect: /);
+  });
+
+  it('a cause with line breaks stays on the Cause line', () => {
+    const s = fresh();
+    s.breakLedger(new Error('first part\n  second part (test)'));
+    const error = s.getCompressionDebt(NOW).error ?? '';
+    assert.equal(error.split('\n').length, 4, error);
+    assert.equal(error.split('\n')[1], "Cause: the store couldn't read this agent's compression quarantine ledger (first part second part (test)).");
   });
 
   it('a thrown value that isn\'t an Error is the error\'s text', () => {
