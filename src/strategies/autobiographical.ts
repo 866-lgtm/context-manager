@@ -3327,13 +3327,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       : [];
     const mergeQuarantine = this.store.getStateJson(this.mergeQuarantineStateId);
     const storedMergeRecords = Array.isArray(mergeQuarantine) ? (mergeQuarantine as MergeQuarantineRecord[]) : [];
-    const loadedMergeRecords = storedMergeRecords.filter((r) => r && typeof r.key === 'string' && Array.isArray(r.sourceIds));
+    // A record's sources are read as the merge queue's below are (isIdList): a
+    // record whose sources identify nothing holds no group, and kept, an empty
+    // list would stand for good (mergeRecordStands), holding `critical` or
+    // `degraded` with nothing to clear.
+    const loadedMergeRecords = storedMergeRecords.filter((r) => r && typeof r.key === 'string' && isIdList(r.sourceIds));
     this.mergeQuarantine = new Map(loadedMergeRecords.map((r) => [r.key, r]));
     // What the load can't read is named, as the merge queue's load below names
-    // what it removes. Every record this writes has a string key and a list of
-    // sourceIds, so one without them, or a stored value that holds no list, is
-    // damage or another writer's. What's left out holds nothing back and counts
-    // nowhere, and persistMergeQuarantine writes the map back without it.
+    // what it removes. Records are written from a merge group, by
+    // refuseCrossedMerge and quarantineMerge, so one that fails this, or a
+    // stored value that holds no list, is damage, another writer's, or the
+    // empty group the threshold pass offers when mergeThreshold is 0 (#285).
+    // What's left out holds nothing back and counts nowhere, and
+    // persistMergeQuarantine writes the map back without it.
     const mergeQuarantineAt = `[merge-quarantine] on branch '${this.store.currentBranch().name}', ${this.mergeQuarantineStateId}`;
     const leftOutMergeRecords = storedMergeRecords.length - loadedMergeRecords.length;
     if (mergeQuarantine != null && !Array.isArray(mergeQuarantine)) {
@@ -3344,7 +3350,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     } else if (leftOutMergeRecords > 0) {
       const one = leftOutMergeRecords === 1;
       this.diag.warn(
-        `${mergeQuarantineAt} holds ${leftOutMergeRecords} record${one ? '' : 's'} without a string key or a list of sourceIds, ` +
+        `${mergeQuarantineAt} holds ${leftOutMergeRecords} record${one ? '' : 's'} whose key isn't a string or whose sourceIds ` +
+          `isn't a non-empty list of ids, ` +
           `so the merge quarantine leaves ${one ? 'it' : 'them'} out: ${one ? 'its group is' : 'their groups are'} no longer held ` +
           `out of merges or counted by the merge-quarantine alarm or getCompressionDebt(), and the next write of the quarantine ` +
           `erases ${one ? 'it' : 'them'}`,

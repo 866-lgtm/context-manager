@@ -230,9 +230,9 @@ describe('a crossed merge is refused at mint time', () => {
       console.warn = warn;
     }
     try {
-      const named = warned.filter((line) => line.includes('[merge-quarantine]') && line.includes('without a string key'));
+      const named = warned.filter((line) => line.includes('[merge-quarantine]') && line.includes('non-empty list of ids'));
       assert.equal(named.length, 1, `one line names the damaged record: ${JSON.stringify(warned)}`);
-      assert.match(named[0], /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 1 record without a string key or a list of sourceIds, so the merge quarantine leaves it out: its group is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\), and the next write of the quarantine erases it/);
+      assert.match(named[0], /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 1 record whose key isn't a string or whose sourceIds isn't a non-empty list of ids, so the merge quarantine leaves it out: its group is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\), and the next write of the quarantine erases it/);
       assert.equal(again.quarantine().size, 1, 'the standing record loaded');
       const debt = again.getCompressionDebt();
       assert.equal(debt.topologyRefusals, 1, 'only the standing record counts');
