@@ -113,6 +113,8 @@ describe('getCompressionDebt', () => {
   it('a merge-quarantine record with another outcome isn\'t a refused crossed merge', () => {
     const s = fresh();
     const m = (s as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine;
+    // Its group stands, every source present and unparented, so only its outcome keeps it from counting.
+    for (const id of ['a', 'b']) s.seedSummary({ id, level: 1, content: id, tokens: 1, sourceLevel: 0, sourceIds: [], created: NOW } as unknown as SummaryEntry);
     m.set('k', { key: 'k', sourceIds: ['a', 'b'], lastOutcome: 'refusal' });
     const d = s.getCompressionDebt(NOW);
     assert.equal(d.topologyRefusals, 0);
