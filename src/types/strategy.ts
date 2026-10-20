@@ -1202,7 +1202,8 @@ export interface AutobiographicalConfig {
   maxLiveImages?: number;
   /** Token depth from the newest message beyond which images are stripped to a
    *  text placeholder, even though the surrounding text stays verbatim. Measured
-   *  the same way as recentWindowTokens (cumulative tokens walked from the tail).
+   *  as cumulative tokens walked from the tail over the stored messages, before
+   *  tool pruning and image strips, which the recent window's walk counts after.
    *  Typically much shallower than recentWindowTokens. 0 = never strip by depth. */
   imageStripDepthTokens?: number;
 
@@ -1598,6 +1599,20 @@ export interface AutobiographicalConfig {
    * brief marker naming the tool and the limit; a limit of 0 replaces every
    * result of the tool.
    *
+   * The count runs over the whole conversation, not only what a compile
+   * renders raw: a result is replaced once the conversation holds N newer
+   * answered calls of its tool, folded ones included, so folding never
+   * brings a replaced result back. A result answers the earliest call with
+   * its id, in an earlier message, that no result has answered yet; a
+   * further result for an answered call goes with that call. Calls are
+   * ordered by the message that made them, and calls made in one message by
+   * where their results are stored, as the render sends them unless pairing
+   * repair moves some. A result is replaced before `maxMessageTokens` cuts its
+   * message, and the plan and the render stats price it as its marker. A
+   * fractional limit keeps its whole part. A limit that isn't a number of 0
+   * or more, such as a null from a caller outside TypeScript, sets no limit.
+   * The stored message, which chunking and compression read, is unchanged.
+   *
    * Two shapes accepted:
    *  - `number`: applies as a global default across all tools.
    *  - `Record<toolName, number>`: per-tool limit; tools not listed are
@@ -1611,9 +1626,11 @@ export interface AutobiographicalConfig {
 
   /**
    * Truncate `tool_use` block inputs whose serialized JSON exceeds this
-   * many tokens. The truncated input becomes `{ "_truncated": true,
-   * "_originalTokens": N }` plus a head slice of the original input
-   * keys for context. Default: 0 (no truncation).
+   * many tokens, at four characters a token. The truncated input becomes
+   * `{ "_truncated": true, "_originalTokens": N, "_keys": [...] }`, `_keys`
+   * holding the original input's first five keys. The plan and the render
+   * stats price the truncated input, and the stored message is unchanged.
+   * Default: 0 (no truncation).
    */
   toolUseInputMaxTokens?: number;
 
