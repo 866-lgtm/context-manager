@@ -2026,8 +2026,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Branch-scoped projection of the append-only quarantine event ledger. */
   private compressionRefusalQuarantine = new Map<string, ActiveCompressionQuarantine>();
-  /** Incremented on every initialize, including every ContextManager branch switch. */
+  /** Advanced by endGeneration(): on every initialize, every ContextManager branch switch included, and at detach(). */
   private compressionBranchGeneration = 0;
+  /** The controller of each provider call out (callProvider), until the call settles. */
+  private readonly callsOut = new Set<AbortController>();
   /**
    * Branch whose derived mirrors completed initialization. This is deliberately
    * absent while initialize() is running: partially loaded summaries/chunks/
@@ -2524,7 +2526,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // interval, not continue using the previously loaded branch.
     this.loadedBranchIdentity = null;
     this.initializingBranchIdentity = null;
-    this.compressionBranchGeneration++;
+    this.endGeneration();
     this.clearBranchMirrors();
     // Damage in the quarantine is named once per load: this load's reads name
     // what they find, on whatever store, namespace and branch it binds to.
@@ -2632,15 +2634,64 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * The manager is done with this strategy (ContextStrategy.detach). A new
    * generation fails every compression and merge still in flight at its next
    * isCompressionBranchCurrent() check, so each discards its result instead
-   * of writing. The loaded identity no longer matches either, so each
-   * entrypoint that requires the loaded branch throws, getSummary() and
-   * getStats() among them, and a drain tick already scheduled does nothing.
-   * None of these checks reads the store, which the manager may close next.
-   * The health reads, such as getCompressionQuarantineStatus(), still never
-   * throw. initialize() starts afresh.
+   * of writing, and ends the provider calls they have out (endGeneration).
+   * The loaded identity no longer matches either, so each entrypoint that
+   * requires the loaded branch throws, getSummary() and getStats() among
+   * them, and a drain tick already scheduled does nothing. None of these
+   * checks reads the store, which the manager may close next. The health
+   * reads, such as getCompressionQuarantineStatus(), still never throw.
+   * initialize() starts afresh.
    */
   detach(): void {
+    this.endGeneration();
+  }
+
+  /**
+   * Start a new generation, for initialize() and detach(). The work of the
+   * one that ends fails its next currency check, and each provider call it
+   * has out is cancelled. Membrane rejects the call at once, during the call
+   * or in its own wait before a retry, and retries nothing. A host's
+   * beforeRequest hook that is running then, or a provider client's wait
+   * inside its own retry, as @anthropic-ai/sdk 0.52.0 waits with no signal,
+   * isn't interrupted: the call ends when that returns, sending nothing more.
+   */
+  private endGeneration(): void {
     this.compressionBranchGeneration++;
+    for (const call of this.callsOut) call.abort();
+  }
+
+  /**
+   * `membrane.complete()` for the current generation's work, with a
+   * controller of its own kept in callsOut while the call is out, so that
+   * the generation's end cancels it. Each site checks its work's currency
+   * just before, with nothing awaited between, so the generation is the
+   * work's own.
+   *
+   * A controller per call, not one signal per generation: a generation lasts
+   * as long as the session, membrane hands the caller's signal to the adapter
+   * as it is when no progress deadline is set, and @anthropic-ai/sdk 0.52.0
+   * adds an abort listener to that signal for each request and never removes
+   * it (fetchWithTimeout). In a probe, one shared signal held 15 listeners
+   * after 15 settled requests, where each per-call signal held one, which
+   * goes with its call.
+   *
+   * A host can end a call too, by a signal it combines with this one in the
+   * membrane it handed in. Its cancellation comes back as itself, and each
+   * site takes it as compressionFailureKind() does, as an 'abort', once the
+   * work's currency check passes: nothing counts it, a compression's or
+   * merge's work stays queued, and a transition summary's caller gets the
+   * cancellation. That check is what tells it from the generation's own
+   * cancellation, since endGeneration() ends the generation before it aborts
+   * the calls.
+   */
+  private async callProvider(membrane: Membrane, request: NormalizedRequest): Promise<NormalizedResponse> {
+    const call = new AbortController();
+    this.callsOut.add(call);
+    try {
+      return await membrane.complete(request, { formatter: this.nativeFormatter, signal: call.signal });
+    } finally {
+      this.callsOut.delete(call);
+    }
   }
 
   /** Drop every branch-derived mirror without touching durable state. */
@@ -6894,8 +6945,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (`setTimeout` 0), so one chunk's compression doesn't block the
    * scheduling of the next. No caller awaits that tick, so nothing it throws
    * leaves the timer: a tick that comes due on a closed store doesn't run,
-   * and whatever a tick throws is logged. A tick already running when the
-   * store closes ends in the drain's own `.catch`, which logs it.
+   * and what a tick throws is logged, unless it is a host's withdrawal or
+   * cancellation (compressionFailureKind's 'abort'), which ends the drain
+   * quietly. A tick already running when the store closes ends in the
+   * drain's own `.catch`, which does the same.
    *
    * Stops if a tick fails to make progress (no queue item consumed, by
    * `_drainProgress`) — guards against runaway recursion when tick is a
@@ -6957,7 +7010,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // timer: an uncaught exception ends the host's process. A tick that
           // comes due on a store the host has closed, as its stop() closes
           // one, doesn't run, and the drain ends quietly, as on a withdrawal.
-          // Whatever the tick throws is logged, as below.
+          // What the tick throws is logged, as below, unless it is a host's
+          // withdrawal or cancellation.
           try {
             if (this.store?.isClosed()) return;
             if (this.loadedBranchIdentity !== drainIdentity || !this.isLoadedBranchCurrent()) return;
@@ -6968,8 +7022,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }, 0);
       })
       .catch((err) => {
-        // A host's withdrawal stops the drain quietly: the host asked for it.
-        if (isCompressionWithdrawn(err)) return;
+        // A host's withdrawal, or its cancellation of a call, stops the drain
+        // quietly: the host asked for it.
+        if (compressionFailureKind(err) === 'abort') return;
         this.diag.error(`AutobiographicalStrategy: speculative-drain error: ${describeCompressionFailure(err)}`);
       });
   }
@@ -7307,9 +7362,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.noteCompressionLanded(mergeMembrane, mergeModel);
         }
       } catch (error) {
-        // Withdrawn by the host: no attempt, no streak; the merge stays at the
-        // head of the queue for the next tick.
-        if (isCompressionWithdrawn(error)) throw error;
+        // Withdrawn by the host, or its call cancelled by the host: no
+        // attempt, no streak; the merge stays at the head of the queue for
+        // the next tick.
+        if (compressionFailureKind(error) === 'abort') throw error;
         // Terminal-disposition rejection: the LLM answered, but with a
         // refusal / truncation / tool call / empty — bounded-retry policy,
         // not a crash. Anything else (429, network, timeout) keeps the
@@ -9436,6 +9492,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // preimage — keys off this, so a summary's provenance never names a
         // request the model never saw (sol review, 2026-08-24).
         let acceptedRequest = attemptRequest;
+        // A call's error, when its work lost its branch or strategy
+        // generation while the call was out (a detach, a branch move), is
+        // discarded as the call's result would be: no rung counts it, a split
+        // part abandons nothing on it, and no second call follows. A host's
+        // withdrawal (CompressionWithdrawn) keeps its own path on any branch,
+        // as in ladderStep. A cancellation is discarded with the rest, since
+        // the generation's end makes one too.
+        const discardIfStale = (error: unknown): void => {
+          if (isCompressionWithdrawn(error) || this.isCompressionBranchCurrent(sourceBranch)) return;
+          this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:error`, quarantineRecord);
+          throw Object.assign(new Error('Compression error crossed a branch boundary'), {
+            name: 'CompressionBranchDiscard',
+          });
+        };
         // The transport's rejection of this exact request's reasoning carriers
         // is a deterministic answer like any rung's, kept under its own
         // identity: a resumed ladder goes straight to the stripped request.
@@ -9447,10 +9517,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (carrierKnownRejected) {
             throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
           }
-          response = await ctx.membrane!.complete(
-            attemptRequest,
-            { formatter: this.nativeFormatter },
-          );
+          response = await this.callProvider(ctx.membrane!, attemptRequest);
           // An answer ends its route's pause, on whatever branch.
           this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(attemptRequest));
         } catch (error) {
@@ -9459,6 +9526,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             noteDispatchedModel(error, attemptRequest);
             if (error !== null && typeof error === 'object') dispatchedRequestHash.set(error, attemptHash);
           }
+          discardIfStale(error);
           // Degraded mode: the transport rejected the carrier blocks
           // themselves (invalid_request about thinking — never a refusal).
           // Retry this attempt once with text-only recall pairs, loudly. Only a
@@ -9471,14 +9539,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             !requestCarriesReasoning(attemptRequest)
           )) {
             throw error;
-          }
-          // Work that lost its branch or strategy generation while the first
-          // call was out (a detach, a branch move) makes no second one.
-          if (!this.isCompressionBranchCurrent(sourceBranch)) {
-            this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:before_call`, quarantineRecord);
-            throw Object.assign(new Error('Compression result crossed a branch boundary'), {
-              name: 'CompressionBranchDiscard',
-            });
           }
           if (!known) {
             noteOutcome({
@@ -9505,10 +9565,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // prepared request stays prepared.
           acceptedRequest = stripReasoningFromRequest(attemptRequest);
           try {
-            response = await ctx.membrane!.complete(
-              acceptedRequest,
-              { formatter: this.nativeFormatter },
-            );
+            response = await this.callProvider(ctx.membrane!, acceptedRequest);
           } catch (retryError) {
             noteDispatchedModel(retryError, acceptedRequest);
             if (retryError !== null && typeof retryError === 'object') {
@@ -10364,13 +10421,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             } catch (error) {
               // A deferral by the caller's provider admission made no call:
               // it takes no window slot and counts as no call. Nor does a
-              // host's withdrawal, which is no outcome of this part either:
+              // host's withdrawal, or its cancellation of the call
+              // (compressionFailureKind's 'abort'), which is no outcome of
+              // this part either:
               // its slot goes back once its call returns (until then the slot
               // counts), so withdrawn parts don't accumulate in the window. A
               // part sends one call: its request carries no reasoning
               // (buildSub strips the raw thinking and adds no recall pairs), so
               // the carrier fallback never sends a second.
-              if (isNoCallDeferral(error) || isCompressionWithdrawn(error)) {
+              if (isNoCallDeferral(error) || compressionFailureKind(error) === 'abort') {
                 calls--;
                 attempted.calls--;
                 const at = this.splitCallTimes.lastIndexOf(slot);
@@ -10813,6 +10872,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.logCompressionBranchDiscard(sourceBranch, logWithdrawn ? 'canonical_withdrawn' : 'canonical_error', quarantineRecord);
         return;
       }
+      // On work still current, a host's cancellation of a call
+      // (compressionFailureKind's 'abort') is a withdrawal too. On a moved
+      // branch it was discarded just above with the rest, as the strategy's
+      // own cancellation is.
+      if (compressionFailureKind(error) === 'abort') logWithdrawn = true;
       if (error instanceof CompressionSplitWindowWait) {
         // Nothing failed: the chunk waits for the split rung's call window.
         this.diag.warn(`[autobiographical] ${error.message}; the chunk from ${chunk.messages[0]?.id ?? '?'} waits ${Math.ceil(error.waitMs / 1000)} s`);
@@ -10820,8 +10884,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         inFlightError = error;
         throw error;
       }
-      // A host's withdrawal is no failure: its receipt says withdrawn, and
-      // the lane doesn't pause.
+      // A host's withdrawal or cancellation is no failure: its receipt says
+      // withdrawn, and the lane doesn't pause.
       if (!logWithdrawn) {
         this.diag.error(`Failed to compress chunk (hierarchical): ${describeCompressionFailure(error)}`);
         // A failure that says nothing about the request pauses the lane; the
@@ -11788,13 +11852,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // succeeds it is the request the transport accepted, which authored the
     // merge. See the L1 ladder's `acceptedRequest` (sol review, 2026-08-24).
     let acceptedRequest = dispatchRequest;
+    // As in the L1 ladder, a call's error on work that lost its currency is
+    // discarded as its result would be: the merge returns quietly, and makes
+    // no second call. A host's withdrawal (CompressionWithdrawn) keeps its own
+    // path on any branch; a cancellation is discarded with the rest, since
+    // the generation's end makes one too.
+    const stale = (error: unknown): boolean =>
+      !isCompressionWithdrawn(error) && !this.isCompressionBranchCurrent(sourceBranch);
+    // Preparing the request can run a subclass's prepareCompressionRequest(),
+    // so the currency is checked again just before the call, as each L1
+    // attempt checks it: a generation ended there makes no call.
+    if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
 
     try {
       let response: NormalizedResponse;
       try {
-        response = await ctx.membrane.complete(dispatchRequest, { formatter: this.nativeFormatter });
+        response = await this.callProvider(ctx.membrane, dispatchRequest);
       } catch (error) {
         noteDispatchedModel(error, dispatchRequest);
+        // An error on work that lost its currency is discarded as its result
+        // would be, before the carrier fallback: no second call follows.
+        if (stale(error)) return false;
         // Same degraded-mode fallback as the L1 ladder: transport rejected
         // the carrier blocks → retry once text-only, loudly. Only a failure
         // classified as a request-attributable rejection qualifies, which a
@@ -11804,8 +11882,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           !isCarrierTransportRejection(error) ||
           !requestCarriesReasoning(dispatchRequest)
         ) throw error;
-        // As in the L1 ladder: no second call for work that lost its currency.
-        if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
         this.diag.error(
           `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
             `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -11819,9 +11895,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // prepared request stays prepared.
         acceptedRequest = stripReasoningFromRequest(dispatchRequest);
         try {
-          response = await ctx.membrane.complete(acceptedRequest, { formatter: this.nativeFormatter });
+          response = await this.callProvider(ctx.membrane, acceptedRequest);
         } catch (retryError) {
           noteDispatchedModel(retryError, acceptedRequest);
+          if (stale(retryError)) return false;
           throw retryError;
         }
       }
@@ -11975,15 +12052,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.checkMergeThreshold();
       return true;
     } catch (error) {
+      // A host's withdrawal, or its cancellation of the call, is no failure:
+      // it logs nothing, and its receipt says withdrawn rather than carrying
+      // an error.
+      const withdrawn = compressionFailureKind(error) === 'abort';
       // Disposition rejections already warned + receipted above — don't
       // double-log them as crashes; tick() consumes them for retry policy.
       if (error instanceof MergeHoldDiscard) {
         this.diag.warn(`[autobiographical] ${error.message}; the merge stays queued until the hold is released`);
-      } else if (!(error instanceof MergeDispositionRejection) && !isCompressionWithdrawn(error)) {
+      } else if (!(error instanceof MergeDispositionRejection) && !withdrawn) {
         this.diag.error(`Failed to merge summaries into L${targetLevel}: ${describeCompressionFailure(error)}`);
       }
-      // A withdrawal's receipt says withdrawn rather than carrying an error.
-      if (isCompressionWithdrawn(error)) logWithdrawn = true;
+      if (withdrawn) logWithdrawn = true;
       else logError = boundFailureLogText(error instanceof Error ? error.message : String(error));
       throw error;
     } finally {
@@ -16121,10 +16201,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       'transition',
     );
     const prepared = preparation.request;
-    const response = await ctx.membrane.complete(prepared, { formatter: this.nativeFormatter });
-    if (!this.isCompressionBranchCurrent(sourceBranch)) {
-      throw new Error('Transition summary crossed a branch generation; reinitialize before retrying');
+    const crossed = (cause?: unknown) => new Error(
+      'Transition summary crossed a branch generation; reinitialize before retrying',
+      cause === undefined ? undefined : { cause },
+    );
+    // Preparing the request can run a subclass's prepareCompressionRequest(),
+    // so the currency is checked again just before the call: a generation
+    // ended there makes no call.
+    if (!this.isCompressionBranchCurrent(sourceBranch)) throw crossed();
+    let response: NormalizedResponse;
+    try {
+      response = await this.callProvider(ctx.membrane, prepared);
+    } catch (error) {
+      // An error on work that lost its currency while the call was out says
+      // so, as its result would below. A host's withdrawal
+      // (CompressionWithdrawn) keeps its own path on any branch; a
+      // cancellation says so with the rest, since the generation's end makes
+      // one too.
+      if (!isCompressionWithdrawn(error) && !this.isCompressionBranchCurrent(sourceBranch)) throw crossed(error);
+      throw error;
     }
+    if (!this.isCompressionBranchCurrent(sourceBranch)) throw crossed();
     // Text-only on purpose: summarizer scratch thinking is not agent history
     return response.content
       .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
