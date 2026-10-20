@@ -105,7 +105,7 @@ describe('the scripts on a store whose compression quarantine ledger can\'t be r
     const finish = seen.at(-1)!;
     assert.equal(finish.completed, false);
     assert.equal(finish.quarantines, null);
-    assert.match(String(finish.debtError), /quarantine ledger couldn't be read: ledger unreadable \(test\)/);
+    assert.match(String(finish.debtError), /compression quarantine ledger \(ledger unreadable \(test\)\)\./);
   });
 
   it('the drain fails when its last report can\'t read the ledger, though it finished', () => {
@@ -114,12 +114,13 @@ describe('the scripts on a store whose compression quarantine ledger can\'t be r
     const finish = events(r.stdout).at(-1)!;
     assert.equal(finish.completed, true, `setup: it finished, and only its last report failed:\n${r.stdout}`);
     assert.equal(finish.quarantines, null);
-    assert.match(String(finish.debtError), /quarantine ledger couldn't be read: ledger unreadable \(test\)/);
+    assert.match(String(finish.debtError), /compression quarantine ledger \(ledger unreadable \(test\)\)\./);
   });
 
   it('the audit prints the report\'s error, and exits 0 with no topology violations', () => {
     const r = run(AUDIT, [pending, '--namespace', 'probe'], UNREADABLE_LEDGER);
     assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /compression debt unknown \(the compression quarantine ledger couldn't be read: ledger unreadable \(test\)\)/);
+    assert.match(r.stdout, /compression debt unknown\n  Compression can't run\.\n  Cause: the store couldn't read a record compression needs, this agent's compression quarantine ledger \(ledger unreadable \(test\)\)\.\n  Effect: [^\n]+\n  Fix: [^\n]+\n/,
+      'the summary, then the error a line each');
   });
 });

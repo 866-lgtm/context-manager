@@ -227,7 +227,13 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
     const d = s.getCompressionDebt(NOW);
     assert.equal(d.state, 'unknown', 'with nothing else owed, one record would make it degraded and none healthy');
     assert.equal(d.compressionQuarantineCount, null, 'a count it couldn\'t read is null, never 0');
-    assert.match(d.error ?? '', /quarantine ledger couldn't be read: ledger unreadable \(test\)/);
+    assert.equal(d.error, [
+      "Compression can't run.",
+      "Cause: the store couldn't read a record compression needs, this agent's compression quarantine ledger (ledger unreadable (test)).",
+      "Effect: no new conversation is summarized while this lasts. Once the conversation it hasn't summarized no longer fits in its context budget, its turns fail until compression catches up.",
+      'Fix: fix what the cause names. Compression resumes by itself once the ledger reads.',
+    ].join('\n'), 'what happened, what it means and what to do, a line each');
+    assert.equal(d.failure, 'quarantine-ledger');
     assert.equal(d.pendingChunks, 0, 'what it could read is still reported');
     assert.equal(d.mergeQuarantineCount, 0);
   });
@@ -239,6 +245,7 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
     assert.equal(d.compressionQuarantineCount, 2);
     assert.equal(d.state, 'degraded');
     assert.equal(d.error, undefined);
+    assert.equal(d.failure, undefined);
   });
 
   it('a ledger it can\'t read leaves the state that the rest decides', () => {
@@ -262,7 +269,8 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
     const d = crossed.getCompressionDebt(NOW);
     assert.equal(d.state, 'critical', 'crossed ownership is critical whatever the ledger holds');
     assert.equal(d.compressionQuarantineCount, null);
-    assert.match(d.error ?? '', /quarantine ledger couldn't be read/, 'the error is given with a decided state too');
+    assert.match(d.error ?? '', /^Compression can't run\.\nCause: the store couldn't read a record compression needs, this agent's compression quarantine ledger \(/, 'the error is given with a decided state too');
+    assert.equal(d.failure, 'quarantine-ledger');
 
     const old = fresh();
     old.breakLedger();
@@ -275,9 +283,15 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
     Object.defineProperty(s, 'chunks', { get() { throw new RangeError('chunks unreadable (test)'); }, configurable: true });
     const d = s.getCompressionDebt(NOW);
     assert.equal(d.state, 'unknown');
-    assert.match(d.error ?? '', /couldn't be computed: chunks unreadable \(test\)/);
+    assert.equal(d.error, [
+      'The compression debt report failed.',
+      'Cause: chunks unreadable (test)',
+      "Effect: the report can't say whether compression is keeping up. Compression itself may be running normally.",
+      'Fix: this points to a fault in context-manager. Report it to its maintainers with this text.',
+    ].join('\n'));
+    assert.equal(d.failure, 'report');
     for (const [field, value] of Object.entries(d)) {
-      if (field === 'state' || field === 'error') continue;
+      if (field === 'state' || field === 'error' || field === 'failure') continue;
       assert.equal(value, null, `${field} is null, not a guess`);
     }
   });
@@ -296,7 +310,8 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
     s.breakLedger(new Error('another failure (test)'));
     const again = logged(() => s.getCompressionDebt(NOW));
     assert.equal(again.length, 1, 'the same failure logs again after a success');
-    assert.match(again[0]!, /another failure \(test\); the report gives null for each count it couldn't compute ns=agents\/probe/);
+    assert.match(again[0]!, /^\[compression-debt\] Compression can't run\. ns=agents\/probe\nCause: [^\n]*\(another failure \(test\)\)\.\nEffect: [^\n]+\nFix: fix what the cause names\. Compression resumes by itself once the ledger reads\.\s/,
+      'the error whole, the namespace on its first line, and nothing after it but the thrown value');
   });
 
   it('an outright failure, a partial one and a report that reads log a line each', () => {
@@ -311,8 +326,8 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
       assert.equal(s.getCompressionDebt(NOW).state, 'healthy');
     });
     assert.equal(lines.length, 3, lines.join('\n'));
-    assert.match(lines[0]!, /^\[compression-debt\] the report couldn't be computed: chunks unreadable \(test\);/);
-    assert.match(lines[1]!, /^\[compression-debt\] the compression quarantine ledger couldn't be read: ledger unreadable \(test\);/);
+    assert.match(lines[0]!, /^\[compression-debt\] The compression debt report failed\.\nCause: chunks unreadable \(test\)\n/);
+    assert.match(lines[1]!, /^\[compression-debt\] Compression can't run\.\nCause: the store couldn't read a record compression needs, this agent's compression quarantine ledger \(ledger unreadable \(test\)\)\.\n/);
     assert.equal(lines[2], '[compression-debt] the report reads again');
   });
 
@@ -331,13 +346,13 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
     const s = fresh();
     s.breakLedger(new Error('100%s gone (test)'));
     const [line] = logged(() => s.getCompressionDebt(NOW));
-    assert.match(line ?? '', /couldn't be read: 100%s gone \(test\); the report gives null/);
+    assert.match(line ?? '', /compression quarantine ledger \(100%s gone \(test\)\)\.\n/);
   });
 
   it('a thrown value that isn\'t an Error is the error\'s text', () => {
     const s = fresh();
     Object.defineProperty(s, 'chunks', { get() { throw 'chunks unreadable (test)'; }, configurable: true });
-    assert.equal(s.getCompressionDebt(NOW).error, "the report couldn't be computed: chunks unreadable (test)");
+    assert.match(s.getCompressionDebt(NOW).error ?? '', /^The compression debt report failed\.\nCause: chunks unreadable \(test\)\n/);
   });
 
   it('a thrown value with no text still gives the report an error', () => {
@@ -348,7 +363,7 @@ describe('getCompressionDebt when it can\'t read what it reports', () => {
     Object.defineProperty(s, 'chunks', { get() { throw odd; }, configurable: true });
     const d = s.getCompressionDebt(NOW);
     assert.equal(d.state, 'unknown');
-    assert.equal(d.error, "the report couldn't be computed: an error that could not be described");
+    assert.match(d.error ?? '', /^The compression debt report failed\.\nCause: an error that could not be described\n/);
   });
 
   it('a logger that throws doesn\'t make the report throw', () => {
