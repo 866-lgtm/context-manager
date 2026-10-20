@@ -172,7 +172,8 @@ function oneLine(text: string): string {
  * the model stops with, since it reads the ledger first. A line saying what
  * happened, then its cause, its effect and its fix, so a surface that shows it
  * whole breaks it where a reader looks. Short enough that a cause of 180
- * characters keeps it under 500, where alerts are often cut.
+ * characters keeps it under 500, where connectome-host's status notices and
+ * agent-framework's alert webhook cut a message.
  */
 function compressionQuarantineUnreadableMessage(cause: unknown): string {
   return [
@@ -210,6 +211,21 @@ class CompressionQuarantineUnreadableError extends Error {
     super(compressionQuarantineUnreadableMessage(cause), { cause });
     this.name = 'CompressionQuarantineUnreadableError';
   }
+}
+
+/**
+ * Whether a merge-quarantine record still holds its group as it was refused:
+ * every source present and unparented. The sweep removes a record once it
+ * doesn't, and the debt report counts a topology refusal only while it does.
+ */
+function mergeRecordStands(
+  record: MergeQuarantineRecord,
+  summaryById: (id: string) => SummaryEntry | undefined,
+): boolean {
+  return record.sourceIds.every((id) => {
+    const summary = summaryById(id);
+    return summary !== undefined && !getSummaryParentId(summary);
+  });
 }
 
 /** A no-call refusal by the caller's provider admission: nothing failed. */
@@ -2499,9 +2515,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.compressionBranchGeneration++;
     this.clearBranchMirrors();
     // Damage in the quarantine is named once per load: this load's reads name
-    // what they find, on whatever store, namespace and branch it binds to.
+    // what they find, on whatever store, namespace and branch it binds to. So
+    // is a debt report's failure: one that lasts across a branch switch is
+    // logged again for the new branch, and no recovery is logged for a
+    // branch that never failed.
     this.namedDroppedQuarantineKeys.clear();
     this.namedUnlistedQuarantineState.clear();
+    this.compressionDebtFailureLogged = null;
 
     // Bind to the chronicle store + namespace for persistent strategy state.
     this.store = ctx.store;
@@ -6495,11 +6515,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const s of this.summaries) byId.set(s.id, s);
     let swept = 0;
     for (const [key, record] of [...this.mergeQuarantine]) {
-      const live = record.sourceIds.filter((id) => {
-        const s = byId.get(id);
-        return s !== undefined && !getSummaryParentId(s);
-      });
-      if (live.length !== record.sourceIds.length) {
+      if (!mergeRecordStands(record, (id) => byId.get(id))) {
         this.mergeQuarantine.delete(key);
         swept++;
       }
@@ -7521,7 +7537,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
   }
 
-  /** The failure getCompressionDebt() last logged, so one that lasts across polls logs once. */
+  /** The failure getCompressionDebt() last logged on this load, so one that lasts across polls logs once. */
   private compressionDebtFailureLogged: string | null = null;
 
   /**
@@ -7608,8 +7624,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     /** Summaries with crossed ownership found by the load-time audit (topologyPolicy 'report'). */
     topologyViolations: number | null;
     /** Merge groups standing in the merge quarantine because merging them would have minted
-     *  a crossed node. Each holds `critical` until its record goes: an operator clears it,
-     *  its group queues as a valid merge, or the sweep finds a source parented or gone. */
+     *  a crossed node: records whose every source is still present and unparented. Each holds
+     *  `critical` until an operator clears it, its group queues as a valid merge, or a source
+     *  is parented or gone, which the sweep then removes. */
     topologyRefusals: number | null;
   } {
     const DEGRADED_AFTER_MS = 60 * 60 * 1000;
@@ -7636,9 +7653,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       const mergeQuarantineCount = this.mergeQuarantine.size;
       const ledger = this.compressionQuarantineRecordCount();
+      // A refusal counts while its group stands as it was refused, by the
+      // sweep's own test, so a group paid off since reads as paid off before
+      // a sweep runs: in an audit, which never ticks, and between ticks.
       let topologyRefusals = 0;
       for (const record of this.mergeQuarantine.values()) {
-        if (record.lastOutcome === 'topology_violation') topologyRefusals++;
+        if (record.lastOutcome === 'topology_violation' && mergeRecordStands(record, (id) => this.summaryById(id))) topologyRefusals++;
       }
       const mints = this.summaries
         .map((s) => s.created)

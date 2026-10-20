@@ -115,7 +115,7 @@ function l1r(id: string, src: string[], level = 1): SummaryEntry {
     sourceRange: { first: src[0], last: src[src.length - 1] }, created: 1 } as SummaryEntry;
 }
 const STORES = ['./test-topology-guard-demand', './test-topology-guard-refuse', './test-topology-guard-pass', './test-topology-guard-store',
-  './test-topology-guard-cleared', './test-topology-guard-restart'];
+  './test-topology-guard-cleared', './test-topology-guard-restart', './test-topology-guard-paid-off'];
 const wipe = () => { for (const s of STORES) if (existsSync(s)) rmSync(s, { recursive: true, force: true }); };
 
 describe('demand-path merges respect holes (issue #95)', () => {
@@ -210,6 +210,17 @@ describe('a crossed merge is refused at mint time', () => {
     } finally {
       reopened.close();
     }
+  });
+
+  test('a refused group paid off since reads as paid off before a sweep removes its record', async () => {
+    const { manager, p } = await refusedCrossedMerge(STORES[6]);
+    // a merges validly with b afterwards, which parents a source of the refused group a+c.
+    for (const summary of p.allSummaries()) if (summary.id === 'a' || summary.id === 'b') summary.mergedInto = 'ab';
+    const debt = p.getCompressionDebt();
+    assert.equal(p.quarantine().size, 1, 'setup: no sweep has removed the record');
+    assert.equal(debt.topologyRefusals, 0, 'the record no longer stands as a refusal');
+    assert.notEqual(debt.state, 'critical');
+    manager.close();
   });
 
   test('adjacent sources pass the gate (reaches the summarizer)', async () => {

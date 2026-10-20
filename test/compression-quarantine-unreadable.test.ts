@@ -85,4 +85,51 @@ describe('compression while the quarantine ledger cannot be read', () => {
       manager.close();
     }
   });
+
+  it("logs a failure again on a branch it switches to, and no recovery for a branch that never failed", async () => {
+    const strategy = new AutobiographicalStrategy({ autoTickOnNewMessage: false, quarantineAlarmIntervalMs: 0 } as never);
+    const path = `${BASE}-branches-${process.pid}`;
+    paths.push(path);
+    const manager = await ContextManager.open({ path, strategy });
+    const lines: string[] = [];
+    const realError = console.error, realWarn = console.warn;
+    const logged = (read: () => void): string[] => {
+      lines.length = 0;
+      console.error = (...a: unknown[]) => { lines.push(String(a[0])); };
+      console.warn = (...a: unknown[]) => { lines.push(String(a[0])); };
+      try { read(); } finally { console.error = realError; console.warn = realWarn; }
+      return lines.filter((line) => line.startsWith('[compression-debt]'));
+    };
+    try {
+      const ids = [0, 1, 2, 3].map((i) => manager.addMessage(i % 2 ? 'Claude' : 'User', [text(`raw-${i}`)]));
+      const internals = strategy as unknown as {
+        store: { getStateJson(id: string): unknown };
+        compressionRefusalQuarantineLedgerStateId: string;
+        compressionRefusalQuarantineStateId: string;
+      };
+      // While `broken`, the store can't read the ledger's state on whichever branch is loaded.
+      let broken = false;
+      const store = internals.store;
+      const read = store.getStateJson.bind(store);
+      const cause = new Error('ledger unreadable (test)');
+      store.getStateJson = (id: string) => {
+        const ledger = [internals.compressionRefusalQuarantineLedgerStateId, internals.compressionRefusalQuarantineStateId];
+        if (broken && ledger.includes(id)) throw cause;
+        return read(id);
+      };
+      broken = true;
+      assert.equal(logged(() => strategy.getCompressionDebt()).length, 1, 'setup: the failure is logged on the first branch');
+      broken = false;
+      await manager.switchBranch(manager.branchAt(ids[3]!, 'other'));
+      broken = true;
+      assert.equal(logged(() => strategy.getCompressionDebt()).length, 1, 'the same failure is logged again on the branch switched to');
+      broken = false;
+      await manager.switchBranch(manager.branchAt(ids[3]!, 'third'));
+      assert.deepEqual(logged(() => strategy.getCompressionDebt()), [], 'a branch that never failed logs no recovery');
+    } finally {
+      console.error = realError;
+      console.warn = realWarn;
+      manager.close();
+    }
+  });
 });
