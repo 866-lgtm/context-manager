@@ -451,7 +451,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const realError = console.error;
     console.error = (...args: unknown[]) => { errors.push(args); };
     try {
-      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: new ThrowingDetach() });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: new ThrowingDetach(), namespace: 'agents/zz-throwing' });
       const replacement = new ThrowingDetach();
       await manager.setStrategy(replacement);
       assert.strictEqual(manager.getStrategy(), replacement);
@@ -459,7 +459,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       manager.addMessage('User', [{ type: 'text', text: 'still works' }]);
       manager.close();
       assert.strictEqual(manager.getStore().isClosed(), true, 'close() closed the store it owns');
-      assert.strictEqual(errors.filter((args) => args[0] === 'Strategy detach failed:').length, 2, 'each failed detach is logged');
+      assert.strictEqual(errors.filter((args) => args[0] === 'Strategy detach failed: ns=agents/zz-throwing').length, 2, 'each failed detach is logged, naming its namespace');
     } finally {
       console.error = realError;
     }
@@ -820,15 +820,15 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const unhandled = watchUnhandled();
     try {
       const errors = await errorsDuring(async () => {
-        const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: new AsyncDetach() });
+        const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: new AsyncDetach(), namespace: 'agents/zz-async' });
         await manager.setStrategy(new PassthroughStrategy());
         await settle(20);
         manager.close();
       });
       assert.deepStrictEqual(unhandled.seen, [], 'no unhandled rejection');
       assert.ok(
-        errors.some((args) => args[0] === 'Strategy detach failed:' && args[1] === 'passthrough' && String(args[2]).includes('async detach failed')),
-        'the rejection is logged with the strategy\'s name',
+        errors.some((args) => args[0] === 'Strategy detach failed: ns=agents/zz-async' && args[1] === 'passthrough' && String(args[2]).includes('async detach failed')),
+        'the rejection is logged with the strategy\'s name and the manager\'s namespace',
       );
     } finally {
       unhandled.restore();
@@ -1161,15 +1161,15 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const unhandled = watchUnhandled();
     try {
       const errors = await errorsDuring(async () => {
-        const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: new ThenableDetach() });
+        const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: new ThenableDetach(), namespace: 'agents/zz-thenable' });
         await manager.setStrategy(new PassthroughStrategy());
         await settle(20);
         manager.close();
       });
       assert.deepStrictEqual(unhandled.seen, [], 'no unhandled rejection');
       assert.ok(
-        errors.some((args) => args[0] === 'Strategy detach failed:' && args[1] === 'passthrough' && String(args[2]).includes('thenable detach failed')),
-        "the rejection is logged with the strategy's name",
+        errors.some((args) => args[0] === 'Strategy detach failed: ns=agents/zz-thenable' && args[1] === 'passthrough' && String(args[2]).includes('thenable detach failed')),
+        "the rejection is logged with the strategy's name and the manager's namespace",
       );
     } finally {
       unhandled.restore();
@@ -1702,13 +1702,19 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     });
   }
 
-  // An instance set again while its detached tick's call is out: the new
-  // generation's tick holds the single-flight marker, and the detached tick
-  // settling must leave it, or the next tick starts work beside the new
-  // tick's. Both ways an instance is set again: a new manager on the same
-  // app-owned store after close(), and setStrategy() on the same manager.
-  for (const reuse of ['reopen', 'setStrategy'] as const) {
-    it(`an instance set again (${reuse}) while its detached compression's call is out starts no work beside the new generation's when that call settles`, async () => {
+  // An instance started again while its last generation's tick has a call
+  // out: the next tick starts no work beside the new generation's. A new
+  // manager on the same app-owned store after close(), and setStrategy() on
+  // the same manager, start the new generation on the same branch, so its
+  // first compression joins the last generation's call for the same chunk:
+  // these two pin the hand-back of that thrown-away work. A fork() starts it
+  // on another branch, whose in-flight key differs, so its own compression is
+  // under way, its tick holding the single-flight marker, when the last
+  // generation's call settles: that one pins the L1 tick's clear of only its
+  // own marker, which the next tick would otherwise find empty. The merge
+  // test after this loop pins the merge tick's.
+  for (const reuse of ['reopen', 'setStrategy', 'fork'] as const) {
+    it(`an instance started again (${reuse}) while its last generation's compression call is out starts no work beside the new generation's when that call settles`, async () => {
       const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
       const { calls, membrane } = heldMembrane();
       const strategy = newStrategy();
@@ -1723,9 +1729,11 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         if (reuse === 'reopen') {
           first.close();
           manager = await ContextManager.open({ store, strategy, membrane: membrane as never });
-        } else {
+        } else if (reuse === 'setStrategy') {
           await first.setStrategy(new PassthroughStrategy());
           await first.setStrategy(strategy);
+        } else {
+          await first.fork();
         }
         await manager.compile();
         const newTick = manager.tick();
@@ -2138,7 +2146,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
         return { bodyGroupId: 'group', shards: [0, 1].map((i) => ({ content: [{ type: 'text' as const, text: `shard ${i}` }], shardIndex: i })) };
       }
     }
-    const manager = await ContextManager.open({ path, strategy: new ShardingStrategy() });
+    const manager = await ContextManager.open({ path, strategy: new ShardingStrategy(), namespace: 'agents/zz-close' });
     try {
       const store = manager.getStore();
       const closeStore = store.close.bind(store);
@@ -2149,7 +2157,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       });
       assert.ok(store.isClosed(), 'the store is closed');
       assert.ok(
-        logged.some((line) => line.includes('closing the store after a close() from a listener failed') && line.includes('the final sync failed')),
+        logged.some((line) => line.includes('closing the store after a close() from a listener failed; the store is closed all the same: ns=agents/zz-close ') && line.includes('the final sync failed')),
         `the failure is logged: ${JSON.stringify(logged)}`,
       );
     } finally {
