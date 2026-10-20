@@ -7453,40 +7453,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // render and writes nothing, so a preview can't strip images from the next
     // live compile. It's loaded here, before it's saved, so the value put back
     // is the loaded one.
-    const saved = {
-      imageWatermark: this.imageWatermark(),
-      postStripMemo: this._postStripMemo,
-      chunks: this.chunks,
-      compressionQueue: this.compressionQueue,
-      compressionQueueGeneration: this.compressionQueueGeneration,
-      // The dry rebuild orders its queue (orderCompressionQueue), which prunes
-      // the failure orders, runs and window waits of chunks its own cut
-      // doesn't have, and the failure orders and runs of merges not queued
-      // now. A dry select commits nothing, so all of them are put back as
-      // they were.
-      compressionFailureOrder: new Map(this.compressionFailureOrder),
-      compressionNotBefore: new Map(this.compressionNotBefore),
-      mergeFailureOrder: new Map(this.mergeFailureOrder),
-      compressionFailureRuns: new Map(this.compressionFailureRuns),
-      mergeFailureRuns: new Map(this.mergeFailureRuns),
-      chunkRecordsOrphaned: this.chunkRecordsOrphaned,
-      orphanWarned: this._orphanWarned,
-      prevCacheKeys: this._prevCacheKeys,
-      lastFrontierTokens: this.lastFrontierTokens,
-      transitionBlocked: this.transitionBlocked,
-      lastRenderStats: this._lastRenderStats,
-      lastCompileEstimate: this._lastCompileEstimate,
-      calibrationArmed: this._calibrationArmed,
-      calibrationLoaded: this._calibrationLoaded,
-      calibration: this._calibration,
-      calibrationReset: this._calibrationReset,
-      calibrationProvisional: this._calibrationProvisional,
-      storeCalibration: store.getTokenCalibration?.(),
-      storeView: this._storeView,
-      storeOrder: this._storeOrder,
-      storeOrderSource: this._storeOrderSource,
-      headStartMemo: this._cachedHeadStartIndex,
-    };
+    const restore = this.saveDryRunState(store);
+    const lastRenderStats = this._lastRenderStats;
     this._lastPreviewStats = undefined;
     this._dryRunSelect = true;
     try {
@@ -7497,36 +7465,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._dryRunSelect = false;
       // Only stats this dry run produced are its preview's: on a throw before
       // they're written, the previous select's must not pose as the preview's.
-      if (this._lastRenderStats !== saved.lastRenderStats) {
+      if (this._lastRenderStats !== lastRenderStats) {
         this._lastPreviewStats = this._lastRenderStats ?? undefined;
       }
-      this._imageWatermark = saved.imageWatermark;
-      this._postStripMemo = saved.postStripMemo;
-      this.chunks = saved.chunks;
-      this.compressionQueue = saved.compressionQueue;
-      this.compressionQueueGeneration = saved.compressionQueueGeneration;
-      this.compressionFailureOrder = saved.compressionFailureOrder;
-      this.compressionNotBefore = saved.compressionNotBefore;
-      this.mergeFailureOrder = saved.mergeFailureOrder;
-      this.compressionFailureRuns = saved.compressionFailureRuns;
-      this.mergeFailureRuns = saved.mergeFailureRuns;
-      this.chunkRecordsOrphaned = saved.chunkRecordsOrphaned;
-      this._orphanWarned = saved.orphanWarned;
-      this._prevCacheKeys = saved.prevCacheKeys;
-      this.lastFrontierTokens = saved.lastFrontierTokens;
-      this.transitionBlocked = saved.transitionBlocked;
-      this._lastRenderStats = saved.lastRenderStats;
-      this._lastCompileEstimate = saved.lastCompileEstimate;
-      this._calibrationArmed = saved.calibrationArmed;
-      this._calibrationLoaded = saved.calibrationLoaded;
-      this._calibration = saved.calibration;
-      this._calibrationReset = saved.calibrationReset;
-      this._calibrationProvisional = saved.calibrationProvisional;
-      if (saved.storeCalibration !== undefined) store.setTokenCalibration?.(saved.storeCalibration);
-      this._storeView = saved.storeView;
-      this._storeOrder = saved.storeOrder;
-      this._storeOrderSource = saved.storeOrderSource;
-      this._cachedHeadStartIndex = saved.headStartMemo;
+      restore();
     }
   }
 
@@ -18267,5 +18209,157 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const content = this.truncateContent(msg.content, msgCap, (blocks) =>
       blocks === msg.content ? this.estimateTextOnlyTokens(msg) : this.estimateTextOnlyTokens({ content: blocks } as StoredMessage));
     return { content, extra: cappedPriceExtra(store, msg, content) };
+  }
+
+  /**
+   * What a dry select puts back on every path out (see the dry branch in
+   * `select`), saved now: the returned function puts it back. A dry select
+   * and `renderAsNewest` share it, so a render leaves what the next compile
+   * reads as it found it.
+   */
+  private saveDryRunState(store: MessageStoreView): () => void {
+    const saved = {
+      imageWatermark: this.imageWatermark(),
+      postStripMemo: this._postStripMemo,
+      chunks: this.chunks,
+      compressionQueue: this.compressionQueue,
+      compressionQueueGeneration: this.compressionQueueGeneration,
+      // The dry rebuild orders its queue (orderCompressionQueue), which prunes
+      // the failure orders, runs and window waits of chunks its own cut
+      // doesn't have, and the failure orders and runs of merges not queued
+      // now. A dry select commits nothing, so all of them are put back as
+      // they were.
+      compressionFailureOrder: new Map(this.compressionFailureOrder),
+      compressionNotBefore: new Map(this.compressionNotBefore),
+      mergeFailureOrder: new Map(this.mergeFailureOrder),
+      compressionFailureRuns: new Map(this.compressionFailureRuns),
+      mergeFailureRuns: new Map(this.mergeFailureRuns),
+      chunkRecordsOrphaned: this.chunkRecordsOrphaned,
+      orphanWarned: this._orphanWarned,
+      prevCacheKeys: this._prevCacheKeys,
+      lastFrontierTokens: this.lastFrontierTokens,
+      transitionBlocked: this.transitionBlocked,
+      lastRenderStats: this._lastRenderStats,
+      lastCompileEstimate: this._lastCompileEstimate,
+      calibrationArmed: this._calibrationArmed,
+      calibrationLoaded: this._calibrationLoaded,
+      calibration: this._calibration,
+      calibrationReset: this._calibrationReset,
+      calibrationProvisional: this._calibrationProvisional,
+      storeCalibration: store.getTokenCalibration?.(),
+      storeView: this._storeView,
+      storeOrder: this._storeOrder,
+      storeOrderSource: this._storeOrderSource,
+      headStartMemo: this._cachedHeadStartIndex,
+    };
+    return () => {
+      this._imageWatermark = saved.imageWatermark;
+      this._postStripMemo = saved.postStripMemo;
+      this.chunks = saved.chunks;
+      this.compressionQueue = saved.compressionQueue;
+      this.compressionQueueGeneration = saved.compressionQueueGeneration;
+      this.compressionFailureOrder = saved.compressionFailureOrder;
+      this.compressionNotBefore = saved.compressionNotBefore;
+      this.mergeFailureOrder = saved.mergeFailureOrder;
+      this.compressionFailureRuns = saved.compressionFailureRuns;
+      this.mergeFailureRuns = saved.mergeFailureRuns;
+      this.chunkRecordsOrphaned = saved.chunkRecordsOrphaned;
+      this._orphanWarned = saved.orphanWarned;
+      this._prevCacheKeys = saved.prevCacheKeys;
+      this.lastFrontierTokens = saved.lastFrontierTokens;
+      this.transitionBlocked = saved.transitionBlocked;
+      this._lastRenderStats = saved.lastRenderStats;
+      this._lastCompileEstimate = saved.lastCompileEstimate;
+      this._calibrationArmed = saved.calibrationArmed;
+      this._calibrationLoaded = saved.calibrationLoaded;
+      this._calibration = saved.calibration;
+      this._calibrationReset = saved.calibrationReset;
+      this._calibrationProvisional = saved.calibrationProvisional;
+      if (saved.storeCalibration !== undefined) store.setTokenCalibration?.(saved.storeCalibration);
+      this._storeView = saved.storeView;
+      this._storeOrder = saved.storeOrder;
+      this._storeOrderSource = saved.storeOrderSource;
+      this._cachedHeadStartIndex = saved.headStartMemo;
+    };
+  }
+
+  /**
+   * See `ContextStrategy.renderAsNewest`. The steps a compile takes for the
+   * messages it sends last and as they stand, over the view's suffix from the
+   * batch's oldest message to its newest: each stored copy cut as
+   * `cappedForSend` cuts it, a body's shards joined by
+   * `mergeAdjacentBodyGroupRaw` under adaptive resolution (the hierarchical
+   * select sends each shard as its own message), then `applyImageStripping`,
+   * so a message stored after the batch counts toward the images as in a
+   * compile. The tool pass that comes between them (postProcessToolEntries)
+   * is left out: it pairs and prunes by the window around these messages.
+   *
+   * Those messages are the recent window's, and the head window's too when
+   * no message comes between the two: a compile places the middle's
+   * messages, and the history before a head window that was reset, after
+   * the head. The hierarchical select can also place summaries there, which
+   * are text and change no image decision. A message before them comes back
+   * as null.
+   *
+   * It takes a compile's steps before its windows as a dry select takes
+   * them: it rebuilds the chunks, then, under adaptive resolution, loads the
+   * calibration, and it puts back what a dry select puts back, so it prices
+   * as the next compile will and leaves what that compile reads as it found
+   * it.
+   */
+  renderAsNewest(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null> {
+    this.requireLoadedBranch('renderAsNewest');
+    const restore = this.saveDryRunState(store);
+    this._dryRunSelect = true;
+    try {
+      this.rebuildChunks(store);
+      if (this.config.adaptiveResolution) this.loadCalibration(store, { dryRun: true });
+      const messages = store.getAll();
+      const posById = this.positionIndex(messages);
+      const headStart = this.getHeadWindowStartIndex(store);
+      const headEnd = this.getHeadWindowEnd(store);
+      const tailStart = Math.max(this.getRecentWindowStart(store), headEnd);
+      const start = headStart === 0 && headEnd === tailStart ? 0 : tailStart;
+      const msgCap = this.config.maxMessageTokens;
+      // As selectPath chooses: only the adaptive select joins a body's
+      // shards, so only there does an id stand for its whole body.
+      const joins = this.config.adaptiveResolution;
+      // Each id's whole body, read back by its first shard's id, which the
+      // merge keeps; one that starts before the suffix has none.
+      const firstOf = new Map<MessageId, MessageId>();
+      let from = messages.length;
+      for (const id of ids) {
+        const at = posById.get(id);
+        if (at === undefined) continue;
+        const body = joins ? bodyBoundsIn(messages, at) : { from: at, to: at };
+        if (body.from < start) continue;
+        firstOf.set(id, messages[body.from]!.id);
+        from = Math.min(from, body.from);
+      }
+      const entries: ContextEntry[] = [];
+      for (let k = from; k < messages.length; k++) {
+        const msg = messages[k]!;
+        entries.push({
+          index: entries.length,
+          sourceMessageId: msg.id,
+          sourceRelation: 'copy',
+          participant: msg.participant,
+          content: this.cappedForSend(store, msg, msgCap).content,
+        });
+      }
+      const merged = joins ? this.mergeAdjacentBodyGroupRaw(entries, store, messages) : entries;
+      this.applyImageStripping(merged, store);
+      const rendered = new Map<MessageId, ContentBlock[]>();
+      for (const entry of merged) {
+        if (entry.sourceMessageId !== undefined) rendered.set(entry.sourceMessageId, entry.content);
+      }
+      return ids.map((id) => {
+        const first = firstOf.get(id);
+        return first === undefined ? null : rendered.get(first) ?? null;
+      });
+    } finally {
+      this._dryRunSelect = false;
+      restore();
+    }
   }
 }

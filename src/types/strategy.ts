@@ -153,6 +153,36 @@ export interface ContextStrategy {
   readonly maxMessageTokens?: number;
 
   /**
+   * What the next compile sends for each of `ids`, messages just stored and
+   * so among the newest of the window, in the order given. Each comes back
+   * cut by the per-message cap, and as one message where the compile joins a
+   * body's shards into one; the strategy makes every image decision it makes
+   * there: its count, depth and byte limits, counted newest-first over the
+   * view from the oldest of these messages to its newest, as a compile
+   * counts them. It's for a caller that appends messages it has just stored
+   * to a compiled request without recompiling, such as a turn's mid-turn
+   * injections, so that what it appends is what the next compile sends. A
+   * later compile can still strip an image of theirs as newer ones arrive.
+   *
+   * `store` is the view a compile reads. An id comes back as null when the
+   * next compile doesn't send that message as one of its newest: the view
+   * leaves it out, such as by its filter, or the compile sends it elsewhere,
+   * such as a body too big for the window's recent part. What the next
+   * compile decides from its budget isn't foreseen, since a render has none:
+   * windowed passthrough's re-anchor, or its refusal of a newest message
+   * bigger than the budget; the memory strategy's refusal of a recent window
+   * over budget, or the adaptive select's drop of a provisional calibration
+   * that puts it over budget.
+   *
+   * What comes back is made of the stored arrays and blocks, as a compile's
+   * messages are, so a caller that edits what comes back copies it first.
+   * Tool blocks come back as the cap leaves them, since how a compile pairs
+   * and prunes them depends on the window around them. Rendering doesn't
+   * change what a later compile sends.
+   */
+  renderAsNewest?(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null>;
+
+  /**
    * Initialize the strategy with context.
    * Called when strategy is set on ContextManager.
    */

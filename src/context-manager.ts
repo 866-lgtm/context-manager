@@ -1550,6 +1550,39 @@ export class ContextManager {
     return this.strategy;
   }
 
+  /**
+   * What the next compile sends for each of `ids`, messages this manager has
+   * just stored, rendered as the newest of the window (see
+   * `ContextStrategy.renderAsNewest`). Give each message by the id
+   * `addMessage` returned. For a body stored as shards that's its first
+   * shard's, which stands for the whole body where the compile joins its
+   * shards; where the compile sends each shard on its own, an id gives back
+   * its own shard.
+   * Undefined when the strategy has no such hook, so a caller appends the
+   * content as stored. An id comes back as null when the next compile
+   * doesn't send that message as one of its newest, such as one the view
+   * filter leaves out. It throws for an id no stored message has, before
+   * the strategy has initialized, and where the strategy's select would
+   * throw first, as the autobiographical strategy does on a branch it
+   * hasn't loaded. Like a compile, it releases compression holds that have
+   * timed out before it renders, so it reads the holds the next compile
+   * will.
+   */
+  renderAsNewest(ids: readonly MessageId[]): Array<ContentBlock[] | null> | undefined {
+    this.requireInitialized('renderAsNewest');
+    const stored = this.mergedMessageView();
+    const unknown = ids.filter((id) => stored.get(id) === null);
+    if (unknown.length > 0) {
+      throw new Error(
+        `ContextManager.renderAsNewest: no stored message has id ${unknown.join(', ')}; ` +
+          'give each message by the id addMessage returned for it',
+      );
+    }
+    if (typeof this.strategy.renderAsNewest !== 'function') return undefined;
+    this.expireCompressionHolds();
+    return this.strategy.renderAsNewest(this.strategyMessageView(), ids);
+  }
+
   /** Read the active strategy's allowlisted live settings, if supported. */
   getHotContextSettings(): HotContextSettingsStatus | null {
     this.requireInitialized('getHotContextSettings');
