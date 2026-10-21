@@ -6215,10 +6215,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // one-message L1s days later) sat next to the open frontier and merged with
   // it, producing L2/L3s that mix the chronicle's opening with weeks-later
   // material. The demand path (#95) never checked adjacency at all. Every
-  // grouping decision and the mint itself now use one index: chunk-owned
-  // messages, positioned by the store listing. Messages no chunk owns (head,
-  // never-chunked) occupy no position, so they never split a run; a hole is
-  // always another live representation.
+  // grouping decision and the mint itself now use one index
+  // (mergePositionIndex): every message of the store listing at its place.
+  // A message no chunk owns renders raw at its own place, between the
+  // summaries around it: a raw pin, a message an unpin freed before the
+  // chunker reaches it, a head window a reset left mid-stream. A summary
+  // across one would hold history from both sides of a message shown between
+  // them, and kv-unified's canonical forest, which has a leaf for every listed
+  // message, rejects such a node ("owns non-contiguous live leaves") at every
+  // compile unless it treeifies or preserves gap-bearing summaries. So such a
+  // message keeps the runs on its two sides apart; at the ends of the store
+  // (the head window before every chunk, the never-chunked frontier) it
+  // splits nothing.
+  // The load-time audit judges ownership alone (ownershipPositionIndex): a
+  // node minted across such a message before this rule has whole ownership,
+  // no owned message between its sources missing, so it stays as it stands,
+  // though kv-unified's forest rejects it.
   // ===========================================================================
 
   /** Store position per message id, refreshed from every listing we see. */
@@ -6279,24 +6291,36 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Position per owned message id (chunk records ∪ live L1 sourceIds): store
-   * order where known, then any owned id the last listing did not contain
-   * (messages appended since) after it, in record order. Without any listing
-   * (hosts that drive the grouping without a store view) this degrades to
-   * record order.
+   * Position per message for merge grouping: every message of the last
+   * listing at its place, whether a chunk owns it or not, then any chunk
+   * member that listing did not contain (appended since) after it, in record
+   * order. Two summaries are adjacent exactly when no listed message stands
+   * between their sources. Without any listing (hosts that drive the
+   * grouping without a store view) this degrades to record order, as
+   * ownershipPositionIndex does.
    */
   protected mergePositionIndex(): Map<MessageId, number> {
-    // Ownership authority = chunk members ∪ live L1 sourceIds (an L1 is
-    // coverage even where its chunk record is missing; see ownedMessageIds).
-    const chunkMember = new Set<MessageId>();
-    const members: MessageId[] = [];
-    for (const ch of this.chunks) for (const m of ch.messages) if (!chunkMember.has(m.id)) { chunkMember.add(m.id); members.push(m.id); }
-    const seen = new Set(chunkMember);
-    for (const id of this.liveL1Ids()) {
-      const s = this.summaryById(id);
-      if (!s) continue;
-      for (const leaf of s.sourceIds) if (!seen.has(leaf)) { seen.add(leaf); members.push(leaf); }
-    }
+    const { members, chunkMember } = this.ownedMembers();
+    const order = this._storeOrder;
+    if (order.size === 0) return new Map(members.map((id, i) => [id, i] as const));
+    const index = new Map(order);
+    let position = this._storeOrderSource.length;
+    for (const id of members) if (!index.has(id) && chunkMember.has(id)) index.set(id, position++);
+    return index;
+  }
+
+  /**
+   * Position per owned message id alone (chunk records ∪ live L1 sourceIds):
+   * store order where known, then any chunk member the last listing did not
+   * contain after it, in record order. The load-time audit's index
+   * (auditStoreTopology), which judges whether each summary's ownership is
+   * whole. A summary minted across a message no chunk owns, before merges
+   * were kept apart at one, still has whole ownership (no owned message
+   * between its sources is missing), so the audit leaves it as it stands,
+   * though kv-unified's forest finds its live leaves non-contiguous.
+   */
+  protected ownershipPositionIndex(): Map<MessageId, number> {
+    const { members, chunkMember } = this.ownedMembers();
     const order = this._storeOrder;
     if (order.size === 0) return new Map(members.map((id, i) => [id, i] as const));
     const known = members.filter((id) => order.has(id)).sort((a, b) => order.get(a)! - order.get(b)!);
@@ -6308,6 +6332,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // hidden (viewFilter) or pruned: it occupies no position at all.
     for (const id of members) if (!index.has(id) && chunkMember.has(id)) index.set(id, position++);
     return index;
+  }
+
+  /** Owned message ids, chunk members first, then live L1 sources: ownership
+   *  authority is chunk members ∪ live L1 sourceIds (an L1 is coverage even
+   *  where its chunk record is missing; see ownedMessageIds). */
+  private ownedMembers(): { members: MessageId[]; chunkMember: Set<MessageId> } {
+    const chunkMember = new Set<MessageId>();
+    const members: MessageId[] = [];
+    for (const ch of this.chunks) for (const m of ch.messages) if (!chunkMember.has(m.id)) { chunkMember.add(m.id); members.push(m.id); }
+    const seen = new Set(chunkMember);
+    for (const id of this.liveL1Ids()) {
+      const s = this.summaryById(id);
+      if (!s) continue;
+      for (const leaf of s.sourceIds) if (!seen.has(leaf)) { seen.add(leaf); members.push(leaf); }
+    }
+    return { members, chunkMember };
   }
 
   /** First live L1 per message id (the fold-path fallback in selectAdaptive),
@@ -6392,7 +6432,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const unplaced = sources.filter((s) =>
       position.get(s.sourceRange.first) === undefined || position.get(s.sourceRange.last) === undefined);
     if (unplaced.length > 0) {
-      return `source position unresolved (pruned or unowned range endpoints): ${unplaced.map((s) => s.id).join(',')}`;
+      return `source position unresolved (range endpoints neither in the store listing nor owned by a chunk): ${unplaced.map((s) => s.id).join(',')}`;
     }
     const runs = this.contiguousSourceRuns(sources, position);
     if (runs.length !== 1) {
@@ -6446,7 +6486,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   auditStoreTopology(messages: ReadonlyArray<{ id: MessageId }>): TopologyViolation[] {
     this.refreshStoreOrder(messages);
-    const position = this.mergePositionIndex();
+    const position = this.ownershipPositionIndex();
     if (position.size === 0) return [];
     const byPosition: MessageId[] = [];
     for (const [id, p] of position) byPosition[p] = id;
@@ -6788,10 +6828,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *    it up.
    *
    *  - `level >= 2`: the picker has asked for an L_n covering a contiguous
-   *    range. We gather unmerged L_{n-1} summaries whose source ranges
-   *    fall within that range (de-duplicated against entries already in
-   *    `mergeQueue`) and enqueue a single merge over them. The merge fires
-   *    on the next `tick()`.
+   *    range. We gather unmerged L_{n-1} summaries by
+   *    `enqueueMergeForRange`'s rule (a source counts when either of its
+   *    ends lies in the range; with a range end that has no position, every
+   *    source counts), de-duplicated against entries already in
+   *    `mergeQueue`, and enqueue a merge over the first `mergeThreshold` of
+   *    their longest contiguous run. The merge fires on the next `tick()`.
    *
    * The handler is conservative: it never enqueues a singleton or empty
    * merge, and it never re-enqueues an id that's already pending. That
@@ -6895,7 +6937,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Enqueue an L_{targetLevel} merge over unmerged L_{targetLevel-1}
-   * summaries whose source ranges fall within [firstMsgId..lastMsgId].
+   * summaries whose source ranges reach into [firstMsgId..lastMsgId]: a
+   * source counts when either of its ends lies in the range. With a range
+   * end neither in the store listing nor owned by a chunk, which has no
+   * position, every source counts.
    * No-op if fewer than 2 viable sources are available (a singleton merge
    * would just rename a summary without consolidating).
    */
@@ -6915,8 +6960,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // Position per chunk-owned message id in store order (see
-    // mergePositionIndex), for "within range" and contiguity tests.
+    // Position per listed message in store order (see mergePositionIndex),
+    // for "within range" and contiguity tests.
     const messageOrder = this.mergePositionIndex();
     const firstSeq = messageOrder.get(firstMsgId);
     const lastSeq = messageOrder.get(lastMsgId);
@@ -11293,7 +11338,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // This was a silent drop (rev-5 review: "frontier debt, no log").
         this.warnMergeExclusion(
           s.id,
-          `L${s.level} ${s.id}: source position unresolved (pruned source messages?) — permanently unmergeable, frontier debt`,
+          `L${s.level} ${s.id}: source position unresolved (pruned or hidden source messages?) — permanently unmergeable, frontier debt`,
         );
         continue;
       }
@@ -11325,8 +11370,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     withPos.sort((a, b) => a.first - b.first);
 
     // Split into strictly contiguous live runs. Deleted messages do not occupy
-    // positions in `messageOrder`, so this still bridges true tombstones; it
-    // refuses only holes containing another live representation. A hole that
+    // positions in `messageOrder`, so this still bridges true tombstones; a
+    // run splits wherever a listed message stands between two sources, owned
+    // by another summary or by none (mergePositionIndex). A hole that
     // work put back after a failure will fill at this level (pendingRetrySpans)
     // isn't stranded: the run before it waits, as the newest run does. A run
     // can grow only up to the next run or the first held summary after it,
@@ -11567,7 +11613,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Last line of defence: a crossed node is never minted. Whatever enqueued
     // this group (threshold pass, demand path, a persisted queue from an older
     // grammar, an operator), the sources must be one level below the target
-    // and strictly adjacent among chunk-owned messages in store order.
+    // and strictly adjacent in store order, with no listed message between
+    // them (mergePositionIndex).
     const topology = this.mergeTopologyProblem(targetLevel, sources, position);
     if (topology) {
       this.refuseCrossedMerge(targetLevel, sourceIds, topology);

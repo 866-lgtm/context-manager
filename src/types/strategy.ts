@@ -1217,11 +1217,14 @@ export interface AutobiographicalConfig {
   imageStripDepthTokens?: number;
 
   /**
-   * Merge grouping (2026-07-12 contiguity fix): break a merge run when the
-   * positional gap between consecutive unmerged candidates exceeds this many
-   * messages. Small holes (wiped/pruned nodes) bridge fine; cross-era gaps
-   * must not — a merge group spanning already-merged history can straddle
-   * the recent window and block its whole lineage from folding. Default 300.
+   * Not read since canonical merge ownership (2026-08-31). Merge grouping
+   * (2026-07-12 contiguity fix) used to break a merge run when the positional
+   * gap between consecutive unmerged candidates exceeded this many messages,
+   * bridging smaller holes. Every grouping decision now requires exact
+   * adjacency in store order, with no listed message between two sources,
+   * whatever this is set to. Configurations that set it still type-check.
+   *
+   * @deprecated Not read: grouping requires exact adjacency.
    */
   mergeContiguityGapLimit?: number;
 
