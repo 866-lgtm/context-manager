@@ -2026,10 +2026,24 @@ export class ContextManager {
     // strategy: a close() from a listener lets the write it interrupted
     // finish, and that write's remaining shards are stored unheard.
     if (this.strategy.onNewMessage && !this.closed) {
-      // Fire and forget - don't block on strategy processing
-      this.strategy.onNewMessage(message, this.createStrategyContext()).catch((err) => {
-        this.diag.error('Strategy onNewMessage failed:', err);
-      });
+      // Fire and forget: the write doesn't wait for the strategy, and the
+      // strategy's failure isn't the write's (#288). The hook runs here,
+      // inside the append, so its synchronous part comes before addMessage
+      // returns. A hook that isn't async can throw before returning, which is
+      // logged as a rejection is, or return no promise, which is no failure.
+      // Either way the message stays stored, as do a sharded body's remaining
+      // shards. Only the strategy's call is caught: the manager's own work
+      // here still fails the write, as onMessage's note says.
+      const failed = (err: unknown) => this.diag.error('Strategy onNewMessage failed:', err);
+      const ctx = this.createStrategyContext();
+      try {
+        const returned = this.strategy.onNewMessage(message, ctx) as unknown;
+        if (typeof (returned as PromiseLike<unknown> | null | undefined)?.then === 'function') {
+          Promise.resolve(returned as PromiseLike<unknown>).catch(failed);
+        }
+      } catch (err) {
+        failed(err);
+      }
     }
   }
 

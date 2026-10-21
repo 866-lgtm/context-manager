@@ -228,7 +228,11 @@ export interface ContextStrategy {
 
   /**
    * React to new messages.
-   * Called after a message is added to the store.
+   * Called after a message is added to the store, inside the write that
+   * stored it, so its synchronous part runs before addMessage returns; the
+   * manager doesn't wait for the promise. A rejection, or a throw before it
+   * returns, is logged and doesn't reach addMessage's caller: the message
+   * stays stored.
    */
   onNewMessage?(message: StoredMessage, ctx: StrategyContext): Promise<void>;
 
