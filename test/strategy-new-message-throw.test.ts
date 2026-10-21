@@ -43,6 +43,19 @@ async function errorsDuring(fn: () => Promise<void>): Promise<unknown[][]> {
   return errors;
 }
 
+/** What the real console writes to stderr while `fn` runs, as it renders it. */
+async function stderrDuring(fn: () => Promise<void>): Promise<string> {
+  const written: string[] = [];
+  const write = process.stderr.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  try {
+    await fn();
+  } finally {
+    process.stderr.write = write;
+  }
+  return written.join('');
+}
+
 /** The logged failures of onNewMessage under `namespace`, as [first line, thrown value]. */
 function failures(errors: unknown[][], namespace: string): unknown[][] {
   return errors.filter((args) => String(args[0]).startsWith('Strategy onNewMessage failed for message ') && String(args[0]).endsWith(` ns=${namespace}`));
@@ -60,10 +73,10 @@ function watchUnhandled() {
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 /** Opens a manager on the test store, runs `fn` with it, and closes it whatever `fn` does. */
-async function withManager(strategy: PassthroughStrategy, namespace: string | undefined, fn: (manager: ContextManager) => Promise<void> | void): Promise<void> {
+async function withManager<T>(strategy: PassthroughStrategy, namespace: string | undefined, fn: (manager: ContextManager) => Promise<T> | T): Promise<T> {
   const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy, ...(namespace ? { namespace } : {}) });
   try {
-    await fn(manager);
+    return await fn(manager);
   } finally {
     manager.close();
   }
@@ -88,11 +101,14 @@ class ReturnsNothing extends PassthroughStrategy {
   }
 }
 
-/** ThrowsSynchronously, storing each message as three shards. */
+/** ThrowsSynchronously, storing each message as three shards of one body group. */
 class ShardsAndThrows extends ThrowsSynchronously {
+  constructor(readonly group = 'zz-group') {
+    super();
+  }
   chunkIngressMessage(_participant: string, content: ContentBlock[]) {
     const body = content.map((b) => (b.type === 'text' ? b.text : '')).join('');
-    return { bodyGroupId: 'zz-group', shards: [0, 1, 2].map((shardIndex) => ({ content: [text(`${body} part ${shardIndex}`)], shardIndex })) };
+    return { bodyGroupId: this.group, shards: [0, 1, 2].map((shardIndex) => ({ content: [text(`${body} part ${shardIndex}`)], shardIndex })) };
   }
 }
 
@@ -116,7 +132,7 @@ describe('a strategy onNewMessage that fails without rejecting (#288)', () => {
       assert.deepEqual(strategy.heard, [id], 'the strategy heard it once');
       const logged = failures(errors, 'agents/zz-sync');
       assert.equal(logged.length, 1, 'the failure is logged once, naming the namespace');
-      assert.ok(String(logged[0]![0]).startsWith(`Strategy onNewMessage failed for message ${id}:`), `names the message: ${String(logged[0]![0])}`);
+      assert.equal(String(logged[0]![0]), `Strategy onNewMessage failed for message ${id}: ns=agents/zz-sync`);
       assert.match(String(logged[0]![1]), /zz onNewMessage threw synchronously/);
       assert.deepEqual(unhandled.seen, [], 'nothing escapes as an uncaught error');
     } finally {
@@ -125,23 +141,60 @@ describe('a strategy onNewMessage that fails without rejecting (#288)', () => {
   });
 
   it('a synchronous throw of a value console cannot format is still logged, and addMessage still returns', async () => {
-    // The real console formats an object through its inspect hook, which can throw.
-    const strategy = new ThrowsSynchronously();
+    // The real console formats an object through its inspect hook, which can
+    // throw; the line's '%' must print as itself on that path too.
+    const strategy = new ShardsAndThrows('zz-%s');
     strategy.thrown = { [inspect.custom]() { throw new Error('custom inspect failed'); } };
-    const write = process.stderr.write;
-    const written: string[] = [];
     let id: string | undefined;
-    await withManager(strategy, 'agents/zz-unprintable', (manager) => {
-      process.stderr.write = ((chunk: string | Uint8Array) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;
-      try {
-        id = manager.addMessage('User', [text('hello')]);
-      } finally {
-        process.stderr.write = write;
-      }
-      assert.equal(manager.getAllMessages().length, 1, 'the message is stored');
+    const written = await withManager(strategy, 'agents/zz-unprintable', async (manager) => {
+      const out = await stderrDuring(async () => { id = manager.addMessage('User', [text('hello')]); });
+      assert.equal(manager.getAllMessages().length, 3, 'the whole body is stored');
+      return out;
     });
     assert.ok(id, 'addMessage returned an id');
-    assert.ok(written.some((w) => w.includes(`Strategy onNewMessage failed for message ${id}:`) && w.includes('[object Object]')), `reported: ${written.join('')}`);
+    assert.ok(
+      written.includes(`Strategy onNewMessage failed for message ${id} (body group zz-%s): [object Object] ns=agents/zz-unprintable`),
+      `reported: ${written}`,
+    );
+  });
+
+  it('a rejection with a value console cannot format is still logged, and nothing is left unhandled', async () => {
+    class RejectsUnprintable extends PassthroughStrategy {
+      async onNewMessage(_message: StoredMessage, _ctx: StrategyContext): Promise<void> {
+        throw { [inspect.custom]() { throw new Error('custom inspect failed'); } };
+      }
+    }
+    const unhandled = watchUnhandled();
+    try {
+      let id: string | undefined;
+      const written = await withManager(new RejectsUnprintable(), 'agents/zz-rejects-unprintable', (manager) =>
+        stderrDuring(async () => {
+          id = manager.addMessage('User', [text('hello')]);
+          await settle();
+        }));
+      assert.ok(
+        written.includes(`Strategy onNewMessage failed for message ${id}: [object Object] ns=agents/zz-rejects-unprintable`),
+        `reported: ${written}`,
+      );
+      assert.deepEqual(unhandled.seen, []);
+    } finally {
+      unhandled.restore();
+    }
+  });
+
+  it("a '%' in a body group a host's strategy chose prints as itself, with the error after it", async () => {
+    // A '%' in the line's message would be read as a format directive and take the error's place.
+    const strategy = new ShardsAndThrows('zz-%s-%d');
+    let id: string | undefined;
+    const written = await withManager(strategy, 'agents/zz-percent', async (manager) => {
+      manager.onMessage((event) => { if (event.type === 'add' && event.message.shardIndex === 0) throw new Error('zz the listener threw'); });
+      return stderrDuring(async () => { id = manager.addMessage('User', [text('hello')]); });
+    });
+    const lines = written.split('\n');
+    const hook = lines.findIndex((l) => l === `Strategy onNewMessage failed for message ${id} (body group zz-%s-%d): ns=agents/zz-percent Error: zz onNewMessage threw synchronously`);
+    assert.ok(hook >= 0, `the hook's line: ${written}`);
+    const listener = lines.findIndex((l) => l.startsWith(`[context-manager] an onMessage listener threw on a 'add' event for message ${id} (body group zz-%s-%d); the write stands: ns=agents/zz-percent Error: zz the listener threw`));
+    assert.ok(listener >= 0, `the listener's line: ${written}`);
   });
 
   it('an onNewMessage that returns no promise passes, logging nothing', async () => {
@@ -158,7 +211,7 @@ describe('a strategy onNewMessage that fails without rejecting (#288)', () => {
       assert.ok(id, 'addMessage returned an id');
       assert.equal(count, 1);
       assert.deepEqual(strategy.heard, [id]);
-      assert.deepEqual(errors.filter((args) => String(args[0]).startsWith('Strategy onNewMessage failed')), [], 'no promise is no failure');
+      assert.deepEqual(errors, [], 'no promise is no failure, and nothing is logged');
       assert.deepEqual(unhandled.seen, []);
     } finally {
       unhandled.restore();
@@ -190,10 +243,12 @@ describe('a strategy onNewMessage that fails without rejecting (#288)', () => {
     const strategy = new ThrowsSynchronously();
     const heard: string[] = [];
     let id: string | undefined;
-    await errorsDuring(() => withManager(strategy, 'agents/zz-listener', (manager) => {
+    const errors = await errorsDuring(() => withManager(strategy, 'agents/zz-listener', (manager) => {
       manager.onMessage((event) => { if (event.type === 'add') heard.push(event.message.id); });
       id = manager.addMessage('User', [text('hello')]);
     }));
+    assert.deepEqual(strategy.heard, [id], 'the strategy was called, and threw');
+    assert.equal(failures(errors, 'agents/zz-listener').length, 1, 'its throw was logged');
     assert.deepEqual(heard, [id], 'the listener registered after the manager heard the add');
   });
 
