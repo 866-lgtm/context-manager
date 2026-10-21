@@ -1253,8 +1253,10 @@ export interface AutobiographicalConfig {
    * oldest live images are stripped one at a time until every limit fits
    * ratio × itself. A target that rounds to 0 is 0, but the newest image
    * stays while it fits the full limits, so `maxLiveImages: 1` gets no
-   * headroom. A compile, a preview, a reopen and a fork at the same point give
-   * the same set, switching the option on later gives the set it would have
+   * headroom, and so do the other images of its message while only depth is
+   * over its target, since stripping them can't lower the depth they're at.
+   * A compile, a preview, a reopen and a fork at the same point give the
+   * same set, switching the option on later gives the set it would have
    * had from the start, and a fold moves nothing. An edit or a removal of any
    * message, text-only included, replays a different history, so it can
    * strip or bring back images on either side of it; many of them are newer

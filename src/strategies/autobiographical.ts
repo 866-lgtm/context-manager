@@ -16897,7 +16897,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  already text, so they're naturally unaffected. The adjacent
    *  "[image attachment: <name>]" text added at ingest preserves the filename,
    *  so the placeholder itself stays terse. Reduces tokens, so it never pushes
-   *  a compiled context back over budget.
+   *  a compiled context back over budget. With `imageStripHysteresisRatio`,
+   *  the rule's set (imageStripReplay) decides instead: an entry's first
+   *  images go, as many as the rule strips across its sources.
    *
    *  Runs INSIDE each select path, *before* `rsEnd()` and `placeCacheMarkers`,
    *  so the committed render stats (and the cache breakpoints) describe the
@@ -16995,7 +16997,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * or the oldest live image deeper than `imageStripDepthTokens`), strip the
    * oldest live images one at a time until every limit fits ratio × itself.
    * A target that rounds to 0 is 0, but the newest image stays while it fits
-   * the full limits. Depth is counted as getImageStripStart counts it: an
+   * the full limits, and so do the other images of its message while only
+   * depth is over its target, since stripping them can't lower the depth
+   * they're at. Depth is counted as getImageStripStart counts it: an
    * image's own message and every newer one, at the store's estimates.
    * Stripping takes the oldest images first, so a message's stripped images
    * are its first ones: the answer is how many, by message id (a message
@@ -17041,17 +17045,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         live.push({ at: i, bytes });
         liveBytes += bytes;
       }
+      const overCountOrBytes = (count: number, size: number): boolean =>
+        (countCap > 0 && live.length - first > count) || (bytesCap > 0 && liveBytes > size);
       const over = (depth: number, count: number, size: number): boolean =>
-        (countCap > 0 && live.length - first > count) ||
-        (bytesCap > 0 && liveBytes > size) ||
+        overCountOrBytes(count, size) ||
         (depthCap > 0 && first < live.length && tokensBefore[i + 1]! - tokensBefore[live[first]!.at]! > depth);
       if (!over(depthCap, countCap, bytesCap)) continue;
       const depth = Math.floor(depthCap * ratio);
       const count = Math.floor(countCap * ratio);
       const size = Math.floor(bytesCap * ratio);
       while (first < live.length && over(depth, count, size)) {
-        // The newest image, alone and within the full limits, stays.
-        if (live.length - first === 1 && !over(depthCap, countCap, bytesCap)) break;
+        // The images left are one message's and within the full limits: the
+        // newest of them stays, and the rest stay too while only depth is over
+        // its target, since stripping images of one message can't lower the
+        // depth it's at.
+        if (
+          live[first]!.at === live[live.length - 1]!.at && !over(depthCap, countCap, bytesCap) &&
+          (live.length - first === 1 || !overCountOrBytes(count, size))
+        ) break;
         const oldest = live[first++]!;
         liveBytes -= oldest.bytes;
         const id = messages[oldest.at]!.id;
@@ -17073,11 +17084,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * newest (counted newest-first) or deeper than `imageStripDepthTokens` of
    * raw estimate from the live end renders as a placeholder — so every place
    * that BUDGETS messages (recent-window walk-back, head/tail sums, middle
-   * chunk sizes) must cost it as one. Pricing stripped images at their full
-   * estimate collapsed an image-dense tail to a fraction of its configured
-   * size (42k rendered of a 120k window), and pricing them post-strip in the
-   * walk-back alone made the picker's raw-priced tail overflow the budget
-   * (318k) — the estimate must be consistent EVERYWHERE.
+   * chunk sizes) must cost it as one. With `imageStripHysteresisRatio`, the
+   * rule's set (imageStripReplay) decides instead: a message's first images
+   * are priced as placeholders, as many as the rule strips of it. Pricing
+   * stripped images at their full estimate collapsed an image-dense tail to
+   * a fraction of its configured size (42k rendered of a 120k window), and
+   * pricing them post-strip in the walk-back alone made the picker's
+   * raw-priced tail overflow the budget (318k) — the estimate must be
+   * consistent EVERYWHERE.
    * Each message is priced in the form it's sent in (prunedForSend), so a
    * tool result `toolResultMaxLastN` replaces costs its marker and a
    * `tool_use` input `toolUseInputMaxTokens` truncates costs its truncation.

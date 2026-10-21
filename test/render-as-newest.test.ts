@@ -389,17 +389,21 @@ describe('renderAsNewest', () => {
       }
     }
     const strategy = new FailingCut({
-      headWindowTokens: 0, recentWindowTokens: 1_000_000, hierarchical: true, imageStripDepthTokens: 0,
-      maxLiveImages: 2, imageStripHysteresisRatio: 0.5, maxMessageTokens: 50,
+      headWindowTokens: 0, recentWindowTokens: 1_000_000, hierarchical: true, maxMessageTokens: 50,
     } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
     await withManager(strategy, async (manager) => {
-      const ids = [1, 2, 3, 4].map((i) => manager.addMessage('user', imageMessage(`img-${i}`, 1)));
+      const ids = [1, 2, 3, 4].map((i) => manager.addMessage('user', [{ type: 'text', text: `message ${i}` }]));
       ids.push(manager.addMessage('user', longText('LONG', 300)));
-      const state = strategy as unknown as { _dryRunSelect: boolean };
+      const state = strategy as unknown as {
+        _dryRunSelect: boolean; chunks: unknown; compressionQueue: unknown; _storeOrder: unknown; _lastRenderStats: unknown;
+      };
+      const found = () => [state.chunks, state.compressionQueue, state._storeOrder, state._lastRenderStats];
+      const before = found();
       failCut = true;
       assert.throws(() => manager.renderAsNewest(ids), /cut failed/);
       failCut = false;
       assert.equal(state._dryRunSelect, false, 'the next select is live');
+      found().forEach((now, k) => assert.ok(now === before[k], `the chunks, the compression queue, the store order and the render stats are the ones it found (${k})`));
     });
   });
 

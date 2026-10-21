@@ -153,6 +153,29 @@ describe('imageStripHysteresisRatio', () => {
     await m.close();
   });
 
+  it("a depth trim leaves one message's images while they fit the full limits: stripping them can't lower the depth", async () => {
+    // img-1, then img-2's three images, about 4,800 tokens, under a depth of
+    // 5,000. img-2's arrival puts img-1 past it, and the trim to 2,500 takes
+    // img-1. The rest are img-2's, all at its depth, within the full 5,000.
+    const kinds = async (m: ContextManager) => {
+      const compiled = await m.compile(BUDGET);
+      const first = compiled.messages.find((x) => x.content.some((b) => b.type === 'text' && b.text === 'img-1'))!;
+      const second = compiled.messages.find((x) => x.content.some((b) => b.type === 'text' && b.text === 'img-2'))!;
+      const of = (x: { content: ContentBlock[] }) => x.content.filter((b) => b.type === 'image' || (b.type === 'text' && !/^img-/.test(b.text))).map((b) => b.type === 'image' ? 'I' : '.').join('');
+      return `${of(first)} ${of(second)}`;
+    };
+    const on = await ContextManager.open({ path: STORE, strategy: strategy({ imageStripDepthTokens: 5000, imageStripHysteresisRatio: 0.5 }) });
+    const off = await ContextManager.open({ path: `${STORE}-off`, strategy: strategy({ imageStripDepthTokens: 5000 }) });
+    for (const m of [on, off]) {
+      m.addMessage('user', img('img-1'));
+      m.addMessage('user', images('img-2', 3));
+    }
+    assert.equal(await kinds(off), '. III', 'without the ratio');
+    assert.equal(await kinds(on), '. III');
+    await on.close();
+    await off.close();
+  });
+
   it('the newest image goes when it alone is over a full limit', async () => {
     let m = await ContextManager.open({ path: STORE, strategy: strategy({ maxLiveImageBytes: 4, imageStripHysteresisRatio: 0.5 }) });
     m.addMessage('user', img('img-1', 8));
@@ -470,7 +493,37 @@ describe('imageStripHysteresisRatio', () => {
       await m.close();
     });
 
-    it('render stats before a compile reconstruct the window, and the next compile strips as the rule says', async () => {
+    it('a dry compile releases an expired hold, whose rebuild commits, and renders what a live compile does', async () => {
+      // The release runs before the select, so it isn't part of the dry run
+      // (SelectOptions.dryRun's doc).
+      class Releases extends ImageRatioStrategy {
+        releasedDuringDryRun: boolean[] = [];
+        override onCompressionHoldsReleased(ctx: Parameters<AutobiographicalStrategy['onCompressionHoldsReleased']>[0]): void {
+          this.releasedDuringDryRun.push((this as unknown as { _dryRunSelect: boolean })._dryRunSelect);
+          super.onCompressionHoldsReleased(ctx);
+        }
+      }
+      const patterns: string[] = [];
+      for (const dryRun of [true, false]) {
+        cleanup();
+        let now = 1000;
+        const s = new Releases({
+          headWindowTokens: 0, recentWindowTokens: 1_000_000, hierarchical: false, adaptiveResolution: true, compressionModel: 'mock',
+          targetChunkTokens: 100, autoTickOnNewMessage: false, imageStripDepthTokens: 0, maxLiveImages: 4, imageStripHysteresisRatio: 0.5,
+        } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
+        const m = await ContextManager.open({ path: STORE, strategy: s, now: () => now });
+        for (let i = 1; i <= 6; i++) m.addMessage('user', img(`img-${i}`));
+        m.holdCompression([m.getAllMessages()[0]!.id], { timeoutMs: 100 });
+        now += 100;
+        const compiled = await m.compile(BUDGET, undefined, { dryRun });
+        assert.deepEqual(s.releasedDuringDryRun, [false], `${dryRun ? 'dry' : 'live'}: released once, outside the dry select`);
+        patterns.push(imagePattern(compiled.messages, 6));
+        await m.close();
+      }
+      assert.deepEqual(patterns, ['...III', '...III']);
+    });
+
+    it('render stats before a compile reconstruct the window, leave the stored state as they found it, and the next compile strips as the rule says', async () => {
       const s = adaptive({ imageStripHysteresisRatio: undefined });
       let m = await ContextManager.open({ path: STORE, strategy: s });
       for (let i = 1; i <= 6; i++) m.addMessage('user', img(`img-${i}`));
@@ -478,8 +531,13 @@ describe('imageStripHysteresisRatio', () => {
       const on = adaptive({ imageStripHysteresisRatio: 0 });
       m = await ContextManager.open({ path: STORE, strategy: on });
       on.enableImageRatio();
+      const stored = () => JSON.stringify(m.getStore().listStates());
+      const before = stored();
+      const chunks = (on as unknown as { chunks: unknown }).chunks;
       const stats = m.getRenderStats();
       assert.ok(stats && stats.tail.messages === 6, 'the observer reconstructs the window');
+      assert.equal(stored(), before, 'the observer writes no stored state');
+      assert.ok((on as unknown as { chunks: unknown }).chunks === chunks, 'and leaves the chunks it found');
       assert.equal(await stripped(m, 6), '...III');
       await m.close();
     });
