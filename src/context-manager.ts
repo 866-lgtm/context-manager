@@ -2029,18 +2029,20 @@ export class ContextManager {
       // Fire and forget: the write doesn't wait for the strategy, and the
       // strategy's failure isn't the write's (#288). The hook runs here,
       // inside the append, so its synchronous part comes before addMessage
-      // returns. A hook that isn't async can throw before returning, which is
-      // logged as a rejection is, or return no promise, which is no failure.
-      // Either way the message stays stored, as do a sharded body's remaining
-      // shards. Only the strategy's call is caught: the manager's own work
-      // here still fails the write, as onMessage's note says.
-      const failed = (err: unknown) => this.diag.error('Strategy onNewMessage failed:', err);
+      // returns, after a holdCompression hold is placed. A hook that isn't
+      // async can throw before returning, which is logged as a rejection is,
+      // or return no promise, which is no failure. Either way the message
+      // stays stored, as do a sharded body's remaining shards, and the
+      // strategy isn't offered it again. What runs inside the strategy's call
+      // is caught, a store write the hook itself makes included; the
+      // manager's own work around the call, the context it hands the strategy
+      // among it, still fails the write, as onMessage's note says. The log is
+      // logThrown's, which survives a thrown value that can't be formatted.
+      const failed = (err: unknown) =>
+        logThrown(`Strategy onNewMessage failed for ${describeStoreEvent({ type: 'add', message })}:`, err, this.diag);
       const ctx = this.createStrategyContext();
       try {
-        const returned = this.strategy.onNewMessage(message, ctx) as unknown;
-        if (typeof (returned as PromiseLike<unknown> | null | undefined)?.then === 'function') {
-          Promise.resolve(returned as PromiseLike<unknown>).catch(failed);
-        }
+        Promise.resolve(this.strategy.onNewMessage(message, ctx)).catch(failed);
       } catch (err) {
         failed(err);
       }
