@@ -155,6 +155,36 @@ test('a stored merge quarantine that holds no list is named at load and replaced
   }
 });
 
+test('an audit-only open leaves out what it can\'t read, names it, and writes the quarantine back without it, as its doc says', async () => {
+  const first = await open();
+  first.addMessage('User', [{ type: 'text', text: 'hello' }]);
+  internals(first).store.setStateJson(internals(first).mergeQuarantineStateId, [
+    { key: 'not-strings', level: 2, sourceIds: [7, 8], attempts: 0, quarantinedAt: 1, lastOutcome: 'refusal' },
+  ]);
+  first.close();
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+  let manager: ContextManager | undefined;
+  try {
+    manager = await ContextManager.open({
+      path: join(dir, 'store'),
+      strategy: new AutobiographicalStrategy({ compressionModel: 'm', hierarchical: true, autoTickOnNewMessage: false, quarantineAlarmIntervalMs: 0, auditOnly: true }),
+      membrane: membrane as never,
+    });
+  } finally {
+    console.warn = warn;
+  }
+  try {
+    const named = unreadable(warned);
+    assert.equal(named.length, 1, `one line: ${JSON.stringify(warned)}`);
+    assert.match(named[0], ONE_LEFT_OUT);
+    assert.deepEqual(stored(manager), [], 'written back without it');
+  } finally {
+    manager?.close();
+  }
+});
+
 test('a take-up of another instance\'s writes leaves out what it can\'t read, names it, and writes the quarantine back without it', async () => {
   const manager = await open();
   try {

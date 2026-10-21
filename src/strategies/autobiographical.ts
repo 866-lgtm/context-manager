@@ -3336,7 +3336,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // queue an empty group, and its refused record, standing, is what keeps
     // enqueueMerge() from queuing that group again (mergeRecordStands; #285,
     // whose fix decides what such a record means).
-    const isSourceList = (ids: unknown): boolean => Array.isArray(ids) && ids.every((id) => typeof id === 'string' && id !== '');
+    const isSourceList = (ids: unknown): boolean => Array.isArray(ids) && (ids.length === 0 || isIdList(ids));
     const loadedMergeRecords = storedMergeRecords.filter((r) => r && typeof r.key === 'string' && isSourceList(r.sourceIds));
     this.mergeQuarantine = new Map(loadedMergeRecords.map((r) => [r.key, r]));
     // What the load can't read is named and written back without, as the merge
@@ -3349,6 +3349,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const leftOutMergeRecords = storedMergeRecords.length - loadedMergeRecords.length;
     const unlistedMergeQuarantine = mergeQuarantine != null && !Array.isArray(mergeQuarantine);
     if (unlistedMergeQuarantine || leftOutMergeRecords > 0) {
+      // Written first, as the repairs beside it are, so the line says what was done.
+      this.persistMergeQuarantine();
       const at = `[merge-quarantine] on branch '${this.store.currentBranch().name}', ${this.mergeQuarantineStateId}`;
       const one = leftOutMergeRecords === 1;
       this.diag.warn(
@@ -3361,7 +3363,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               `${one ? 'it' : 'they'} held is no longer held out of merges or counted by the merge-quarantine alarm or ` +
               'getCompressionDebt()',
       );
-      this.persistMergeQuarantine();
     }
     // A queued merge is kept only while it is an entry whose sources are kept
     // summaries, as for a summary above L1.
