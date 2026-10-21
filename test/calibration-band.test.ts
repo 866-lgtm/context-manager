@@ -12,8 +12,9 @@ import assert from 'node:assert';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Membrane, MockAdapter, NativeFormatter } from '@animalabs/membrane';
+import { Membrane, MockAdapter, NativeFormatter, type ContentBlock } from '@animalabs/membrane';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import type { MessageStoreView, StoredMessage } from '../src/types/index.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'calibration-band-'));
 const BUDGET = { maxTokens: 100_000, reserveForResponse: 2_000 };
@@ -30,7 +31,7 @@ type Internals = {
 
 /** A budget the store fits under at 1.0 and `factor` times the hard-budget
  *  check's count, but not above: for a multiplier the load should drop. */
-async function tightBudget(name: string, factor: number, opts: { signedThinking?: boolean } = {}) {
+async function tightBudget(name: string, factor: number, opts: { signedThinking?: boolean; maxMessageTokens?: number } = {}) {
   // openManager appends six messages per open, so the probe goes through the
   // same open → close → reopen as the stores under test, to hold the same content.
   const probeFirst = await openManager(name, opts);
@@ -65,13 +66,14 @@ async function calibrationWarnings<T>(fn: () => Promise<T>): Promise<{ result: T
 /** Anthropic keep-all signed thinking: the content pricing epoch 1 repriced. */
 const SIGNED_THINKING = { type: 'thinking', thinking: '', signature: 'sig'.repeat(110) } as const;
 
-async function openManager(name: string, opts: { signedThinking?: boolean; stampedThinking?: boolean; generatedImage?: boolean; nestedGeneratedImage?: boolean; recentWindowTokens?: number } = {}) {
+async function openManager(name: string, opts: { signedThinking?: boolean; stampedThinking?: boolean; generatedImage?: boolean; nestedGeneratedImage?: boolean; recentWindowTokens?: number; maxMessageTokens?: number } = {}) {
   const membrane = new Membrane(new MockAdapter({}), { formatter: new NativeFormatter() });
   const strategy = new AutobiographicalStrategy({
     targetChunkTokens: 5_000,
     recentWindowTokens: opts.recentWindowTokens ?? 50_000,
     compressionModel: 'mock',
     adaptiveResolution: true, // the calibration sample is armed on the adaptive (folding) path only
+    ...(opts.maxMessageTokens !== undefined ? { maxMessageTokens: opts.maxMessageTokens } : {}),
   });
   const cm = await ContextManager.open({ path: join(dir, name), strategy, membrane });
   for (let i = 0; i < 6; i++) {
@@ -79,7 +81,7 @@ async function openManager(name: string, opts: { signedThinking?: boolean; stamp
       ...(i % 2 && opts.signedThinking ? [SIGNED_THINKING as never] : []),
       // As agent-framework stamps it from usage (src/thinking-token-stamp.ts).
       ...(i % 2 && opts.stampedThinking ? [{ ...SIGNED_THINKING, tokenEstimate: 900 } as never] : []),
-      // Priced at 0 before pricing epoch 3, and as an image since.
+      // Priced at 0 before pricing epoch 5, and as an image since.
       ...(i % 2 && opts.generatedImage ? [{ type: 'generated_image', data: 'C'.repeat(64), mimeType: 'image/png' } as never] : []),
       // A tool's generated image, nested in its result.
       ...(i === 3 && opts.nestedGeneratedImage
@@ -288,27 +290,28 @@ describe('estimator calibration band', () => {
     signedReopened.cm.close();
   });
 
-  it('an epoch-2 multiplier is discarded in a store holding a generated image, and kept in one without', async () => {
-    // Epoch 3 priced generated images as images, where they had cost 0: the
-    // residual learned under epoch 2 absorbed those images' real tokens.
+  it('an epoch-3 multiplier is discarded in a store holding a generated image, and kept in one without', async () => {
+    // Epoch 5 priced generated images as images, where they had cost 0: the
+    // residual learned under epoch 3, which 0.17.1 stamps, absorbed those
+    // images' real tokens. Epoch 4 repriced nothing these stores hold.
     const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
-    const generated = await openManager('epoch3-generated', { generatedImage: true });
+    const generated = await openManager('epoch5-generated', { generatedImage: true });
     await generated.cm.compile(BUDGET);
-    generated.internals.store!.setStateJson(generated.internals.calibrationStateId, { multiplier: 1.4, at: 1, pricing: 2 });
+    generated.internals.store!.setStateJson(generated.internals.calibrationStateId, { multiplier: 1.4, at: 1, pricing: 3 });
     generated.cm.close();
-    const generatedReopened = await openManager('epoch3-generated', { generatedImage: true });
+    const generatedReopened = await openManager('epoch5-generated', { generatedImage: true });
     await generatedReopened.cm.compile(BUDGET);
     const cal = generatedReopened.cm.getRenderStats()!.calibration!;
     assert.equal(cal.multiplier, 1, 'restarts from 1');
     assert.equal(cal.reset?.discardedMultiplier, 1.4);
-    assert.equal(cal.reset?.fromEpoch, 2);
+    assert.equal(cal.reset?.fromEpoch, 3);
     generatedReopened.cm.close();
 
-    const plain = await openManager('epoch3-plain');
+    const plain = await openManager('epoch5-plain');
     await plain.cm.compile(BUDGET);
-    plain.internals.store!.setStateJson(plain.internals.calibrationStateId, { multiplier: 1.4, at: 1, pricing: 2 });
+    plain.internals.store!.setStateJson(plain.internals.calibrationStateId, { multiplier: 1.4, at: 1, pricing: 3 });
     plain.cm.close();
-    const plainReopened = await openManager('epoch3-plain');
+    const plainReopened = await openManager('epoch5-plain');
     await plainReopened.cm.compile(BUDGET);
     assert.equal(plainReopened.internals._calibration, 1.4, 'nothing this store holds was repriced');
     const saved = plainReopened.internals.store!.getStateJson(plainReopened.internals.calibrationStateId) as { pricing?: number };
@@ -317,11 +320,11 @@ describe('estimator calibration band', () => {
   });
 
   it('a generated image nested in a tool result reprices the store too', async () => {
-    const nested = await openManager('epoch3-nested', { nestedGeneratedImage: true });
+    const nested = await openManager('epoch5-nested', { nestedGeneratedImage: true });
     await nested.cm.compile(BUDGET);
-    nested.internals.store!.setStateJson(nested.internals.calibrationStateId, { multiplier: 1.4, at: 1, pricing: 2 });
+    nested.internals.store!.setStateJson(nested.internals.calibrationStateId, { multiplier: 1.4, at: 1, pricing: 3 });
     nested.cm.close();
-    const reopened = await openManager('epoch3-nested', { nestedGeneratedImage: true });
+    const reopened = await openManager('epoch5-nested', { nestedGeneratedImage: true });
     await reopened.cm.compile(BUDGET);
     const cal = reopened.cm.getRenderStats()!.calibration!;
     assert.equal(cal.multiplier, 1, 'restarts from 1');
@@ -342,13 +345,14 @@ describe('estimator calibration band', () => {
   });
 
   it("a previous epoch's provisional 1 stays provisional when it's kept and re-stamped", async () => {
-    // A discard under epoch 2 persisted its restart as provisional; no
-    // sample confirmed it before the upgrade, in a store epoch 3 didn't reprice.
+    // A discard under epoch 3 persisted its restart as provisional; no
+    // sample confirmed it before the upgrade, in a store epochs 4 and 5
+    // didn't reprice.
     const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
     const reset = { discardedMultiplier: 0.6, fromEpoch: 1, at: 5 };
     const first = await openManager('provisional-kept');
     await first.cm.compile(BUDGET);
-    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1, at: 1, pricing: 2, reset, provisional: true });
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1, at: 1, pricing: 3, reset, provisional: true });
     first.cm.close();
     const reopened = await openManager('provisional-kept');
     await reopened.cm.compile(BUDGET);
@@ -358,16 +362,16 @@ describe('estimator calibration band', () => {
     reopened.cm.close();
   });
 
-  it("a previous epoch's provisional 1 is kept in a store epoch 3 repriced, not discarded again over its reset", async () => {
-    // As 0.15.0 persists a discard under epoch 2: the restart's 1, flagged
+  it("a previous epoch's provisional 1 is kept in a store epoch 5 repriced, not discarded again over its reset", async () => {
+    // As 0.17.1 persists a discard under epoch 3: the restart's 1, flagged
     // provisional, beside the reset that records what it replaced. The store
-    // holds a generated image, which epoch 3 repriced, but a 1 no sample has
-    // confirmed holds nothing learned under epoch 2's pricing.
+    // holds a generated image, which epoch 5 repriced, but a 1 no sample has
+    // confirmed holds nothing learned under epoch 3's pricing.
     const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
     const reset = { discardedMultiplier: 1.45, fromEpoch: 1, at: 5 };
     const first = await openManager('provisional-generated', { generatedImage: true });
     await first.cm.compile(BUDGET);
-    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1, at: 1, pricing: 2, reset, provisional: true });
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1, at: 1, pricing: 3, reset, provisional: true });
     first.cm.close();
     const reopened = await openManager('provisional-generated', { generatedImage: true });
     const { lines } = await calibrationWarnings(() => reopened.cm.compile(BUDGET));
@@ -375,16 +379,17 @@ describe('estimator calibration band', () => {
     const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { pricing?: number; provisional?: boolean; reset?: unknown };
     assert.deepEqual([saved.pricing, saved.provisional, saved.reset], [epoch, true, reset], 're-stamped, still provisional, its reset kept');
     assert.deepEqual(lines, [
-      `[estimator-calibration] kept the provisional multiplier 1.00 from pricing epoch 2 (current ${epoch}): ` +
+      `[estimator-calibration] kept the provisional multiplier 1.00 from pricing epoch 3 (current ${epoch}): ` +
         `a restart that no provider sample has confirmed holds nothing learned under that epoch's pricing, so ` +
-        `this store's content repriced since doesn't discard it; re-stamped, still provisional`,
+        `this store's content repriced since doesn't discard it; re-stamped, still provisional ns=default`,
     ]);
     reopened.cm.close();
   });
 
   it('an epoch-1 multiplier is discarded in a store whose only content repriced since is a generated image', async () => {
-    // The reprice check walks every epoch after the record's: epoch 2 repriced
-    // nothing this store holds, and epoch 3 repriced its generated images.
+    // The reprice check walks every epoch after the record's: epochs 2 to 4
+    // repriced nothing this store holds, and epoch 5 repriced its generated
+    // images.
     const first = await openManager('epoch1-generated', { generatedImage: true });
     await first.cm.compile(BUDGET);
     first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1.4, at: 1, pricing: 1 });
@@ -671,16 +676,24 @@ describe('estimator calibration band', () => {
     // `fits: false` instead), so a preview under a provisional 1.45 said the
     // window doesn't fit where the real compile drops to 1 and fits. Store B's
     // signature ("Adaptive picker exhausted ...") is this path. It needs the
-    // picker over and the emitter under: a sharded body of prose followed by
-    // JSON is planned shard by shard (the JSON shards at the dense rate) and
-    // emitted as one joined text, priced by its first 2000 chars (prose). A
-    // small recent window keeps the body in the middle, where no summary
-    // exists yet to fold it.
+    // picker over and the emitter under, so that the picker's refusal is the
+    // only one the preview can fall back at. The strategy's own prices don't
+    // give that for a body of text, since the middle counts a body's raw
+    // shards as the plan does, so the emitter here counts less by
+    // construction: an estimateTokens that halves its answer, which in this
+    // fixture, with no summaries yet, prices the raw run the middle sends and
+    // nothing the plan counts. A small recent window keeps the sharded body in
+    // the middle, where no summary exists yet to fold it.
+    class HalfCountingEmitter extends AutobiographicalStrategy {
+      protected override estimateTokens(content: ContentBlock[]): number {
+        return Math.ceil(super.estimateTokens(content) / 2);
+      }
+    }
     const BODY = `${'the quick brown fox jumps over the lazy dog and keeps running. '.repeat(45)}` +
       JSON.stringify(Array.from({ length: 400 }, (_, i) => ({ id: i, key: `k_${i}`, value: [i, i * 2, i * 3], flag: i % 2 === 0 })));
     const openSharded = async (name: string, seed: boolean) => {
       const membrane = new Membrane(new MockAdapter({}), { formatter: new NativeFormatter() });
-      const strategy = new AutobiographicalStrategy({
+      const strategy = new HalfCountingEmitter({
         targetChunkTokens: 1_000, headWindowTokens: 0, recentWindowTokens: 1_000,
         compressionModel: 'mock', adaptiveResolution: true,
       });
@@ -792,6 +805,166 @@ describe('estimator calibration band', () => {
       assert.equal(reopened.internals._calibration, 1, `${carrier.type}: discarded`);
       assert.equal(reopened.cm.getRenderStats()!.calibration!.reset?.fromEpoch, null, `${carrier.type}: from a record with no stamp`);
       reopened.cm.close();
+    }
+  });
+
+  it('epoch 3: a store holding a message the cap cuts discards a multiplier from before it, so a compile that multiplier would refuse runs', async () => {
+    // Before epoch 3 the render stats counted a capped message at no more
+    // than the cap plus 50, and the calibration sample compares provider
+    // usage with them, so a multiplier learned beside capped content made up
+    // for that price. Kept, it would run high under the price that replaced
+    // it, and a current-epoch multiplier isn't provisional, so a compile it
+    // put over the hard budget would stay refused with no sample to fix it.
+    // Each turn openManager writes is cut at a cap of 100.
+    const CAP = { maxMessageTokens: 100 };
+    const tight = await tightBudget('cap-cuts-probe', 1.35, CAP);
+
+    // Control: the same budget with a current-epoch 1.8 refuses, so the
+    // compile below can't run vacuously.
+    const control = await openManager('cap-cuts-control', CAP);
+    await control.cm.compile(BUDGET);
+    control.internals.store!.setStateJson(control.internals.calibrationStateId, {
+      multiplier: 1.8, at: Date.now(), pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+    });
+    control.cm.close();
+    const controlReopened = await openManager('cap-cuts-control', CAP);
+    await assert.rejects(controlReopened.cm.compile(tight), /budget/i);
+    controlReopened.cm.close();
+
+    const first = await openManager('cap-cuts', CAP);
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1.8, at: 1, pricing: 2 });
+    first.cm.close();
+    const reopened = await openManager('cap-cuts', CAP);
+    await reopened.cm.compile(tight);
+    assert.equal(reopened.internals._calibration, 1);
+    assert.equal(reopened.cm.getRenderStats()!.calibration!.reset?.fromEpoch, 2);
+    const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { multiplier?: number; pricing?: number };
+    assert.deepEqual([saved.multiplier, saved.pricing], [1, AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH], 'the reset is persisted');
+    reopened.cm.close();
+  });
+
+  it('epoch 3: a store with no cap keeps a multiplier from before it, re-stamped', async () => {
+    // The same turns with no cap: nothing epoch 3 repriced, so the residual
+    // still means what it did, and the host is spared a reprice.
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const first = await openManager('no-cap-kept');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, { multiplier: 1.3, at: 1, pricing: 2 });
+    first.cm.close();
+    const reopened = await openManager('no-cap-kept');
+    await reopened.cm.compile(BUDGET);
+    assert.equal(reopened.internals._calibration, 1.3);
+    assert.deepEqual(reopened.cm.getRenderStats()!.calibration, { multiplier: 1.3, pricingEpoch: epoch });
+    const saved = reopened.internals.store!.getStateJson(reopened.internals.calibrationStateId) as { multiplier?: number; pricing?: number };
+    assert.deepEqual([saved.multiplier, saved.pricing], [1.3, epoch], 're-stamped under the current epoch');
+    reopened.cm.close();
+  });
+
+  it("epoch 3's predicate: a positive cap, and a message the cut's test puts past it or one whose estimate could have passed the cap plus 50", () => {
+    // A stored message whose price the cap plus 50 limited, uncut, was
+    // repriced too, and how far its estimate ran depended on the multiplier
+    // then, so the predicate bounds the estimate at the clamp's ceiling from
+    // the one at the applied multiplier and asks whether it could have passed
+    // the cap plus 50.
+    const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[3]!;
+    const blocks = (count: number, chars: number) =>
+      ({ content: Array.from({ length: count }, () => ({ type: 'text', text: 'r'.repeat(chars) })) }) as unknown as StoredMessage;
+    const text = (chars: number) => blocks(1, chars);
+    /** A store pricing text at 2.9 characters a token, at the multiplier given,
+     *  each block rounded on its own, as MessageStore rounds them. */
+    const storeAt = (multiplier: number) => ({
+      estimateTokens: (m: StoredMessage) => m.content.reduce(
+        (sum, block) => sum + Math.round(Math.ceil((block as { text: string }).text.length / 2.9) * multiplier), 0),
+      getTokenCalibration: () => multiplier,
+    }) as unknown as MessageStoreView;
+    const at = (cap: number | undefined) => new AutobiographicalStrategy({ maxMessageTokens: cap as number });
+    // Cut: 44 characters are 11 tokens to the cut's estimate, past a cap of
+    // 10, while 16 at the store's rate, times 1.8, stays under 60.
+    assert.equal(reprices([text(44)], at(10), storeAt(1)), true, 'a message the cap cuts');
+    // Uncut, but 20,000 characters estimate at 6,897, and 1.8 times that
+    // passes 10,050, while the cut's estimate, 5,000, is under the cap.
+    assert.equal(reprices([text(20_000)], at(10_000), storeAt(1)), true, 'a message the old price could have limited');
+    // The same at an applied multiplier of 0.6, which the estimate is read
+    // back from, not taken at.
+    assert.equal(reprices([text(20_000)], at(10_000), storeAt(0.6)), true, 'the estimate is read back from the applied multiplier');
+    // 10,000 characters: 3,449 at 1, which bounds the estimate at 1.8 by
+    // 6,209.6, under 10,050, and uncut.
+    assert.equal(reprices([text(10_000)], at(10_000), storeAt(1)), false, 'nothing near the cap');
+    // 83 one-character blocks, under a cap of 100 to the cut's estimate,
+    // estimate at 83 at a multiplier of 1, and 83 times 1.8 is 149.4, under
+    // 150. But each block rounds to 2 at 1.75, so the store estimated the
+    // message at 166, which the cap plus 50 limited.
+    assert.equal(reprices([blocks(83, 1)], at(100), storeAt(1)), true, "a message of small blocks, each rounded on its own");
+    // 39 blocks of four characters, 39 tokens to the cut's estimate, are 2
+    // tokens each to the store at 1: 2.4 at 1.2 rounds to 2, so it estimates
+    // 78, and 3.6 at the ceiling rounds to 4, 156 in all, past 150. Read back
+    // from 1.2 without either block's rounding, the bound is 117; with the
+    // reading's rounding alone, 146.25; with the ceiling's too, 165.75.
+    assert.equal(reprices([blocks(39, 4)], at(100), storeAt(1.2)), true, "each block's rounding, read back and at the ceiling");
+    for (const cap of [0, -1, Number.NaN, undefined]) {
+      assert.equal(reprices([text(80_000)], at(cap), storeAt(1)), false, `no cap: ${cap}`);
+    }
+  });
+
+  it("epoch 3's bound, over messages of equal text blocks, counts each whose estimate at the clamp's ceiling passes the cap plus 50, and none under it by 1 + 1.8/F tokens a block, at applied multipliers from 0.6 to 1.8 in steps of 0.05", () => {
+    // The old price limited a message wherever the store's estimate passed
+    // the cap plus 50 at the multiplier then, which the clamp kept at 1.8 or
+    // under, and a block's rounded estimate only grows with the multiplier,
+    // so the estimate at 1.8 is the largest the old price could have met.
+    // The bound over-counts by less than 1 + 1.8/F tokens a block. Equal
+    // blocks all round the same way at a given multiplier, so their errors
+    // add up, the case the bound is tightest for. Only messages the cut's own
+    // test leaves are swept, so the bound decides each.
+    const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[3]!;
+    const rawOf = (chars: number) => Math.ceil(chars / 2.9);
+    let counted = 0;
+    let left = 0;
+    for (let step = 0; step <= 24; step++) {
+      const multiplier = (60 + 5 * step) / 100;
+      const store = {
+        estimateTokens: (m: StoredMessage) => m.content.reduce(
+          (sum, block) => sum + Math.round(rawOf((block as { text: string }).text.length) * multiplier), 0),
+        getTokenCalibration: () => multiplier,
+      } as unknown as MessageStoreView;
+      for (const cap of [50, 100]) {
+        const strategy = new AutobiographicalStrategy({ maxMessageTokens: cap });
+        for (let chars = 1; chars <= 12; chars++) {
+          for (let count = 1; count <= 80; count++) {
+            if (count * Math.ceil(chars / 4) > cap) continue;
+            const atCeiling = count * Math.round(rawOf(chars) * 1.8);
+            const message = { content: Array.from({ length: count }, () => ({ type: 'text', text: 'r'.repeat(chars) })) } as unknown as StoredMessage;
+            const where = `${count} blocks of ${chars} characters at ${multiplier}, cap ${cap}: ${atCeiling} at the ceiling`;
+            if (atCeiling > cap + 50) {
+              assert.equal(reprices([message], strategy, store), true, where);
+              counted++;
+            } else if (atCeiling + count * (1 + 1.8 / multiplier) <= cap + 50) {
+              assert.equal(reprices([message], strategy, store), false, where);
+              left++;
+            }
+          }
+        }
+      }
+    }
+    assert.ok(counted > 0 && left > 0, `premise: the sweep reaches both sides: ${counted} counted, ${left} left`);
+  });
+
+  it("epoch 3's bound reads a multiplier the view doesn't report as a positive finite number at the clamp's floor, 0.6", () => {
+    // 26 blocks of three characters, under a cap of 50 to the cut's
+    // estimate, estimate at 26 at 0.6 and 104 at 1.8, past 100. Read at 1,
+    // the bound would be 83.2; read at 0.6, it's 130.
+    const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[3]!;
+    const message = { content: Array.from({ length: 26 }, () => ({ type: 'text', text: 'rrr' })) } as unknown as StoredMessage;
+    const estimateTokens = (m: StoredMessage) => m.content.reduce(
+      (sum, block) => sum + Math.round(Math.ceil((block as { text: string }).text.length / 2.9) * 0.6), 0);
+    const strategy = new AutobiographicalStrategy({ maxMessageTokens: 50 });
+    const views: Array<[string, MessageStoreView]> = [
+      ['no getTokenCalibration', { estimateTokens } as unknown as MessageStoreView],
+      ...[Number.NaN, 0, -1, Number.POSITIVE_INFINITY].map((reported): [string, MessageStoreView] =>
+        [`getTokenCalibration reporting ${reported}`, { estimateTokens, getTokenCalibration: () => reported } as unknown as MessageStoreView]),
+    ];
+    for (const [what, view] of views) {
+      assert.equal(reprices([message], strategy, view), true, what);
     }
   });
 

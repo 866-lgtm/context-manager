@@ -6,8 +6,13 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
-import { attributeEntries, coversStoredContent, rawBodiesOf } from '../src/compile-provenance.js';
-import type { ContextEntry, StoredMessage } from '../src/index.js';
+import { attributeEntries as attributeIn, coversStoredContent, rawBodiesOf } from '../src/compile-provenance.js';
+import type { ContextEntry, ContextLogView, MessageStoreView, StoredMessage, TokenBudget } from '../src/index.js';
+
+/** Attribution over `stored`, resolving an id to its sequence among those messages, as a store's lookup does. */
+function attributeEntries(entries: readonly ContextEntry[], stored: readonly StoredMessage[]) {
+  return attributeIn(entries, stored, (id) => stored.find((m) => m.id === id)?.sequence);
+}
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
 const image = (data: string): ContentBlock => ({ type: 'image', source: { type: 'base64', data, mediaType: 'image/png' } } as ContentBlock);
@@ -208,7 +213,7 @@ describe('a body is an ingestion, not its content hash', () => {
     assert.deepEqual(later.sources[0], { kind: 'raw', bodies: [{ messageId: 'c0', sequence: 6, complete: true }] });
   });
 
-  it('reads bodies as body-runs.ts does, whatever the list', async () => {
+  it('reads bodies as body-runs.ts does, whatever the list and whichever of its messages the entries name, in any order', async () => {
     const { bodyBoundsIn } = await import('../src/index.js');
     const g = { bodyGroupId: 'bg-rule', shardCount: 2 };
     const lists: StoredMessage[][] = [
@@ -220,11 +225,22 @@ describe('a body is an ingestion, not its content hash', () => {
       [msg('p0', 1, [text('a')], { ...g, shardIndex: 0 }), msg('mid', 2, [text('between')]), msg('p1', 3, [text('b')], { ...g, shardIndex: 1 })],
     ];
     for (const stored of lists) {
-      const { bodies } = attributeEntries(stored.map((m) => copy(m)), stored);
-      stored.forEach((m, i) => {
-        const { from, to } = bodyBoundsIn(stored, i);
-        assert.deepEqual(bodies.get(m.id)!.map((b) => b.id), stored.slice(from, to + 1).map((b) => b.id), m.id);
-      });
+      const selections = [
+        stored,
+        [...stored].reverse(),
+        stored.filter((_, i) => i % 2 === 1),
+        [stored[stored.length - 1]!],
+      ];
+      for (const named of selections) {
+        const { bodies, sources } = attributeEntries(named.map((m) => copy(m)), stored);
+        named.forEach((m, k) => {
+          const { from, to } = bodyBoundsIn(stored, stored.indexOf(m));
+          const body = stored.slice(from, to + 1).map((b) => b.id);
+          assert.deepEqual(bodies.get(m.id)!.map((b) => b.id), body, m.id);
+          const source = sources[k]!;
+          assert.ok(source.kind === 'raw' && source.bodies[0]!.messageId === body[0], `${m.id}: its body's head`);
+        });
+      }
     }
   });
 
@@ -320,6 +336,200 @@ describe('a body is an ingestion, not its content hash', () => {
       assert.equal(again.rawBodies!.get(third)![0]!.sequence > again.rawBodies!.get(second)!.at(-1)!.sequence, true);
       cm.close();
     } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('attribution reads what the raw entries name, not the stored history', () => {
+  it('reads the history only around the named bodies, with one lookup for each run of consecutive messages', () => {
+    // A long history whose newest messages render raw, ending in a sharded
+    // body, with one old message recalled raw ahead of them: two runs.
+    const n = 50_000;
+    const history = Array.from({ length: n }, (_, i) => msg(`m${i}`, 2 * i + 1, [text(`message ${i}`)]));
+    const g = { bodyGroupId: 'tail-doc', shardCount: 3 };
+    for (let s = 0; s < 3; s++) history[n - 3 + s] = msg(`d${s}`, 2 * (n - 3 + s) + 1, [text(`part ${s} `)], { ...g, shardIndex: s });
+    const sequences = new Map(history.map((m) => [m.id, m.sequence]));
+    let reads = 0;
+    const stored = new Proxy(history, {
+      get(target, prop, receiver) {
+        if (typeof prop === 'string' && /^\d+$/.test(prop)) reads++;
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    let lookups = 0;
+    const sequenceOf = (id: string) => {
+      lookups++;
+      return sequences.get(id);
+    };
+    const window = history.slice(n - 20, n - 3);
+    const doc: ContextEntry = { index: 0, sourceMessageIds: ['d0', 'd1', 'd2'], sourceRelation: 'copy', participant: 'user', content: [text('part 0 part 1 part 2 ')] };
+    const entries = [copy(history[1000]!), ...window.map((m) => copy(m)), doc];
+
+    const result = attributeIn(entries, stored, sequenceOf);
+    const heads = result.sources.map((s) => (s.kind === 'raw' ? s.bodies.map((b) => [b.messageId, b.complete]) : null));
+    assert.deepEqual(heads, [[['m1000', true]], ...window.map((m) => [[m.id, true]]), [['d0', true]]]);
+    assert.deepEqual(rawBodiesOf(result).get('d0')!.map((m) => m.id), ['d0', 'd1', 'd2']);
+    assert.ok(rawBodiesOf(result).get('d0')!.every((m, s) => m === history[n - 3 + s]), "the stored array's own objects");
+    assert.ok(reads < 500, `read ${reads} of the ${n} stored messages for ${entries.length} raw entries`);
+    assert.ok(lookups <= 2, `${lookups} lookups for two runs of consecutive messages`);
+  });
+
+  it("finds nothing where the lookup answers with another message's sequence, or with one no stored message has", () => {
+    const stored = [msg('a', 1, [text('a')]), msg('b', 3, [text('b')]), msg('c', 5, [text('c')]), msg('d', 7, [text('d')])];
+    // c's lookup answers with b's sequence, d's with a sequence nothing has,
+    // and an unknown id's with nothing; b is found through its own.
+    const answers = new Map([['c', 3], ['d', 4], ['b', 3]]);
+    const entries = [copy(stored[2]!), copy(stored[3]!), copy(msg('x', 9, [text('x')])), copy(stored[1]!)];
+    const result = attributeIn(entries, stored, (id) => answers.get(id));
+    const heads = result.sources.map((s) => (s.kind === 'raw' ? s.bodies.map((b) => b.messageId) : null));
+    assert.deepEqual(heads, [[], [], [], ['b']], "no body is credited to c or d, and b's is its own");
+    assert.deepEqual([...rawBodiesOf(result).keys()], ['b']);
+  });
+
+  it('through compile, a render that starts partway through the history finds each raw body in the store', async () => {
+    const { ContextManager, PassthroughStrategy } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    class Halves extends PassthroughStrategy {
+      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+        if (content.length < 2) return null;
+        return { bodyGroupId: 'late-doc', shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })) };
+      }
+    }
+    const path = './test-attribution-tail';
+    rmSync(path, { recursive: true, force: true });
+    try {
+      const cm = await ContextManager.open({ path, strategy: new Halves() });
+      const line = (i: number) => text(`line ${i}: ${'words of an ordinary turn '.repeat(8)}`);
+      for (let i = 0; i < 60; i++) cm.addMessage(i % 2 ? 'bob' : 'alice', [line(i)]);
+      const doc = cm.addMessage('alice', [line(60), line(61)]);
+      for (let i = 62; i < 66; i++) cm.addMessage('bob', [line(i)]);
+      const stored = cm.getAllMessages();
+
+      const result = await cm.compile({ maxTokens: 1500, reserveForResponse: 0 });
+      const raw = result.provenance!.messages.map((m) => (m.kind === 'raw' ? m.bodies : []));
+      assert.ok(result.messages.length < stored.length / 2, `a tail render (${result.messages.length} of ${stored.length})`);
+      assert.ok(raw.every((bodies) => bodies.length === 1), 'every compiled message names its body');
+      const rendered = stored.slice(stored.length - result.messages.length);
+      assert.deepEqual(raw.map((bodies) => bodies[0]!.messageId), rendered.map((m) => (m.bodyGroupId ? doc : m.id)));
+      assert.ok(raw.every((bodies) => bodies[0]!.complete), 'each body complete, the document with both shards');
+      assert.deepEqual(result.rawBodies!.get(doc)!.map((m) => m.shardIndex), [0, 1]);
+      cm.close();
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('through compile, a run of raw entries costs a sequence lookup, not a read of its message (#273)', async () => {
+    const { ContextManager, PassthroughStrategy, MessageStore } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    // Every other message renders raw, so each raw entry starts a run of its
+    // own and attribution looks up where each one sits.
+    class EveryOther extends PassthroughStrategy {
+      select(store: MessageStoreView, log: ContextLogView, budget: TokenBudget): ContextEntry[] {
+        return super.select(store, log, budget).filter((_, i) => i % 2 === 0);
+      }
+    }
+    const path = './test-attribution-lookups';
+    rmSync(path, { recursive: true, force: true });
+    // The point read under get() and sequenceOf(): a read of one stored item
+    // through chronicle, whichever of them asked.
+    const proto = MessageStore.prototype as unknown as { getInternal(index: number): unknown };
+    const getInternal = proto.getInternal;
+    let reads = 0;
+    try {
+      const cm = await ContextManager.open({ path, strategy: new EveryOther() });
+      for (let i = 0; i < 40; i++) cm.addMessage(i % 2 ? 'bob' : 'alice', [text(`line ${i}`)]);
+      proto.getInternal = function (this: unknown, index: number) {
+        reads++;
+        return getInternal.call(this, index);
+      };
+      const result = await cm.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+      proto.getInternal = getInternal;
+      const raw = result.provenance!.messages.map((m) => (m.kind === 'raw' ? m.bodies.map((b) => [b.messageId, b.complete]) : null));
+      assert.deepEqual(raw, cm.getAllMessages().filter((_, i) => i % 2 === 0).map((m) => [[m.id, true]]), 'each raw entry names its own complete body');
+      assert.equal(reads, 0, `compile read ${reads} stored messages one at a time`);
+      cm.close();
+    } finally {
+      proto.getInternal = getInternal;
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('under a view filter, after a write, a compile reads no stored message to place the runs the filter breaks (#273)', async () => {
+    const { ContextManager, PassthroughStrategy, MessageStore } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    // Hiding every other message starts a run at each shown one. Attribution
+    // then reads the merged view before the filter, and a resident writes
+    // before each compile.
+    const path = './test-attribution-lookups-filtered';
+    rmSync(path, { recursive: true, force: true });
+    const proto = MessageStore.prototype as unknown as { getInternal(index: number): unknown };
+    const getInternal = proto.getInternal;
+    let reads = 0;
+    try {
+      const cm = await ContextManager.open({ path, strategy: new PassthroughStrategy(), viewFilter: (m) => !m.metadata?.tuneOut });
+      const turn = (i: number) => {
+        cm.addMessage('bob', [text(`hidden ${i}`)], { tuneOut: { epochId: `e${i}` } });
+        return cm.addMessage('alice', [text(`shown ${i}`)]);
+      };
+      const shown = Array.from({ length: 20 }, (_, i) => turn(i));
+      await cm.compile();
+      shown.push(turn(20));
+      proto.getInternal = function (this: unknown, index: number) {
+        reads++;
+        return getInternal.call(this, index);
+      };
+      const result = await cm.compile();
+      proto.getInternal = getInternal;
+      const raw = result.provenance!.messages.map((m) => (m.kind === 'raw' ? m.bodies.map((b) => [b.messageId, b.complete]) : null));
+      assert.deepEqual(raw, shown.map((id) => [[id, true]]), 'each shown message is its own complete body');
+      assert.equal(reads, 0, `compile read ${reads} stored messages one at a time`);
+      cm.close();
+    } finally {
+      proto.getInternal = getInternal;
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+
+  it('a raw run from an auxiliary slot is placed without reading its message (#273)', async () => {
+    const { ContextManager, PassthroughStrategy, MessageStore } = await import('../src/index.js');
+    const { rmSync } = await import('node:fs');
+    // The hidden message breaks the run, so the second shown one, which only
+    // the auxiliary slot holds, is placed by its sequence.
+    const path = './test-attribution-lookups-auxiliary';
+    rmSync(path, { recursive: true, force: true });
+    const proto = MessageStore.prototype as unknown as { getInternal(index: number): unknown };
+    const getInternal = proto.getInternal;
+    let reads = 0;
+    try {
+      const main = await ContextManager.open({ path, strategy: new PassthroughStrategy() });
+      const side = await ContextManager.open({
+        store: main.getStore(),
+        namespace: 'subconscious/reader',
+        isolate: true,
+        strategy: new PassthroughStrategy(),
+        auxiliaryMessageViews: [{}],
+        viewFilter: (m) => !m.metadata?.tuneOut,
+      });
+      const first = main.addMessage('alice', [text('first')]);
+      main.addMessage('bob', [text('hidden')], { tuneOut: { epochId: 'e1' } });
+      const second = main.addMessage('alice', [text('second')]);
+      // The first compile reads the writer's appends into the reader's listing.
+      await side.compile();
+      proto.getInternal = function (this: unknown, index: number) {
+        reads++;
+        return getInternal.call(this, index);
+      };
+      const result = await side.compile();
+      proto.getInternal = getInternal;
+      const raw = result.provenance!.messages.map((m) => (m.kind === 'raw' ? m.bodies.map((b) => [b.messageId, b.complete]) : null));
+      assert.deepEqual(raw, [[[first, true]], [[second, true]]]);
+      assert.equal(reads, 0, `compile read ${reads} stored messages one at a time`);
+      side.close();
+      main.close();
+    } finally {
+      proto.getInternal = getInternal;
       rmSync(path, { recursive: true, force: true });
     }
   });
@@ -658,6 +868,8 @@ describe('sharded writes declare their group size', () => {
       const middle = cm.addMessage('carol', [text('four '), text('five '), text('six')]);
       assert.deepEqual(heard, ['add', 'add', 'add', 'add', 'add', 'add', 'add'], 'every shard heard, nothing removed');
       assert.equal(logged.filter((l) => l.includes('onMessage listener threw')).length, 3);
+      // The manager's lines name its namespace, the default one here (#239).
+      assert.ok(logged.filter((l) => l.includes('onMessage listener threw')).every((l) => l.includes('the write stands: ns=default')), logged.join('\n'));
       assert.ok(logged.some((l) => l.includes(`'add' event for message ${plain};`)), 'each names the message it missed');
       assert.ok(logged.some((l) => l.includes('onMessage listener threw') && l.includes('(body group three);')), "and a shard's body group");
       const result = await cm.compile();
@@ -666,6 +878,13 @@ describe('sharded writes declare their group size', () => {
         assert.equal(bodies.find((b) => b.messageId === id)?.complete, true, `${id}: stored whole`);
       }
       cm.close();
+      // A manager in a namespace names it (#239).
+      const named = await ContextManager.open({ path, strategy: new PassthroughStrategy(), namespace: 'agents/tern' });
+      named.onMessage(() => { throw new Error('listener failed'); });
+      logged.length = 0;
+      named.addMessage('bob', [text('named')]);
+      assert.ok(logged.some((l) => l.includes('onMessage listener threw') && l.includes('the write stands: ns=agents/tern')), logged.join('\n'));
+      named.close();
     } finally {
       console.error = error;
       rmSync(path, { recursive: true, force: true });

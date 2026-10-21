@@ -1,3 +1,0 @@
-- **Anyone running context-manager on Node 20 or 21, or on Node 22 before 22.12:** context-manager now declares `engines.node` `>=22.12.0`, where it declared `>=20.0.0`, and CI tests at Node 22.12.0 exactly, at 24 and at the newest Node, where it tested the newest 20.x and 24. Node 20 reached end of life on 2026-04-30. npm warns when it installs context-manager on an older Node, and refuses only with `engine-strict` set. Nothing in context-manager's code changes with this; older Node versions are simply no longer tested.
-  - **Migration:** run Node 22.12 or later.
-  - **Unchanged:** context-manager's API, what it stores, and what it compiles.

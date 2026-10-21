@@ -92,9 +92,69 @@ describe('mergeMessageStoreViews', () => {
     assert.deepEqual(merged.getTail(2).map((m) => m.id), ['x2', 'p2']);
   });
 
+  it("answers a sequence through each view's sequenceOf, and through get where a view has none", () => {
+    const primary = fakeView([{ id: 'p1', sequence: 1 }]);
+    const reads: string[] = [];
+    primary.sequenceOf = (id) => (id === 'p1' ? 1 : undefined);
+    const get = primary.get;
+    primary.get = (id) => {
+      reads.push(id);
+      return get(id);
+    };
+    const aux = fakeView([{ id: 'x1', sequence: 2 }]);
+    const merged = mergeMessageStoreViews(primary, [aux]);
+
+    assert.equal(merged.sequenceOf?.('p1'), 1);
+    assert.equal(merged.sequenceOf?.('x1'), 2, 'the auxiliary view, through its get');
+    assert.equal(merged.sequenceOf?.('nope'), undefined);
+    assert.deepEqual(reads, [], "the primary's messages were never read");
+  });
+
   it('returns the primary view untouched when there is nothing to merge', () => {
     const primary = fakeView([{ id: 'p1', sequence: 1 }]);
     assert.equal(mergeMessageStoreViews(primary, []), primary);
+  });
+
+  it('serves one merged listing while every source listing is the same array', () => {
+    // A store's getAll returns its cached array until a write; the memo
+    // keys on those arrays, so fresh view objects over unchanged sources
+    // share the merge and the listing keeps its identity.
+    let primaryListing: StoredMessage[] = fakeView([{ id: 'p1', sequence: 1 }, { id: 'p2', sequence: 4 }]).getAll();
+    let auxListing: StoredMessage[] = fakeView([{ id: 'x1', sequence: 2 }]).getAll();
+    const stable = (read: () => StoredMessage[]): MessageStoreView => ({
+      getAll: read,
+      get: (id) => read().find((m) => m.id === id) ?? null,
+      getFrom: (index) => read().slice(index),
+      getTail: (count) => read().slice(Math.max(0, read().length - count)),
+      length: () => read().length,
+      estimateTokens: () => 10,
+    });
+    const primary = stable(() => primaryListing);
+    const aux = stable(() => auxListing);
+
+    const first = mergeMessageStoreViews(primary, [aux]).getAll();
+    assert.deepEqual(first.map((m) => m.id), ['p1', 'x1', 'p2']);
+    assert.equal(mergeMessageStoreViews(primary, [aux]).getAll(), first, 'a fresh view over the same sources shares the merge');
+    assert.equal(mergeMessageStoreViews(primary, [aux]).getTail(5), first);
+
+    // An append replaces the source array: the merge is rebuilt once and shared again.
+    const oldAuxListing = auxListing;
+    const oldAux = stable(() => oldAuxListing);
+    auxListing = [...auxListing, { id: 'x2', sequence: 3 } as StoredMessage];
+    const second = mergeMessageStoreViews(primary, [aux]).getAll();
+    assert.notEqual(second, first);
+    assert.deepEqual(second.map((m) => m.id), ['p1', 'x1', 'x2', 'p2']);
+    assert.equal(mergeMessageStoreViews(primary, [aux]).getAll(), second);
+
+    // A view still holding the old auxiliary array is served the old merge.
+    assert.equal(mergeMessageStoreViews(primary, [oldAux]).getAll(), first);
+
+    // The primary moving on rebuilds against the current sources.
+    primaryListing = [...primaryListing];
+    const third = mergeMessageStoreViews(primary, [aux]).getAll();
+    assert.notEqual(third, second);
+    assert.deepEqual(third.map((m) => m.id), ['p1', 'x1', 'x2', 'p2']);
+    assert.equal(mergeMessageStoreViews(primary, [aux]).getAll(), third);
   });
 });
 
@@ -169,10 +229,15 @@ describe('ContextManager auxiliaryMessageViews', () => {
     });
 
     await side.compile(); // prime any caches
-    main.addMessage('alice', text('after-prime'));
+    const appended = main.addMessage('alice', text('after-prime'));
     const result = await side.compile();
     const rendered = result.messages.map((m) => (m.content[0] as { text: string }).text);
     assert.deepEqual(rendered, ['after-prime']);
+    // The merged listing is memoized on the source arrays; an edit on the
+    // other instance changes the aux slot's array as an append does.
+    main.editMessage(appended, text('after-edit'));
+    const edited = await side.compile();
+    assert.deepEqual(edited.messages.map((m) => (m.content[0] as { text: string }).text), ['after-edit']);
 
     await side.close();
     await main.close();
@@ -302,8 +367,18 @@ describe('WindowedPassthroughStrategy: branch-scoped anchor', () => {
     await manager.close();
 
     const strategy2 = new WindowedPassthroughStrategy({ anchorStateId });
-    const manager2 = await ContextManager.open({ path, strategy: strategy2 });
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+    let manager2: ContextManager;
+    try {
+      manager2 = await ContextManager.open({ path, strategy: strategy2, namespace: 'agents/tern' });
+    } finally {
+      console.warn = warn;
+    }
     assert.equal(strategy2.getAnchor(), 0);
+    // The reset is said, naming the strategy's namespace (#239).
+    assert.ok(warned.some((w) => w.startsWith('[windowed-passthrough] persisted anchor 1000000 is past the branch head') && w.endsWith(' ns=agents/tern')), warned.join('\n'));
     assert.deepEqual(texts(await manager2.compile()), ['a', 'b']);
     await manager2.close();
   });
@@ -429,7 +504,9 @@ describe('WindowedPassthroughStrategy: hard budget', () => {
 });
 
 describe('the message cap\'s omission marker, in both strategies', () => {
-  const budget = { maxTokens: 300, reserveForResponse: 50 }; // usable 250, as the cap tests above
+  // Room for the image the cap keeps, which a capped message's price counts
+  // as it renders (#223), at the store's 1,600 tokens.
+  const budget = { maxTokens: 3000, reserveForResponse: 50 };
   const strategies = [
     ['windowed passthrough', () => new WindowedPassthroughStrategy({ maxMessageTokens: 100 })],
     ['autobiographical', () => new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 100_000, maxMessageTokens: 100 })],

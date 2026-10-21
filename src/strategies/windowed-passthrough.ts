@@ -1,8 +1,10 @@
+import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import type {
   ContextStrategy,
   StrategyContext,
   ReadinessState,
   MessageStoreView,
+  MessageId,
   ContextLogView,
   TokenBudget,
   ContextEntry,
@@ -17,7 +19,7 @@ import type { JsStore } from '@animalabs/chronicle';
 import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
 import { hasImage, imagesIn, inlineImageBytes, replaceImages, strippedImageSaving } from '../inline-images.js';
-import { capContent } from './message-cap.js';
+import { capContent, cappedPriceExtra } from './message-cap.js';
 
 /**
  * Options for {@link WindowedPassthroughStrategy}.
@@ -54,8 +56,9 @@ export interface WindowedPassthroughOptions {
    * tool-result clamp mirrors it. Side-process agents should mirror their
    * principal's value so the two see the same truncation policy. Images are
    * not subject to this cap; they are governed by the live-image policy
-   * below. Unset = no truncation, in which case a single message larger
-   * than the usable budget is refused (see {@link OverBudgetError}).
+   * below. Unset, or any value that isn't a positive number, = no
+   * truncation, in which case a single message larger than the usable
+   * budget is refused (see {@link OverBudgetError}).
    */
   maxMessageTokens?: number;
   /**
@@ -136,6 +139,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   private anchor: Sequence = 0;
   private store: JsStore | null = null;
   private stateId: string | null = null;
+  /** Its namespace, set in initialize(), which its stderr lines name (#239). */
+  private ns = '';
+  private readonly diag: Diagnostics = namespaceDiagnostics(() => this.ns);
   /** The branch (name + generation) the in-memory state was loaded from. */
   private loadedBranch: StoreBranchGeneration | null = null;
   /** Content identity of the previous committed compile's entries. */
@@ -159,6 +165,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
 
   async initialize(ctx: StrategyContext): Promise<void> {
     this.store = ctx.store;
+    this.ns = ctx.namespace;
     this.stateId = this.anchorStateIdOverride ?? `${ctx.namespace}/windowed:anchor`;
     registerStateIfAbsent(this.store, { id: this.stateId, strategy: 'snapshot' });
     this.loadBranchState();
@@ -214,7 +221,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       // Cannot name a position on this branch. A stale value here would make
       // every select() return an empty window — and the next re-anchor would
       // persist the stale-derived value into this branch.
-      console.warn(
+      this.diag.warn(
         `[windowed-passthrough] persisted anchor ${value} is past the branch head ${head} ` +
         `(${this.store.currentBranch().name}); resetting to 0`,
       );
@@ -266,28 +273,30 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     // will actually be sent: the live-image policy's verdicts, decided once
     // from the newest message down to the anchor (liveImagePolicy), so the
     // window is priced without the images the strip takes out, and
-    // truncation. A message the cap cuts is priced as the autobiographical
-    // strategy prices one, at min(estimate, cap + 50). At cap + 50 the price
-    // leaves out the images truncation keeps. That price isn't a bound on what
-    // renders: the cut's suffix, a string result's omission notice and the omission
-    // marker can take a capped message past it. A message the truncator
-    // leaves whole renders whole and is priced at its estimate, even past
-    // the cap, where the autobiographical strategy prices every message at
-    // min(estimate, cap + 50). The two estimates differ: the store's counts
-    // every block, thinking included, and the truncator's counts text and
-    // string results alone, rounding each block up, so either can pass the
-    // cap with nothing cut.
+    // truncation. A message the cap cuts is priced as it renders, as the
+    // autobiographical strategy prices one: its price after the policy,
+    // plus what the cut adds to it as the store estimates the content sent
+    // (cappedPriceExtra). The cut changes text and string results alone,
+    // and the store prices the text the cap keeps at its own rates, so the
+    // difference holds the kept text, the suffix, the omission notices and
+    // the marker, and the message's other blocks keep their price, its
+    // images at the policy's. A message the truncator leaves whole renders
+    // whole and is priced at its estimate after the policy, even past the
+    // cap. The two estimates differ: the store's counts every block,
+    // thinking included, and the truncator's counts text and string results
+    // alone, rounding each block up, so either can pass the cap with nothing
+    // cut. The image strip's depth (liveImagePolicy) is still measured by
+    // the store's estimate of each stored message, before the cap, as the
+    // autobiographical strategy measures its own.
     const policy = this.liveImagePolicy(messages, store, start);
-    const cap = this.maxMessageTokens ?? 0;
     const shaped = new Map<number, ContentBlock[]>();
     const priced = (i: number): number => {
       const msg = messages[i];
       const estimate = Math.max(0, store.estimateTokens(msg) - (policy.saved[i] ?? 0));
-      if (cap <= 0) return estimate;
-      const content = truncateContent(msg.content, cap);
+      const content = this.cappedContent(msg);
       if (content === msg.content) return estimate;
       shaped.set(i, content);
-      return Math.min(estimate, cap + 50);
+      return estimate + cappedPriceExtra(store, msg, content);
     };
 
     let total = 0;
@@ -360,16 +369,59 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       });
     }
 
-    for (const entry of entries) {
-      const strips = policy.strips[entry.index];
-      if (!strips) continue;
-      // Truncation passes every block that holds an image through, so the
-      // entry's images are its message's, in the order the verdicts follow.
-      let k = 0;
-      entry.content = replaceImages(entry.content, () => strips[k++]!, IMAGE_PLACEHOLDER);
-    }
+    this.stripImages(entries, policy);
     if (!opts?.dryRun) this.placeCacheMarkers(entries);
     return entries;
+  }
+
+  /** A stored message's content as select sends it under the per-message
+   *  cap: the content itself when no cap is set or nothing needs cutting. */
+  private cappedContent(msg: StoredMessage): ContentBlock[] {
+    const cap = this.maxMessageTokens ?? 0;
+    return cap <= 0 ? msg.content : truncateContent(msg.content, cap);
+  }
+
+  /**
+   * See `ContextStrategy.renderAsNewest`. The steps select takes for the
+   * messages it sends, over the view's suffix from the batch's oldest
+   * message to its newest: each cut as select cuts it (cappedContent), then
+   * the live-image policy's verdicts applied (liveImagePolicy, stripImages),
+   * each decided from its message and newer ones, with depth from the view's
+   * newest message, so they're select's. A message before the anchor, which select
+   * leaves out, comes back as null. Like select, it first reloads the
+   * branch the store has moved to. A re-anchor the next compile's budget
+   * forces isn't foreseen: it moves the anchor only past a window bigger
+   * than the budget allows. A body sharded under the autobiographical
+   * strategy comes back shard by shard, since select sends each as its own
+   * message.
+   */
+  renderAsNewest(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null> {
+    this.syncToBranch();
+    const messages = store.getAll();
+    const at = new Map(messages.map((m, i) => [m.id, i] as const));
+    const shown = (i: number): boolean => messages[i]!.sequence >= this.anchor;
+    let from = messages.length;
+    for (const id of ids) {
+      const i = at.get(id);
+      if (i !== undefined && shown(i)) from = Math.min(from, i);
+    }
+    // Timeline order with each message's position as its index, as select's
+    // entries have, which stripImages reads the verdicts by.
+    const entries: ContextEntry[] = [];
+    for (let i = from; i < messages.length; i++) {
+      const msg = messages[i]!;
+      entries.push({
+        index: i,
+        sourceMessageId: msg.id,
+        sourceRelation: 'copy',
+        participant: msg.participant,
+        content: this.cappedContent(msg),
+      });
+    }
+    this.stripImages(entries, this.liveImagePolicy(messages, store, from));
+    const rendered = new Map<MessageId, ContentBlock[]>();
+    for (const entry of entries) rendered.set(entry.sourceMessageId!, entry.content);
+    return ids.map((id) => rendered.get(id) ?? null);
   }
 
   /** 'window' when the last committed select moved the window's start. */
@@ -389,10 +441,12 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * `imagesIn` and `replaceImages` visit a message's images), and the tokens
    * each message's estimate gives back for the images it loses (`saved`).
    * `select` prices the window by `saved` and applies `strips` to what it
-   * emits, so the verdicts it prices are the ones the strip applies.
+   * emits (stripImages), so the verdicts it prices are the ones the strip
+   * applies.
    *
    * That holds wherever the window starts, and the re-anchor walk reads them
-   * as they are: the window is every message from the anchor on, and each
+   * as they are, as `renderAsNewest` does from the batch's oldest message:
+   * the window is every message from the anchor on, and each
    * verdict is decided from that message and newer ones only, its depth from
    * the newest message over the whole view and its count and bytes
    * newest-first. So a message's verdicts, and its price after them, are the
@@ -454,6 +508,19 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       saved[i] = tokens;
     }
     return { strips, saved };
+  }
+
+  /** The policy's verdicts applied to entries whose `index` is their
+   *  message's position. Truncation passes every block that holds an image
+   *  through, so an entry's images are its message's, in the order the
+   *  verdicts follow. */
+  private stripImages(entries: ContextEntry[], policy: { strips: (boolean[] | undefined)[] }): void {
+    for (const entry of entries) {
+      const strips = policy.strips[entry.index];
+      if (!strips) continue;
+      let k = 0;
+      entry.content = replaceImages(entry.content, () => strips[k++]!, IMAGE_PLACEHOLDER);
+    }
   }
 
   // --------------------------------------------------------------------------

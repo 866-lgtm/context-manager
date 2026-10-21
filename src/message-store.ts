@@ -1,3 +1,4 @@
+import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
 import type { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
@@ -118,7 +119,15 @@ interface NativeIndexEqOpts {
  */
 const sharedWriteVersions = new WeakMap<object, Map<string, number>>();
 
-function bumpWriteVersion(store: object, stateId: string): number {
+/**
+ * Its `[cm-cache]` line goes through `log`, the bumping store's diagnostics (#239).
+ *
+ * An append moves the version by one and adds one record; every other
+ * mutation moves it and adds no record. getAllInternal reads "only appends
+ * since" from that: a slot grown by exactly the versions moved. That holds
+ * only while the slot is written through MessageStore alone.
+ */
+function bumpWriteVersion(store: object, stateId: string, log: Diagnostics): number {
   let m = sharedWriteVersions.get(store);
   if (!m) {
     m = new Map();
@@ -128,7 +137,7 @@ function bumpWriteVersion(store: object, stateId: string): number {
   m.set(stateId, next);
   if (typeof process !== 'undefined' && process.env?.CM_CACHE_DIAG) {
     const site = (new Error().stack ?? '').split('\n')[2]?.trim();
-    console.error(`[cm-cache] writeVersion bump ${stateId} → ${next} at ${site}`);
+    log.error(`[cm-cache] writeVersion bump ${stateId} → ${next} at ${site}`);
   }
   return next;
 }
@@ -158,8 +167,9 @@ function currentEditVersion(store: object, stateId: string): number {
  *  full rebuild is ~20s of CPU on a large store on production hardware —
  *  a silent cache miss IS the latency incident (mythos, 2026-07-26). */
 const CACHE_DIAG = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
-function cacheDiag(msg: string): void {
-  if (CACHE_DIAG) console.error(`[cm-cache] ${msg}`);
+/** Through `log`, the store's diagnostics, so an isolated slot's lines name its namespace (#239). */
+function cacheDiag(msg: string, log: Diagnostics): void {
+  if (CACHE_DIAG) log.error(`[cm-cache] ${msg}`);
 }
 
 /**
@@ -230,6 +240,14 @@ export class MessageStore {
   private tokenEstimator: (text: string) => number;
   private stateId: string;
 
+  /**
+   * Where its stderr lines go, its `[cm-cache]` lines included: a slot of one
+   * namespace (an isolated manager's, or an auxiliary slot named by its
+   * namespace) names it; the shared slot is no one namespace's, and its lines
+   * name none (#239).
+   */
+  private readonly log: Diagnostics;
+
   constructor(
     private store: JsStore,
     options: TokenEstimatorOptions & {
@@ -237,6 +255,8 @@ export class MessageStore {
       namespace?: string;
     } = {}
   ) {
+    const namespace = options.namespace;
+    this.log = namespace ? namespaceDiagnostics(() => namespace) : console;
     this.stateId = options.namespace
       ? `${options.namespace}/messages`
       : DEFAULT_MESSAGE_STATE_ID;
@@ -380,11 +400,12 @@ export class MessageStore {
    * Memo of the fully-materialized internal state (2026-07-18, sonn5 OOM /
    * CPU-churn class, companion to the BlobManager resolve cache).
    *
-   * `getAllInternal()` is a full chronicle `getStateJson` — serde
-   * serialize + JS parse of the ENTIRE message state. Compile calls it
-   * ~6× per pass (postStripEstimates, getRecentWindowStart,
-   * getHeadWindowEnd, getCompressibleMessages, selectAdaptive,
-   * rebuildChunks), and compression catch-up repeats those passes
+   * A miss in `getAllInternal()` is a full chronicle `getStateJson` — serde
+   * serialize + JS parse of the ENTIRE message state — unless only appends
+   * happened since the cache was built, which it reads by point lookup
+   * (#251). Compile calls it ~6× per pass (postStripEstimates,
+   * getRecentWindowStart, getHeadWindowEnd, getCompressibleMessages,
+   * selectAdaptive, rebuildChunks), and compression catch-up repeats those passes
    * continuously: on a 19.5k-message store, perf showed the agent pinning
    * a full core in serde_json between LLM calls.
    *
@@ -468,7 +489,7 @@ export class MessageStore {
       this.indexBranchId === branchId &&
       this.indexWriteVersion === currentWriteVersion(this.store, this.stateId);
     const cacheWasCurrent = this.cacheIsCurrent();
-    const version = bumpWriteVersion(this.store, this.stateId);
+    const version = bumpWriteVersion(this.store, this.stateId, this.log);
     const record = this.store.appendToStateJsonWithIdentity(
       this.stateId,
       partialInternal,
@@ -519,10 +540,18 @@ export class MessageStore {
       // sees a version mismatch and full-rebuilds on EVERY append — the
       // quadratic ingest this write-through exists to prevent.
       this.allCache.writeVersion = currentWriteVersion(this.store, this.stateId);
+    } else if (!cacheWasCurrent && this.allCache) {
+      // The cache wasn't current: a sibling wrote since it was built, or it
+      // was built on another branch. It's kept: the next read extends it with
+      // what was appended, this write included, where only appends happened
+      // on its branch, and rebuilds it otherwise (getAllInternal), so a
+      // sibling's append costs no reload here either.
+      cacheDiag(`append write-through deferred (cache wasn't current before the append) stateId=${this.stateId} — cache kept for the next read to extend or rebuild`, this.log);
     } else {
       if (this.allCache) {
         cacheDiag(
-          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : !cacheWasCurrent ? 'cache was stale before the append' : this.allCache.branchId !== this.store.currentBranch().id ? 'branch mismatch' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) — cache dropped`,
+          `append write-through FAILED (${!canPointLookup ? 'no point lookup' : !canonical ? 'canonical null' : `length mismatch cache=${this.allCache.internals.length} index=${index}`}) stateId=${this.stateId} — cache dropped`,
+          this.log,
         );
       }
       this.allCache = null;
@@ -568,7 +597,7 @@ export class MessageStore {
     // The old content as a read gives it, so an edit can replace a message
     // whose stored content doesn't match ContentBlock.
     const oldContent = this.blobManager.resolveBlobs(
-      wellFormedContent(oldMessage.content, `message ${messageId}`, this.malformedLogged),
+      wellFormedContent(oldMessage.content, `message ${messageId}`, this.malformedLogged, this.log),
     );
     const storedContent = this.blobManager.extractBlobs(newContent);
 
@@ -579,7 +608,7 @@ export class MessageStore {
     };
 
     const cacheWasCurrent = this.cacheIsCurrent();
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId, this.log);
     bumpEditVersion(this.store, this.stateId);
     this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
 
@@ -633,7 +662,7 @@ export class MessageStore {
     }
 
     const cacheWasCurrent = this.cacheIsCurrent();
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId, this.log);
     bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
     // Write-through the materialized cache (see append); fall back to
@@ -670,7 +699,7 @@ export class MessageStore {
     if (!target?.bodyGroupId) {
       // Not sharded — defer to normal remove path (re-look up via getInternal
       // since the normal `remove` checks bodyGroupId).
-      this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+      this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId, this.log);
       bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
       this.allCache = null; // rare path: plain invalidation
@@ -685,7 +714,7 @@ export class MessageStore {
     const { from, to } = bodyBoundsIn(all, index);
     const firstId = all[from].id;
     const lastId = all[to].id;
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId, this.log);
     bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, from, to + 1);
     this.allCache = null; // rare path: plain invalidation
@@ -728,7 +757,7 @@ export class MessageStore {
       );
     }
 
-    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId);
+    this.indexWriteVersion = bumpWriteVersion(this.store, this.stateId, this.log);
     bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, fromIndex, toIndex + 1);
     this.allCache = null; // rare path: plain invalidation
@@ -752,6 +781,19 @@ export class MessageStore {
     }
 
     return this.internalToStored(internal, messageId, index);
+  }
+
+  /**
+   * A message's sequence, as `get(id)?.sequence` answers it. While the
+   * materialized cache is current (a compile has just listed the slot), it
+   * answers from there instead of reading the item through chronicle, which
+   * get() does even to report one field (#273).
+   */
+  sequenceOf(messageId: MessageId): number | undefined {
+    const index = this.lookupIndex(messageId);
+    if (index === undefined) return undefined;
+    const internal = this.cacheIsCurrent() ? this.allCache!.internals[index] : this.getInternal(index);
+    return internal?.sequence;
   }
 
   /**
@@ -1127,6 +1169,7 @@ export class MessageStore {
     return {
       getAll: () => this.getAll(),
       get: (id) => this.get(id),
+      sequenceOf: (id) => this.sequenceOf(id),
       getFrom: (index) => this.getFrom(index),
       getTail: (count) => this.getTail(count),
       length: () => this.length(),
@@ -1798,13 +1841,56 @@ export class MessageStore {
         missReason = `revalidate-fail count (cached ${this.allCache.internals.length} live ${count}${canPointLookup ? '' : ', no point lookup'})`;
       }
     }
+    // Only appends since the cache was built, through any MessageStore on
+    // this store: the slot grew by exactly the write versions moved
+    // (bumpWriteVersion). The appended records are then read by point lookup
+    // and added, rather than the slot re-materialized for a sibling's append
+    // (#251). The cached records aren't looked up to confirm them: on
+    // chronicle 0.4.0, a point lookup of any record but the newest after a
+    // write rebuilds chronicle's per-item cache, which a read after one
+    // append then avoids. Like the count-and-tail check above, this relies
+    // on the slot being written only through MessageStore. A write outside
+    // it moves no version, so where it adds a record beside a sibling's edit
+    // or removal, the length comes out as the versions predict: the cache is
+    // extended stale, and an edit or removal through its index can reach
+    // another record.
+    if (this.allCache && this.allCache.branchId === branchId && this.allCache.writeVersion !== writeVersion) {
+      const appended = this.appendedSince(this.allCache.internals, writeVersion - this.allCache.writeVersion);
+      if (appended) {
+        for (const record of appended) this.allCache.internals.push(record);
+        this.allCache.writeVersion = writeVersion;
+        this.allCache.sequence = sequence;
+        return this.allCache.internals;
+      }
+      missReason = `${missReason}, not appends only (cached ${this.allCache.internals.length} + ${writeVersion - this.allCache.writeVersion} versions, live ${this.length()})`;
+    }
     const _t = CACHE_DIAG ? Date.now() : 0;
     const state = this.store.getStateJson(this.stateId);
     const internals =
       !state || !Array.isArray(state) ? [] : (state as StoredMessageInternal[]);
     this.allCache = { branchId, sequence, internals, writeVersion };
-    cacheDiag(`getAllInternal MISS (${missReason}) stateId=${this.stateId} rebuilt ${internals.length} in ${Date.now() - _t}ms`);
+    cacheDiag(`getAllInternal MISS (${missReason}) stateId=${this.stateId} rebuilt ${internals.length} in ${Date.now() - _t}ms`, this.log);
     return internals;
+  }
+
+  /**
+   * The `added` records appended to the slot after `cached`, an earlier
+   * materialization of it, by point lookup; null where they can't be read
+   * that way: a slot whose length isn't `cached`'s plus `added`, a record
+   * that won't read, or a chronicle without point lookup, where getInternal
+   * falls back to getAllInternal itself.
+   */
+  private appendedSince(cached: readonly StoredMessageInternal[], added: number): StoredMessageInternal[] | null {
+    if (typeof (this.store as { getStateItemJson?: unknown }).getStateItemJson !== 'function') return null;
+    const count = this.length();
+    if (count !== cached.length + added) return null;
+    const appended: StoredMessageInternal[] = [];
+    for (let i = cached.length; i < count; i++) {
+      const record = this.getInternal(i);
+      if (!record) return null;
+      appended.push(record);
+    }
+    return appended;
   }
 
   private getSliceInternal(offset: number, limit: number): StoredMessageInternal[] {
@@ -1848,7 +1934,7 @@ export class MessageStore {
   ): StoredMessage {
     // What doesn't match ContentBlock is left out before anything reads it,
     // blob resolution included (well-formed-content.ts).
-    const content = wellFormedContent(internal.content, `message ${id}`, this.malformedLogged);
+    const content = wellFormedContent(internal.content, `message ${id}`, this.malformedLogged, this.log);
     const stored: StoredMessage = {
       id,
       // chronicle record sequence captured when the message was appended

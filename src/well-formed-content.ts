@@ -22,7 +22,19 @@
  * store's own: a `blob_ref`, which the store writes in place of inline media.
  * A write can't give one, and a read takes one whose `ref` is an object with
  * a string `hash` and an `originalType` of image, document, audio or video,
- * which is what a read turns the blob back into.
+ * which is what a read turns the blob back into, and, but for an image, a
+ * string `mediaType`: a read gives an image the type its bytes' signature
+ * names, where they carry one, and nothing else names a document's, audio's
+ * or video's. The rule holds at any depth, as the read's other checks do.
+ * Three shapes a read gives still meet a write's refusal, each in a record
+ * the store's writes don't make: inline media at the top of the content,
+ * where the store keeps a blob, whose source it can't keep as one
+ * (unstorableSource: data it can't read, or no media type it can give it); a
+ * `blob_ref` the read takes inside a `tool_result`, which resolution leaves
+ * as it is, since it resolves the content's own blocks; and an image's
+ * `blob_ref` without a string `mediaType` whose bytes carry no signature
+ * (refHasMediaType). Leaving out the first two would take a read that knows
+ * where a block sits, which these walks don't.
  *
  * Every reader of stored content, from the token estimators to compression
  * and the formatters, is written against `ContentBlock`, and a reader that
@@ -55,6 +67,7 @@
  * through a `tool_result`'s content, always does, and JSON can't produce it.
  */
 
+import type { Diagnostics } from './diagnostics.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredContentBlock } from './types/index.js';
 import { releaseEditedRawForms } from './raw-forms.js';
@@ -105,11 +118,27 @@ function wellFormed(block: unknown, side: Side): boolean {
         side === 'read' &&
         isRecord(block.ref) &&
         typeof block.ref.hash === 'string' &&
-        MEDIA_TYPES.has(block.ref.originalType as string)
+        MEDIA_TYPES.has(block.ref.originalType as string) &&
+        refHasMediaType(block.ref)
       );
     default:
       return MEDIA_TYPES.has(type) ? isRecord(block.source) : true;
   }
+}
+
+/**
+ * Whether a blob reference of a known `originalType` names the media type it
+ * reads back with: a string `mediaType`, which nothing else names for a
+ * document, audio or video, and without which a write refuses the media it
+ * reads back as. An image's reference passes whatever its `mediaType` holds,
+ * since a read gives an image the type its bytes' signature names
+ * (blockFromBlob), and only the blob's bytes can say whether they carry one:
+ * an image whose bytes carry no png, jpeg, gif or webp signature still reads
+ * back with the reference's `mediaType`, which a write refuses unless it's a
+ * string.
+ */
+function refHasMediaType(ref: Record<string, unknown>): boolean {
+  return typeof ref.mediaType === 'string' || ref.originalType === 'image';
 }
 
 /** Whether inline media in `block`, a block of the content, is media the store can't keep as a blob (unstorableSource). */
@@ -220,6 +249,8 @@ function placesIn(block: unknown, at: string, places: string[], side: Side): voi
           `${at}.ref.originalType is ${typeof originalType === 'string' ? JSON.stringify(originalType) : kindOf(originalType)}, ` +
             'not image, document, audio or video',
         );
+      } else if (!refHasMediaType(block.ref)) {
+        places.push(`${at}.ref.mediaType is ${kindOf(block.ref.mediaType)}, not a string`);
       }
       return;
     default:
@@ -356,8 +387,9 @@ function writeBlock(block: Record<string, unknown>): ContentBlock {
  * string `type`, a text block without its string, unsigned thinking without
  * its string, media without a source or the data and media type to make
  * one, a generated image without its data or media type, and a `blob_ref`
- * that doesn't reference a blob or whose `originalType` isn't image,
- * document, audio or video.
+ * that doesn't reference a blob, whose `originalType` isn't image, document,
+ * audio or video, or, for a document, audio or video, without a string
+ * `mediaType`.
  */
 function readBlock(block: Record<string, unknown>): ContentBlock | undefined {
   if (wellFormed(block, 'read')) return block as unknown as ContentBlock;
@@ -403,6 +435,8 @@ export function wellFormedContent(
   content: StoredContentBlock[],
   where: string,
   logged: Set<string>,
+  /** Where the line goes: a namespace's diagnostics, for a record of its own state (#239). */
+  log: Diagnostics = console,
 ): StoredContentBlock[] {
   const array = Array.isArray(content);
   if (array && allWellFormed(content, 'read')) return content;
@@ -410,7 +444,7 @@ export function wellFormedContent(
   const key = `${where}\u0000${places}`;
   if (!logged.has(key)) {
     logged.add(key);
-    console.error(
+    log.error(
       `[context-manager] ${where}: reads leave out or mend what doesn't match ContentBlock (${places}); ` +
         'the store keeps it as written',
     );

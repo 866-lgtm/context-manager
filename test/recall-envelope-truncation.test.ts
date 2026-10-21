@@ -21,9 +21,10 @@
  *     characters of prose inside intact tags rather than a broken tag.
  *  2. With the envelope off, capped renders are byte-identical to the tree
  *     before the fix apart from the omission marker the truncator writes
- *     where it drops text, for which the golden was captured again once,
- *     pinned against
- *     `test/fixtures/recall-envelope-truncation-golden.json`. The pre-existing
+ *     where it drops text, and the adaptive renders' choice of what to fold,
+ *     which pricing a capped raw message as it renders (#223) moved, for each
+ *     of which the golden was captured again (see its generator), pinned
+ *     against `test/fixtures/recall-envelope-truncation-golden.json`. The pre-existing
  *     null golden runs the fixtures UNCAPPED and so cannot see this
  *     restructure; a red here is the fix leaking into the default path.
  */

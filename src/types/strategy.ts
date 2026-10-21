@@ -17,6 +17,14 @@ export interface MessageStoreView {
   getAll(): StoredMessage[];
   /** Get a specific message */
   get(id: MessageId): StoredMessage | null;
+  /**
+   * A message's sequence, as `get(id)?.sequence` answers it, without reading
+   * the message where the view can (optional — a reader without it falls
+   * back to `get`). MessageStore answers from its listing while that is
+   * cached, as it is during a compile, and reads the item otherwise; a merged
+   * view asks each source's, and the source's `get` where it has none.
+   */
+  sequenceOf?(id: MessageId): number | undefined;
   /** Get messages from a specific index */
   getFrom(index: number): StoredMessage[];
   /** Get the last N messages */
@@ -96,7 +104,14 @@ export interface StrategyContext {
   systemPrompt?: string;
   /** Read-only view of context log */
   contextLog: ContextLogView;
-  /** Membrane instance for LLM calls (compression) */
+  /**
+   * Membrane instance for LLM calls (compression). AutobiographicalStrategy
+   * passes each call a signal of its own (`CompleteOptions.signal`) and
+   * aborts it when it lets go of the call's work, at detach() or when it is
+   * initialized again, so a host that wraps this membrane passes the signal
+   * on, and may combine its own with it to end calls itself (see
+   * CompressionWithdrawn).
+   */
   membrane?: Membrane;
   /** Current sequence number */
   currentSequence: Sequence;
@@ -140,14 +155,70 @@ export interface ContextStrategy {
 
   /** Maximum tokens per individual message. Used by the framework to truncate
    *  tool results in-flight (yielding stream) and at storage time.
-   *  0 or undefined = no limit. */
+   *  A value that isn't a positive number, such as 0, undefined, a negative
+   *  or NaN, means no limit. */
   readonly maxMessageTokens?: number;
+
+  /**
+   * What the next compile sends for each of `ids`, messages just stored and
+   * so among the newest of the window, in the order given. Each comes back
+   * cut by the per-message cap, and as one message where the compile joins a
+   * body's shards into one; the strategy makes every image decision it makes
+   * there: its count, depth and byte limits, counted newest-first over the
+   * view from the oldest of these messages to its newest, as a compile
+   * counts them. It's for a caller that appends messages it has just stored
+   * to a compiled request without recompiling, such as a turn's mid-turn
+   * injections, so that what it appends is what the next compile sends. A
+   * later compile can still strip an image of theirs as newer ones arrive.
+   *
+   * `store` is the view a compile reads. An id comes back as null when the
+   * next compile doesn't send that message as one of its newest: the view
+   * leaves it out, such as by its filter, or the compile sends it elsewhere,
+   * such as a body too big for the window's recent part. What the next
+   * compile decides from its budget isn't foreseen, since a render has none:
+   * windowed passthrough's re-anchor, or its refusal of a newest message
+   * bigger than the budget; the memory strategy's refusal of a recent window
+   * over budget, or the adaptive select's drop of a provisional calibration
+   * that puts it over budget.
+   *
+   * What comes back is made of the stored arrays and blocks, as a compile's
+   * messages are, so a caller that edits what comes back copies it first.
+   * Tool blocks come back as the cap leaves them, since how a compile pairs
+   * and prunes them depends on the window around them. Rendering doesn't
+   * change what a later compile sends.
+   */
+  renderAsNewest?(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null>;
 
   /**
    * Initialize the strategy with context.
    * Called when strategy is set on ContextManager.
    */
   initialize?(ctx: StrategyContext): Promise<void>;
+
+  /**
+   * The manager is done with this strategy: setStrategy() replaced it, the
+   * manager closed, or the open() that was initializing it failed. The
+   * strategy stops the work it still has running for that manager, so it
+   * writes nothing more to the store and starts no further provider call.
+   * It is synchronous and not awaited. A strategy can cancel the provider
+   * calls it has out then, as AutobiographicalStrategy does; one that
+   * doesn't lets a call already waiting on the provider finish, with any
+   * retries the provider client makes of it, and throws its result away. A
+   * promise or other thenable it returns anyway isn't awaited either; the
+   * manager logs its rejection. A later setStrategy() of the same instance
+   * on a manager that isn't closed initializes it again, so a strategy whose
+   * detach() stops it starts again in initialize(). A setStrategy() of
+   * another strategy, or a close(), that lands while the strategy
+   * initializes detaches it at once, and again once initialize() returns or
+   * rejects, unless the manager holds it again by then: an instance set
+   * again fences its earlier initialization's work itself. So detach() can
+   * be called more than once for one instance, and must be safe to repeat.
+   * It is per instance: sharing one instance between two managers isn't
+   * supported, and either letting it go detaches it for both. A manager
+   * whose close() interrupted an initialization of the instance holds it
+   * until that initialization ends.
+   */
+  detach?(): void;
 
   /**
    * Periodic background maintenance.
@@ -682,6 +753,41 @@ export interface RenderStats {
      *  'flat-profile'). Surfaces the policy actually in force — a config
      *  clobber that silently downgrades the solver is invisible without it. */
     solver?: string;
+    /** Messages in the strategy's view of the branch this compile read (after
+     *  the view filter, auxiliary slots included), before any folding. Logged
+     *  as `messages=`, so a compile time can be read against the history size
+     *  it covered. The new fields here are optional so a custom strategy's
+     *  stats still type-check. */
+    messages?: number;
+    /** Time in the base `AutobiographicalStrategy.select()` up to the
+     *  `[plan-vs-actual]` line, in whole ms: chunk rebuild, planning (the fold
+     *  solver) and emission. It excludes a subclass's own `select()` override
+     *  and the `ContextManager` work around the call; a host that wants the
+     *  whole compile times `compile()` itself. It includes a
+     *  `productionBudgetTokens` shadow pick, whose solve `solveMs` leaves out,
+     *  and after a provisional-calibration retry the refused first attempt.
+     *  Logged as `compileMs=`. */
+    compileMs?: number;
+    /** Under `foldingStrategy: 'kv-unified'` only: the forest build, solve and
+     *  latent-demand ranking of the compile's final pick inside `compileMs`,
+     *  in whole ms (`solveMs=`). */
+    solveMs?: number;
+    /** Under `foldingStrategy: 'kv-unified'` only, where the label ceiling
+     *  stopped a search in the compile's final pick (#252): `live` where the
+     *  compile took the minimum-token cut, `joint` where the joint
+     *  latent-demand forest's solve exceeded it and the candidates were
+     *  ranked one at a time, `gate` where no merge was demanded because the
+     *  base solve without the certificate exceeded it, and `whatIfs:N` for
+     *  N individual what-if solves it stopped or, remembered from a compile
+     *  on the same inputs, skipped, joined by `+` (`ceiling=`). */
+    ceiling?: string;
+    /** Set on a dry run or preview (`dryRun: true`, `previewContext`), which
+     *  skips work a live compile does; logged as `dryRun=true`. Absent on a
+     *  live compile. A caller reads a dry pass's stats only from
+     *  `previewContext(..., { render: true })`'s `stats`: `compile()` returns
+     *  no stats, and a dry pass leaves `getRenderStats()` describing the last
+     *  live compile. */
+    dryRun?: true;
     /** Which chunks moved between which levels, and where this request's
      *  entries first differ from those of the last request the strategy
      *  returned, past which no cached prefix reaches. Present only when a
@@ -714,8 +820,60 @@ export function isRenderStatsCapable(s: ContextStrategy): s is RenderStatsCapabl
  * Public quarantine status shape (health surfaces + the repeating alarm).
  */
 export interface CompressionQuarantineStatus {
+  /** Quarantine records: one per request shape a span exhausted, so a span can hold several. */
   count: number;
+  /** The records' keys, as `clearCompressionRefusalQuarantine()` takes them. */
   keys: string[];
+  /** The quarantined spans, each once however many records it holds, the longest waiting first. */
+  spans: CompressionQuarantineSpan[];
+  /**
+   * Present when the quarantine couldn't be read, such as when the store
+   * failed to return its ledger. `count`, `keys` and `spans` are then empty
+   * and say nothing about what's quarantined, and the alarm neither sounds
+   * its all-clear nor calls its handler until a read succeeds.
+   */
+  unreadable?: true;
+}
+
+/** One quarantined span: a chunk's messages, which stay raw while it's quarantined. */
+export interface CompressionQuarantineSpan {
+  /** The span's identity: the hash of its chunk's message ids. */
+  chunkSourceHash: string;
+  /** Its first and last message ids; null when no current chunk has this span. */
+  firstMessageId: string | null;
+  lastMessageId: string | null;
+  /**
+   * How long since its chunk closed, from the newest of its messages'
+   * timestamps: how long it has stayed raw. Null when unknown.
+   */
+  closedAgeMs: number | null;
+  /**
+   * When its earliest record was made (ms since the epoch): how long it has
+   * been refused, where `closedAgeMs` is how long it has stayed raw. The
+   * alarm line shows it as "refusing since". A re-cut chunk's records start
+   * over.
+   */
+  quarantinedAt: number;
+  /** Its quarantine records, one per request shape it exhausted. */
+  records: number;
+  /**
+   * Requests a provider answered for those records, none giving a summary:
+   * the canonical request and its no-tools and tools-less retries, and each
+   * fallback after them. A recall variant planned over the compression's
+   * context budget, recorded as `admission_rejected` and never sent, isn't
+   * counted, and neither is a rung its failures decided
+   * (`provider_error:persistent-<class>`), which no provider gave as an answer.
+   * A record an earlier version wrote holds one outcome for the whole
+   * canonical stage, so it counts that stage once.
+   */
+  answeredAttempts: number;
+  /**
+   * The newest record's last outcome, with its error type after a colon when
+   * it carries one (`refusal`, `incomplete`, `provider_error:invalid_request`,
+   * `admission_rejected`, or `provider_error:persistent-<class>` for a rung its
+   * failures decided); null when that record holds none.
+   */
+  latestOutcome: string | null;
 }
 
 /** Delimiter convention applied to recall answer content. See `recallEnvelope`. */
@@ -741,10 +899,33 @@ export interface KvUnifiedConfig {
     continuityRecencyFloor: number;
     continuityStableHalfLife: number;
     continuityStableFloor: number;
+    /**
+     * Bands per doubling the solver reads ages at (fidelity age in
+     * sequences, continuity recency in tokens, stability in turns): an age
+     * is priced at the lower edge of its band, so a leaf's weight changes
+     * only when it crosses a band edge instead of on every append. 4 unless
+     * set (a band is a factor of 2^(1/4) ≈ 1.19 wide; at most 64); 0 prices exact ages,
+     * which is what the solver itself does when the key is absent. Two
+     * continuity readings differ from the plain band rule whenever banding
+     * is on, whatever the count: recency is at its floor from eight
+     * half-lives out, and stability is 1 for the first half of a half-life
+     * after a move and then read at whole doublings of the turns since.
+     */
+    ageBandSteps?: number;
   };
   tokenBucketSize: number;
   continuityBucketSize: number;
   fidelityBucketSize: number;
+  /**
+   * The most labels a kv-unified search may hold at one state (or make in
+   * all, on the `leaf` engine). It bounds a search, not the compile (#252):
+   * a live solve that exceeds it takes the minimum-token cut and demands no
+   * merge, and the strategy's first solve that does warns. A latent-demand
+   * search that exceeds it measures nothing: its candidate isn't demanded,
+   * or keeps the gain an earlier search showed; a joint forest's candidates
+   * are ranked one at a time; and where the base solve that decides the
+   * gate exceeds it, nothing is demanded that compile.
+   */
   labelCeiling: number;
   adoptEpsilon: number;
   treeifyNonContiguousSummaries: boolean;
@@ -758,6 +939,24 @@ export interface KvUnifiedConfig {
    * built from a recipe fills in `true`.
    */
   hysteresisCertificate?: boolean;
+  /**
+   * Which propagation engine solves the forest (see
+   * `docs/kv-unified-subtree-memo.md`). `auto` (absent): the
+   * subtree-memoized engine, run again on the packed DAG engine once if the
+   * subtree engine exceeds the label ceiling. `subtree` and `dag` pin one.
+   */
+  engine?: 'auto' | 'subtree' | 'dag';
+  /**
+   * How producible merges are measured against the live cut (see
+   * `KvUnifiedOptions.latentDemand.mode`). `joint` unless set to
+   * `individual`: one what-if solve with every candidate present, instead of
+   * two solves per candidate. The gain gating a demand is then the set's,
+   * measured once, and a compile with a merge backlog pays one extra solve.
+   * In either mode a merge in the merge quarantine is not a candidate: its
+   * request would be refused, and a joint cut that used it would hide the
+   * merge it would otherwise demand.
+   */
+  latentDemandMode?: 'individual' | 'joint';
 }
 
 export interface AutobiographicalConfig {
@@ -798,7 +997,10 @@ export interface AutobiographicalConfig {
    * memories (observed 2026-07-26: an inheriting resident's L1s
    * first-personing scenes from before his arrival). Chunks that straddle
    * the boundary use the standard instruction — the agent's own turns are
-   * present in them.
+   * present in them. Reading mode (a portion of a much larger message, or a
+   * merge of portions of one) keeps its own instructions, which have no
+   * witnessed variant, except that the split rung's pieces and a merge
+   * retried after a refusal take the witnessed one.
    */
   witnessedBeforeSequence?: number;
   /**
@@ -808,7 +1010,7 @@ export interface AutobiographicalConfig {
    */
   witnessedInstruction?: string;
   /**
-   * Identity reminder appended to every compression and merge instruction
+   * Identity reminder appended to compression and merge instructions
    * (L1 chunk, reading-mode, and all merge variants). Whether a compression
    * request carries a system prompt is the HOST's call: with none declared
    * (StrategyContext.systemPrompt unset) it carries none and identity is
@@ -827,8 +1029,60 @@ export interface AutobiographicalConfig {
    * <name>. Speak in the first person only for what you yourself said,
    * did, and felt; attribute other participants' words and experiences to
    * them by name."
+   *
+   * A wholly inherited target (see `witnessedBeforeSequence`) takes
+   * `witnessedIdentityReminder` instead, when that is set.
+   *
+   * For guidance the memory should follow without quoting it, end the
+   * reminder by asking for that, e.g. "Apply this guidance silently. Do not
+   * quote, restate, or recite it in the memory. Begin with the substantive
+   * record."
    */
   identityReminder?: string;
+  /**
+   * Identity reminder for WHOLLY inherited targets: an L1 chunk entirely
+   * before `witnessedBeforeSequence`, or a merge whose every source is
+   * witnessed. When set (a blank value counts as unset), those targets use
+   * it instead of `identityReminder`. Every other target keeps
+   * `identityReminder`, including a mixed one: a chunk that spans the pin,
+   * or a merge of inherited and lived sources. A mixed target's request
+   * shows inherited and lived material together under the live instruction
+   * and reminder, with no label saying which is which, so the live reminder
+   * (after a rename, the new name's) reaches the inherited material there.
+   * When the split rung (`compressionSplitFallback`) folds a chunk in
+   * pieces, every piece takes its chunk's reminder and its chunk's
+   * compression instruction (`getCompressionInstruction`, never the reading
+   * one), so a piece of a mixed chunk takes the live ones even when its own
+   * messages all predate the pin.
+   *
+   * The protection is opt-in. With only `identityReminder` set, it is
+   * appended, current name included, to wholly inherited targets too, so an
+   * inherited-history migration should set this explicitly.
+   *
+   * For residents whose Chronicle begins with reviewed inherited history,
+   * the inherited reminder can stay frozen (it was reviewed with the import)
+   * while the live one stays neutral and revisable by the resident.
+   *
+   * A wholly inherited reading-mode target (a portion of a much larger
+   * message, or a merge of portions of one) gets this reminder after the
+   * reading instruction, which has no witnessed variant: it asks the agent
+   * to speak in its own voice as the reader. The split rung's pieces and a
+   * merge retried after a refusal take the witnessed instruction instead of
+   * the reading one.
+   *
+   * The reminder follows the target whatever instruction it gets. An
+   * override of `getCompressionInstruction` or `getMergeInstruction` that
+   * doesn't read the pin, such as KnowledgeStrategy's phase prompts and
+   * merge instruction, gives a wholly inherited target its own instruction
+   * with this reminder. It doesn't reach a reading-mode chunk or merge,
+   * which takes `getReadingChunkInstruction` or `getReadingMergeInstruction`
+   * (though the split rung's pieces take `getCompressionInstruction`), or a
+   * merge retried after a refusal, which takes the base merge instruction,
+   * the witnessed one when every source is witnessed.
+   *
+   * Unset: every target uses `identityReminder` (unchanged behavior).
+   */
+  witnessedIdentityReminder?: string;
   /** Label shown before summaries in compiled context */
   summaryContextLabel?: string;
 
@@ -935,7 +1189,8 @@ export interface AutobiographicalConfig {
    */
   compressionMaxTokens?: number;
   /** Maximum tokens per individual message in compiled output. Messages exceeding
-   *  this limit have their text/tool_result content truncated. 0 = no limit. */
+   *  this limit have their text/tool_result content truncated. A value that
+   *  isn't a positive number, such as 0 or NaN, means no limit. */
   maxMessageTokens: number;
 
   /**
@@ -967,16 +1222,20 @@ export interface AutobiographicalConfig {
   maxLiveImages?: number;
   /** Token depth from the newest message beyond which images are stripped to a
    *  text placeholder, even though the surrounding text stays verbatim. Measured
-   *  the same way as recentWindowTokens (cumulative tokens walked from the tail).
+   *  as cumulative tokens walked from the tail over the stored messages, before
+   *  tool pruning and image strips, which the recent window's walk counts after.
    *  Typically much shallower than recentWindowTokens. 0 = never strip by depth. */
   imageStripDepthTokens?: number;
 
   /**
-   * Merge grouping (2026-07-12 contiguity fix): break a merge run when the
-   * positional gap between consecutive unmerged candidates exceeds this many
-   * messages. Small holes (wiped/pruned nodes) bridge fine; cross-era gaps
-   * must not — a merge group spanning already-merged history can straddle
-   * the recent window and block its whole lineage from folding. Default 300.
+   * Not read since canonical merge ownership (2026-08-31). Merge grouping
+   * (2026-07-12 contiguity fix) used to break a merge run when the positional
+   * gap between consecutive unmerged candidates exceeded this many messages,
+   * bridging smaller holes. Every grouping decision now requires exact
+   * adjacency in store order, with no listed message between two sources,
+   * whatever this is set to. Configurations that set it still type-check.
+   *
+   * @deprecated Not read: grouping requires exact adjacency.
    */
   mergeContiguityGapLimit?: number;
 
@@ -1062,6 +1321,23 @@ export interface AutobiographicalConfig {
    * (never silently retried in a loop, never canonized). Default: 5.
    */
   mergeAttemptLimit?: number;
+  /**
+   * Operator merge holds: summary ids that are never offered as merge
+   * sources (a held summary that hasn't merged stays on the frontier, and
+   * no summary above it forms). Held ids split the frontier into runs like
+   * a hole, so later history still merges around them. They still count as
+   * unmerged summaries: a held L1 toward `maxSpeculativeL1s`, and every
+   * held summary toward its level's `mergeThreshold`. The run of
+   * same-level summaries just before a held one can't grow past it, so it
+   * merges as a run between two summaries does, which can be at two, below
+   * `mergeThreshold`. Lifting a hold doesn't undo
+   * the merges formed around the summary: it can then
+   * merge only with an unmerged summary of its level beside it, and one
+   * with none beside it stays at its level. Sources of a merge quarantined
+   * after provider failures are held the same way while its group could be
+   * retried as it stands. Use for summaries awaiting review.
+   */
+  mergeHoldSummaryIds?: string[];
   /**
    * Store-topology policy. On every load the summary archive is audited for
    * crossed ownership: a summary whose leaves are not contiguous among the
@@ -1350,6 +1626,20 @@ export interface AutobiographicalConfig {
    * brief marker naming the tool and the limit; a limit of 0 replaces every
    * result of the tool.
    *
+   * The count runs over the whole conversation, not only what a compile
+   * renders raw: a result is replaced once the conversation holds N newer
+   * answered calls of its tool, folded ones included, so folding never
+   * brings a replaced result back. A result answers the earliest call with
+   * its id, in an earlier message, that no result has answered yet; a
+   * further result for an answered call goes with that call. Calls are
+   * ordered by the message that made them, and calls made in one message by
+   * where their results are stored, as the render sends them unless pairing
+   * repair moves some. A result is replaced before `maxMessageTokens` cuts its
+   * message, and the plan and the render stats price it as its marker. A
+   * fractional limit keeps its whole part. A limit that isn't a number of 0
+   * or more, such as a null from a caller outside TypeScript, sets no limit.
+   * The stored message, which chunking and compression read, is unchanged.
+   *
    * Two shapes accepted:
    *  - `number`: applies as a global default across all tools.
    *  - `Record<toolName, number>`: per-tool limit; tools not listed are
@@ -1363,18 +1653,28 @@ export interface AutobiographicalConfig {
 
   /**
    * Truncate `tool_use` block inputs whose serialized JSON exceeds this
-   * many tokens. The truncated input becomes `{ "_truncated": true,
-   * "_originalTokens": N }` plus a head slice of the original input
-   * keys for context. Default: 0 (no truncation).
+   * many tokens, at four characters a token. The truncated input becomes
+   * `{ "_truncated": true, "_originalTokens": N, "_keys": [...] }`, `_keys`
+   * holding the original input's first five keys. The plan and the render
+   * stats price the truncated input, and the stored message is unchanged.
+   * Default: 0 (no truncation).
    */
   toolUseInputMaxTokens?: number;
 
   /**
-   * Cap on the number of speculative L1 summaries the strategy will hold
-   * (queued + unmerged). When `count(unmerged L1s) + count(queued chunks)`
-   * exceeds this cap, `onNewMessage`'s auto-tick is held back. Chunks
-   * still form and queue, but compression is deferred until a manual
-   * `tick()` or `compile()` triggers it.
+   * Cap on the number of produced, unmerged L1 summaries. Past it, while an
+   * L1→L2 merge is queued and `hierarchical` is on, `tick` takes no chunk
+   * to compress into an L1, whether the background drain or a manual
+   * `tick()` calls it, and runs the merge, which brings the count back down.
+   * Production waits for that merge as long as the merge waits, such as on
+   * a compression hold over its sources. Chunks still form and queue, and
+   * queued chunks don't count toward the cap.
+   *
+   * With no L1 merge queued, the cap holds nothing. No merge forms below
+   * `mergeThreshold` unmerged L1s, so a cap below `mergeThreshold - 1` lets
+   * them rise to the threshold. Unmerged L1s that can never merge count
+   * toward the cap without holding production. Under `hierarchical: false`
+   * tick runs no merge, so the cap holds nothing.
    *
    * Default: undefined (no cap; compression fires eagerly on every
    * new message when `autoTickOnNewMessage` is true).
@@ -1686,10 +1986,13 @@ export interface ProtectedRange {
   created: number;
   /**
    * Pin-AT-level-k (V2 dynamic pins, `docs/best-fit-frontier-resolution.md` §7).
-   * Fix the covered chunks to render at EXACTLY this fold level (0 = raw): the
+   * Fix the covered chunks to render at this fold level (0 = raw): the
    * frontier cut passes through the L_k node — neither folded deeper nor
-   * un-folded shallower. Takes precedence over `maxLevel`. Omitted → not a
-   * fixed-level pin.
+   * un-folded shallower. Under kv-stable, a chunk with no summary at k (its
+   * summaries stop below k, its lineage skips k with a parent more than one
+   * level up, or its own-lineage summary at k doesn't list it) renders at the
+   * next level down where it has one, or raw. Takes precedence over
+   * `maxLevel`. Omitted → not a fixed-level pin.
    *
    * Honored by the folding strategies that read level bounds
    * (`foldingStrategy: 'kv-stable'` and `'kv-unified'`, with
@@ -1721,7 +2024,9 @@ export interface ProtectedRange {
 /** Optional fold-depth bounds for a V2 dynamic pin (see `ProtectedRange`). */
 export interface PinLevelOptions {
   name?: string;
-  /** Pin AT exactly this level (0 = raw). Fixes the cut through the L_k node. */
+  /** Pin at this level (0 = raw): fixes the cut through the L_k node, with
+   *  kv-stable's exceptions for a chunk its summaries don't reach there
+   *  (`ProtectedRange.level`). */
   level?: number;
   /** Fold no deeper than this level (hard cap; `0` ≡ classic pin-raw). */
   maxLevel?: number;

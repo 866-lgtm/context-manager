@@ -356,9 +356,9 @@ describe('AutobiographicalStrategy — persistence', () => {
         assert.deepEqual(rangesOf(strategy.getSummariesView()), ranges, 'held with its sources\' ends');
         assert.deepEqual(rangesOf(strategy.readPersistedSummaries()), ranges, 'and stored so');
         assert.deepEqual(warnings.filter((w) => w.includes('storing summary')), [
-          '[autobiographical] storing summary L1-0 at L1 with its sourceRange set to its first and last source, a bug in the code that built it: it held {"first":"m1","last":"m2"}',
-          '[autobiographical] storing summary L1-1 at L1 with its sourceRange set to its first and last source, a bug in the code that built it: it held null',
-          '[autobiographical] storing summary L1-3 at L1 with its sourceRange set to its first and last source, a bug in the code that built it: it held {"first":"m6","last":"m8"}',
+          '[autobiographical] storing summary L1-0 at L1 with its sourceRange set to its first and last source, a bug in the code that built it: it held {"first":"m1","last":"m2"} ns=default',
+          '[autobiographical] storing summary L1-1 at L1 with its sourceRange set to its first and last source, a bug in the code that built it: it held null ns=default',
+          '[autobiographical] storing summary L1-3 at L1 with its sourceRange set to its first and last source, a bug in the code that built it: it held {"first":"m6","last":"m8"} ns=default',
         ]);
         manager.sync();
       } finally {
@@ -1072,8 +1072,12 @@ describe('AutobiographicalStrategy — persistence', () => {
       const run = groups.map((group, g) => first.seedL1(`L1-TEXT-${g}`, group).id);
       first.persistRawChunks(groups.map((group, g) => ({ id: `c-${g}`, sourceIds: group, compressed: true, summaryId: run[g]! })));
       // A second instance on the store loads the run before either merges it;
-      // merges don't coalesce across instances, so both merge it.
+      // merges don't coalesce across instances, so both merge it. A merge now
+      // finds another instance's in the store and writes nothing, so this one
+      // skips the parent checks, as merges did before them: stores they wrote
+      // can hold both merges, which the open repairs.
       const second = new TestableStrategy(config);
+      (second as unknown as { parentedMergeSources: () => string[] }).parentedMergeSources = () => [];
       const secondManager = await ContextManager.open({ store: manager.getStore(), strategy: second, membrane: membrane('MERGED LATER') as never });
       await first.merge(2, run, manager);
       await second.merge(2, run, secondManager);
@@ -1905,7 +1909,7 @@ describe('AutobiographicalStrategy — persistence', () => {
         _level: SummaryLevel,
         _sourceIds: string[],
         _ctx: import('../src/types/index.js').StrategyContext,
-      ): Promise<void> {
+      ): Promise<boolean> {
         throw this.executeMergeError;
       }
     }

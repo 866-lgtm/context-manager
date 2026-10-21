@@ -234,6 +234,22 @@ describe('live image accounting', () => {
     cm.close();
   });
 
+  it("the image watermark counts a tool result as it's sent, so one toolResultMaxLastN replaces holds no image", async () => {
+    const cm = await ContextManager.open({
+      path: fresh(),
+      strategy: new AutobiographicalStrategy({
+        headWindowTokens: 0, recentWindowTokens: 1_000_000, maxLiveImages: 4, imageStripDepthTokens: 0, imageStripHysteresisRatio: 0.5,
+        toolResultMaxLastN: { shot: 4 },
+      }),
+    });
+    const labels = ['h-1', 'h-2', 'h-3', 'h-4', 'h-5'];
+    for (const label of labels) toolRound(cm, label, base64Image());
+    const { messages } = await cm.compile(BUDGET);
+    assert.deepEqual(labels.map((label) => stateOf(messages, label)), ['missing', 'image', 'image', 'image', 'image'],
+      "the oldest result is sent as its marker, so four nested images are sent, within the cap of four, and none is trimmed");
+    cm.close();
+  });
+
   it('releases the raw replay form of a tool result whose nested image it strips', async () => {
     const cm = await ContextManager.open({
       path: fresh(),
@@ -418,6 +434,40 @@ describe('live image accounting', () => {
       assert.equal(stateOf(entries, 'tail'), 'image');
     });
   }
+
+  it("the strip counts a folded message's images as it's sent, so one in a result toolResultMaxLastN replaces takes no slot, as in the estimate", () => {
+    /** Head window message 0, recent window from message 3: messages 1 and 2 are the middle's. */
+    class FoldedRound extends FoldedWindow {
+      protected override getRecentWindowStart(): number { return 3; }
+    }
+    const call = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'shot', input: {} }) as ContentBlock;
+    const result = (id: string, label: string): ContentBlock =>
+      ({ type: 'tool_result', toolUseId: id, toolName: 'shot', content: [base64Image(), { type: 'text', text: label }] }) as unknown as ContentBlock;
+    const messages = [
+      { id: 'head', sequence: 0, participant: 'User', content: [base64Image(), { type: 'text', text: 'head' }] as ContentBlock[] },
+      { id: 'call-1', sequence: 1, participant: 'Claude', content: [call('t-1')] },
+      { id: 'middle', sequence: 2, participant: 'User', content: [result('t-1', 'middle')] },
+      { id: 'call-2', sequence: 3, participant: 'Claude', content: [call('t-2')] },
+      { id: 'tail', sequence: 4, participant: 'User', content: [result('t-2', 'tail')] },
+    ];
+    const store = viewOf(messages);
+    // The tool's last result shows; the middle's is replaced by its marker,
+    // image and all.
+    const strategy = new FoldedRound({ maxLiveImages: 2, imageStripDepthTokens: 0, toolResultMaxLastN: { shot: 1 } } as never);
+    const estimates = strategy.estimates(store);
+    // The fold leaves the middle's two messages out.
+    const entries: ContextEntry[] = [
+      { index: 0, sourceMessageId: 'head', sourceRelation: 'copy', participant: 'User', content: messages[0]!.content },
+      { index: 1, sourceMessageIds: ['call-1', 'middle'], sourceRelation: 'derived', participant: 'User', content: [{ type: 'text', text: 'what came between' }] },
+      { index: 2, sourceMessageId: 'call-2', sourceRelation: 'copy', participant: 'Claude', content: messages[3]!.content },
+      { index: 3, sourceMessageId: 'tail', sourceRelation: 'copy', participant: 'User', content: messages[4]!.content },
+    ];
+    strategy.strip(entries, store);
+    assert.equal(estimates[2], 0, "premise: the middle's result is replaced, so its estimate holds no image");
+    assert.equal(estimates[0], 1600 + 1, "the tail's image and the head's take the two live slots in the estimate");
+    assert.equal(stateOf(entries, 'head'), 'image', "and the strip keeps the head's image, the replaced result's taking no slot");
+    assert.equal(stateOf(entries, 'tail'), 'image');
+  });
 
   it("the strip counts a merged body's images once, at its first shard, where the chunker puts them, as the estimate does", () => {
     // chunkIngressMessage puts a body's images on its first shard, and
