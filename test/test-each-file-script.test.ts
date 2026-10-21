@@ -212,7 +212,7 @@ test("a path with a space runs as it is, and a file that reads stdin leaves the 
     "dist/test/b has spaces.test.js",
     "dist/test/c-passes.test.js",
   ]);
-  assert.match(run.stdout, /read 0 bytes of stdin/);
+  assert.match(run.stdout, /read 0 bytes of stdin/, run.log);
 });
 
 test("an empty dist/test ends the run red", notOnWindows, () => {
