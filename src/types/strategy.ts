@@ -228,7 +228,13 @@ export interface ContextStrategy {
 
   /**
    * React to new messages.
-   * Called after a message is added to the store.
+   * Called after a message is added to the store, inside the write that
+   * stored it, so its synchronous part runs before addMessage returns; the
+   * manager doesn't wait for the promise. A rejection, or a throw before it
+   * returns, is logged through the manager's diagnostics, naming the message,
+   * and doesn't reach addMessage's caller: the message stays stored, and the
+   * strategy isn't offered it again. A hook that returns no promise, as one
+   * written in JavaScript can, isn't a failure, and nothing is logged.
    */
   onNewMessage?(message: StoredMessage, ctx: StrategyContext): Promise<void>;
 
