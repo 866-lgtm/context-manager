@@ -6828,10 +6828,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *    it up.
    *
    *  - `level >= 2`: the picker has asked for an L_n covering a contiguous
-   *    range. We gather unmerged L_{n-1} summaries whose source ranges
-   *    fall within that range (de-duplicated against entries already in
-   *    `mergeQueue`) and enqueue a single merge over them. The merge fires
-   *    on the next `tick()`.
+   *    range. We gather unmerged L_{n-1} summaries by
+   *    `enqueueMergeForRange`'s rule (a source counts when either of its
+   *    ends lies in the range; with a range end that has no position, every
+   *    source counts), de-duplicated against entries already in
+   *    `mergeQueue`, and enqueue a merge over the first `mergeThreshold` of
+   *    their longest contiguous run. The merge fires on the next `tick()`.
    *
    * The handler is conservative: it never enqueues a singleton or empty
    * merge, and it never re-enqueues an id that's already pending. That

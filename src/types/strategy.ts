@@ -1223,6 +1223,8 @@ export interface AutobiographicalConfig {
    * bridging smaller holes. Every grouping decision now requires exact
    * adjacency in store order, with no listed message between two sources,
    * whatever this is set to. Configurations that set it still type-check.
+   *
+   * @deprecated Not read: grouping requires exact adjacency.
    */
   mergeContiguityGapLimit?: number;
 
