@@ -395,28 +395,24 @@ describe('renderAsNewest', () => {
     await withManager(strategy, async (manager) => {
       const ids = [1, 2, 3, 4].map((i) => manager.addMessage('user', imageMessage(`img-${i}`, 1)));
       ids.push(manager.addMessage('user', longText('LONG', 300)));
-      const state = strategy as unknown as { _imageWatermark: unknown; _imageWatermarkLoaded: boolean; _postStripMemo: unknown; _dryRunSelect: boolean };
-      state._imageWatermark = undefined;
-      state._imageWatermarkLoaded = true;
-      state._postStripMemo = null;
+      const state = strategy as unknown as { _dryRunSelect: boolean };
       failCut = true;
       assert.throws(() => manager.renderAsNewest(ids), /cut failed/);
       failCut = false;
-      assert.equal(state._imageWatermark, undefined, 'the watermark is as it was');
-      assert.equal(state._postStripMemo, null, 'the estimates are as they were');
       assert.equal(state._dryRunSelect, false, 'the next select is live');
     });
   });
 
-  it("autobiographical: images the hysteresis watermark trims, as the next compile trims them", async () => {
-    // Eight new images under a count of 6 at ratio 0.5: the watermark keeps
-    // the newest 3 or 4, where the count alone would keep 6.
+  it("autobiographical: images the hysteresis rule trims, as the next compile trims them", async () => {
+    // Eight new images under a count of 6 at ratio 0.5: the rule keeps the
+    // newest 4 (a trim to 3 at the seventh, then the eighth), where the count
+    // alone would keep 6.
     await withManager(memory({ maxLiveImages: 6, imageStripHysteresisRatio: 0.5 }), async (manager) => {
       const ids: string[] = [];
       for (let i = 1; i <= 8; i++) ids.push(manager.addMessage('user', imageMessage(`new-${i}`, 1)));
       const { rendered, next } = await renderedAndSent(manager, ids);
       assert.deepEqual(rendered, next);
-      assert.ok(rendered.filter((c) => imagesIn(c) > 0).length < 6, `the watermark trimmed past the count (${rendered.map(imagesIn).join('')})`);
+      assert.equal(rendered.map(imagesIn).join(''), '00001111', 'the rule trimmed past the count, to the newest 4');
     });
   });
 
@@ -494,28 +490,6 @@ describe('renderAsNewest', () => {
       const id = manager.addMessage('user', [{ type: 'text', text: 'as stored' }]);
       assert.equal(manager.renderAsNewest([id]), undefined);
       assert.throws(() => manager.renderAsNewest([id, 'no-such-id']), /no stored message has id no-such-id/, 'it refuses an unknown id first');
-    });
-  });
-
-  it('autobiographical: rendering puts back the watermark and post-strip estimates it priced from', async () => {
-    // With the watermark unloaded and no estimates kept, the render's image
-    // pass prices afresh and advances the watermark for itself, as a dry
-    // select does; what the next compile reads must be as it was before.
-    const strategy = memory({ maxLiveImages: 2, imageStripHysteresisRatio: 0.5 });
-    await withManager(strategy, async (manager) => {
-      const ids = [1, 2, 3, 4].map((i) => manager.addMessage('user', imageMessage(`img-${i}`, 1)));
-      const state = strategy as unknown as { _imageWatermark: unknown; _imageWatermarkLoaded: boolean; _postStripMemo: unknown; imageWatermarkStateId: string };
-      state._imageWatermark = undefined;
-      state._imageWatermarkLoaded = true;
-      state._postStripMemo = null;
-      // The stored watermark a restart would load, older than any advance.
-      const store = (manager as unknown as { store: JsStore }).store;
-      store.setStateJson(state.imageWatermarkStateId, { sequence: 0, at: 1 });
-      const rendered = manager.renderAsNewest(ids)!;
-      assert.equal(rendered.map(imagesIn).join(''), '0001', 'the watermark the render advanced keeps one image, where the count alone keeps two');
-      assert.equal(state._imageWatermark, undefined, 'the watermark is as it was');
-      assert.equal(state._postStripMemo, null, 'the estimates are as they were');
-      assert.deepEqual(store.getStateJson(state.imageWatermarkStateId), { sequence: 0, at: 1 }, 'the stored watermark is as it was');
     });
   });
 
