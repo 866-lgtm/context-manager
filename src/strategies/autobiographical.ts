@@ -233,19 +233,17 @@ class CompressionQuarantineUnreadableError extends Error {
 }
 
 /**
- * Whether a merge group still stands as it was recorded: its sources a list
- * of ids (isIdList), every one present and unparented. The sweep removes a
- * merge-quarantine record once it doesn't, the debt report counts a topology
- * refusal only while it does, and a record neither holds its sources nor is
- * retried or cleared by a valid merge of its group while it doesn't. A record
- * whose sources identify nothing, such as the empty group the threshold pass
- * offers when mergeThreshold is 0 (#285), never stands.
+ * Whether a merge group still stands as it was recorded: every source present
+ * and unparented. The sweep removes a merge-quarantine record once it
+ * doesn't, the debt report counts a topology refusal only while it does, and
+ * a record neither holds its sources nor is retried or cleared by a valid
+ * merge of its group while it doesn't.
  */
 function mergeRecordStands(
   record: Pick<MergeQuarantineRecord, 'sourceIds'>,
   summaryById: (id: string) => SummaryEntry | undefined,
 ): boolean {
-  return isIdList(record.sourceIds) && record.sourceIds.every((id) => {
+  return record.sourceIds.every((id) => {
     const summary = summaryById(id);
     return summary !== undefined && !getSummaryParentId(summary);
   });
@@ -3331,17 +3329,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       : [];
     const mergeQuarantine = this.store.getStateJson(this.mergeQuarantineStateId);
     const storedMergeRecords = Array.isArray(mergeQuarantine) ? (mergeQuarantine as MergeQuarantineRecord[]) : [];
-    // A record's sources are read as the merge queue's below are (isIdList): a
-    // record whose sources identify nothing holds no group.
-    const loadedMergeRecords = storedMergeRecords.filter((r) => r && typeof r.key === 'string' && isIdList(r.sourceIds));
+    // A record's sources are a list of ids, each a non-empty string. The list
+    // may be empty: the threshold pass at mergeThreshold 0 queues an empty
+    // group, and its refused record, standing, is what keeps the pass from
+    // offering that group again (#285, whose fix decides what such a record
+    // means).
+    const isSourceList = (ids: unknown): boolean => Array.isArray(ids) && ids.every((id) => typeof id === 'string' && id !== '');
+    const loadedMergeRecords = storedMergeRecords.filter((r) => r && typeof r.key === 'string' && isSourceList(r.sourceIds));
     this.mergeQuarantine = new Map(loadedMergeRecords.map((r) => [r.key, r]));
     // What the load can't read is named and written back without, as the merge
     // queue's load below names what it removes and writes its queue back.
     // Records are written from a merge group, by refuseCrossedMerge and
     // quarantineMerge, so an entry that fails this, or a stored value that
-    // holds no list, is damage, another writer's, or the empty group the
-    // threshold pass offers when mergeThreshold is 0 (#285). Left in the store,
-    // it would go at whatever write came next, the load's own sweep included,
+    // holds no list, is damage or another writer's. Left in the store, it
+    // would go at whatever write of the map came next, the sweep's included,
     // and a store holding nothing else would name it at every load.
     const leftOutMergeRecords = storedMergeRecords.length - loadedMergeRecords.length;
     const unlistedMergeQuarantine = mergeQuarantine != null && !Array.isArray(mergeQuarantine);
@@ -3353,10 +3354,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ? `${at} holds no list, so the load reads no record from it and writes an empty list in its place: whatever it held ` +
               'is lost'
           : `${at} holds ${leftOutMergeRecords} entr${one ? 'y' : 'ies'} the load can't read as ${one ? 'a record' : 'records'} ` +
-              `(${one ? 'it needs' : 'each needs'} a string key and a non-empty sourceIds list of non-empty string ids), so the ` +
-              `load leaves ${one ? 'it' : 'them'} out and writes the quarantine back without ${one ? 'it' : 'them'}: whatever ` +
-              `${one ? 'group it' : 'groups they'} held ${one ? 'is' : 'are'} no longer held out of merges or counted by the ` +
-              'merge-quarantine alarm or getCompressionDebt()',
+              `(${one ? 'it needs' : 'each needs'} a string key and a sourceIds list of non-empty string ids), so the load ` +
+              `leaves ${one ? 'it' : 'them'} out and writes the quarantine back without ${one ? 'it' : 'them'}: any group ` +
+              `${one ? 'it' : 'they'} held is no longer held out of merges or counted by the merge-quarantine alarm or ` +
+              'getCompressionDebt()',
       );
       this.persistMergeQuarantine();
     }

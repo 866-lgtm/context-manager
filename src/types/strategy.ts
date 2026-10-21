@@ -1355,9 +1355,11 @@ export interface AutobiographicalConfig {
    * summary's parent pointers, and
    * reopens or removes the chunk records and queued merges that name a
    * summary it doesn't keep. It also stores the summary-id counter when the
-   * stored one trails the ids the store holds, and leaves out of the merge
-   * quarantine, and names, every entry that isn't a record with a string key
-   * and a non-empty `sourceIds` list of non-empty string ids.
+   * stored one trails the ids the store holds. It leaves out of the merge
+   * quarantine, names and writes it back without every entry that isn't a
+   * record with a string key and a `sourceIds` list of non-empty string ids,
+   * and replaces a stored merge quarantine that isn't a list with an empty
+   * one.
    */
   auditOnly?: boolean;
   /** Legacy first-choice target-only merge request. Default false. */

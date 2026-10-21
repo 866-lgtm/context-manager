@@ -48,24 +48,18 @@ async function reopenHolding(value: unknown): Promise<{ manager: ContextManager;
   return openWarned();
 }
 
-const ONE_LEFT_OUT = /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 1 entry the load can't read as a record \(it needs a string key and a non-empty sourceIds list of non-empty string ids\), so the load leaves it out and writes the quarantine back without it: whatever group it held is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\)/;
+const ONE_LEFT_OUT = /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 1 entry the load can't read as a record \(it needs a string key and a sourceIds list of non-empty string ids\), so the load leaves it out and writes the quarantine back without it: any group it held is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\)/;
 const NO_LIST = /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds no list, so the load reads no record from it and writes an empty list in its place: whatever it held is lost/;
 
-test('a record whose sourceIds is an empty list is left out at load, named and written back without, so it no longer stands for good as a refused crossed merge', async () => {
-  const { manager, warned } = await reopenHolding([
-    { key: 'empty', level: 2, sourceIds: [], attempts: 0, quarantinedAt: 1, lastOutcome: 'topology_violation', lastErrorType: '0 source(s); a merge needs at least two' },
-  ]);
+test('a refused record of no sources, as mergeThreshold 0 stores one (#285), loads and stands as on main, with no line and no write', async () => {
+  const empty = { key: 'empty', level: 2, sourceIds: [], attempts: 0, quarantinedAt: 1, lastOutcome: 'topology_violation', lastErrorType: '0 source(s); a merge needs at least two' };
+  const { manager, warned } = await reopenHolding([empty]);
   try {
-    const named = unreadable(warned);
-    assert.equal(named.length, 1, `one line: ${JSON.stringify(warned)}`);
-    assert.match(named[0], ONE_LEFT_OUT);
-    assert.match(named[0], / ns=default$/, 'through the strategy\'s diagnostics, which end the line with its namespace');
-    const strategy = (manager as unknown as { strategy: AutobiographicalStrategy }).strategy;
-    assert.equal(strategy.getMergeQuarantineStatus().count, 0);
-    const debt = strategy.getCompressionDebt();
-    assert.equal(debt.topologyRefusals, 0);
-    assert.notEqual(debt.state, 'critical');
-    assert.deepEqual(stored(manager), [], 'the load wrote the quarantine back without it');
+    assert.deepEqual(warned.filter((line) => line.includes('[merge-quarantine]')), [], `no line: ${JSON.stringify(warned)}`);
+    const debt = (manager as unknown as { strategy: AutobiographicalStrategy }).strategy.getCompressionDebt();
+    assert.equal(debt.topologyRefusals, 1);
+    assert.equal(debt.state, 'critical');
+    assert.deepEqual(stored(manager), [empty], 'left as stored');
   } finally {
     manager.close();
   }
@@ -79,6 +73,7 @@ test('a record whose sourceIds holds ids that aren\'t strings is left out at loa
     const named = unreadable(warned);
     assert.equal(named.length, 1, `one line: ${JSON.stringify(warned)}`);
     assert.match(named[0], ONE_LEFT_OUT);
+    assert.match(named[0], / ns=default$/, 'through the strategy\'s diagnostics, which end the line with its namespace');
     assert.ok(!warned.some((line) => line.includes('[merge-quarantine] swept')), `no sweep line: ${JSON.stringify(warned)}`);
     assert.equal((manager as unknown as { strategy: AutobiographicalStrategy }).strategy.getMergeQuarantineStatus().count, 0);
     assert.deepEqual(stored(manager), []);
@@ -99,7 +94,7 @@ test('entries the load can\'t read as records are left out, one line names the s
   try {
     const named = unreadable(warned);
     assert.equal(named.length, 1, `one line: ${JSON.stringify(warned)}`);
-    assert.match(named[0], /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 4 entries the load can't read as records \(each needs a string key and a non-empty sourceIds list of non-empty string ids\), so the load leaves them out and writes the quarantine back without them: whatever groups they held are no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\)/);
+    assert.match(named[0], /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 4 entries the load can't read as records \(each needs a string key and a sourceIds list of non-empty string ids\), so the load leaves them out and writes the quarantine back without them: any group they held is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\)/);
     assert.ok(warned.some((line) => line.includes('[merge-quarantine] swept 1')), 'the well-formed stale record is the sweep\'s, not this line\'s');
     assert.deepEqual(stored(manager), [], 'written back without the four, and swept of the stale one');
   } finally {
@@ -117,6 +112,7 @@ test('a stored merge quarantine that holds no list is named at load and replaced
   const { manager: fresh, warned: none } = await openWarned(join(dir, 'fresh'));
   try {
     assert.deepEqual(none.filter((line) => line.includes('[merge-quarantine]')), [], 'a store with no merge quarantine names nothing');
+    assert.equal(stored(fresh), null, 'and writes none');
   } finally {
     fresh.close();
   }
@@ -146,7 +142,7 @@ test('a take-up of another instance\'s writes leaves out what it can\'t read, na
     manager.addMessage('User', [{ type: 'text', text: 'hello' }]);
     // As another instance sharing the store might leave it.
     internals(manager).store.setStateJson(internals(manager).mergeQuarantineStateId, [
-      { key: 'empty', level: 2, sourceIds: [], attempts: 0, quarantinedAt: 1, lastOutcome: 'topology_violation' },
+      { key: 'not-strings', level: 2, sourceIds: [7, 8], attempts: 0, quarantinedAt: 1, lastOutcome: 'topology_violation' },
     ]);
     const warned: string[] = [];
     const warn = console.warn;
