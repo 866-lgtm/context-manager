@@ -39,23 +39,41 @@ const internals = (manager: ContextManager): Internals => (manager as unknown as
 const stored = (manager: ContextManager): unknown => internals(manager).store.getStateJson(internals(manager).mergeQuarantineStateId);
 const unreadable = (warned: string[]): string[] => warned.filter((line) => line.includes('[merge-quarantine]') && line.includes("can't read"));
 
-/** Stores `value` as the merge quarantine, reopens with console.warn captured, and returns the reopened manager and what was warned. */
-async function reopenHolding(value: unknown): Promise<{ manager: ContextManager; warned: string[] }> {
+/**
+ * Stores `value` as the merge quarantine, reopens with console.warn captured, and returns the reopened manager, what
+ * was warned, and how many times the reopen wrote the merge quarantine.
+ */
+async function reopenHolding(value: unknown): Promise<{ manager: ContextManager; warned: string[]; quarantineWrites: number }> {
   const first = await open();
   first.addMessage('User', [{ type: 'text', text: 'hello' }]);
-  internals(first).store.setStateJson(internals(first).mergeQuarantineStateId, value);
+  const { store, mergeQuarantineStateId } = internals(first);
+  store.setStateJson(mergeQuarantineStateId, value);
   first.close();
-  return openWarned();
+  // The store's class, as the reopen builds a new store of it.
+  const proto = Object.getPrototypeOf(store) as { setStateJson(id: string, v: unknown): void };
+  const set = proto.setStateJson;
+  let quarantineWrites = 0;
+  proto.setStateJson = function (this: unknown, id: string, v: unknown) {
+    if (id === mergeQuarantineStateId) quarantineWrites += 1;
+    return set.call(this, id, v);
+  };
+  try {
+    const opened = await openWarned();
+    return { ...opened, quarantineWrites };
+  } finally {
+    proto.setStateJson = set;
+  }
 }
 
-const ONE_LEFT_OUT = /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 1 entry the load can't read as a record \(it needs a string key and a sourceIds list of non-empty string ids\), so the load leaves it out and writes the quarantine back without it: any group it held is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\)/;
+const ONE_LEFT_OUT = /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 1 entry the load can't read as a record \(it needs a string key, and sourceIds a list whose ids are all non-empty strings\), so the load leaves it out and writes the quarantine back without it: any group it held is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\)/;
 const NO_LIST = /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds no list, so the load reads no record from it and writes an empty list in its place: whatever it held is lost/;
 
 test('a refused record of no sources, as mergeThreshold 0 stores one (#285), loads and stands as on main, with no line and no write', async () => {
   const empty = { key: 'empty', level: 2, sourceIds: [], attempts: 0, quarantinedAt: 1, lastOutcome: 'topology_violation', lastErrorType: '0 source(s); a merge needs at least two' };
-  const { manager, warned } = await reopenHolding([empty]);
+  const { manager, warned, quarantineWrites } = await reopenHolding([empty]);
   try {
     assert.deepEqual(warned.filter((line) => line.includes('[merge-quarantine]')), [], `no line: ${JSON.stringify(warned)}`);
+    assert.equal(quarantineWrites, 0, 'the load writes no merge quarantine');
     const debt = (manager as unknown as { strategy: AutobiographicalStrategy }).strategy.getCompressionDebt();
     assert.equal(debt.topologyRefusals, 1);
     assert.equal(debt.state, 'critical');
@@ -66,7 +84,7 @@ test('a refused record of no sources, as mergeThreshold 0 stores one (#285), loa
 });
 
 test('a record whose sourceIds holds ids that aren\'t strings is left out at load and named, not swept as paid off', async () => {
-  const { manager, warned } = await reopenHolding([
+  const { manager, warned, quarantineWrites } = await reopenHolding([
     { key: 'not-strings', level: 2, sourceIds: [7, 8], attempts: 5, quarantinedAt: 1, lastOutcome: 'refusal' },
   ]);
   try {
@@ -75,6 +93,7 @@ test('a record whose sourceIds holds ids that aren\'t strings is left out at loa
     assert.match(named[0], ONE_LEFT_OUT);
     assert.match(named[0], / ns=default$/, 'through the strategy\'s diagnostics, which end the line with its namespace');
     assert.ok(!warned.some((line) => line.includes('[merge-quarantine] swept')), `no sweep line: ${JSON.stringify(warned)}`);
+    assert.equal(quarantineWrites, 1, 'the load writes the quarantine back once (and the count sees a write)');
     assert.equal((manager as unknown as { strategy: AutobiographicalStrategy }).strategy.getMergeQuarantineStatus().count, 0);
     assert.deepEqual(stored(manager), []);
   } finally {
@@ -94,7 +113,7 @@ test('entries the load can\'t read as records are left out, one line names the s
   try {
     const named = unreadable(warned);
     assert.equal(named.length, 1, `one line: ${JSON.stringify(warned)}`);
-    assert.match(named[0], /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 4 entries the load can't read as records \(each needs a string key and a sourceIds list of non-empty string ids\), so the load leaves them out and writes the quarantine back without them: any group they held is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\)/);
+    assert.match(named[0], /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 4 entries the load can't read as records \(each needs a string key, and sourceIds a list whose ids are all non-empty strings\), so the load leaves them out and writes the quarantine back without them: any group they held is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\)/);
     assert.ok(warned.some((line) => line.includes('[merge-quarantine] swept 1')), 'the well-formed stale record is the sweep\'s, not this line\'s');
     assert.deepEqual(stored(manager), [], 'written back without the four, and swept of the stale one');
   } finally {

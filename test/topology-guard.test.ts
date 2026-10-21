@@ -232,7 +232,7 @@ describe('a crossed merge is refused at mint time', () => {
     try {
       const named = warned.filter((line) => line.includes('[merge-quarantine]') && line.includes("can't read"));
       assert.equal(named.length, 1, `one line names the damaged record: ${JSON.stringify(warned)}`);
-      assert.match(named[0], /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 1 entry the load can't read as a record \(it needs a string key and a sourceIds list of non-empty string ids\), so the load leaves it out and writes the quarantine back without it: any group it held is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\)/);
+      assert.match(named[0], /^\[merge-quarantine\] on branch 'main', default\/autobio:merge-quarantine holds 1 entry the load can't read as a record \(it needs a string key, and sourceIds a list whose ids are all non-empty strings\), so the load leaves it out and writes the quarantine back without it: any group it held is no longer held out of merges or counted by the merge-quarantine alarm or getCompressionDebt\(\)/);
       assert.equal(again.quarantine().size, 1, 'the standing record loaded');
       const stored = (again as unknown as { store: { getStateJson(id: string): unknown }; mergeQuarantineStateId: string });
       assert.deepEqual(stored.store.getStateJson(stored.mergeQuarantineStateId), [standing], 'written back with the standing record alone');
