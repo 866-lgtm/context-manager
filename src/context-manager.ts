@@ -2026,10 +2026,26 @@ export class ContextManager {
     // strategy: a close() from a listener lets the write it interrupted
     // finish, and that write's remaining shards are stored unheard.
     if (this.strategy.onNewMessage && !this.closed) {
-      // Fire and forget - don't block on strategy processing
-      this.strategy.onNewMessage(message, this.createStrategyContext()).catch((err) => {
-        this.diag.error('Strategy onNewMessage failed:', err);
-      });
+      // Fire and forget: the write doesn't wait for the strategy, and the
+      // strategy's failure isn't the write's (#288). The hook runs here,
+      // inside the append, so its synchronous part comes before addMessage
+      // returns, after a holdCompression hold is placed. A hook that isn't
+      // async can throw before it returns, and the throw is logged the same
+      // way as a rejection. It can also return no promise, which isn't a
+      // failure. Either way the message stays stored, as do a sharded body's
+      // remaining shards, and the strategy isn't offered it again. Only the
+      // strategy's call is caught: the manager's own work around it, the
+      // context it hands the strategy among it, still fails the write, as
+      // onMessage's note says. The log is logThrown's, which survives a
+      // thrown value that can't be formatted.
+      const failed = (err: unknown) =>
+        logThrown(`Strategy onNewMessage failed for ${describeStoreEvent({ type: 'add', message })}:`, err, this.diag);
+      const ctx = this.createStrategyContext();
+      try {
+        Promise.resolve(this.strategy.onNewMessage(message, ctx)).catch(failed);
+      } catch (err) {
+        failed(err);
+      }
     }
   }
 
@@ -2201,15 +2217,23 @@ export class ContextManager {
   }
 }
 
-/** What a store event was about, for a log line: its message (and body group), or its span. */
+/**
+ * What a store event was about, for a log line's message: its message (and
+ * body group), or its span. The message is a format string, since a thrown
+ * value follows it, so a '%' in an id, such as a body group a host's strategy
+ * chose, is doubled to print as itself.
+ */
 function describeStoreEvent(event: MessageStoreEvent): string {
-  switch (event.type) {
-    case 'add':
-      return `message ${event.message.id}${event.message.bodyGroupId ? ` (body group ${event.message.bodyGroupId})` : ''}`;
-    case 'edit':
-    case 'remove':
-      return `message ${event.messageId}`;
-    case 'removeRange':
-      return `messages ${event.fromId} to ${event.toId}`;
-  }
+  const text = ((): string => {
+    switch (event.type) {
+      case 'add':
+        return `message ${event.message.id}${event.message.bodyGroupId ? ` (body group ${event.message.bodyGroupId})` : ''}`;
+      case 'edit':
+      case 'remove':
+        return `message ${event.messageId}`;
+      case 'removeRange':
+        return `messages ${event.fromId} to ${event.toId}`;
+    }
+  })();
+  return text.replaceAll('%', '%%');
 }

@@ -228,7 +228,13 @@ export interface ContextStrategy {
 
   /**
    * React to new messages.
-   * Called after a message is added to the store.
+   * Called after a message is added to the store, inside the write that
+   * stored it, so its synchronous part runs before addMessage returns; the
+   * manager doesn't wait for the promise. A rejection, or a throw before it
+   * returns, is logged through the manager's diagnostics, naming the message,
+   * and doesn't reach addMessage's caller: the message stays stored, and the
+   * strategy isn't offered it again. A hook that returns no promise, as one
+   * written in JavaScript can, isn't a failure, and nothing is logged.
    */
   onNewMessage?(message: StoredMessage, ctx: StrategyContext): Promise<void>;
 
@@ -1372,7 +1378,11 @@ export interface AutobiographicalConfig {
    * summary's parent pointers, and
    * reopens or removes the chunk records and queued merges that name a
    * summary it doesn't keep. It also stores the summary-id counter when the
-   * stored one trails the ids the store holds.
+   * stored one trails the ids the store holds. It leaves out of the merge
+   * quarantine, names and writes it back without every entry that isn't a
+   * record with a string key and a `sourceIds` list whose ids are all
+   * non-empty strings (an empty list is kept), and replaces a stored merge
+   * quarantine that isn't a list with an empty one.
    */
   auditOnly?: boolean;
   /** Legacy first-choice target-only merge request. Default false. */
