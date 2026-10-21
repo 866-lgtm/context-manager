@@ -76,7 +76,7 @@ import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
-import { hasImage, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
+import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
@@ -1838,6 +1838,14 @@ function sentForm(block: ContentBlock): ContentBlock {
     return { type: block.type, rawItem: item } as unknown as ContentBlock;
   }
   return withoutRawForms(block);
+}
+
+const TOP_LEVEL_IMAGES = Symbol('top-level images');
+/** Which of its message's image groups a block's images belong to, for the
+ *  verdicts postStripEstimates keeps: a tool result's are its call's, and a
+ *  message's top-level images are one group. */
+function imageGroup(block: ContentBlock): unknown {
+  return block.type === 'tool_result' ? block.toolUseId : TOP_LEVEL_IMAGES;
 }
 
 /**
@@ -14726,10 +14734,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  units, by kind and key, or the first of them where the newest messages
    *  were removed, then a raw unit for each newer chunk. A newer chunk shown
    *  folded doesn't keep it: the rebuild renders newer messages raw, and
-   *  those can replace an earlier tool result that the emission, folding
-   *  them, leaves as it was. An earlier image they leave alike either way:
-   *  the strip counts a folded message's images as it counts a raw one's
-   *  (applyImageStripping's asEstimated). */
+   *  pairing repair can move a raw newer message's late tool result into an
+   *  earlier call's stub slot, which the emission, folding that message,
+   *  leaves a stub. An earlier image they leave alike either way: the strip
+   *  gives each image the verdict postStripEstimates gave it, whether its
+   *  message is folded or raw (applyImageStripping's asEstimated). */
   private kvUnifiedKeepsPresentation(layout: RenderLayout, kept: RenderLayout): boolean {
     return layout.units.every((unit, i) =>
       i < kept.units.length
@@ -14771,12 +14780,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  while one that misses a change the emission makes, such as a pass it
    *  lacks, credits the changed prefix. Where a compile keeps the reference's
    *  presentation, its record compares the two (kvUnifiedSelfCheck). A
-   *  candidate that folds a newer result's message
-   *  can render an earlier one as the reference had it, and is credited less
-   *  than the provider serves; one that renders raw a chunk the reference
-   *  showed folded can tip a newest-first count, and is credited as before
-   *  this check. A newer image's message does neither: the strip counts its
-   *  images whether it's folded or raw (applyImageStripping's asEstimated). A reference without a record that describes its markers,
+   *  candidate that renders a newer message differently from the reference,
+   *  folded where it was raw or raw where it was folded, can change an
+   *  earlier call's slot, since pairing repair moves a raw message's late
+   *  tool result into its call's stub slot. The rebuild keeps the reference's
+   *  presentation, so it doesn't see that change, and credits the markers
+   *  past the slot, which over-credits them (#295). Images take no part: the
+   *  strip gives each image the verdict postStripEstimates gave it, whether
+   *  its message is folded or raw and wherever the repair moves it
+   *  (applyImageStripping's asEstimated). A reference without a record that describes its markers,
    *  such as one an earlier version wrote, is credited as it is. A marker on
    *  the reference's head unit stands for the head's end, so it holds only
    *  while its message ends this compile's head window. */
@@ -16953,12 +16965,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  a `maxMessageTokens` cut changes (cappedForSend), which leaves a
    *  message's images at the price the selection gave them.
    *
-   *  `asEstimated`: the caller prices messages by `postStripEstimates`, which
-   *  counts the images of every stored message as it's sent, so the strip
-   *  counts, ahead of each image it sends, the images of the newer messages
-   *  no entry sends, and the two keep and strip the same images. Each image's
-   *  verdict then follows from the store alone, whichever messages the
-   *  layout folds. `selectAdaptive` asks: every budgeting site in it prices a
+   *  `asEstimated`: the caller prices messages by `postStripEstimates`, so
+   *  the strip applies the verdicts that pass gave each image of each stored
+   *  message's cut (cappedForSend), rather than counting the images it sends.
+   *  An image's verdict is its own message's: the entry's source's, or, for
+   *  an image in a tool result that pairing repair moved into this entry,
+   *  the message it was moved from, which relocateOrDropMissingResults
+   *  records where the entry it moved it from has an id, as every entry that
+   *  holds a tool result does. Within the message, a tool result's images, and the top-level
+   *  images, take that group's verdicts in order, since the cut and the
+   *  repair keep each block's images in order, copying a block at most. A
+   *  result the repair drops, such as a second one for a call, leaves its
+   *  verdicts unused, so its images took slots the window could have used.
+   *  Two results for one call id in a single message share a group, which
+   *  pairing repair, taking ids to be unique, doesn't expect: where it moves
+   *  one, they can take each other's verdicts. A verdict whose image had
+   *  another payload (imagePayload) isn't this image's, so the image is
+   *  replaced, as is one with no verdict at all, such as an entry with no
+   *  source would send: both err under the budget. Only the same image in
+   *  both, stamped at two prices, could go out live at the higher price on
+   *  the lower one's verdict.
+   *  Each image's verdict then follows from the store alone, whichever
+   *  messages the layout folds or the repair moves. `selectAdaptive` asks: every budgeting site in it prices a
    *  message by those estimates, with what a cut changes added, apart from
    *  the middle region's text-only entry of a sharded body, priced by its
    *  text. So does the kv-unified cache check's rebuild of what it sends
@@ -16968,21 +16996,71 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  head, middle and tail at the store's full estimate of each message as
    *  it's sent, with what a cut changes added. So it priced no image as the
    *  placeholder, and counting images it doesn't send would only cost it
-   *  live ones. (Its recent window's start and the image watermark count the
-   *  stored images, as the estimates do.) A caller that prices by the
-   *  estimates asks too. */
+   *  live ones. (Its recent window's start and the image watermark count each
+   *  stored message's images as it's sent, as the estimates do.) A caller that
+   *  prices by the estimates asks too. */
   protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView, opts: { asEstimated?: boolean } = {}): void {
     const maxLive = this.config.maxLiveImages ?? 0;             // 0 = unlimited count
     const depthTokens = this.config.imageStripDepthTokens ?? 0; // 0 = no depth strip
     const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
-    if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return; // policy disabled
+    // Policy disabled: no limit is positive, as postStripEstimates decides it,
+    // which then gives no verdicts.
+    if (!(maxLive > 0) && !(depthTokens > 0) && !(maxLiveBytes > 0)) return;
 
     const messages = store.getAll();
     const posById = this.positionIndex(messages);
+    // Image-bearing entries, newest-first by source position. Entries with no
+    // resolvable source position sort last (pos -1).
+    const ordered = entries
+      .map((entry, idx) => ({
+        idx,
+        pos: entry.sourceMessageId !== undefined ? posById.get(entry.sourceMessageId) ?? -1 : -1,
+      }))
+      .filter(({ idx }) => this.hasImageBlock(entries[idx].content))
+      .sort((a, b) => b.pos - a.pos);
+
+    if (opts.asEstimated) {
+      const verdicts = this.postStripVerdicts(store);
+      const taken = new Map<number, Map<unknown, number>>();
+      /** The verdict of the next image of `group` in the message at `home`,
+       *  if that image has this image's payload. */
+      const verdictOf = (image: ContentBlock, home: number, group: unknown): boolean => {
+        let byGroup = taken.get(home);
+        if (!byGroup) taken.set(home, byGroup = new Map());
+        const n = byGroup.get(group) ?? 0;
+        byGroup.set(group, n + 1);
+        const judged = verdicts.get(home)?.get(group)?.[n];
+        return judged !== undefined && judged.key === imagePayload(image) && judged.keep;
+      };
+      for (const { idx, pos } of ordered) {
+        const keeps: boolean[] = [];
+        for (const block of entries[idx].content) {
+          const group = imageGroup(block);
+          // A tool result's images are its own message's: this entry's, or,
+          // where pairing repair moved it here, the one it was moved from.
+          const from = this._movedFrom.get(block);
+          const home = from === undefined ? pos : posById.get(from) ?? -1;
+          for (const image of imagesIn([block])) keeps.push(verdictOf(image, home, group));
+        }
+        // replaceImages asks about each image once, in imagesIn's order.
+        let next = 0;
+        entries[idx].content = replaceImages(entries[idx].content, () => !keeps[next++],
+          AutobiographicalStrategy.IMAGE_PLACEHOLDER);
+      }
+      return;
+    }
+
+    // Counting what the entries send: an entry with no resolvable position is
+    // stripped wherever a depth limit is set. A merged body's images all sit
+    // at its first shard's position, in block order: chunkIngressMessage puts
+    // every non-text block of a body on its first shard, and
+    // mergeAdjacentBodyGroupRaw keeps them ahead of the text, so they are that
+    // shard's images. (A chunker that spread images over shards would need a
+    // position per image.)
     const stripStart = depthTokens > 0 ? this.getImageStripStart(store, depthTokens) : 0;
 
-    // Same region windows select() bucketed by, so a stripped image's reclaimed
-    // tokens come back out of the bucket it was originally tallied into.
+    // The region each source position fell in when select() bucketed it. The
+    // strip leaves the buckets as each selection tallied them (see the doc above).
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     const recentStart = Math.max(this.getRecentWindowStart(store), headEnd);
@@ -16992,39 +17070,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (pos >= recentStart) return 'tail';
       return 'middleRaw';
     };
-    // Image-bearing entries, newest-first by source position. Entries with no
-    // resolvable source position sort last (pos -1), and are stripped wherever
-    // a depth limit is set. A merged body's images all sit at its first
-    // shard's position, in block order: chunkIngressMessage puts every
-    // non-text block of a body on its first shard, and mergeAdjacentBodyGroupRaw
-    // keeps them ahead of the text, so they are that shard's images, counted
-    // where postStripEstimates counts that message. (A chunker that spread
-    // images over shards would need a position per image.)
-    const ordered = entries
-      .map((entry, idx) => ({
-        idx,
-        pos: entry.sourceMessageId !== undefined ? posById.get(entry.sourceMessageId) ?? -1 : -1,
-      }))
-      .filter(({ idx }) => this.hasImageBlock(entries[idx].content))
-      .sort((a, b) => b.pos - a.pos);
-
-    // Asked to strip as the estimates count (asEstimated): the stored messages
-    // whose images some entry sends, each image-bearing entry's position. In
-    // this package an entry that sends an image is a raw copy of the message
-    // at its position and sends every image that message has (truncation
-    // keeps every image, and a merged body's are its first shard's, as
-    // above); an entry that sends none, such as a summary or the middle
-    // region's text of a body, sends none of its sources'. postStripEstimates
-    // counts the images of every stored message as it's sent (prunedForSend:
-    // a tool result toolResultMaxLastN replaces holds none), so the strip
-    // counts those of every other one too, such as a message a fold replaced with its
-    // summary, or a body's first shard where the middle region sends the
-    // body's text only: their images take their live slots here as they did
-    // in the estimate. The two passes then keep and strip alike, and the
-    // window sends no image its estimate priced at the placeholder, at the
-    // cost of an older raw image the window could have carried losing its
-    // slot to one it doesn't send.
-    const carried = new Set(ordered.map(({ pos }) => pos));
 
     let keptImages = 0;
     let keptImageBytes = 0;
@@ -17040,15 +17085,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       keptImageBytes += blockBytes;
       return true;
     };
-    // The newest stored position not yet passed: before each entry, the
-    // images of the messages newer than it that no entry sends are counted,
-    // at their own positions, newest-first, as the estimate counts them.
-    let next = messages.length - 1;
     for (const { idx, pos } of ordered) {
-      for (; opts.asEstimated && pos >= 0 && next > pos; next--) {
-        if (carried.has(next)) continue;
-        for (const image of imagesIn(this.prunedForSend(store, messages[next]!).content)) keeps(image, next);
-      }
       const entry = entries[idx];
       const bucket = bucketAt(pos);
       // Every image the entry carries, nested in a tool_result included, in
@@ -17116,8 +17153,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // A message's own tokens count toward its depth, as getImageStripStart
         // counts them: the message that crosses the cap is beyond it.
         depth += store.estimateTokens(m);
-        // Its images as it's sent, as the limits count them (prunedForSend).
-        for (const b of imagesIn(this.prunedForSend(store, m).content)) {
+        // Its images as it's sent, as the limits count them (cappedForSend).
+        for (const b of imagesIn(this.cappedForSend(store, m, this.config.maxMessageTokens).content)) {
           const size = inlineImageBytes(b);
           const misfit = (depthCap > 0 && depth > depthCap) || (countCap > 0 && count >= countCap) ||
             (bytesCap > 0 && bytes + size > bytesCap);
@@ -17180,11 +17217,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Each message is priced in the form it's sent in (prunedForSend), so a
    * tool result `toolResultMaxLastN` replaces costs its marker and a
    * `tool_use` input `toolUseInputMaxTokens` truncates costs its truncation.
-   * The strip depth is still measured over the stored messages, as
-   * getImageStripStart measures it.
+   * Its images are counted in the form its cut sends (cappedForSend), and the
+   * verdict each gets is kept for the strip, which applies it
+   * (applyImageStripping's asEstimated). A cut that leaves an image out, as an
+   * override of `truncateContent` can, takes it off at its full price through
+   * the cut's extra, which every site that prices what's sent adds. Two sites
+   * don't: the recent window's size (getUnheldRecentWindowStart), since no
+   * window's size is measured after the cap (see cappedForSend), and the
+   * middle region's text-only entry of a sharded body, which sends its
+   * shards uncut. The strip depth is still
+   * measured over the stored messages, as getImageStripStart measures it.
    */
   protected postStripEstimates(store: MessageStoreView): number[] {
     return this.withToolPruning(store, () => this.postStripEstimatesHeld(store, this._toolPruningInUse!.pruning));
+  }
+
+  /** The verdicts postStripEstimates gave each message's images (see
+   *  applyImageStripping's asEstimated). */
+  private postStripVerdicts(store: MessageStoreView): NonNullable<AutobiographicalStrategy['_postStripMemo']>['verdicts'] {
+    // The pass leaves its memo set for this listing, hit or miss.
+    this.withToolPruning(store, () => this.postStripEstimatesHeld(store, this._toolPruningInUse!.pruning));
+    return this._postStripMemo!.verdicts;
   }
 
   private postStripEstimatesHeld(
@@ -17204,13 +17257,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the memo. A branch reload clears both. Callers treat the array as read-only.
     const memoCalibration = store.getTokenCalibration?.() ?? 1;
     const ratio = this.imageHysteresisRatio();
+    // The cut decides which images go out, so its cap keys the memo too: a
+    // preview can override it alone.
+    const msgCap = this.config.maxMessageTokens;
     const memo = this._postStripMemo;
     if (
       memo && memo.messages === messages && memo.calibration === memoCalibration &&
       memo.stripDepth === stripDepth && memo.maxLive === maxLive && memo.maxLiveBytes === maxLiveBytes &&
-      memo.ratio === ratio && memo.pruning === pruning
+      memo.ratio === ratio && memo.pruning === pruning && memo.msgCap === msgCap
     ) return memo.out;
     const out = new Array<number>(messages.length);
+    // What applyImageStripping's asEstimated applies: by message position,
+    // each block's images (a tool result's by its call's id, the top-level
+    // images together), each with its payload (imagePayload) and whether the
+    // strip keeps it, in order.
+    const verdicts = new Map<number, Map<unknown, Array<{ key: unknown; keep: boolean }>>>();
     const stripActive = stripDepth > 0 || maxLive > 0 || maxLiveBytes > 0;
     if (stripActive) this.maybeAdvanceImageWatermark(store);
     // The placeholder as the store prices it, calibrated, by its own text
@@ -17240,29 +17301,44 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const sent = this.prunedForSend(store, messages[i]!);
       let est = sent === messages[i] ? raw : store.estimateTokens(sent);
       if (stripActive) {
-        for (const b of imagesIn(sent.content)) {
-          const bytes = inlineImageBytes(b);
-          const beyondDepth = stripDepth > 0 && rawDepth > stripDepth;
-          const beyondCount = maxLive > 0 && liveImagesSeen >= maxLive;
-          const beyondBytes = maxLiveBytes > 0 && liveImageBytes + bytes > maxLiveBytes;
-          const belowMark = this.belowImageWatermark(messages[i].sequence);
-          if (belowMark || beyondDepth || beyondCount || beyondBytes) {
-            est -= strippedImageSaving(b, placeholderPrice, calibration);
-          } else {
-            liveImagesSeen++;
-            liveImageBytes += bytes;
+        // The images the cut sends (cappedForSend), whose verdicts the strip
+        // applies, so a cut that leaves one out takes it off at its full
+        // price, through the cut's extra, rather than here.
+        // Block by block, which walks the cut's images in imagesIn's order.
+        const cut = this.cappedForSend(store, messages[i]!, msgCap).content;
+        const groups = new Map<unknown, Array<{ key: unknown; keep: boolean }>>();
+        for (const block of cut) {
+          const group = imageGroup(block);
+          for (const b of imagesIn([block])) {
+            const bytes = inlineImageBytes(b);
+            const beyondDepth = stripDepth > 0 && rawDepth > stripDepth;
+            const beyondCount = maxLive > 0 && liveImagesSeen >= maxLive;
+            const beyondBytes = maxLiveBytes > 0 && liveImageBytes + bytes > maxLiveBytes;
+            const belowMark = this.belowImageWatermark(messages[i].sequence);
+            const keep = !(belowMark || beyondDepth || beyondCount || beyondBytes);
+            if (keep) {
+              liveImagesSeen++;
+              liveImageBytes += bytes;
+            } else {
+              est -= strippedImageSaving(b, placeholderPrice, calibration);
+            }
+            let judged = groups.get(group);
+            if (!judged) groups.set(group, judged = []);
+            judged.push({ key: imagePayload(b), keep });
           }
         }
+        if (groups.size > 0) verdicts.set(i, groups);
       }
       // Belt and braces: a message never costs less than nothing.
       out[i] = Math.max(0, est);
     }
-    this._postStripMemo = { messages, calibration: memoCalibration, stripDepth, maxLive, maxLiveBytes, ratio, pruning, out };
+    this._postStripMemo = { messages, calibration: memoCalibration, stripDepth, maxLive, maxLiveBytes, ratio, pruning, msgCap, out, verdicts };
     return out;
   }
 
   private _postStripMemo: {
-    messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; ratio: number | undefined; pruning: object; out: number[];
+    messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; ratio: number | undefined; pruning: object; msgCap: number | undefined; out: number[];
+    verdicts: ReadonlyMap<number, ReadonlyMap<unknown, ReadonlyArray<{ key: unknown; keep: boolean }>>>;
   } | null = null;
 
   /** Byte wall default: 20MB of base64 (API total-request cap is 32MB). */
@@ -18028,6 +18104,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = 0; i < entries.length; i++) entries[i].index = i;
   }
 
+  /** The message each tool result pairing repair moved was moved from, by
+   *  the block it placed (relocateOrDropMissingResults), where the entry it
+   *  came from has an id. */
+  private readonly _movedFrom = new WeakMap<ContentBlock, MessageId>();
+
   /**
    * For each `missing` tool_use id (a use in the preceding entry with no
    * adjacent result), return the result block to place next to it:
@@ -18070,7 +18151,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // The result still reaches the request, next to its tool_use:
         // provenance credits the source body with it there.
         (src.relocatedResults ??= []).push(id);
-        return releaseSharedRawFormsOnMove(real, source);
+        const moved = releaseSharedRawFormsOnMove(real, source);
+        // Where it came from, for the image strip (applyImageStripping's
+        // asEstimated).
+        if (src.sourceMessageId !== undefined) this._movedFrom.set(moved, src.sourceMessageId);
+        return moved;
       }
       return this.createToolResultStub(id);
     });
@@ -18808,7 +18893,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * cappedForSend's, which gives a stored message's cached estimate for that
    * message's own content. This is the strategy's one cut: raw messages and
    * summaries alike go through it, so an override changes both, and the
-   * price of a raw message follows what the override sends.
+   * price of a raw message follows what the override sends. A compile cuts
+   * each message more than once, to price it and to send it, so an override
+   * must answer the same arguments with the same content.
    */
   protected truncateContent(
     content: ContentBlock[],

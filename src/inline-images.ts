@@ -32,6 +32,20 @@ export function inlineImageBytes(block: unknown): number {
   return typeof image.data === 'string' ? image.data.length : 0;
 }
 
+/**
+ * What identifies an image whatever copies of its block are made: a base64
+ * source's data, a URL source's URL, or a generated image's data; otherwise
+ * its source object, or the block itself.
+ */
+export function imagePayload(block: ContentBlock): unknown {
+  const image = block as { data?: unknown; source?: { data?: unknown; url?: unknown } };
+  const src = image.source;
+  if (typeof src?.data === 'string') return src.data;
+  if (typeof src?.url === 'string') return src.url;
+  if (typeof image.data === 'string') return image.data;
+  return typeof src === 'object' && src !== null ? src : block;
+}
+
 /** The content array a `tool_result` nests, if it nests one. */
 function nestedContent(block: ContentBlock): ContentBlock[] | undefined {
   const content = (block as { type: string; content?: unknown }).content;

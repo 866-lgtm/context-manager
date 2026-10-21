@@ -250,6 +250,31 @@ describe('live image accounting', () => {
     cm.close();
   });
 
+  it('the image watermark counts each message as its cut sends it', async () => {
+    /** A cut that leaves out the images of the oldest round. */
+    class DropsFirstRound extends AutobiographicalStrategy {
+      protected override truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
+        const first = content.some((b) => b.type === 'tool_result' && (b as { toolUseId?: string }).toolUseId === 't-h-1');
+        return maxTokens > 0 && first
+          ? content.map((b) => (b.type === 'tool_result' ? { ...b, content: [{ type: 'text', text: 'h-1 cut' }] } as ContentBlock : b))
+          : content;
+      }
+    }
+    const cm = await ContextManager.open({
+      path: fresh(),
+      strategy: new DropsFirstRound({
+        headWindowTokens: 0, recentWindowTokens: 1_000_000, maxLiveImages: 4, imageStripDepthTokens: 0, imageStripHysteresisRatio: 0.5,
+        maxMessageTokens: 100_000,
+      }),
+    });
+    const labels = ['h-1', 'h-2', 'h-3', 'h-4', 'h-5'];
+    for (const label of labels) toolRound(cm, label, base64Image());
+    const { messages } = await cm.compile(BUDGET);
+    assert.deepEqual(labels.slice(1).map((label) => stateOf(messages, label)), ['image', 'image', 'image', 'image'],
+      "the oldest round's cut sends no image, so four are sent, within the cap of four, and none is trimmed");
+    cm.close();
+  });
+
   it('releases the raw replay form of a tool result whose nested image it strips', async () => {
     const cm = await ContextManager.open({
       path: fresh(),
@@ -379,6 +404,21 @@ describe('live image accounting', () => {
     }
   });
 
+  it('windowed passthrough prices a message the cap cuts after its image policy too', async () => {
+    const cm = await ContextManager.open({
+      path: fresh(),
+      strategy: new WindowedPassthroughStrategy({ maxLiveImages: 0, imageStripDepthTokens: 0, maxLiveImageBytes: 1000, maxMessageTokens: 100 }),
+    });
+    cm.addMessage('Claude', [{ type: 'text', text: 'wp-capped ' + 'x'.repeat(2000) }, { type: 'image', source: { type: 'base64', data: 'A'.repeat(5000), mediaType: 'image/png' } } as ContentBlock]);
+    // About 2,300 tokens as stored, about 700 with its image replaced by the
+    // placeholder, and under 200 cut to its cap as well: a budget of 300 fits
+    // only the price after both the policy and the cut.
+    const { messages } = await cm.compile({ maxTokens: 300, reserveForResponse: 0 });
+    assert.equal(stateOf(messages, 'wp-capped'), 'stripped', 'the image goes, and the message is sent');
+    assert.ok(messages.flatMap((m) => m.content).some((b) => b.type === 'text' && b.text.includes('[truncated')), 'premise: the cap cut its text');
+    cm.close();
+  });
+
   it('windowed passthrough keeps its anchor while the window fits once its images are stripped', async () => {
     const cm = await ContextManager.open({
       path: fresh(),
@@ -466,6 +506,33 @@ describe('live image accounting', () => {
     assert.equal(estimates[2], 0, "premise: the middle's result is replaced, so its estimate holds no image");
     assert.equal(estimates[0], 1600 + 1, "the tail's image and the head's take the two live slots in the estimate");
     assert.equal(stateOf(entries, 'head'), 'image', "and the strip keeps the head's image, the replaced result's taking no slot");
+    assert.equal(stateOf(entries, 'tail'), 'image');
+  });
+
+  it("the strip counts a folded message's images as its cut sends them, so one a truncateContent override leaves out takes no slot, as in the estimate", () => {
+    /** A cut that leaves out every image of a message whose text says so. */
+    class DropsMarkedImages extends FoldedWindow {
+      protected override truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
+        const marked = content.some((b) => b.type === 'text' && b.text.includes('drop images'));
+        return maxTokens > 0 && marked ? content.filter((b) => b.type !== 'image') : content;
+      }
+    }
+    const messages = [
+      { id: 'head', sequence: 0, participant: 'User', content: [base64Image(), { type: 'text', text: 'head' }] as ContentBlock[] },
+      { id: 'middle', sequence: 1, participant: 'User', content: [base64Image(), { type: 'text', text: 'middle, drop images' }] as ContentBlock[] },
+      { id: 'tail', sequence: 2, participant: 'Claude', content: [base64Image(), { type: 'text', text: 'tail' }] as ContentBlock[] },
+    ];
+    const store = viewOf(messages);
+    const strategy = new DropsMarkedImages({ maxLiveImages: 2, imageStripDepthTokens: 0, maxMessageTokens: 1000 } as never);
+    const estimates = strategy.estimates(store);
+    const entries: ContextEntry[] = [
+      { index: 0, sourceMessageId: 'head', sourceRelation: 'copy', participant: 'User', content: messages[0]!.content },
+      { index: 1, sourceMessageIds: ['middle'], sourceRelation: 'derived', participant: 'User', content: [{ type: 'text', text: 'what came between' }] },
+      { index: 2, sourceMessageId: 'tail', sourceRelation: 'copy', participant: 'Claude', content: messages[2]!.content },
+    ];
+    strategy.strip(entries, store);
+    assert.equal(estimates[0], 1600 + 1, "the middle's cut sends no image, so the tail's and the head's take the two live slots in the estimate");
+    assert.equal(stateOf(entries, 'head'), 'image', 'and the strip keeps the head\'s image');
     assert.equal(stateOf(entries, 'tail'), 'image');
   });
 
@@ -661,5 +728,142 @@ describe('live image accounting', () => {
     assert.deepEqual(Subclass.sizes(dataUrlImage(5000)), [5000, 5000], "a data: URL's payload, not the whole URL");
     assert.deepEqual(Subclass.sizes(generatedImage(300)), [300, 300]);
     assert.deepEqual(Subclass.sizes({ type: 'image', source: { type: 'url', url: 'https://example.com/a.png' } }), [0, 0]);
+  });
+});
+
+describe("the adaptive strip applies the estimate's verdicts", () => {
+  const image = (data: string, tokenEstimate: number): ContentBlock =>
+    ({ type: 'image', source: { type: 'base64', data, mediaType: 'image/png' }, tokenEstimate }) as ContentBlock;
+  /** Compiles the messages under the adaptive selection, and returns what's
+   *  sent, by the store's estimate, the render stats' total and its plan, and
+   *  the live images' data, by message. */
+  async function compileMoved(maxLiveImages: number, messages: Array<[string, ContentBlock[]]>) {
+    const cm = await ContextManager.open({
+      path: fresh(),
+      strategy: new AutobiographicalStrategy({ adaptiveResolution: true, overBudgetGraceRatio: 0, maxLiveImages }),
+    });
+    for (const [participant, content] of messages) cm.addMessage(participant, content);
+    const store = (cm as unknown as { messageStore: { estimateTokens(message: StoredMessage): number } }).messageStore;
+    const compiled = await cm.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+    const sent = compiled.messages.reduce((sum, m) => sum + store.estimateTokens({ content: m.content } as StoredMessage), 0);
+    const stats = cm.getRenderStats()!;
+    const live = compiled.messages.map((m) => [...imagesOf(m.content)].map((b) => (b as { source: { data: string } }).source.data).join(','));
+    /** The text the repair leaves where it moved a message's only result, which no estimate prices. */
+    const movedText = store.estimateTokens({ content: [{ type: 'text', text: '[tool result moved during context repair]' }] } as unknown as StoredMessage);
+    cm.close();
+    return { sent, total: stats.total.tokens, planned: stats.planVsActual?.planned, actual: stats.planVsActual?.actual, live, movedText };
+  }
+  function* imagesOf(content: ContentBlock[]): Generator<ContentBlock> {
+    for (const b of content) {
+      if (b.type === 'image') yield b;
+      const nested = (b as { content?: unknown }).content;
+      if (b.type === 'tool_result' && Array.isArray(nested)) yield* imagesOf(nested as ContentBlock[]);
+    }
+  }
+  const calls = ['Claude', [
+    { type: 'tool_use', id: 'a', name: 'shot', input: {} }, { type: 'tool_use', id: 'b', name: 'shot', input: {} },
+  ] as ContentBlock[]] as [string, ContentBlock[]];
+  const resultB = ['User', [{ type: 'tool_result', toolUseId: 'b', content: [{ type: 'text', text: 'result b' }] }] as unknown as ContentBlock[]] as [string, ContentBlock[]];
+
+  for (const knob of ['maxLiveImages', 'imageStripDepthTokens', 'maxLiveImageBytes'] as const) for (const value of [-1, Number.NaN]) {
+    it(`sends every image where no limit is positive (${knob} ${value}), as the estimate prices them`, async () => {
+      const cm = await ContextManager.open({
+        path: fresh(),
+        strategy: new AutobiographicalStrategy({
+          adaptiveResolution: true, overBudgetGraceRatio: 0, maxLiveImages: 0, imageStripDepthTokens: 0, maxLiveImageBytes: 0, [knob]: value,
+        }),
+      });
+      cm.addMessage('User', [{ type: 'text', text: 'first' }, image('AAAA', 1600)]);
+      cm.addMessage('Claude', [{ type: 'text', text: 'second' }, image('BBBB', 1600)]);
+      const store = (cm as unknown as { messageStore: { estimateTokens(message: StoredMessage): number } }).messageStore;
+      const compiled = await cm.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+      const sent = compiled.messages.reduce((sum, m) => sum + store.estimateTokens({ content: m.content } as StoredMessage), 0);
+      assert.equal([...compiled.messages.flatMap((m) => [...imagesOf(m.content)])].length, 2, 'both images go out');
+      assert.equal(cm.getRenderStats()!.total.tokens, sent);
+      cm.close();
+    });
+  }
+
+  it("keeps the verdict the estimate gave a moved result's image, ahead of a later image in its message", async () => {
+    // Result a holds image A, ahead of image B in its message: the estimate
+    // keeps A live and prices B as the placeholder. Pairing repair moves
+    // result a up beside result b, so the entries meet B first.
+    const r = await compileMoved(1, [
+      calls, resultB,
+      ['User', [{ type: 'tool_result', toolUseId: 'a', content: [image('AAAA', 100), { type: 'text', text: 'result a' }] }, image('BBBB', 1600)] as unknown as ContentBlock[]],
+      ['Claude', [{ type: 'text', text: 'done' }]],
+    ]);
+    assert.deepEqual(r.live, ['', 'AAAA', '', ''], 'premise: result a moved beside result b; A goes out live, B as the placeholder');
+    assert.equal(r.total, r.sent, `render stats ${r.total}, sent ${r.sent}`);
+    assert.equal(r.planned, r.actual);
+  });
+
+  it("keeps each image's own verdict where a moved result's image has the payload of a later image in its message, at another price", async () => {
+    // As above, but A and B carry one payload: A's verdict is still A's.
+    const r = await compileMoved(1, [
+      calls, resultB,
+      ['User', [{ type: 'tool_result', toolUseId: 'a', content: [image('AAAA', 100), { type: 'text', text: 'result a' }] }, image('AAAA', 1600)] as unknown as ContentBlock[]],
+      ['Claude', [{ type: 'text', text: 'done' }]],
+    ]);
+    assert.deepEqual(r.live, ['', 'AAAA', '', ''], "premise: result a moved beside result b, and its image is the one that goes out live");
+    assert.equal(r.total, r.sent, `render stats ${r.total}, sent ${r.sent}`);
+    assert.equal(r.planned, r.actual);
+  });
+
+  it("gives an unmoved result its own message's verdicts where a later message reuses its call's id", async () => {
+    const round = (label: string, data: string): Array<[string, ContentBlock[]]> => [
+      ['Claude', [{ type: 'tool_use', id: 'x', name: 'shot', input: {} }] as ContentBlock[]],
+      ['User', [{ type: 'tool_result', toolUseId: 'x', content: [image(data, 1600), { type: 'text', text: label }] }] as unknown as ContentBlock[]],
+    ];
+    const r = await compileMoved(2, [...round('first', 'FFFF'), ...round('second', 'SSSS'), ['Claude', [{ type: 'text', text: 'done' }]]]);
+    assert.deepEqual(r.live, ['', 'FFFF', '', 'SSSS', ''], 'both rounds\' images go out live, within the limit of two');
+    assert.equal(r.total, r.sent, `render stats ${r.total}, sent ${r.sent}`);
+  });
+
+  it("keeps a moved result's verdict where the repair copies it, giving up a raw form it shared with a block left behind", async () => {
+    // Result a and the text after it share one raw item, so the moved result
+    // is a copy without it (releaseSharedRawFormsOnMove): the copy is what
+    // the repair records and what the strip meets.
+    const item = { type: 'message', id: 'm-a', role: 'user', content: [] };
+    const r = await compileMoved(1, [
+      calls, resultB,
+      ['User', [
+        { type: 'tool_result', toolUseId: 'a', rawItem: item, content: [image('AAAA', 100), { type: 'text', text: 'result a' }] },
+        { type: 'text', text: 'after the result', rawItem: item },
+        image('BBBB', 1600),
+      ] as unknown as ContentBlock[]],
+      ['Claude', [{ type: 'text', text: 'done' }]],
+    ]);
+    assert.deepEqual(r.live, ['', 'AAAA', '', ''], "result a's copy moved beside result b goes out live, on its own verdict; B goes out as the placeholder");
+  });
+
+  it("gives a moved result its own message's verdicts where a later message reuses its call's id", async () => {
+    // Text between call x and its result makes the repair move the result
+    // up, into an entry of its own; a later round reuses the id x.
+    const r = await compileMoved(2, [
+      ['Claude', [{ type: 'tool_use', id: 'x', name: 'shot', input: {} }] as ContentBlock[]],
+      ['User', [{ type: 'text', text: 'between' }]],
+      ['User', [{ type: 'tool_result', toolUseId: 'x', content: [image('FFFF', 1600), { type: 'text', text: 'first' }] }] as unknown as ContentBlock[]],
+      ['Claude', [{ type: 'tool_use', id: 'x', name: 'shot', input: {} }] as ContentBlock[]],
+      ['User', [{ type: 'tool_result', toolUseId: 'x', content: [image('SSSS', 1600), { type: 'text', text: 'second' }] }] as unknown as ContentBlock[]],
+      ['Claude', [{ type: 'text', text: 'done' }]],
+    ]);
+    assert.deepEqual(r.live.filter((data) => data !== '').sort(), ['FFFF', 'SSSS'], 'both rounds\' images go out live, within the limit of two');
+    // Everything is priced but the text the repair leaves in the first result's place.
+    assert.equal(r.total + r.movedText, r.sent, `render stats ${r.total} and the repair's text ${r.movedText}, sent ${r.sent}`);
+  });
+
+  it("counts a moved result's image once, so an older image the estimate kept stays live", async () => {
+    // Result a's message sends nothing once the repair moves its result, so
+    // its image goes out in result b's entry.
+    const r = await compileMoved(2, [
+      ['User', [{ type: 'text', text: 'old' }, image('OOOO', 1600)]],
+      calls, resultB,
+      ['User', [{ type: 'tool_result', toolUseId: 'a', content: [image('AAAA', 1600), { type: 'text', text: 'result a' }] }] as unknown as ContentBlock[]],
+      ['Claude', [{ type: 'text', text: 'done' }]],
+    ]);
+    assert.deepEqual(r.live, ['OOOO', '', 'AAAA', '', ''], 'premise: result a moved beside result b; both images live');
+    // Everything is priced but the text the repair leaves in result a's place.
+    assert.equal(r.total + r.movedText, r.sent, `render stats ${r.total} and the repair's text ${r.movedText}, sent ${r.sent}`);
   });
 });

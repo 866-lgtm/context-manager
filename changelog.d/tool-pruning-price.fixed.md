@@ -23,4 +23,5 @@
     go out over its hard budget by that margin with no refusal. At 1, a
     compile is off by the store's own multiplier until the first accepted
     sample, normally the first compile's. A store holding none of these keeps
-    its multiplier.
+    its multiplier, unless it holds a generated image, which epoch 5 reprices
+    (see the live image accounting entry).

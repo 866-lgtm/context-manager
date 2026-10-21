@@ -695,8 +695,10 @@ export interface RenderStats {
   };
   pending: { chunks: number; merges: number };
   /**
-   * Sum across all buckets — the actual rendered context size. A summary is a
-   * Q/A pair, so it counts as 2 messages here.
+   * Sum across all buckets — the rendered context's size as the selection
+   * priced it: the adaptive selection prices each message after the image
+   * strip, and the hierarchical one counts an image the strip replaces at its
+   * full price. A summary is a Q/A pair, so it counts as 2 messages here.
    */
   total: { messages: number; tokens: number };
 
