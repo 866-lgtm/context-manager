@@ -8055,10 +8055,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Richer per-render stats: requires a message store view to compute the
-   * head + tail (recent window) sizes. Returns counts AND token sums per
-   * summary level, so observers can see "how much of the agent's context
-   * is in raw tail vs folded into L1/L2/L3."
+   * Richer per-render stats: counts AND token sums for the head, the tail
+   * (recent window), the raw middle and each summary level, so observers can
+   * see "how much of the agent's context is in raw tail vs folded into
+   * L1/L2/L3."
    *
    * Useful for TUI / dashboards. The token sums use the strategy's own
    * token estimates (which match what `select()` uses for budget math).
@@ -8495,10 +8495,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     r.summaries[k].tokens += tokens;
   }
 
-  /** Commit the accumulated stats as the last-render snapshot. */
-  protected rsEnd(): void {
+  /** Commit the accumulated stats as the last-render snapshot, and return
+   *  it; null when this pass recorded none. */
+  protected rsEnd(): RenderStats | null {
     const r = this._rs;
-    if (!r) return;
+    if (!r) return null;
     r.pending = {
       chunks: this.chunks.filter(c => !c.compressed).length,
       merges: this.mergeQueue.length,
@@ -8573,67 +8574,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
     this._lastRenderStats = r;
     this._rs = null;
+    return r;
   }
 
   /**
-   * Stats describing the LAST rendered context. Returns the inspected snapshot
-   * captured during the most recent `select()`. Before any compile has run (no
-   * snapshot yet), falls back to a reconstructed pyramid view so callers still
-   * get a non-null shape.
+   * Stats describing the last live compile: the snapshot its `select()`
+   * recorded as it emitted each entry. Null until a live select has run since
+   * the strategy loaded its branch (`initialize`, a branch reload). The stats
+   * depend on the budget a compile is given, which this read isn't, so nothing
+   * stands in for them before one: the pyramid of live summaries this used to
+   * return instead was neither the hierarchical cut nor the adaptive one (#304,
+   * connectome-host#425). A dry run or preview records none (see `select()`).
    */
-  getRenderStats(store: MessageStoreView): RenderStats {
+  getRenderStats(_store: MessageStoreView): RenderStats | null {
     this.requireLoadedBranch('getRenderStats');
-    if (this._lastRenderStats) return this._lastRenderStats;
-    return this.withToolPruning(store, () => this.reconstructRenderStats(store));
-  }
-
-  /**
-   * Pre-render fallback: re-derive head/tail windows + the full live pyramid.
-   * NOTE: this is the old "reconstruct" behavior and does NOT reflect adaptive
-   * folding — used only until the first compile populates the inspected stats.
-   */
-  protected reconstructRenderStats(store: MessageStoreView): RenderStats {
-    const messages = store.getAll();
-    const headStart = this.getHeadWindowStartIndex(store);
-    const headEnd = this.getHeadWindowEnd(store);
-    const recentStart = this.getRecentWindowStart(store);
-
-    // Each message priced as a compile sends it before any cut, its images
-    // whole: this reconstruction strips none.
-    const sumTokens = (slice: StoredMessage[]): number =>
-      slice.reduce((acc, m) => acc + store.estimateTokens(this.prunedForSend(store, m)), 0);
-
-    const headMsgs = messages.slice(headStart, headEnd);
-    const tailMsgs = messages.slice(recentStart);
-
-    const live = (level: SummaryLevel) =>
-      this.summaries.filter(s => s.level === level && !s.mergedInto);
-    const sumLevelTokens = (level: SummaryLevel): number =>
-      live(level).reduce((acc, s) => acc + s.tokens, 0);
-
-    const head = { messages: headMsgs.length, tokens: sumTokens(headMsgs) };
-    const tail = { messages: tailMsgs.length, tokens: sumTokens(tailMsgs) };
-    const summaries = {
-      l1: { count: live(1).length, tokens: sumLevelTokens(1) },
-      l2: { count: live(2).length, tokens: sumLevelTokens(2) },
-      l3: { count: live(3).length, tokens: sumLevelTokens(3) },
-    };
-    return {
-      head,
-      tail,
-      middleRaw: { messages: 0, tokens: 0 },
-      summaries,
-      pending: {
-        chunks: this.chunks.filter(c => !c.compressed).length,
-        merges: this.mergeQueue.length,
-      },
-      total: {
-        messages: head.messages + tail.messages
-          + (summaries.l1.count + summaries.l2.count + summaries.l3.count) * 2,
-        tokens: head.tokens + tail.tokens
-          + summaries.l1.tokens + summaries.l2.tokens + summaries.l3.tokens,
-      },
-    };
+    return this._lastRenderStats;
   }
 
   /**
@@ -13719,16 +13674,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!dryRun && this.kvUnifiedReceiptSupersedePending && this.config.foldingStrategy !== 'kv-unified') {
       this.supersedeKvUnifiedReceipt();
     }
-    this.rsEnd();
+    const rs = this.rsEnd();
     // Closed-loop calibration bookkeeping: the committed render stats total
     // (in CURRENT calibrated units) is what this compile claims the request
     // will cost — reportRealInputTokens compares provider usage against it.
+    // rsEnd() returns null only for a pass that began no tally, and
+    // selectAdaptive's rsBegin() at its top always begins one, so the guard
+    // answers rsEnd()'s type.
     this._storeView = store;
-    const rs = this.getRenderStats(store);
-    this._lastCompileEstimate =
-      rs.head.tokens + rs.tail.tokens + rs.middleRaw.tokens +
-      rs.summaries.l1.tokens + rs.summaries.l2.tokens + rs.summaries.l3.tokens;
-    this._calibrationArmed = true; // exactly one sample per compile
+    if (rs) {
+      this._lastCompileEstimate =
+        rs.head.tokens + rs.tail.tokens + rs.middleRaw.tokens +
+        rs.summaries.l1.tokens + rs.summaries.l2.tokens + rs.summaries.l3.tokens;
+      this._calibrationArmed = true; // exactly one sample per compile
+    }
     return merged;
   }
 
@@ -18384,8 +18343,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * neither touches it. A compile
    * prices and emits every raw message from this form: postStripEstimates,
    * cappedForSend, the hierarchical selection's raw prices, the adaptive
-   * middle's shard path, which sends a shard's text, and the render stats
-   * before the first compile. A raw replay form an edit changes is released
+   * middle's shard path, which sends a shard's text. A raw replay form an edit changes is released
    * (see raw-forms.ts). The store's own message is never written: chunking
    * and compression read it. Each message's form is kept with the
    * replacements and input cap it was made for, so a later decision that
@@ -18428,9 +18386,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     { inputCap: number; results: ReadonlyMap<number, string> | undefined; sent: StoredMessage }
   >();
 
-  /** Hold `store`'s decision while `fn` prices it. A selection,
-   *  postStripEstimates and the render stats before the first compile
-   *  (getRenderStats) price every raw message, and a merged view lists
+  /** Hold `store`'s decision while `fn` prices it. A selection and
+   *  postStripEstimates price every raw message, and a merged view lists
    *  afresh at every read (mergeMessageStoreViews), so prunedForSend reads
    *  the decision held here rather than the view. Nothing holds it outside
    *  those, so a view read later decides from its listing then. */

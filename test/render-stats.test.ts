@@ -21,6 +21,12 @@ function text(t: string): ContentBlock[] {
   return [{ type: 'text', text: t }];
 }
 
+/** The store's estimate of the compiled messages as they go out. */
+function sentTokens(manager: ContextManager, messages: ReadonlyArray<{ content: ContentBlock[] }>): number {
+  const store = (manager as unknown as { messageStore: { estimateTokens(m: { content: ContentBlock[] }): number } }).messageStore;
+  return messages.reduce((sum, m) => sum + store.estimateTokens({ content: m.content }), 0);
+}
+
 function assertConsistent(rs: RenderStats): void {
   const s = rs.summaries;
   const sumTokens =
@@ -95,15 +101,97 @@ describe('getRenderStats — inspect, not reconstruct', () => {
     manager.close();
   });
 
-  it('returns a non-null shape (with the new fields) before any compile', async () => {
+  // Before a live compile there are no stats to report: they depend on the
+  // budget a compile is given. The pyramid of live summaries that stood in
+  // for them was neither cut (#304; connectome-host#425, where a kv-stable
+  // resident's health readout showed 192 messages against a 377-message
+  // request).
+  it("is null before a live compile, and a dry run doesn't fill it (#304, the hierarchical path)", async () => {
     const manager = await ContextManager.open({
       path: TEST_STORE_PATH,
-      strategy: new AutobiographicalStrategy({ adaptiveResolution: true }),
+      strategy: new AutobiographicalStrategy({ headWindowTokens: 60, recentWindowTokens: 120, autoTickOnNewMessage: false }),
     });
-    manager.addMessage('user', text('hi'));
-    const rs = manager.getRenderStats(); // no compile yet -> reconstruction fallback
-    assert.ok(rs, 'fallback stats present');
-    assert.ok(rs!.middleRaw && rs!.total, 'fallback includes middleRaw + total');
+    for (let i = 0; i < 24; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', text(`M-${i} ${'word '.repeat(10)}`));
+    assert.strictEqual(manager.getRenderStats(), null, 'no live compile yet');
+    const budget = { maxTokens: 1_000_000, reserveForResponse: 0 };
+    await manager.compile(budget, undefined, { dryRun: true });
+    assert.strictEqual(manager.getRenderStats(), null, 'a dry run records no stats');
+    const compiled = await manager.compile(budget);
+    const rs = manager.getRenderStats();
+    assert.ok(rs, 'a live compile records its stats');
+    assertConsistent(rs!);
+    assert.strictEqual(rs!.total.messages, compiled.messages.length, 'the stats count every message the compile sent');
+    assert.strictEqual(rs!.total.tokens, sentTokens(manager, compiled.messages), 'and price them as it sent them');
+    assert.ok(rs!.middleRaw.messages > 0, "the middle's raw messages are counted");
     manager.close();
+  });
+
+  it('is null again after a branch switch on the same strategy, until a live compile there', async () => {
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy: new AutobiographicalStrategy({ headWindowTokens: 60, recentWindowTokens: 120, autoTickOnNewMessage: false }),
+    });
+    for (let i = 0; i < 12; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', text(`M-${i} ${'word '.repeat(10)}`));
+    const budget = { maxTokens: 1_000_000, reserveForResponse: 0 };
+    await manager.compile(budget);
+    assert.ok(manager.getRenderStats(), 'the live compile recorded its stats');
+    await manager.fork('other');
+    assert.strictEqual(manager.getRenderStats(), null, "the other branch hasn't compiled");
+    const compiled = await manager.compile(budget);
+    assert.strictEqual(manager.getRenderStats()?.total.messages, compiled.messages.length, "its first live compile records the branch's own stats");
+    // Handing back the same instance, which has compiled, loads its branch again.
+    await manager.setStrategy(manager.getStrategy());
+    assert.strictEqual(manager.getRenderStats(), null, 'setStrategy() loads the branch again, so no live compile has run since');
+    manager.close();
+  });
+
+  it('is null after a reopen until a live compile under kv-stable, then describes that compile', async () => {
+    const summarizer = {
+      complete: async () => ({
+        stopReason: 'end_turn',
+        content: [{ type: 'text', text: 'A memory of this stretch, kept brief: ' + 'detail '.repeat(12) }],
+        usage: { input_tokens: 1000, output_tokens: 40 },
+      }),
+    };
+    const strategy = () => new AutobiographicalStrategy({
+      compressionModel: 'zz-model',
+      targetChunkTokens: 120,
+      headWindowTokens: 0,
+      recentWindowTokens: 400,
+      hierarchical: true,
+      mergeThreshold: 3,
+      adaptiveResolution: true,
+      foldingStrategy: 'kv-stable',
+    } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
+    const budget = { maxTokens: 4_000, reserveForResponse: 0 };
+    // A compressed history with L1s and merges, as budget-expands-detail builds it.
+    const builder = await ContextManager.open({ path: TEST_STORE_PATH, strategy: strategy(), membrane: summarizer as any });
+    for (let i = 0; i < 160; i++) {
+      builder.addMessage(i % 2 === 0 ? 'user' : 'agent',
+        text(`turn ${i}: steady substantive traffic about the ongoing work, with specifics `.repeat(4)));
+      for (let k = 0; k < 200 && !builder.isReady(); k++) await builder.tick();
+    }
+    await builder.compile(budget);
+    for (let k = 0; k < 500 && !builder.isReady(); k++) await builder.tick();
+    await builder.close();
+
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: strategy(), membrane: summarizer as any });
+    assert.strictEqual(manager.getRenderStats(), null, 'no live compile since the store opened');
+    await manager.compile(budget, undefined, { dryRun: true });
+    assert.strictEqual(manager.getRenderStats(), null, 'a dry run records no stats');
+    // A preview is the route to figures before a first compile: its own stats
+    // come back with it, and it records none for the getter either.
+    const preview = manager.previewContext(budget, undefined, { render: true });
+    assert.ok(preview?.stats && preview.stats.total.messages > 0, 'the preview returns its own stats');
+    assert.strictEqual(manager.getRenderStats(), null, 'a preview records no stats');
+    const compiled = await manager.compile(budget);
+    const rs = manager.getRenderStats();
+    assert.ok(rs, 'a live compile records its stats');
+    assertConsistent(rs!);
+    const s = rs!.summaries;
+    assert.ok(s.l1.count + s.l2.count + s.l3.count > 0, 'the cut holds recall pairs');
+    assert.strictEqual(rs!.total.messages, compiled.messages.length, 'the stats count every message the compile sent');
+    assert.strictEqual(rs!.total.tokens, sentTokens(manager, compiled.messages), 'and price them as it sent them, recall pairs included');
+    await manager.close();
   });
 });
