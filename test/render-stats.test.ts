@@ -21,6 +21,12 @@ function text(t: string): ContentBlock[] {
   return [{ type: 'text', text: t }];
 }
 
+/** The store's estimate of the compiled messages as they go out. */
+function sentTokens(manager: ContextManager, messages: ReadonlyArray<{ content: ContentBlock[] }>): number {
+  const store = (manager as unknown as { messageStore: { estimateTokens(m: { content: ContentBlock[] }): number } }).messageStore;
+  return messages.reduce((sum, m) => sum + store.estimateTokens({ content: m.content }), 0);
+}
+
 function assertConsistent(rs: RenderStats): void {
   const s = rs.summaries;
   const sumTokens =
@@ -115,7 +121,24 @@ describe('getRenderStats — inspect, not reconstruct', () => {
     assert.ok(rs, 'a live compile records its stats');
     assertConsistent(rs!);
     assert.strictEqual(rs!.total.messages, compiled.messages.length, 'the stats count every message the compile sent');
+    assert.strictEqual(rs!.total.tokens, sentTokens(manager, compiled.messages), 'and price them as it sent them');
     assert.ok(rs!.middleRaw.messages > 0, "the middle's raw messages are counted");
+    manager.close();
+  });
+
+  it('is null again after a branch switch on the same strategy, until a live compile there', async () => {
+    const manager = await ContextManager.open({
+      path: TEST_STORE_PATH,
+      strategy: new AutobiographicalStrategy({ headWindowTokens: 60, recentWindowTokens: 120, autoTickOnNewMessage: false }),
+    });
+    for (let i = 0; i < 12; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', text(`M-${i} ${'word '.repeat(10)}`));
+    const budget = { maxTokens: 1_000_000, reserveForResponse: 0 };
+    await manager.compile(budget);
+    assert.ok(manager.getRenderStats(), 'the live compile recorded its stats');
+    await manager.fork('other');
+    assert.strictEqual(manager.getRenderStats(), null, "the other branch hasn't compiled");
+    const compiled = await manager.compile(budget);
+    assert.strictEqual(manager.getRenderStats()?.total.messages, compiled.messages.length, "its first live compile records the branch's own stats");
     manager.close();
   });
 
@@ -160,7 +183,7 @@ describe('getRenderStats — inspect, not reconstruct', () => {
     const s = rs!.summaries;
     assert.ok(s.l1.count + s.l2.count + s.l3.count > 0, 'the cut holds recall pairs');
     assert.strictEqual(rs!.total.messages, compiled.messages.length, 'the stats count every message the compile sent');
-    assert.strictEqual(rs!.planVsActual?.actual, rs!.total.tokens, "the stats' tokens are the compile's own");
+    assert.strictEqual(rs!.total.tokens, sentTokens(manager, compiled.messages), 'and price them as it sent them, recall pairs included');
     await manager.close();
   });
 });

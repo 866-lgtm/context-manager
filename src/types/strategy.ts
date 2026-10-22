@@ -422,7 +422,8 @@ export interface PreviewResult {
   /**
    * Segment breakdown (head / middle / tail / summaries-by-level) for the
    * HYPOTHETICAL compile. Also `{render:true}` only. Distinct from
-   * `getRenderStats()`, which continues to describe the live context.
+   * `getRenderStats()`, which describes the last live compile, or is null
+   * before one.
    */
   stats?: RenderStats;
 }
@@ -645,7 +646,7 @@ export interface SummaryOverviewStrategy extends ContextStrategy {
    * List summaries whose source message span overlaps `[fromMs, toMs]`
    * (both ends inclusive; either bound may be omitted for an open range).
    * Requires a `MessageStoreView` to resolve each summary's source message
-   * IDs to timestamps — same reason `getRenderStats` takes one.
+   * IDs to timestamps.
    */
   listSummariesInRange(
     store: MessageStoreView,
@@ -677,8 +678,9 @@ export interface CalibrationReset {
 }
 
 /**
- * Per-render observability stats from a strategy, recorded by a live compile
- * as it emits each entry. Counts and token sums for head / tail / summaries /
+ * Per-render observability stats from a strategy, recorded by a compile as it
+ * emits each entry: a live compile's from `getRenderStats()`, a preview's from
+ * `previewContext(..., { render: true })`. Counts and token sums for head / tail / summaries /
  * pending work, suitable for TUIs and dashboards that want to display "how
  * much of the context is folded vs raw" at a glance. Token sums use the
  * strategy's own estimates so they line up with the numbers `select()` uses

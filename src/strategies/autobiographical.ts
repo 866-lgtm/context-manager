@@ -8055,10 +8055,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Richer per-render stats: requires a message store view to compute the
-   * head + tail (recent window) sizes. Returns counts AND token sums per
-   * summary level, so observers can see "how much of the agent's context
-   * is in raw tail vs folded into L1/L2/L3."
+   * Richer per-render stats: counts AND token sums for the head, the tail
+   * (recent window), the raw middle and each summary level, so observers can
+   * see "how much of the agent's context is in raw tail vs folded into
+   * L1/L2/L3."
    *
    * Useful for TUI / dashboards. The token sums use the strategy's own
    * token estimates (which match what `select()` uses for budget math).
@@ -13678,9 +13678,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Closed-loop calibration bookkeeping: the committed render stats total
     // (in CURRENT calibrated units) is what this compile claims the request
     // will cost — reportRealInputTokens compares provider usage against it.
-    // A pass that recorded no stats arms no sample: there is no claim to
-    // compare (assertMiddleCoverage above has refused the one way to get here
-    // without them).
+    // rsEnd() returns null only for a pass that began no tally, and
+    // selectAdaptive's rsBegin() at its top always begins one, so the guard
+    // answers rsEnd()'s type.
     this._storeView = store;
     if (rs) {
       this._lastCompileEstimate =
@@ -18343,8 +18343,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * neither touches it. A compile
    * prices and emits every raw message from this form: postStripEstimates,
    * cappedForSend, the hierarchical selection's raw prices, the adaptive
-   * middle's shard path, which sends a shard's text, and the render stats
-   * before the first compile. A raw replay form an edit changes is released
+   * middle's shard path, which sends a shard's text. A raw replay form an edit changes is released
    * (see raw-forms.ts). The store's own message is never written: chunking
    * and compression read it. Each message's form is kept with the
    * replacements and input cap it was made for, so a later decision that
