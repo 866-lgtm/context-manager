@@ -1277,7 +1277,10 @@ export interface AutobiographicalConfig {
    * The set is computed from the stored messages, keeping no state of its
    * own: they're replayed oldest first, and whenever a limit binds, the
    * oldest live images are stripped one at a time until every limit fits
-   * ratio × itself. A target that rounds to 0 is 0, but the newest image
+   * ratio × itself. Within a message they go first to last, so the option
+   * keeps a message's last images, where the limits without it keep the first
+   * that fit: switching the option on can change which of a message's images
+   * stay, not only how many. A target that rounds to 0 is 0, but the newest image
    * stays while it fits the full limits, so `maxLiveImages: 1` gets no
    * headroom, and so do the other images of its message while only depth is
    * over its target, since stripping them can't lower the depth they're at.

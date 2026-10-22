@@ -571,6 +571,60 @@ describe('imageStripHysteresisRatio', () => {
     });
   });
 
+  it("with no byte cap set, the rule trims to ratio × the default byte cap, which its verdicts would otherwise drop", async () => {
+    // Three images of 8 MiB, past the default 20 MiB and under the default
+    // count. The rule's verdicts replace the limits, so the default byte cap
+    // binds only through the rule.
+    const big = 8 * 1024 * 1024;
+    const off = await ContextManager.open({ path: `${STORE}-off`, strategy: strategy({}) });
+    for (let i = 1; i <= 3; i++) off.addMessage('user', img(`img-${i}`, big));
+    assert.equal(await stripped(off, 3), '.II', 'without the ratio, the default keeps the newest two');
+    await off.close();
+    const m = await ContextManager.open({ path: STORE, strategy: strategy({ imageStripHysteresisRatio: 0.5 }) });
+    for (let i = 1; i <= 3; i++) m.addMessage('user', img(`img-${i}`, big));
+    assert.equal(await stripped(m, 3), '..I', 'with it, the trim goes to ratio × the default, 10 MiB');
+    await m.close();
+  });
+
+  it('within one message, the rule keeps its last images, where the limits alone keep the first that fit', async () => {
+    // One message of three 8 MiB images, told apart by their data, under the
+    // default byte cap.
+    const big = 8 * 1024 * 1024;
+    const content = ['A', 'B', 'C'].map((c) => ({ type: 'image', source: { type: 'base64', data: c.repeat(big), mediaType: 'image/png' } }) as ContentBlock);
+    const live = async (m: ContextManager): Promise<string> => {
+      const entry = (await m.compile(BUDGET)).messages.find((e) => e.content.some((b) => b.type === 'text' && b.text === 'zz-label'));
+      const kept = new Set((entry?.content ?? []).flatMap((b) => b.type === 'image' ? [(b as { source: { data: string } }).source.data[0]] : []));
+      return ['A', 'B', 'C'].map((c) => kept.has(c) ? 'I' : '.').join('');
+    };
+    const off = await ContextManager.open({ path: `${STORE}-off`, strategy: strategy({}) });
+    off.addMessage('user', [...content, { type: 'text', text: 'zz-label' }]);
+    assert.equal(await live(off), 'II.', 'without the ratio, its first two stay');
+    await off.close();
+    const m = await ContextManager.open({ path: STORE, strategy: strategy({ imageStripHysteresisRatio: 0.5 }) });
+    m.addMessage('user', [...content, { type: 'text', text: 'zz-label' }]);
+    assert.equal(await live(m), '..I', 'with it, its last stays: a message\'s stripped images are its first ones');
+    await m.close();
+  });
+
+  it("the replay's memo is keyed on the listing too, for a tool pruning override that keeps one decision", async () => {
+    // toolPruning's contract asks only that a different decision be a new
+    // object, so an override may keep one for every listing.
+    class OneDecision extends ImageRatioStrategy {
+      private readonly decision = { replaced: new Map(), inputCap: 0 };
+      protected override toolPruning() { return this.decision; }
+    }
+    const m = await ContextManager.open({
+      path: STORE,
+      strategy: new OneDecision({ headWindowTokens: 0, recentWindowTokens: 1_000_000, hierarchical: true, imageStripDepthTokens: 0,
+        maxLiveImages: 4, imageStripHysteresisRatio: 0.5 } as ConstructorParameters<typeof AutobiographicalStrategy>[0]),
+    });
+    for (let i = 1; i <= 3; i++) m.addMessage('user', img(`img-${i}`));
+    assert.equal(await stripped(m, 5), 'III--');
+    for (let i = 4; i <= 5; i++) m.addMessage('user', img(`img-${i}`));
+    assert.equal(await stripped(m, 5), '...II', 'the new listing is replayed, not the memo of the old');
+    await m.close();
+  });
+
   it('off (default): the classic window slides one image at a time', async () => {
     const m = await ContextManager.open({ path: STORE, strategy: strategy({ maxLiveImages: 4 }) });
     for (let i = 1; i <= 5; i++) m.addMessage('user', img(`img-${i}`));
