@@ -177,10 +177,12 @@ export interface CompileResult {
    * This compile's render stats, as its select tallied them while emitting
    * entries: the same accounting `getRenderStats()` gives a live compile.
    * They describe the selection rather than the exact request: injections
-   * merged in afterwards aren't counted, nor are the select's last structural
-   * passes, which can trim an orphaned tool call or add a stub tool result.
-   * A live compile's are the object
-   * `ContextManager.getRenderStats()` then returns. A dry compile's
+   * merged in afterwards aren't counted, an entry that mixes tool calls and
+   * results counts once though the compile splits it into several messages,
+   * and the select's last structural passes, which can trim an orphaned tool
+   * call or add a stub tool result, aren't counted either. A live compile's
+   * are the object `ContextManager.getRenderStats()` then returns, so treat
+   * them as read-only. A dry compile's
    * (`dryRun`) are its own, which `getRenderStats()` never returns, so a host
    * can show the composition of the request a dry compile built without
    * sending it. Absent when the strategy records none.
