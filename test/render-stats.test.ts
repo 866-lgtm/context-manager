@@ -139,6 +139,9 @@ describe('getRenderStats — inspect, not reconstruct', () => {
     assert.strictEqual(manager.getRenderStats(), null, "the other branch hasn't compiled");
     const compiled = await manager.compile(budget);
     assert.strictEqual(manager.getRenderStats()?.total.messages, compiled.messages.length, "its first live compile records the branch's own stats");
+    // Handing back the same instance, which has compiled, loads its branch again.
+    await manager.setStrategy(manager.getStrategy());
+    assert.strictEqual(manager.getRenderStats(), null, 'setStrategy() loads the branch again, so no live compile has run since');
     manager.close();
   });
 
@@ -176,6 +179,11 @@ describe('getRenderStats — inspect, not reconstruct', () => {
     assert.strictEqual(manager.getRenderStats(), null, 'no live compile since the store opened');
     await manager.compile(budget, undefined, { dryRun: true });
     assert.strictEqual(manager.getRenderStats(), null, 'a dry run records no stats');
+    // A preview is the route to figures before a first compile: its own stats
+    // come back with it, and it records none for the getter either.
+    const preview = manager.previewContext(budget, undefined, { render: true });
+    assert.ok(preview?.stats && preview.stats.total.messages > 0, 'the preview returns its own stats');
+    assert.strictEqual(manager.getRenderStats(), null, 'a preview records no stats');
     const compiled = await manager.compile(budget);
     const rs = manager.getRenderStats();
     assert.ok(rs, 'a live compile records its stats');
