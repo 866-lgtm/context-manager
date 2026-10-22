@@ -19,7 +19,9 @@
   reported `headTokens: 0` and counted the head as middle.
 - Those refusals name `'compression'` in `clearedBy` only for work that folds
   a message before the refused item or in it, where a summary the combined
-  pair's cap leaves out counts as neither. Before, they named it for work on
-  any message the selection can fold, including messages after the refused
-  item, and for a chunk's compression that only moves raw messages into the
-  combined pair, neither of which can clear the refusal.
+  pair's cap leaves out counts as neither. A compression in flight with
+  nothing recorded of what it folds still counts, since nothing says what it
+  folds. Before, they named it for work on any message the selection can
+  fold, including messages after the refused item, and for a chunk's
+  compression that only moves raw messages into the combined pair, neither of
+  which can clear the refusal.

@@ -494,6 +494,7 @@ async function refusalOfWholeMiddle(manager: ContextManager): Promise<OverBudget
   while (await refuses(high)) {
     low = high;
     high *= 2;
+    assert.ok(high <= 1_000_000, 'the compile stops refusing before a million tokens');
   }
   while (high - low > 1) {
     const middle = Math.floor((low + high) / 2);
