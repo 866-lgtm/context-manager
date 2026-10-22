@@ -429,6 +429,35 @@ describe('imageStripHysteresisRatio', () => {
     }
   });
 
+  for (const hierarchical of [true, false]) {
+    it(`a tool result that pairing repair moves up keeps its own message's count (${hierarchical ? 'hierarchical' : 'adaptive'})`, async () => {
+      // Result a holds image A, ahead of image B in its message. Under a cap
+      // of 1 the rule strips that message's first image, A, and keeps B.
+      // Pairing repair moves result a up beside result b, so the entries
+      // meet B first, in an entry of its own.
+      const image = (data: string): ContentBlock => ({ type: 'image', source: { type: 'base64', data, mediaType: 'image/png' } }) as ContentBlock;
+      const m = await ContextManager.open({
+        path: STORE,
+        strategy: new AutobiographicalStrategy({
+          headWindowTokens: 0, recentWindowTokens: 1_000_000, hierarchical, adaptiveResolution: !hierarchical,
+          imageStripDepthTokens: 0, maxLiveImages: 1, imageStripHysteresisRatio: 0.5,
+        } as ConstructorParameters<typeof AutobiographicalStrategy>[0]),
+      });
+      m.addMessage('Claude', [{ type: 'tool_use', id: 'a', name: 'shot', input: {} }, { type: 'tool_use', id: 'b', name: 'shot', input: {} }] as ContentBlock[]);
+      m.addMessage('User', [{ type: 'tool_result', toolUseId: 'b', content: [{ type: 'text', text: 'result b' }] }] as unknown as ContentBlock[]);
+      m.addMessage('User', [{ type: 'tool_result', toolUseId: 'a', content: [image('AAAA'), { type: 'text', text: 'result a' }] }, image('BBBB')] as unknown as ContentBlock[]);
+      m.addMessage('Claude', [{ type: 'text', text: 'done' }]);
+      const compiled = await m.compile(BUDGET);
+      const results = (content: ContentBlock[]) => content.filter((b) => b.type === 'tool_result').map((b) => (b as unknown as { toolUseId: string }).toolUseId).sort().join(',');
+      assert.ok(compiled.messages.some((x) => results(x.content) === 'a,b'), 'premise: result a moved beside result b');
+      const data = (content: ContentBlock[]): string[] => content.flatMap((b) =>
+        b.type === 'image' ? [(b as { source: { data: string } }).source.data]
+          : b.type === 'tool_result' && Array.isArray((b as { content?: unknown }).content) ? data((b as unknown as { content: ContentBlock[] }).content) : []);
+      assert.deepEqual(compiled.messages.flatMap((x) => data(x.content)), ['BBBB'], 'A stripped, B live');
+      await m.close();
+    });
+  }
+
   describe('previews and dry compiles', () => {
     const adaptive = (extra: Record<string, unknown> = {}) => strategy({
       hierarchical: false, adaptiveResolution: true, compressionModel: 'mock', targetChunkTokens: 100,

@@ -16129,8 +16129,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // priced every message at the store's full estimate of the form it sends,
     // plus what a maxMessageTokens cut changes, which leaves its images at
     // full price. So it priced no image as the placeholder, and the strip
-    // counts only the images it sends (see applyImageStripping's
-    // asEstimated). The render stats keep each message at the price emission
+    // counts only the images it sends, or, with imageStripHysteresisRatio,
+    // applies the rule's verdicts (see applyImageStripping's asEstimated).
+    // The render stats keep each message at the price emission
     // gave it, a stripped image included.
     this.applyImageStripping(entries, store);
     this.rsEnd();
@@ -16961,7 +16962,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  the placeholder (see `strippedImageSaving`). With
    *  `imageStripHysteresisRatio`, the rule's set (imageStripReplay) decides
    *  in place of the limits: a message's first images go, as many as the
-   *  rule strips of it.
+   *  rule strips of it, applied on every path as `asEstimated` applies them.
    *
    *  Runs INSIDE each select path, *before* `rsEnd()` and `placeCacheMarkers`,
    *  so the cache breakpoints describe the post-strip context. It leaves the
@@ -17005,7 +17006,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  placeholder, and counting images it doesn't send would only cost it
    *  live ones. (Its recent window's start and imageStripReplay count each
    *  stored message's images as it's sent, as the estimates do.) A caller that
-   *  prices by the estimates asks too. */
+   *  prices by the estimates asks too. With `imageStripHysteresisRatio`,
+   *  every caller gets the verdicts: the rule's set is per stored message,
+   *  so counting what the entries send has nothing to add, and a tool result
+   *  pairing repair moved keeps its own message's count. */
   protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView, opts: { asEstimated?: boolean } = {}): void {
     const maxLive = this.config.maxLiveImages ?? 0;             // 0 = unlimited count
     const depthTokens = this.config.imageStripDepthTokens ?? 0; // 0 = no depth strip
@@ -17026,7 +17030,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       .filter(({ idx }) => this.hasImageBlock(entries[idx].content))
       .sort((a, b) => b.pos - a.pos);
 
-    if (opts.asEstimated) {
+    if (opts.asEstimated || this.imageHysteresisRatio() !== undefined) {
       const verdicts = this.postStripVerdicts(store);
       const taken = new Map<number, Map<unknown, number>>();
       /** The verdict of the next image of `group` in the message at `home`,
@@ -17091,24 +17095,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       keptImageBytes += blockBytes;
       return true;
     };
-    // With imageStripHysteresisRatio, the rule's set decides in place of the
-    // limits, which it already fits: the first images of the entry's message,
-    // as many as the rule strips of it, in the order the cut sends them.
-    const replay = this.imageStripReplay(store);
     for (const { idx, pos } of ordered) {
       const entry = entries[idx];
       const bucket = bucketAt(pos);
-      let ruleLeft = replay !== undefined && pos >= 0 ? replay.get(messages[pos]!.id) ?? 0 : undefined;
       // Every image the entry carries, nested in a tool_result included, in
       // the order postStripEstimates and imageStripReplay count them. A block
       // is copied only when an image in it goes, and the raw forms an edited
       // block carried are released, so a replay can't bring the image back.
       entry.content = replaceImages(entry.content, (image) => {
-        if (ruleLeft !== undefined) {
-          if (ruleLeft <= 0) return false;
-          ruleLeft--;
-          return true;
-        }
         if (keeps(image, pos)) return false;
         // Stats-neutral: the bucket stays as its path tallied it (see the
         // doc above). selectAdaptive tallies at post-strip prices, so
@@ -17143,10 +17137,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * images first, so a message's stripped images are its first ones: the
    * answer is how many, by message id (a message with none stripped is
    * absent). Undefined when the option is off or no limit is set.
-   * postStripEstimates gives those images their verdicts, which the strip
-   * applies where the caller prices by the estimates (applyImageStripping's
-   * asEstimated), and the strip applies the counts itself where it counts
-   * what it sends. The adaptive middle's and kv-unified's raw body entries
+   * postStripEstimates gives those images their verdicts, which
+   * applyImageStripping applies on every path while the option is on. The adaptive middle's and kv-unified's raw body entries
    * carry their shards' text alone, so the images of those shards aren't
    * sent, though the rule counts them toward the limits, and the budget
    * prices them.
