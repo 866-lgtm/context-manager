@@ -8663,7 +8663,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Without estimates (the hierarchical selection), the pruned form's
     // own, with its images whole: that selection's strip counts only the
-    // images it sends.
+    // images it sends, or, with imageStripHysteresisRatio, applies that
+    // option's set, and it prices no image as the placeholder either way.
     const est = (i: number): number => pse?.[i] ?? store.estimateTokens(this.prunedForSend(store, messages[i]!));
     const accepted: number[] = [];
     let acceptedTokens = 0;
@@ -15627,7 +15628,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const msg = messages[i];
       const { content, extra } = this.cappedForSend(store, msg, msgCap);
       // The pruned form's price with its images whole: this selection's
-      // strip counts only the images it sends (#219).
+      // strip counts only the images it sends (#219), or, with
+      // imageStripHysteresisRatio, applies that option's set, and it prices
+      // no image as the placeholder either way.
       const tokens = store.estimateTokens(this.prunedForSend(store, msg)) + extra;
       // The head is sent whole by definition: stopping it mid-window drops
       // messages no summary covers. Refuse honestly beyond grace.

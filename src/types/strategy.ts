@@ -1269,7 +1269,10 @@ export interface AutobiographicalConfig {
    * the prompt cache from that message on, on every image. With a ratio in
    * (0, 1), a binding limit instead trims down to ratio × each limit, so the
    * stripped set changes once per trim, not once per image. E.g. 0.7. Costs
-   * up to (1 - ratio) of the image budget.
+   * up to (1 - ratio) of the image budget right after a trim, and a little
+   * more where ratio × a limit falls between whole images: a count target
+   * rounds down (`maxLiveImages: 4` at 0.7 keeps 2), and the byte and depth
+   * targets are met by stripping whole images.
    *
    * The set is computed from the stored messages, keeping no state of its
    * own: they're replayed oldest first, and whenever a limit binds, the

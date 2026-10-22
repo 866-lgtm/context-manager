@@ -127,12 +127,16 @@ describe('imageStripHysteresisRatio', () => {
   });
 
   it('a message with more images than the target keeps its newest ones (finding 2)', async () => {
-    const m = await ContextManager.open({ path: STORE, strategy: strategy({ maxLiveImages: 4, imageStripHysteresisRatio: 0.5 }) });
-    m.addMessage('user', images('img-1', 5));
-    const message = (await m.compile(BUDGET)).messages.find((x) => x.content.some((b) => b.type === 'text' && b.text === 'img-1'))!;
-    const kinds = message.content.filter((b) => b.type === 'image' || (b.type === 'text' && b.text !== 'img-1')).map((b) => b.type === 'image' ? 'I' : '.').join('');
-    assert.equal(kinds, '...II', 'five images over a cap of 4: trimmed one at a time to 2, the newest two');
-    await m.close();
+    // Five 4-byte images, over a cap of 4 images or of 16 bytes.
+    for (const limit of [{ maxLiveImages: 4 }, { maxLiveImageBytes: 16 }]) {
+      cleanup();
+      const m = await ContextManager.open({ path: STORE, strategy: strategy({ ...limit, imageStripHysteresisRatio: 0.5 }) });
+      m.addMessage('user', images('img-1', 5));
+      const message = (await m.compile(BUDGET)).messages.find((x) => x.content.some((b) => b.type === 'text' && b.text === 'img-1'))!;
+      const kinds = message.content.filter((b) => b.type === 'image' || (b.type === 'text' && b.text !== 'img-1')).map((b) => b.type === 'image' ? 'I' : '.').join('');
+      assert.equal(kinds, '...II', `five images over ${JSON.stringify(limit)}: trimmed one at a time to the target, the newest two`);
+      await m.close();
+    }
   });
 
   it('the newest image stays while it fits the full limits (findings 3 and 5)', async () => {
@@ -517,7 +521,7 @@ describe('imageStripHysteresisRatio', () => {
       await m.close();
     });
 
-    it('a dry compile releases an expired hold, whose rebuild commits, and renders what a live compile does', async () => {
+    it('a dry compile releases an expired hold once, outside the dry select, and renders what a live compile does', async () => {
       // The release runs before the select, so it isn't part of the dry run
       // (SelectOptions.dryRun's doc).
       class Releases extends ImageRatioStrategy {
