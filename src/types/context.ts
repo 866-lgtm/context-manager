@@ -1,5 +1,6 @@
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
 import type { MessageId, StoredContentBlock, StoredMessage } from './message.js';
+import type { RenderStats } from './strategy.js';
 
 /**
  * Describes how a context entry relates to its source message.
@@ -171,6 +172,17 @@ export interface CompileResult {
    * read-only. It's transient and isn't part of the persisted provenance.
    */
   rawBodies?: ReadonlyMap<MessageId, readonly StoredMessage[]>;
+
+  /**
+   * This compile's render stats, as its select recorded them while emitting
+   * each entry: counts and tokens of the strategy's entries, before
+   * injections are merged in and mixed tool messages are split. A live
+   * compile's are the same object `ContextManager.getRenderStats()` then
+   * returns. A dry compile's (`dryRun`) are its own, which
+   * `getRenderStats()` never returns, so a host can show the next request's
+   * composition without sending it. Absent when the strategy records none.
+   */
+  renderStats?: RenderStats;
 }
 
 /** A branch as a compile or receipt saw it: native id, name, creation time. */

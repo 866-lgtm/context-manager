@@ -8,7 +8,7 @@
 import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
-import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
+import { ContextManager, AutobiographicalStrategy, OverBudgetError, PassthroughStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { RenderStats } from '../src/types/index.js';
 
@@ -25,6 +25,38 @@ function text(t: string): ContentBlock[] {
 function sentTokens(manager: ContextManager, messages: ReadonlyArray<{ content: ContentBlock[] }>): number {
   const store = (manager as unknown as { messageStore: { estimateTokens(m: { content: ContentBlock[] }): number } }).messageStore;
   return messages.reduce((sum, m) => sum + store.estimateTokens({ content: m.content }), 0);
+}
+
+const summarizer = {
+  complete: async () => ({
+    stopReason: 'end_turn',
+    content: [{ type: 'text', text: 'A memory of this stretch, kept brief: ' + 'detail '.repeat(12) }],
+    usage: { input_tokens: 1000, output_tokens: 40 },
+  }),
+};
+const kvStable = () => new AutobiographicalStrategy({
+  compressionModel: 'zz-model',
+  targetChunkTokens: 120,
+  headWindowTokens: 0,
+  recentWindowTokens: 400,
+  hierarchical: true,
+  mergeThreshold: 3,
+  adaptiveResolution: true,
+  foldingStrategy: 'kv-stable',
+} as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
+
+/** A compressed history with L1s and merges, as budget-expands-detail builds
+ *  it, closed so the caller reopens it as a host restart does. */
+async function buildKvStableStore(): Promise<void> {
+  const builder = await ContextManager.open({ path: TEST_STORE_PATH, strategy: kvStable(), membrane: summarizer as any });
+  for (let i = 0; i < 160; i++) {
+    builder.addMessage(i % 2 === 0 ? 'user' : 'agent',
+      text(`turn ${i}: steady substantive traffic about the ongoing work, with specifics `.repeat(4)));
+    for (let k = 0; k < 200 && !builder.isReady(); k++) await builder.tick();
+  }
+  await builder.compile({ maxTokens: 4_000, reserveForResponse: 0 });
+  for (let k = 0; k < 500 && !builder.isReady(); k++) await builder.tick();
+  await builder.close();
 }
 
 function assertConsistent(rs: RenderStats): void {
@@ -146,36 +178,9 @@ describe('getRenderStats — inspect, not reconstruct', () => {
   });
 
   it('is null after a reopen until a live compile under kv-stable, then describes that compile', async () => {
-    const summarizer = {
-      complete: async () => ({
-        stopReason: 'end_turn',
-        content: [{ type: 'text', text: 'A memory of this stretch, kept brief: ' + 'detail '.repeat(12) }],
-        usage: { input_tokens: 1000, output_tokens: 40 },
-      }),
-    };
-    const strategy = () => new AutobiographicalStrategy({
-      compressionModel: 'zz-model',
-      targetChunkTokens: 120,
-      headWindowTokens: 0,
-      recentWindowTokens: 400,
-      hierarchical: true,
-      mergeThreshold: 3,
-      adaptiveResolution: true,
-      foldingStrategy: 'kv-stable',
-    } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
     const budget = { maxTokens: 4_000, reserveForResponse: 0 };
-    // A compressed history with L1s and merges, as budget-expands-detail builds it.
-    const builder = await ContextManager.open({ path: TEST_STORE_PATH, strategy: strategy(), membrane: summarizer as any });
-    for (let i = 0; i < 160; i++) {
-      builder.addMessage(i % 2 === 0 ? 'user' : 'agent',
-        text(`turn ${i}: steady substantive traffic about the ongoing work, with specifics `.repeat(4)));
-      for (let k = 0; k < 200 && !builder.isReady(); k++) await builder.tick();
-    }
-    await builder.compile(budget);
-    for (let k = 0; k < 500 && !builder.isReady(); k++) await builder.tick();
-    await builder.close();
-
-    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: strategy(), membrane: summarizer as any });
+    await buildKvStableStore();
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: kvStable(), membrane: summarizer as any });
     assert.strictEqual(manager.getRenderStats(), null, 'no live compile since the store opened');
     await manager.compile(budget, undefined, { dryRun: true });
     assert.strictEqual(manager.getRenderStats(), null, 'a dry run records no stats');
@@ -193,5 +198,61 @@ describe('getRenderStats — inspect, not reconstruct', () => {
     assert.strictEqual(rs!.total.messages, compiled.messages.length, 'the stats count every message the compile sent');
     assert.strictEqual(rs!.total.tokens, sentTokens(manager, compiled.messages), 'and price them as it sent them, recall pairs included');
     await manager.close();
+  });
+});
+
+// A compile's result carries the stats its own select recorded, so a host can
+// show the next request's composition from a dry compile (a preview) beside
+// the last live one's, without sending anything (connectome-host#425's
+// "did my setting take effect?").
+describe("CompileResult.renderStats — the compile's own", () => {
+  before(cleanup);
+  after(cleanup);
+  beforeEach(cleanup);
+
+  it("a dry compile carries its own, a live one the getter's, and neither disturbs the other", async () => {
+    await buildKvStableStore();
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: kvStable(), membrane: summarizer as any });
+    const wide = { maxTokens: 8_000, reserveForResponse: 0 };
+    const narrow = { maxTokens: 4_000, reserveForResponse: 0 };
+
+    const dry = await manager.compile(wide, undefined, { dryRun: true });
+    assert.ok(dry.renderStats, 'a dry compile carries stats');
+    assertConsistent(dry.renderStats!);
+    assert.strictEqual(dry.renderStats!.total.messages, dry.messages.length, 'they count every message the dry compile would send');
+    assert.strictEqual(dry.renderStats!.total.tokens, sentTokens(manager, dry.messages), 'and price them as it would send them');
+    assert.strictEqual(manager.getRenderStats(), null, "they aren't the getter's");
+
+    const live = await manager.compile(narrow);
+    assert.ok(live.renderStats, 'a live compile carries stats');
+    assert.strictEqual(live.renderStats, manager.getRenderStats(), "a live compile's are the getter's");
+    assert.strictEqual(live.renderStats!.total.messages, live.messages.length);
+    const liveBefore = structuredClone(live.renderStats);
+    const dryBefore = structuredClone(dry.renderStats);
+
+    const again = await manager.compile(wide, undefined, { dryRun: true });
+    assert.strictEqual(again.renderStats!.total.messages, again.messages.length, 'a later dry compile carries its own');
+    assert.notStrictEqual(again.renderStats!.total.messages, live.renderStats!.total.messages, 'which differ from the live cut at this budget');
+    assert.strictEqual(manager.getRenderStats(), live.renderStats, 'the getter keeps the live compile');
+    assert.deepStrictEqual(live.renderStats, liveBefore, "the live result's stats are unchanged");
+    assert.deepStrictEqual(dry.renderStats, dryBefore, "and so are the first dry result's");
+    // A refused select records nothing, so an earlier select's stats can't
+    // pose as its own.
+    const strategy = manager.getStrategy() as AutobiographicalStrategy;
+    const tiny = { maxTokens: 50, reserveForResponse: 0 };
+    await assert.rejects(manager.compile(tiny, undefined, { dryRun: true }), OverBudgetError);
+    assert.strictEqual(strategy.getLastSelectStats(), null, 'a refused dry select has no stats');
+    await assert.rejects(manager.compile(tiny), OverBudgetError);
+    assert.strictEqual(strategy.getLastSelectStats(), null, 'nor does a refused live one');
+    await manager.close();
+  });
+
+  it('is absent for a strategy that records none', async () => {
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: new PassthroughStrategy() });
+    manager.addMessage('User', text('hello'));
+    const compiled = await manager.compile();
+    assert.strictEqual(compiled.messages.length, 1);
+    assert.strictEqual(compiled.renderStats, undefined);
+    manager.close();
   });
 });

@@ -816,6 +816,11 @@ export interface RenderStatsCapableStrategy extends ContextStrategy {
   /** The stats of the last live compile, or null before one has run since
    *  the strategy loaded its branch. */
   getRenderStats(store: MessageStoreView): RenderStats | null;
+  /** The stats the strategy's most recent `select()` recorded, live or dry,
+   *  or null when it recorded none. `ContextManager.compile` reads them right
+   *  after its select for `CompileResult.renderStats`; a strategy without
+   *  this method gives compiles none. */
+  getLastSelectStats?(): RenderStats | null;
 }
 
 /** Type guard for strategies that produce render stats. */

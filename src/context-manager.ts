@@ -1186,6 +1186,8 @@ export class ContextManager {
       opts
     );
     const selectionCause = this.strategy.takeSelectionCause?.();
+    // Read now, before anything else selects: these are this select's own.
+    const renderStats = isRenderStatsCapable(this.strategy) ? this.strategy.getLastSelectStats?.() ?? null : null;
     if (_diag) this.diag.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
 
     const viewMessages = view.getAll();
@@ -1233,6 +1235,7 @@ export class ContextManager {
 
     const finish = (result: CompileResult, injected: ContentBlock[][]): CompileResult => {
       result.rawBodies = rawBodiesOf(attribution);
+      if (renderStats) result.renderStats = renderStats;
       const layout = this.renderedLayoutFor(viewMessages, entries, attribution.rawComplete, injected, selectionCause);
       result.provenance = {
         compileId: randomUUID(),

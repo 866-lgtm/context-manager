@@ -88,7 +88,7 @@ With a strategy that supports them, as this one does, the manager also offers:
 - `holdCompression` keeps messages out of compression until `releaseCompression`, or until an optional `timeoutMs` passes, for content you'll still edit. Holds live in memory, so a reopened manager starts with none, and a hold that's never released stalls compression of everything after it.
 - `searchSummaries`, `getSummary` and `getSummariesInRange` read the summaries, for memory tools an agent can call.
 - `setToolDefinitions` and `setSystemPrompt` give the summarizer's calls the agent's own tools and system prompt. A chunk whose messages hold tool calls or results waits to be compressed until tool definitions are set.
-- `getRenderStats` reports how much of the last compile was raw and how much was summaries, with counts for levels 1 to 3. It's `null` until a live compile has run since the strategy loaded its branch, which opening the store, `setStrategy()` and a branch switch each do; a dry compile or preview records none.
+- `getRenderStats` reports how much of the last compile was raw and how much was summaries, with counts for levels 1 to 3. It's `null` until a live compile has run since the strategy loaded its branch, which opening the store, `setStrategy()` and a branch switch each do; a dry compile or preview records none. Each compile's result carries its own as `renderStats`, so a dry compile (`dryRun`) shows the composition of the next request without sending it.
 
 Every option is documented on `AutobiographicalConfig` in `src/types/strategy.ts`.
 
