@@ -1700,8 +1700,15 @@ export interface AutobiographicalConfig {
    * the result exceeds the model's context window — the philosophy is
    * "surface the overage rather than silently lose content."
    *
-   * Default: true (legacy budget-aware truncation: stops emitting recall
-   * pairs and recent messages when the running total exceeds maxTokens).
+   * Default: true. Selection targets the input budget (`budget.maxTokens`
+   * less `reserveForResponse`): it takes no summary past it, except one
+   * coverage completion must include so that no message goes unrepresented.
+   * Emission drops nothing to fit: past the grace window
+   * (`overBudgetGraceRatio`), the hierarchical path's head, its recall pairs
+   * (each positioned pair, or the combined pair under
+   * `positionedRecallPairs: false`) and its raw middle messages refuse the
+   * compile with `OverBudgetError`, and a recent-window eviction that would
+   * drop history no summary covers refuses it with `UncoveredDropError`.
    *
    * Recommended setting for long-lived agents on large-context models
    * (e.g. opus-4-7 with 1M context): false. The window is generous enough

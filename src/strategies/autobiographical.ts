@@ -2842,6 +2842,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._lastRenderStats = null;
     this._lastCompileEstimate = 0;
     this._storeView = null;
+    // Prices memoized over the view just cleared: the next one may estimate otherwise.
+    this._answerCostCache.clear();
     this._calibrationArmed = false;
     this._calibration = 1;
     this._calibrationEma = null;
@@ -12561,13 +12563,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * checkReadiness waits on more: chunks the cap or a hold keeps, and a merge
    * a hold blocks. Compressing a chunk replaces its raw messages with a
    * summary, and a merge folds summaries into one.
+   *
+   * `within`, when given, narrows what counts to work that folds one of those
+   * messages: a hierarchical refusal in the middle passes the messages its
+   * refused prefix holds, raw or under a summary it sends, since work that
+   * folds none of them can't shrink it. Every rule above reads the narrowed
+   * set as it reads the whole, except a compression in flight with nothing
+   * recorded beside it, which counts whatever the prefix holds, since nothing
+   * says what it folds.
    */
-  protected compressionWorkQueued(store: MessageStoreView, path: 'adaptive' | 'hierarchical'): boolean {
+  protected compressionWorkQueued(
+    store: MessageStoreView,
+    path: 'adaptive' | 'hierarchical',
+    within?: ReadonlySet<MessageId>,
+  ): boolean {
     // Work frees room only where its summary folds a message the selection
     // can fold now: both selectors keep the head and recent windows raw, and
     // a message a pin keeps raw. That's the chunker's own reading of what's
     // compressible (getCompressibleMessages).
-    const foldable = new Set(this.getCompressibleMessages(store).map((m) => m.id));
+    const foldable = new Set(
+      this.getCompressibleMessages(store).map((m) => m.id).filter((id) => within === undefined || within.has(id)),
+    );
     const foldsNothing = (chunk: Chunk): boolean => !chunk.messages.some((m) => foldable.has(m.id));
     // A merge's messages are the leaves of its sources, expanded through the
     // summaries in memory as the selectors expand them; a source not loaded
@@ -15398,23 +15414,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return Math.max(0.2, 1 - 0.8 * externalized);
   }
 
-  /** Memoized true render cost of a summary's recall pair (label + answer
-   *  content as the LIVE WINDOW renders it — carriers included under
-   *  `carrierPolicy: 'full'`, omitted under `'live-strip'`, because this
-   *  price feeds the fold planner for that same emission). Keyed by the
-   *  summary identity and every config value that changes these bytes, so a
-   *  scoped preview cannot reuse or poison another policy's price. */
-  private _pairCostCache = new Map<string, number>();
+  /** Memoized price of a summary's recall answer as the LIVE WINDOW renders
+   *  it (carriers included under `carrierPolicy: 'full'`, omitted under
+   *  `'live-strip'`, because this price feeds the fold planner for that same
+   *  emission): `estimate` is the estimate of that content, and `cost` is
+   *  what it's priced at, the estimate floored at the provider's measurement
+   *  where that measurement counts what's sent. Keyed by the summary identity
+   *  and every config value that changes these bytes, so a scoped preview
+   *  cannot reuse or poison another policy's price. The estimator is the
+   *  store's: every caller prices inside a select, with the store's view
+   *  bound, and initialize clears the memo when the strategy takes a store. */
+  private _answerCostCache = new Map<string, { estimate: number; cost: number }>();
 
-  protected recallPairCost(s: SummaryEntry): number {
-    const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
+  protected recallAnswerCost(s: SummaryEntry): { estimate: number; cost: number } {
     const recallEnvelope = this.config.recallEnvelope === 'xml' ? 'xml' : 'none';
     const carrierPolicy = this.config.carrierPolicy === 'live-strip' ? 'live-strip' : 'full';
     const calibration = this._storeView?.getTokenCalibration?.() ?? 1;
-    const key = JSON.stringify([s.id, s.tokens, label, recallEnvelope, carrierPolicy, calibration]);
-    const cached = this._pairCostCache.get(key);
+    const key = JSON.stringify([s.id, s.tokens, recallEnvelope, carrierPolicy, calibration]);
+    const cached = this._answerCostCache.get(key);
     if (cached !== undefined) return cached;
-    const estimatedAnswer = this.estimateTokens(this.liveWindowAnswerContent(s));
+    const estimate = this.estimateTokens(this.liveWindowAnswerContent(s));
     // When responseContent exists, `tokens` is normally the provider's exact
     // output-token count for those same replayed blocks (thinking carriers +
     // text). Re-estimating signed-empty thinking at the 600-token legacy
@@ -15429,15 +15448,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // would charge the fold planner for bytes that are not rendered — the
     // Mica-2026-07-26 wedge from the other side — so the stripped render's
     // estimate stands alone.
-    const answer =
-      carrierPolicy === 'full' && s.responseContent && Number.isFinite(s.tokens) && s.tokens > 0
-        ? Math.max(s.tokens, estimatedAnswer)
-        : estimatedAnswer;
     const cost =
-      this.estimateTokens([{ type: 'text', text: label }]) +
-      answer;
-    this._pairCostCache.set(key, cost);
-    return cost;
+      carrierPolicy === 'full' && s.responseContent && Number.isFinite(s.tokens) && s.tokens > 0
+        ? Math.max(s.tokens, estimate)
+        : estimate;
+    const priced = { estimate, cost };
+    this._answerCostCache.set(key, priced);
+    return priced;
+  }
+
+  /** The true render cost of a summary's recall pair: its label, and its
+   *  answer as recallAnswerCost prices it. */
+  protected recallPairCost(s: SummaryEntry): number {
+    const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
+    return this.estimateTokens([{ type: 'text', text: label }]) + this.recallAnswerCost(s).cost;
   }
 
   /**
@@ -15630,6 +15654,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Matches moltbot's budget waterfall: L3 → L2 → L1 with unused budget flowing down.
    */
   protected selectHierarchical(store: MessageStoreView, budget: TokenBudget): ContextEntry[] {
+    // Recall pairs are priced with the store's estimator, as raw messages are
+    // (store.estimateTokens), not the fallback rules: the adaptive path binds
+    // the view in loadCalibration. Bound for this select alone, so a mint
+    // request's recall pairs (capRecallPairs) price as they did.
+    const bound = this._storeView;
+    this._storeView = store;
+    try {
+      return this.selectHierarchicalBound(store, budget);
+    } finally {
+      this._storeView = bound;
+    }
+  }
+
+  private selectHierarchicalBound(store: MessageStoreView, budget: TokenBudget): ContextEntry[] {
     phaseChannel.report('context-build'); // liveness-watchdog phase
     this.rsBegin();
     const entries: ContextEntry[] = [];
@@ -15700,6 +15738,45 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (entries.length > 0) {
       entries[entries.length - 1].cacheMarker = true;
     }
+
+    // What the head took, for a refusal in the middle to report as head.
+    const headTokens = totalTokens;
+    // A refusal in the middle reports the head as head, and the rest of the
+    // running total, the refused item included, as middle. It names
+    // compression only for work that folds a message the refused prefix
+    // holds: the middle's raw messages up to the refused one, and the leaves
+    // of the summaries it sends up to there. Work after the refused item
+    // can't shrink that prefix, nor can a chunk's compression that only moves
+    // raw messages from after a combined pair into it, and the head never
+    // folds.
+    let summariesById: Map<string, SummaryEntry> | undefined;
+    const middleRefusal = (refused: {
+      actual: number;
+      unit: 'selection-items' | 'raw-messages';
+      count: number;
+      deepestLevel: number;
+      summaries: readonly SummaryEntry[];
+      raw: readonly StoredMessage[];
+    }): OverBudgetError => {
+      summariesById ??= new Map(this.summaries.map((s) => [s.id, s]));
+      const prefix = new Set<MessageId>(refused.raw.map((m) => m.id));
+      for (const s of refused.summaries) this.expandSummaryToLeafMessageIds(s, summariesById, prefix);
+      return this.overBudgetError(budget, {
+        stage: 'Hierarchical emission overran the budget',
+        budget: graceLimit,
+        actual: refused.actual,
+        clearedBy: this.compressionWorkQueued(store, 'hierarchical', prefix) ? ['compression'] : [],
+        diagnostics: {
+          middleCountUnit: refused.unit,
+          deepestLevelKind: 'attempted',
+          headTokens,
+          tailTokens: 0,
+          middleTokens: refused.actual - headTokens,
+          middleChunkCount: refused.count,
+          deepestLevel: refused.deepestLevel,
+        },
+      });
+    };
 
     // Compute recent window exclusion set (also exclude head window messages)
     const recentStart = this.getRecentWindowStart(store);
@@ -15977,8 +16054,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           items.push({ kind: 'pin', position: p.position, msg: p.msg });
         }
         items.sort((a, b) => a.position - b.position);
+        // The middle's summaries and raw messages up to and including item k,
+        // less a summary the loop below skips for having no content.
+        const prefixOf = (k: number): { summaries: SummaryEntry[]; raw: StoredMessage[] } => ({
+          summaries: items.slice(0, k + 1).flatMap((it) => (it.kind === 'summary' && it.summary.content?.trim() ? [it.summary] : [])),
+          raw: items.slice(0, k + 1).flatMap((it) => (it.kind === 'pin' ? [it.msg] : [])),
+        });
 
-        for (const item of items) {
+        for (const [k, item] of items.entries()) {
           if (item.kind === 'summary') {
             const summary = item.summary;
             // Defensive: never emit a recall pair for an empty/bugged summary — an
@@ -16007,20 +16090,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // history (pins / uncompressed / frontier raw). Emit within
             // grace; refuse the turn beyond it.
             if (totalTokens + pairTokens > graceLimit) {
-              throw this.overBudgetError(budget, {
-                stage: 'Hierarchical emission overran the budget',
-                budget: graceLimit,
+              throw middleRefusal({
                 actual: totalTokens + pairTokens,
-                clearedBy: this.compressionWorkQueued(store, 'hierarchical') ? ['compression'] : [],
-                diagnostics: {
-                  middleCountUnit: 'selection-items',
-                  deepestLevelKind: 'attempted',
-                  headTokens: 0,
-                  tailTokens: 0,
-                  middleTokens: totalTokens + pairTokens,
-                  middleChunkCount: items.length,
-                  deepestLevel: summary.level,
-                },
+                unit: 'selection-items',
+                count: items.length,
+                deepestLevel: summary.level,
+                ...prefixOf(k),
               });
             }
             entries.push(questionEntry);
@@ -16032,20 +16107,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const { content, extra } = this.cappedForSend(store, msg, msgCap);
             const tokens = store.estimateTokens(this.prunedForSend(store, msg)) + extra;
             if (totalTokens + tokens > graceLimit) {
-              throw this.overBudgetError(budget, {
-                stage: 'Hierarchical emission overran the budget',
-                budget: graceLimit,
+              throw middleRefusal({
                 actual: totalTokens + tokens,
-                clearedBy: this.compressionWorkQueued(store, 'hierarchical') ? ['compression'] : [],
-                diagnostics: {
-                  middleCountUnit: 'selection-items',
-                  deepestLevelKind: 'attempted',
-                  headTokens: 0,
-                  tailTokens: 0,
-                  middleTokens: totalTokens + tokens,
-                  middleChunkCount: items.length,
-                  deepestLevel: 0,
-                },
+                unit: 'selection-items',
+                count: items.length,
+                deepestLevel: 0,
+                ...prefixOf(k),
               });
             }
             entries.push({
@@ -16062,6 +16129,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       } else {
         // Legacy combined-pair mode for summaries; pins still emit raw at
         // their positions after the combined pair.
+        // The summaries the combined pair's answer holds, which a refusal
+        // after it counts in its prefix.
+        let pairSummaries: SummaryEntry[] = [];
         if (selectedSummaries.length > 0) {
           const contextLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
 
@@ -16091,8 +16161,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             summaries: combinedRefs,
           };
 
+          // The summaries the answer holds: every one the flat cap left
+          // something of, since it passes every carrier through, cut text or
+          // not (capContent), and under the xml envelope those its cap
+          // admitted, which ends at the first summary it cuts.
+          const admittedIds = new Set(combinedRefs.map((ref) => ref.id));
+          const admitted = selectedSummaries.filter((s) => admittedIds.has(s.id));
+          pairSummaries = admitted;
+          // The pair is priced at what goes out: the label, and the answer as
+          // the cap left it, with each summary it holds floored as
+          // recallAnswerCost floors a positioned pair's answer, so a carrier's
+          // measured tokens count here too.
+          let floorExcess = 0;
+          for (const s of admitted) {
+            const { estimate, cost } = this.recallAnswerCost(s);
+            floorExcess += cost - estimate;
+          }
           const pairTokens = this.estimateTokens(questionEntry.content) +
-                             this.estimateTokens(answerEntry.content);
+                             this.estimateTokens(answerEntry.content) + floorExcess;
+          // The pair covers history (coverage completion force-includes its
+          // claimers whatever the budget), so beyond the grace window the
+          // select refuses the turn here, as it refuses a positioned pair,
+          // rather than send over the budget or refuse at what follows it.
+          if (totalTokens + pairTokens > graceLimit) {
+            throw middleRefusal({
+              actual: totalTokens + pairTokens,
+              unit: 'selection-items',
+              count: selectedSummaries.length,
+              deepestLevel: selectedSummaries.reduce((deepest, s) => Math.max(deepest, s.level), 0),
+              summaries: admitted,
+              raw: [],
+            });
+          }
 
           entries.push(questionEntry);
           entries.push(answerEntry);
@@ -16113,20 +16213,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // removes them from the agent's context with no representation at
             // all, so beyond the grace window the select refuses the turn
             // rather than returning a plausible-looking window.
-            throw this.overBudgetError(budget, {
-              stage: 'Hierarchical emission overran the budget',
-              budget: graceLimit,
+            throw middleRefusal({
               actual: totalTokens + tokens,
-              clearedBy: this.compressionWorkQueued(store, 'hierarchical') ? ['compression'] : [],
-              diagnostics: {
-                middleCountUnit: 'raw-messages',
-                deepestLevelKind: 'attempted',
-                headTokens: 0,
-                tailTokens: 0,
-                middleTokens: totalTokens + tokens,
-                middleChunkCount: middleRawSorted.length,
-                deepestLevel: 0,
-              },
+              unit: 'raw-messages',
+              count: middleRawSorted.length,
+              deepestLevel: 0,
+              summaries: pairSummaries,
+              raw: middleRawSorted.slice(0, mi + 1).map((entry) => entry.msg),
             });
           }
           entries.push({
