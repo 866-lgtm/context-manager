@@ -112,7 +112,12 @@ export interface OverBudgetDiagnostics {
  *   an L1 that matches the chunk exactly, which ends the raw fallback the
  *   selector renders for an uncompressed chunk. It assumes the manager has
  *   a membrane to run compression. For the adaptive picker's refusals, its
- *   plan must also still have summaries to produce. Whether that work is
+ *   plan must also still have summaries to produce. For a hierarchical
+ *   refusal in the middle, between the head and the recent window, the work
+ *   must also fold a message of what refused, the middle up to and including
+ *   the refused item, raw or under a summary sent there, since other work
+ *   can't shrink it. Work in flight with nothing recorded beside it counts
+ *   as before, since nothing says what it folds. Whether that work is
  *   enough to fit isn't checked, so a host can tell an agent that
  *   compression may make room, not that it will.
  * - `'newer-message'`: the newest message alone is over the budget, and a
