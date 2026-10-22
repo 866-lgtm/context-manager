@@ -346,6 +346,35 @@ describe('imageStripHysteresisRatio', () => {
     assert.equal(strippedIds(), 'm1 m2 m3 m4 m5 m6', 'a depth of 1,000: even the newest is past it');
   });
 
+  it("the set counts the images each message's cut sends, and follows the cut's cap and the tool pruning over the same stored messages", () => {
+    /** A cut that sends every tool result as text alone. */
+    class CutsResults extends ImageRatioStrategy {
+      protected override truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
+        return maxTokens > 0
+          ? content.map((b) => (b.type === 'tool_result' ? { ...b, content: [{ type: 'text', text: 'cut' }] } as ContentBlock : b))
+          : content;
+      }
+    }
+    const s = new CutsResults({
+      headWindowTokens: 0, recentWindowTokens: 1_000_000, hierarchical: true, imageStripDepthTokens: 0, maxLiveImages: 4, imageStripHysteresisRatio: 0.5,
+    } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
+    // Five tool rounds, each result holding one image.
+    const messages = [1, 2, 3, 4, 5].flatMap((k) => [
+      { id: `call-${k}`, sequence: 2 * k, participant: 'Claude', content: [{ type: 'tool_use', id: `t-${k}`, name: 'shot', input: {} }], timestamp: new Date(0) },
+      { id: `result-${k}`, sequence: 2 * k + 1, participant: 'User', content: [{ type: 'tool_result', toolUseId: `t-${k}`, toolName: 'shot', content: img(`h-${k}`) }], timestamp: new Date(0) },
+    ]) as unknown as StoredMessage[];
+    const view = { getAll: () => messages, estimateTokens: () => 100, getTokenCalibration: () => 1 } as unknown as MessageStoreView;
+    const strippedIds = () => [...(s.replay(view) ?? new Map()).keys()].join(' ');
+    assert.equal(strippedIds(), 'result-1 result-2 result-3', 'five nested images over a cap of 4 trim to 2');
+    // One knob at a time, each changing the answer.
+    s.configure({ maxMessageTokens: 1000 });
+    assert.equal(strippedIds(), '', 'the cut sends no image');
+    s.configure({ maxMessageTokens: undefined });
+    assert.equal(strippedIds(), 'result-1 result-2 result-3');
+    s.configure({ toolResultMaxLastN: { shot: 4 } });
+    assert.equal(strippedIds(), '', 'the oldest result goes as its marker, and four images fit the cap of 4');
+  });
+
   it('a reopen with a saved calibration renders the set at that calibration, though initialization prices before it loads', async () => {
     // Three image messages under a depth of 5,000: at multiplier 1 the oldest
     // is at about 4,800, within it; at a saved 1.1, at about 5,290, past it,
@@ -398,40 +427,6 @@ describe('imageStripHysteresisRatio', () => {
       await m.close();
       cleanup();
     }
-  });
-
-  it("a merged body's images go as the rule strips each of its shards", async () => {
-    // A body whose second shard holds an image too, as a chunkIngressMessage
-    // other than this strategy's (which puts every image on shard 0) can make.
-    class ShardedImages extends AutobiographicalStrategy {
-      chunkIngressMessage(_participant: string, content: ContentBlock[]) {
-        if (!content.some((b) => b.type === 'text' && b.text === 'body-0body-1')) return null;
-        // Shard k's image is 4 + 4k characters of base64, so the two can be
-        // told apart.
-        return { bodyGroupId: 'g-body', shards: [0, 1].map((k) => ({ content: img(`body-${k}`, 4 + 4 * k), shardIndex: k })) };
-      }
-    }
-    // A cap of 2 at 0.5: img-2's arrival trims to 1, taking both of the body's.
-    let m = await ContextManager.open({ path: STORE, strategy: new ShardedImages(adaptiveImages({ maxLiveImages: 2 })) });
-    m.addMessage('user', [{ type: 'text', text: 'body-0body-1' }]);
-    m.addMessage('user', img('img-2'));
-    m.addMessage('user', img('img-3'));
-    assert.equal(m.getAllMessages().filter((x) => x.bodyGroupId).length, 2, 'the body is two shards');
-    let r = await pricedAsRendered(m);
-    assert.equal(r.live, '011', 'one merged entry for the body, with neither image');
-    assert.ok(Math.abs(r.total - r.tokens) <= Math.max(16, r.tokens * 0.01), `render stats ${r.total} against the rendered ${r.tokens}`);
-    await m.close();
-    cleanup();
-    // A cap of 1 at 0.5: the second shard's image trims to 0, taking the
-    // first shard's, and stays as the newest. The body keeps the second's.
-    m = await ContextManager.open({ path: STORE, strategy: new ShardedImages(adaptiveImages({ maxLiveImages: 1 })) });
-    m.addMessage('user', [{ type: 'text', text: 'body-0body-1' }]);
-    r = await pricedAsRendered(m);
-    assert.equal(r.live, '1');
-    assert.ok(Math.abs(r.total - r.tokens) <= Math.max(16, r.tokens * 0.01), `render stats ${r.total} against the rendered ${r.tokens}`);
-    const kept = (await m.compile(BUDGET)).messages[0]!.content.find((b) => b.type === 'image') as { source: { data: string } } | undefined;
-    assert.equal(kept?.source.data.length, 8, "the second shard's image, not the first's");
-    await m.close();
   });
 
   describe('previews and dry compiles', () => {

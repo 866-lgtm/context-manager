@@ -102,6 +102,18 @@ describe('renderAsNewest', () => {
       });
     });
 
+    it(`${name}: an image nested in a tool result counts toward the limits, as in a compile`, async () => {
+      await withManager(make({ maxLiveImages: 1 }), async (manager) => {
+        manager.addMessage('assistant', [{ type: 'tool_use', id: 't-1', name: 'shot', input: {} } as ContentBlock]);
+        const older = manager.addMessage('user', [{ type: 'tool_result', toolUseId: 't-1', content: imageMessage('older') } as unknown as ContentBlock]);
+        const newer = manager.addMessage('user', imageMessage('newer'));
+        const { rendered, next } = await renderedAndSent(manager, [older, newer]);
+        assert.deepEqual(rendered, next);
+        const nested = (content: unknown): number => imagesIn(((content as ContentBlock[])[0] as { content: unknown }).content);
+        assert.deepEqual([nested(rendered[0]), imagesIn(rendered[1])], [0, 1], 'the newer image takes the one slot, and the nested one is stripped');
+      });
+    });
+
     it(`${name}: an image past the byte limit on its own`, async () => {
       await withManager(make({ maxLiveImageBytes: 8 }), async (manager) => {
         const id = manager.addMessage('user', imageMessage('big', 1, 12));
