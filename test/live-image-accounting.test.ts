@@ -2,7 +2,7 @@
  * The live window's image accounting counts every `image` block, whatever its
  * source (base64, a `data:` URL or a remote URL), and every `generated_image`,
  * top-level or nested in a tool result. The strip, the post-strip estimates,
- * the image watermark and the store's price all see the same images and agree
+ * imageStripHysteresisRatio's rule and the store's price all see the same images and agree
  * on how deep each one is, and a strip releases the raw replay form of a tool
  * result whose nested image it replaces, from every block of its message that
  * shares it.
@@ -92,8 +92,7 @@ function viewOf(
 type StripInternals = {
   getImageStripStart(store: unknown, depthTokens: number): number;
   postStripEstimates(store: unknown): number[];
-  maybeAdvanceImageWatermark(store: unknown): void;
-  imageWatermark(): number | undefined;
+  imageStripReplay(store: unknown): ReadonlyMap<string, number> | undefined;
 };
 
 /** The store's and the context log's estimators, each over one message's content on a fresh store. */
@@ -210,18 +209,17 @@ describe('live image accounting', () => {
     assert.equal(internals.postStripEstimates(store)[0], 14, 'and the estimate prices that image at its placeholder');
   });
 
-  it('advances the image watermark for the message that crosses the strip depth', () => {
+  it("imageStripHysteresisRatio's rule strips the image of the message that crosses the strip depth", () => {
     const strategy = new AutobiographicalStrategy({ maxLiveImages: 0, imageStripDepthTokens: 2000, imageStripHysteresisRatio: 0.5 } as never);
     const store = viewOf([
       { id: 'image', sequence: 0, content: [base64Image()] },
       { id: 'text', sequence: 1, content: [{ type: 'text', text: 'x'.repeat(4000) }] },
     ]);
     const internals = strategy as unknown as StripInternals;
-    internals.maybeAdvanceImageWatermark(store);
-    assert.equal(internals.imageWatermark(), 0, 'the image the strip replaces is below the watermark');
+    assert.deepEqual([...(internals.imageStripReplay(store) ?? new Map())], [['image', 1]], 'the image the strip replaces is in the rule\'s set');
   });
 
-  it('the image watermark counts images nested in tool results', async () => {
+  it("imageStripHysteresisRatio's rule counts images nested in tool results", async () => {
     const cm = await ContextManager.open({
       path: fresh(),
       strategy: new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 1_000_000, maxLiveImages: 4, imageStripDepthTokens: 0, imageStripHysteresisRatio: 0.5 }),
@@ -234,7 +232,7 @@ describe('live image accounting', () => {
     cm.close();
   });
 
-  it("the image watermark counts a tool result as it's sent, so one toolResultMaxLastN replaces holds no image", async () => {
+  it("imageStripHysteresisRatio's rule counts a tool result as it's sent, so one toolResultMaxLastN replaces holds no image", async () => {
     const cm = await ContextManager.open({
       path: fresh(),
       strategy: new AutobiographicalStrategy({
@@ -250,7 +248,7 @@ describe('live image accounting', () => {
     cm.close();
   });
 
-  it('the image watermark counts each message as its cut sends it', async () => {
+  it("imageStripHysteresisRatio's rule counts each message as its cut sends it", async () => {
     /** A cut that leaves out the images of the oldest round. */
     class DropsFirstRound extends AutobiographicalStrategy {
       protected override truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {

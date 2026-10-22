@@ -356,8 +356,8 @@ export interface SelectOptions {
    * A compression hold ends at its deadline, whoever looks: the manager
    * releases an expired hold at any compile or hold query, a dry compile
    * included, and that release is the one thing a dry compile can leave.
-   * The release's committing rebuild includes any image-watermark advance;
-   * the dry select then restores the state it found after that rebuild.
+   * The release's rebuild commits; the dry select then restores the state it
+   * found after that rebuild.
    */
   dryRun?: boolean;
   /** Exact normalized tools/system/context-prefix identity supplied by the
@@ -1267,10 +1267,31 @@ export interface AutobiographicalConfig {
    * (`maxLiveImages`, `imageStripDepthTokens`, `maxLiveImageBytes`), each new
    * image strips the oldest live one, a change mid-history that invalidates
    * the prompt cache from that message on, on every image. With a ratio in
-   * (0, 1), a binding limit instead trims down to ratio × each limit and
-   * records a watermark (a message sequence, persisted): every image at or
-   * before it stays stripped, so the stripped set changes once per trim, not
-   * once per image. E.g. 0.7. Costs up to (1 - ratio) of the image budget.
+   * (0, 1), a binding limit instead trims down to ratio × each limit, so the
+   * stripped set changes once per trim, not once per image. E.g. 0.7. Costs
+   * up to (1 - ratio) of the image budget right after a trim, and a little
+   * more where ratio × a limit falls between whole images: a count target
+   * rounds down (`maxLiveImages: 4` at 0.7 keeps 2), and the byte and depth
+   * targets are met by stripping whole images.
+   *
+   * The set is computed from the stored messages, keeping no state of its
+   * own: they're replayed oldest first, and whenever a limit binds, the
+   * oldest live images are stripped one at a time until every limit fits
+   * ratio × itself. Within a message they go first to last, so the option
+   * keeps a message's last images, where the limits without it keep the first
+   * that fit: switching the option on can change which of a message's images
+   * stay, not only how many. A target that rounds to 0 is 0, but the newest image
+   * stays while it fits the full limits, so `maxLiveImages: 1` gets no
+   * headroom, and so do the other images of its message while only depth is
+   * over its target, since stripping them can't lower the depth they're at.
+   * A compile, a preview, a reopen and a fork at the same point give the
+   * same set, switching the option on later gives the set it would have
+   * had from the start, and a fold moves nothing. An edit or a removal of any
+   * message, text-only included, replays a different history, so it can
+   * strip or bring back images on either side of it; many of them are newer
+   * than the change, where the prompt is rewritten anyway. Depth is counted
+   * at the store's calibrated estimates, as the limits are counted without
+   * the option, so a calibration change can move the set as it moves theirs.
    */
   imageStripHysteresisRatio?: number;
 
