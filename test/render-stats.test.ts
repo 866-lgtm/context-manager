@@ -146,8 +146,9 @@ describe('getRenderStats — inspect, not reconstruct', () => {
     for (let i = 0; i < 24; i++) manager.addMessage(i % 2 ? 'Claude' : 'User', text(`M-${i} ${'word '.repeat(10)}`));
     assert.strictEqual(manager.getRenderStats(), null, 'no live compile yet');
     const budget = { maxTokens: 1_000_000, reserveForResponse: 0 };
-    await manager.compile(budget, undefined, { dryRun: true });
+    const dry = await manager.compile(budget, undefined, { dryRun: true });
     assert.strictEqual(manager.getRenderStats(), null, 'a dry run records no stats');
+    assert.strictEqual(dry.renderStats?.total.messages, dry.messages.length, 'the dry result carries its own on this path too');
     const compiled = await manager.compile(budget);
     const rs = manager.getRenderStats();
     assert.ok(rs, 'a live compile records its stats');
@@ -167,13 +168,16 @@ describe('getRenderStats — inspect, not reconstruct', () => {
     const budget = { maxTokens: 1_000_000, reserveForResponse: 0 };
     await manager.compile(budget);
     assert.ok(manager.getRenderStats(), 'the live compile recorded its stats');
+    const strategy = manager.getStrategy() as AutobiographicalStrategy;
     await manager.fork('other');
     assert.strictEqual(manager.getRenderStats(), null, "the other branch hasn't compiled");
+    assert.strictEqual(strategy.getLastSelectStats(), null, 'nor selected');
     const compiled = await manager.compile(budget);
     assert.strictEqual(manager.getRenderStats()?.total.messages, compiled.messages.length, "its first live compile records the branch's own stats");
     // Handing back the same instance, which has compiled, loads its branch again.
-    await manager.setStrategy(manager.getStrategy());
+    await manager.setStrategy(strategy);
     assert.strictEqual(manager.getRenderStats(), null, 'setStrategy() loads the branch again, so no live compile has run since');
+    assert.strictEqual(strategy.getLastSelectStats(), null, 'and no select');
     manager.close();
   });
 
@@ -189,6 +193,8 @@ describe('getRenderStats — inspect, not reconstruct', () => {
     const preview = manager.previewContext(budget, undefined, { render: true });
     assert.ok(preview?.stats && preview.stats.total.messages > 0, 'the preview returns its own stats');
     assert.strictEqual(manager.getRenderStats(), null, 'a preview records no stats');
+    assert.strictEqual((manager.getStrategy() as AutobiographicalStrategy).getLastSelectStats(), preview.stats,
+      "they're the stats of the strategy's most recent select");
     const compiled = await manager.compile(budget);
     const rs = manager.getRenderStats();
     assert.ok(rs, 'a live compile records its stats');
@@ -219,16 +225,19 @@ describe("CompileResult.renderStats — the compile's own", () => {
     const dry = await manager.compile(wide, undefined, { dryRun: true });
     assert.ok(dry.renderStats, 'a dry compile carries stats');
     assertConsistent(dry.renderStats!);
+    const s = dry.renderStats!.summaries;
+    assert.ok(s.l1.count + s.l2.count + s.l3.count > 0, 'its cut holds recall pairs');
     assert.strictEqual(dry.renderStats!.total.messages, dry.messages.length, 'they count every message the dry compile would send');
     assert.strictEqual(dry.renderStats!.total.tokens, sentTokens(manager, dry.messages), 'and price them as it would send them');
     assert.strictEqual(manager.getRenderStats(), null, "they aren't the getter's");
+    const dryBefore = structuredClone(dry.renderStats);
 
     const live = await manager.compile(narrow);
     assert.ok(live.renderStats, 'a live compile carries stats');
     assert.strictEqual(live.renderStats, manager.getRenderStats(), "a live compile's are the getter's");
     assert.strictEqual(live.renderStats!.total.messages, live.messages.length);
+    assert.deepStrictEqual(dry.renderStats, dryBefore, "the live compile leaves the dry result's stats alone");
     const liveBefore = structuredClone(live.renderStats);
-    const dryBefore = structuredClone(dry.renderStats);
 
     const again = await manager.compile(wide, undefined, { dryRun: true });
     assert.strictEqual(again.renderStats!.total.messages, again.messages.length, 'a later dry compile carries its own');
@@ -240,8 +249,11 @@ describe("CompileResult.renderStats — the compile's own", () => {
     // pose as its own.
     const strategy = manager.getStrategy() as AutobiographicalStrategy;
     const tiny = { maxTokens: 50, reserveForResponse: 0 };
+    assert.ok(strategy.getLastSelectStats(), 'the last dry select left stats');
     await assert.rejects(manager.compile(tiny, undefined, { dryRun: true }), OverBudgetError);
-    assert.strictEqual(strategy.getLastSelectStats(), null, 'a refused dry select has no stats');
+    assert.strictEqual(strategy.getLastSelectStats(), null, 'a refused dry select has none');
+    await manager.compile(narrow);
+    assert.ok(strategy.getLastSelectStats(), 'the live select left stats');
     await assert.rejects(manager.compile(tiny), OverBudgetError);
     assert.strictEqual(strategy.getLastSelectStats(), null, 'nor does a refused live one');
     await manager.close();
@@ -252,6 +264,19 @@ describe("CompileResult.renderStats — the compile's own", () => {
     manager.addMessage('User', text('hello'));
     const compiled = await manager.compile();
     assert.strictEqual(compiled.messages.length, 1);
+    assert.strictEqual(compiled.renderStats, undefined);
+    manager.close();
+  });
+
+  it('is absent for a strategy that reports render stats without getLastSelectStats', async () => {
+    // Written against the interface before getLastSelectStats existed.
+    class OlderStatsStrategy extends PassthroughStrategy {
+      getRenderStats(): RenderStats | null { return null; }
+    }
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy: new OlderStatsStrategy() });
+    manager.addMessage('User', text('hello'));
+    const compiled = await manager.compile();
+    assert.strictEqual(compiled.messages.length, 1, 'it still compiles');
     assert.strictEqual(compiled.renderStats, undefined);
     manager.close();
   });

@@ -679,7 +679,8 @@ export interface CalibrationReset {
 
 /**
  * Per-render observability stats from a strategy, recorded by a compile as it
- * emits each entry: a live compile's from `getRenderStats()`, a preview's from
+ * emits each entry: any compile's from its `CompileResult.renderStats`, the
+ * last live compile's from `getRenderStats()`, a preview's from
  * `previewContext(..., { render: true })`. Counts and token sums for head / tail / summaries /
  * pending work, suitable for TUIs and dashboards that want to display "how
  * much of the context is folded vs raw" at a glance. Token sums use the
@@ -794,10 +795,10 @@ export interface RenderStats {
     ceiling?: string;
     /** Set on a dry run or preview (`dryRun: true`, `previewContext`), which
      *  skips work a live compile does; logged as `dryRun=true`. Absent on a
-     *  live compile. A caller reads a dry pass's stats only from
-     *  `previewContext(..., { render: true })`'s `stats`: `compile()` returns
-     *  no stats, and a dry pass leaves `getRenderStats()` describing the last
-     *  live compile, or null before one. */
+     *  live compile. A caller reads a dry pass's stats from its compile's
+     *  `CompileResult.renderStats`, or from `previewContext(..., { render:
+     *  true })`'s `stats`; a dry pass leaves `getRenderStats()` describing the
+     *  last live compile, or null before one. */
     dryRun?: true;
     /** Which chunks moved between which levels, and where this request's
      *  entries first differ from those of the last request the strategy
@@ -816,10 +817,11 @@ export interface RenderStatsCapableStrategy extends ContextStrategy {
   /** The stats of the last live compile, or null before one has run since
    *  the strategy loaded its branch. */
   getRenderStats(store: MessageStoreView): RenderStats | null;
-  /** The stats the strategy's most recent `select()` recorded, live or dry,
-   *  or null when it recorded none. `ContextManager.compile` reads them right
-   *  after its select for `CompileResult.renderStats`; a strategy without
-   *  this method gives compiles none. */
+  /** The stats the strategy's most recent `select()` on its branch
+   *  recorded, live or dry, or null when it recorded none.
+   *  `ContextManager.compile` reads them right after its select for
+   *  `CompileResult.renderStats`; a strategy without this method gives
+   *  compiles none. */
   getLastSelectStats?(): RenderStats | null;
 }
 

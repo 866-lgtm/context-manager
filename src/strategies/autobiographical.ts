@@ -2840,6 +2840,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.transitionBlocked = undefined;
     this._rs = null;
     this._lastRenderStats = null;
+    this._lastSelectStats = null;
     this._lastCompileEstimate = 0;
     this._storeView = null;
     // Prices memoized over the view just cleared: the next one may estimate otherwise.
@@ -7712,12 +7713,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     budget: TokenBudget,
     opts?: SelectOptions
   ): ContextEntry[] {
-    this.requireLoadedBranch('select');
-    this._selectStartedAt = performance.now();
-    this._selectMessages = store.length();
     // Only stats this select records are its own: on a throw before they're
     // written, an earlier select's must not pose as this one's.
     this._lastSelectStats = null;
+    this.requireLoadedBranch('select');
+    this._selectStartedAt = performance.now();
+    this._selectMessages = store.length();
     const lastRenderStats = this._lastRenderStats;
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     const _t0 = _diag ? Date.now() : 0;
@@ -8584,7 +8585,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * depend on the budget a compile is given, which this read isn't, so nothing
    * stands in for them before one: the pyramid of live summaries this used to
    * return instead was neither the hierarchical cut nor the adaptive one (#304,
-   * connectome-host#425). A dry run or preview records none (see `select()`).
+   * connectome-host#425). A dry run or preview leaves them as they were (see
+   * `select()`); its own stats come back with it.
    */
   getRenderStats(_store: MessageStoreView): RenderStats | null {
     this.requireLoadedBranch('getRenderStats');
@@ -8592,10 +8594,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * The stats the most recent `select()` recorded, live or dry, or null when
-   * it recorded none. A compile reads them right after its select, so a dry
-   * compile's result carries its own stats, which `getRenderStats()` never
-   * returns.
+   * The stats the most recent `select()` on this branch recorded, live or
+   * dry, or null when it recorded none (it was refused). A compile reads them
+   * right after its select, so a dry compile's result carries its own stats,
+   * which `getRenderStats()` never returns.
    */
   getLastSelectStats(): RenderStats | null {
     return this._lastSelectStats;
