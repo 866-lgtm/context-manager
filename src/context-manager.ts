@@ -1757,9 +1757,11 @@ export class ContextManager {
   }
 
   /**
-   * Per-render stats from the active strategy: head/tail message + token
+   * Per-render stats of the last live compile: head/tail message + token
    * counts, plus per-level summary counts and total tokens. Returns null
-   * if the strategy doesn't implement `getRenderStats`.
+   * if the strategy doesn't implement `getRenderStats`, and before a live
+   * compile has run since the strategy loaded its branch (opening the store,
+   * `setStrategy()`, a branch switch): a dry run or preview records none.
    *
    * Designed for TUIs / dashboards that want to display "how much of the
    * agent's context is folded vs raw" at a glance.

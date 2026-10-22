@@ -677,11 +677,12 @@ export interface CalibrationReset {
 }
 
 /**
- * Per-render observability stats from a strategy. Counts and token sums for
- * head / tail / summaries / pending work, suitable for TUIs and dashboards
- * that want to display "how much of the context is folded vs raw" at a
- * glance. Token sums use the strategy's own estimates so they line up with
- * the numbers `select()` uses for budget math.
+ * Per-render observability stats from a strategy, recorded by a live compile
+ * as it emits each entry. Counts and token sums for head / tail / summaries /
+ * pending work, suitable for TUIs and dashboards that want to display "how
+ * much of the context is folded vs raw" at a glance. Token sums use the
+ * strategy's own estimates so they line up with the numbers `select()` uses
+ * for budget math.
  */
 export interface RenderStats {
   head: { messages: number; tokens: number };
@@ -794,7 +795,7 @@ export interface RenderStats {
      *  live compile. A caller reads a dry pass's stats only from
      *  `previewContext(..., { render: true })`'s `stats`: `compile()` returns
      *  no stats, and a dry pass leaves `getRenderStats()` describing the last
-     *  live compile. */
+     *  live compile, or null before one. */
     dryRun?: true;
     /** Which chunks moved between which levels, and where this request's
      *  entries first differ from those of the last request the strategy
@@ -810,7 +811,9 @@ export interface RenderStats {
  * implement it simply have `ContextManager.getRenderStats()` return `null`.
  */
 export interface RenderStatsCapableStrategy extends ContextStrategy {
-  getRenderStats(store: MessageStoreView): RenderStats;
+  /** The stats of the last live compile, or null before one has run since
+   *  the strategy loaded its branch. */
+  getRenderStats(store: MessageStoreView): RenderStats | null;
 }
 
 /** Type guard for strategies that produce render stats. */
