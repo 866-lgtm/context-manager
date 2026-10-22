@@ -81,6 +81,7 @@ import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMark
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
+import { storedJson } from '../stored-json.js';
 
 /** A persisted reset record is trusted only if it has the expected shape. */
 function isCalibrationReset(v: unknown): v is CalibrationReset {
@@ -2938,7 +2939,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this.store) return;
     const stored = this.store.getStateJson(this.chunksStateId);
     if (!Array.isArray(stored)) return;
-    const payload = Buffer.from(JSON.stringify(rec));
+    const payload = storedJson(rec);
     let found = false;
     for (let i = 0; i < stored.length; i++) {
       const item = stored[i] as ChunkRecord | null;
@@ -6123,7 +6124,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const stored = this.store.getStateJson(this.summariesStateId);
     if (!Array.isArray(stored)) return;
     let found = false;
-    const payload = Buffer.from(JSON.stringify(entry));
+    const payload = storedJson(entry);
     for (let i = 0; i < stored.length; i++) {
       const item = stored[i] as SummaryEntry | null;
       if (item && item.id === entry.id) {
@@ -13951,7 +13952,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const store = this.store;
     if (!store) return;
     if (typeof (store as { setState?: unknown }).setState === 'function') {
-      store.setState(stateId, Buffer.from(JSON.stringify(value)));
+      store.setState(stateId, storedJson(value));
     } else {
       store.setStateJson(stateId, value);
     }
