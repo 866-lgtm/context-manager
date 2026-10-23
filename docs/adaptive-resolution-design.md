@@ -376,8 +376,9 @@ This case should be rare in practice with unbounded L_n: the picker can almost a
 >
 > *(Pins on messages stored in parts)* A pin or document mark covers the
 > whole of a message stored in parts in the selects. Where that is what
-> doesn't fit, a refusal is answered first by narrowing the pin to the parts
-> its ids name (`selectNarrowingPins`), and the select runs again: the
+> doesn't fit, a refusal is answered first by narrowing a pin that renders
+> the message raw to the parts its ids name (`selectNarrowingPins`), and the
+> select runs again: the
 > narrowing lasts until the store is loaded again, and a host-log warning
 > names the pin. When no narrowing lets the compile through, the refusal is
 > thrown as above.

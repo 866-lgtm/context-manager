@@ -85,14 +85,19 @@ class PinStore extends AutobiographicalStrategy {
   /** How many adaptive selects ran, and the refusals they threw. */
   selects = 0;
   refusals: OverBudgetError[] = [];
+  /** Fail a select that a narrowed pin let through, after it planned. */
+  failNarrowedAfterPlanning = false;
   protected selectAdaptive(store: never, budget: never, opts?: never): never {
     this.selects++;
+    let entries: never;
     try {
-      return super.selectAdaptive(store, budget, opts) as never;
+      entries = super.selectAdaptive(store, budget, opts) as never;
     } catch (err) {
       if (err instanceof OverBudgetError) this.refusals.push(err);
       throw err;
     }
+    if (this.failNarrowedAfterPlanning && this.pins.some((p) => this.narrowedPins.has(this.narrowKey(p)))) throw new Error('select failed');
+    return entries;
   }
   /**
    * Leave the L1s covering these messages as the only record of their
@@ -240,6 +245,21 @@ describe('pins render whole messages', () => {
       });
     });
   }
+
+  it('a mark made after its message\'s early parts were chunked as it arrived sends the whole message raw', async () => {
+    await withDir(async (dir) => {
+      const { cm, strategy } = await open(dir);
+      await history(cm);
+      const b = cm.addMessage('user', words('Bdoc', 6000));
+      const parts = partsOf(cm, b);
+      assert.ok(strategy.chunkedIds().has(parts[1]!), 'the second part was chunked before the mark');
+      cm.markDocument(b);
+      await traffic(cm, 360);
+      await ready(cm);
+      assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(42_000))), 'Bdoc'), allOf(6000));
+      await cm.close();
+    });
+  });
 
   it('a range pin whose ends fall inside long messages covers both of them whole', async () => {
     await withDir(async (dir) => {
@@ -491,6 +511,34 @@ describe('a compile that can\'t hold the whole messages narrows pins', () => {
     });
   });
 
+  it('a mark over parts locked at a fold is narrowed: narrowed, they return to their locked level', async (t) => {
+    await withDir(async (dir) => {
+      warnings(t);
+      const { cm, strategy, marks, before } = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 30_000 });
+      // The earlier version's compile folded the message's later parts; lock them there.
+      const parts = partsOf(cm, strategy.firstIdOf(marks[0]!));
+      for (const id of parts.slice(1)) strategy.lockChunk(id);
+      assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(30_000))), 'Bdoc'), rawWords(before, 'Bdoc'));
+      assert.ok(strategy.isNarrowed(marks[0]!));
+      await cm.close();
+    });
+  });
+
+  it('an error from a narrowed select leaves the refused select\'s frontier and preview', async (t) => {
+    await withDir(async (dir) => {
+      warnings(t);
+      const { cm, strategy, marks } = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 30_000 });
+      strategy.refusals = [];
+      // The narrowed select plans, setting its own frontier, and then fails.
+      strategy.failNarrowedAfterPlanning = true;
+      await assert.rejects(cm.compile(budget(30_000)), /select failed/);
+      strategy.failNarrowedAfterPlanning = false;
+      assert.ok(!strategy.isNarrowed(marks[0]!));
+      assert.strictEqual(strategy.getHotContextSettings().currentFrontierTokens, strategy.refusals[0]!.actual);
+      await cm.close();
+    });
+  });
+
   it('the warning names a named mark and its part, and gives the whole reading\'s refusal', async (t) => {
     await withDir(async (dir) => {
       const out = warnings(t);
@@ -608,6 +656,8 @@ describe('a compile that can\'t hold the whole messages narrows pins', () => {
       assert.strictEqual(said.length, 2);
       assert.match(said[0]!, new RegExp(`document mark ${marks[0]} `));
       assert.match(said[1]!, new RegExp(`document mark ${marks[1]} `));
+      // The refusal's total had both whole, and each warning says so.
+      for (const w of said) assert.ok(w.includes('With the 2 pins narrowed here covering their whole messages, the compile came to ~'), w);
       await cm.close();
     });
   });

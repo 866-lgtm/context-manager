@@ -2097,8 +2097,9 @@ export function getSummaryParentId(s: SummaryEntry): string | undefined {
  * pinned level, compiles fail until each part of the message in the middle
  * (outside the head and recent windows) has the summary that level needs.
  * When a compile can't hold the whole messages within its budget but can
- * hold the rest with the pin narrowed to its ids, it narrows it until the
- * strategy loads the store again (an open, a branch switch or a fork), and
+ * hold the rest with the pin narrowed to its ids, it narrows a pin it renders
+ * raw (one held at a level frees nothing narrowed) until the strategy loads
+ * the store again (an open, a branch switch, a fork or `setStrategy`), and
  * warns. Nothing records the narrowing, so a store loaded again reads the
  * pin whole.
  *

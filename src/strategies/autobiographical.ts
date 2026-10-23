@@ -3576,8 +3576,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * `level` or `maxLevel` the message is kept raw, while `{ maxLevel }` lets
    * it fold no deeper than that level where the selector reads level bounds.
    * Under adaptive resolution, a mark on any part of a message stored in
-   * parts renders the whole message, as `pinRange` does, narrowed to the part
-   * it names where the whole message doesn't fit (`selectNarrowingPins`).
+   * parts renders the whole message, as `pinRange` does: where the whole
+   * message doesn't fit, a mark that renders it raw is narrowed to the part
+   * it names (`selectNarrowingPins`).
    */
   markDocument(messageId: string, opts?: PinLevelOptions): string {
     this.requireLoadedBranch('markDocument');
@@ -3814,6 +3815,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     messages: readonly StoredMessage[],
     reading: 'ids' | 'whole',
   ): { lo: number; hi: number } | undefined {
+    if (reading !== 'ids' && reading !== 'whole') throw new TypeError(`pinSpan: a reading is 'ids' or 'whole', not ${String(reading)}`);
     const first = positionOf.get(pin.firstMessageId);
     const last = positionOf.get(pin.lastMessageId);
     if (first === undefined || last === undefined) return undefined;
@@ -8066,13 +8068,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const narrowed: ProtectedRange[] = [];
     const putBack = (): void => {
       for (const pin of narrowed) this.narrowedPins.delete(this.narrowKey(pin));
+      this._lastPreview = preview;
+      this.lastFrontierTokens = frontier;
+      this.transitionBlocked = blocked;
     };
     let entries: ContextEntry[] | undefined;
     try {
-      // Narrowing a raw pin changes neither another pin's reading nor what
-      // compression leaves out (a part it stops covering stays raw as the
-      // selects read it only where another raw pin's ids keep it so), so the
-      // order taken here holds throughout.
+      // Narrowing a raw pin changes no other pin's reading, and nothing it
+      // stops covering leaves what compression leaves out (a position there
+      // is raw by some pin's ids, and so by that pin's whole reading too), so
+      // the order taken here holds throughout.
       for (const { pin } of this.freedByNarrowing(store)) {
         this.narrowedPins.add(this.narrowKey(pin));
         narrowed.push(pin);
@@ -8092,12 +8097,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     if (!entries) {
       putBack();
-      this._lastPreview = preview;
-      this.lastFrontierTokens = frontier;
-      this.transitionBlocked = blocked;
       throw refusal;
     }
-    if (opts?.dryRun === true) putBack();
+    if (opts?.dryRun === true) for (const pin of narrowed) this.narrowedPins.delete(this.narrowKey(pin));
     else this.warnNarrowedPins(narrowed, refusal);
     return entries;
   }
@@ -8110,8 +8112,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * have an L1 the select can fold them to (their chunk's summary, else
    * `l1ByMessageIndex`, as selectAdaptive finds it), priced as the selects
    * price them (`postStripEstimates`), less those the selects hold at a
-   * level or that are locked. Only those can go out as summaries once it's
-   * narrowed. Where the selects read bounds, a pin with a level or cap above
+   * level, and those locked raw: a pin renders a locked message raw over its
+   * lock (`lockChunk`), and narrowed, the message returns to its locked
+   * level, which frees something only where that level is a fold. Only those
+   * can go out as summaries once it's narrowed. Where the selects read bounds, a pin with a level or cap above
    * 0 frees nothing, since its parts are held at that level: its parts
    * already fold, and where it overlaps a raw pin, narrowing it could turn
    * parts raw. Elsewhere every pin renders raw and can be narrowed. A pin
@@ -8127,8 +8131,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const reading = this.selectsPinReading();
     // A pin keeps raw only where the selects resolve it raw: where they read
     // bounds, a position a pin holds at a level (this one's own, if it has a
-    // level or cap) stays held, and a locked one stays as it is, whether or
-    // not this pin covers it. So a pin with a level or cap frees nothing there.
+    // level or cap) stays held, so a pin with a level or cap frees nothing
+    // there. A message locked raw stays raw narrowed too.
     const bounds = this.resolvedPinBounds(messages, reading);
     const prices = this.postStripEstimates(store);
     const out: Array<{ pin: ProtectedRange; tokens: number }> = [];
@@ -8140,7 +8144,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (let i = whole.lo; i <= whole.hi; i++) {
         const id = messages[i].id;
         const bound = bounds.get(i);
-        const raw = bound !== undefined && AutobiographicalStrategy.isRawPinBound(bound) && !this.locked.has(id);
+        const lockedRaw = this.locked.has(id) && (this.resolutions.get(id) ?? 0) === 0;
+        const raw = bound !== undefined && AutobiographicalStrategy.isRawPinBound(bound) && !lockedRaw;
         if ((i < ids.lo || i > ids.hi) && raw && compressible.has(id) && summarized.has(id)) tokens += prices[i] ?? 0;
       }
       if (tokens > 0) out.push({ pin, tokens });
@@ -8158,7 +8163,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ? `only message ${pin.firstMessageId}, one part of a message stored in parts, not the whole message`
         : `only messages ${pin.firstMessageId} to ${pin.lastMessageId}, not the whole of the messages stored in parts at its ends`;
       this.diag.warn(
-        `autobio: ${what} ${label} now covers ${covers}. With it covering ${one ? 'the whole message' : 'them whole'}, ` +
+        `autobio: ${what} ${label} now covers ${covers}. ${narrowed.length > 1 ? `With the ${narrowed.length} pins narrowed here covering their whole messages` : `With it covering ${one ? 'the whole message' : 'them whole'}`}, ` +
           `the compile came to ~${refusal.actual} tokens against a hard budget of ${refusal.budget}` +
           `${refusal.diagnostics.configuredBudget === undefined ? '' : ` (maxTokens ${refusal.diagnostics.configuredBudget})`}. Until this ` +
           `context is loaded again, the parts it no longer covers fold like any history. Loaded again, as at a restart, the ${what} ` +
@@ -9399,9 +9404,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // optimization that scales catastrophically: a 4000-message import
     // converged to ~500 L1s that never aged out, blowing the 200k
     // window around chunk 118.
-    // Pins in the canonical L1 prompt, read by their ids as compression reads
-    // them (forceRawPinPositions): a marked message's other parts reach the
-    // prompt as their summaries, though the selects send them raw. A
+    // Pins in the canonical L1 prompt, read by their ids (PROMPT_PIN_READING,
+    // forceRawPinPositions): a marked message's other parts reach the prompt
+    // as their summaries, though the selects send them raw. A
     // frontier summary that can't be shown as a recall pair (it covers such a
     // message, or its content is empty) is DESCENDED, not dropped: its
     // children take its place, so only the branch holding the pin opens,
@@ -17096,8 +17101,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * `selectsPinReading`). A part a pin's ids name that another pin's whole
    * reading holds at a level isn't one, since the selects need its summary,
    * and a part a pin covers only as the selects read it isn't either: its
-   * summary is what a narrowing sends. No chunk made after the pin takes a
-   * position in this set, so what relies on that reads it.
+   * summary is what a narrowing sends. No chunk made while a position is in
+   * this set takes it (a chunk recorded before keeps its messages), so what
+   * relies on that reads it.
    */
   protected compressionPinnedPositions(messages: StoredMessage[]): Set<number> {
     // Where the selects read pins by their ids too, the two sets are one.
