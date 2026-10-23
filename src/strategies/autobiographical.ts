@@ -3578,9 +3578,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * `level` or `maxLevel` the message is kept raw, while `{ maxLevel }` lets
    * it fold no deeper than that level where the selector reads level bounds.
    * Under adaptive resolution, a mark on any part of a message stored in
-   * parts renders the whole message, as `pinRange` does: where the whole
-   * message doesn't fit, a mark that renders it raw is narrowed to the part
-   * it names (`selectNarrowingPins`).
+   * parts renders the whole message, less a part locked with `lockChunk`
+   * that it doesn't name (`pinPositions`), as `pinRange` does: where the
+   * whole message doesn't fit, a mark that renders it raw is narrowed to the
+   * part it names (`selectNarrowingPins`). Under `kv-stable`, a mark with a
+   * level holds whole each summary it reaches, so a locked part that shares a
+   * summary with a part the mark covers takes the mark's level.
    */
   markDocument(messageId: string, opts?: PinLevelOptions): string {
     this.requireLoadedBranch('markDocument');
@@ -8098,10 +8101,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
     let entries: ContextEntry[] | undefined;
     try {
-      // Narrowing a raw pin changes no other pin's reading, and nothing it
-      // stops covering leaves what compression leaves out (a position there
-      // is raw by some pin's ids, and so by that pin's whole reading too), so
-      // the order taken here holds throughout.
+      // The order is taken once, before the first narrowing. Narrowing a raw
+      // pin changes no other pin's reading, and what it stops covering
+      // mostly stays out of compression as it was (a position there is raw
+      // by some pin's ids, and so by that pin's whole reading too). Where a
+      // pin with a level overlaps that position, the level can take the
+      // other pin's place once this one is narrowed (`resolvedPinBounds`), so
+      // later candidates' counts can be off there; the loop doesn't take
+      // them again.
       for (const { pin } of this.freedByNarrowing(store)) {
         this.narrowedPins.add(this.narrowKey(pin));
         narrowed.push(pin);

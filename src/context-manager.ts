@@ -1683,9 +1683,12 @@ export class ContextManager {
    * or `maxLevel` the message is kept raw, while
    * `markDocument(id, { maxLevel })` lets it fold no deeper than that level
    * where the selector reads level bounds. Under adaptive resolution, a mark
-   * on any part of a message stored in parts renders the whole message, as
-   * `pinRange` does: where the whole message doesn't fit, a mark that renders
-   * it raw is narrowed to the part it names.
+   * on any part of a message stored in parts renders the whole message, less
+   * a part locked with `lockChunk` that it doesn't name, as `pinRange` does:
+   * where the whole message doesn't fit, a mark that renders it raw is
+   * narrowed to the part it names. Under `kv-stable`, a mark with a level
+   * holds whole each summary it reaches, so a locked part that shares a
+   * summary with a part the mark covers takes the mark's level.
    * Returns the new pin id.
    */
   markDocument(messageId: MessageId, opts?: PinLevelOptions): string {

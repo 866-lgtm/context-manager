@@ -62,6 +62,14 @@ class PinStore extends AutobiographicalStrategy {
   boundsAt(messages: unknown[]): Map<number, unknown> {
     return this.resolvedPinBounds(messages as never, 'whole');
   }
+  /** The positions pins cover in a reading, as a caller passes it, from JavaScript too. */
+  pinnedWith(messages: unknown[], reading: unknown): Set<number> {
+    return this.pinnedPositions(messages as never, reading as never);
+  }
+  /** The level bounds pins give in a reading, as the replay exporter reads them. */
+  levelBoundsWith(messages: unknown[], reading: 'ids' | 'whole'): Map<number, { level?: number; maxLevel?: number }> {
+    return this.pinLevelBounds(messages as never, reading);
+  }
   /** The ids of the messages in compressed chunks. */
   summarizedIds(): Set<string> {
     const out = new Set<string>();
@@ -96,7 +104,11 @@ class PinStore extends AutobiographicalStrategy {
       if (err instanceof OverBudgetError) this.refusals.push(err);
       throw err;
     }
-    if (this.failNarrowedAfterPlanning && this.pins.some((p) => this.narrowedPins.has(this.narrowKey(p)))) throw new Error('select failed');
+    if (this.failNarrowedAfterPlanning && this.pins.some((p) => this.narrowedPins.has(this.narrowKey(p)))) {
+      // As a narrowed select's plan can leave a transition status before a later failure.
+      (this as unknown as { transitionBlocked: string }).transitionBlocked = 'transition-pace-floor';
+      throw new Error('select failed');
+    }
     return entries;
   }
   /**
@@ -217,6 +229,11 @@ const partsOf = (cm: ContextManager, id: string): string[] => {
   const all = viewOf(cm).getAll();
   const group = all.find((m) => m.id === id)!.bodyGroupId;
   return all.filter((m) => m.bodyGroupId !== undefined && m.bodyGroupId === group).map((m) => m.id);
+};
+/** The word numbers of one stored part's own text. */
+const wordsOfPart = (cm: ContextManager, id: string): number[] => {
+  const part = (viewOf(cm).getAll() as unknown as Array<{ id: string; content: ContentBlock[] }>).find((m) => m.id === id)!;
+  return part.content.flatMap((b) => (b.type === 'text' ? [...b.text.matchAll(/\bword(\d+)\b/g)].map((m) => Number(m[1])) : []));
 };
 async function withDir(body: (dir: string) => Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'cm-whole-pins-'));
@@ -533,6 +550,56 @@ describe('a compile that can\'t hold the whole messages narrows pins', () => {
     });
   }
 
+  for (const kind of ['adaptive', 'kv-unified'] as const) {
+    it(`${kind}: parts locked at a fold before the part a mark names keep their lock`, async () => {
+      await withDir(async (dir) => {
+        const { cm, strategy } = await open(dir, kind);
+        await history(cm);
+        const b = cm.addMessage('user', words('Bdoc', 6000));
+        await traffic(cm, 360);
+        await ready(cm);
+        await cm.compile(budget(30_000));
+        const parts = partsOf(cm, b);
+        const earlier = parts.slice(0, -1);
+        for (const id of earlier) strategy.lockChunk(id);
+        assert.ok(earlier.every((id) => strategy.resolutionOf(id) > 0), 'locked at a fold');
+        cm.markDocument(parts.at(-1)!);
+        const last = wordsOfPart(cm, parts.at(-1)!);
+        assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(60_000))), 'Bdoc'), last, 'only the part the mark names');
+        await cm.close();
+      });
+    });
+  }
+
+  it('a level pin\'s bounds leave out a part locked with lockChunk that its ids don\'t name, as the replay exporter reads them', async () => {
+    await withDir(async (dir) => {
+      const { cm, strategy } = await open(dir, 'kv-unified');
+      await history(cm);
+      const b = cm.addMessage('user', words('Bdoc', 6000));
+      const parts = partsOf(cm, b);
+      strategy.lockChunk(parts[3]!);
+      cm.pinAtLevel(b, b, 1);
+      const messages = viewOf(cm).getAll();
+      const at = (id: string) => messages.findIndex((m) => m.id === id);
+      const bounds = strategy.levelBoundsWith(messages, 'whole');
+      assert.deepStrictEqual(parts.filter((id) => bounds.has(at(id))), parts.filter((_, i) => i !== 3));
+      assert.deepStrictEqual(bounds.get(at(parts[0]!)), { level: 1 });
+      await cm.close();
+    });
+  });
+
+  it('a reading other than ids or whole is refused, as from a JavaScript caller that leaves it out', async () => {
+    await withDir(async (dir) => {
+      const { cm, strategy } = await open(dir);
+      cm.markDocument(cm.addMessage('user', words('Bdoc', 6000)));
+      const messages = viewOf(cm).getAll();
+      assert.throws(() => strategy.pinnedWith(messages, undefined), /a reading is 'ids' or 'whole', not undefined/);
+      assert.throws(() => strategy.pinnedWith(messages, 'all'), TypeError);
+      assert.ok(strategy.pinnedWith(messages, 'whole').size > 1);
+      await cm.close();
+    });
+  });
+
   it('a mark over its own part locked at a fold renders it raw over the lock, as before', async () => {
     await withDir(async (dir) => {
       const { cm, strategy } = await open(dir);
@@ -549,7 +616,7 @@ describe('a compile that can\'t hold the whole messages narrows pins', () => {
     });
   });
 
-  it('an error from a narrowed select leaves the refused select\'s frontier and preview', async (t) => {
+  it('an error from a narrowed select leaves the refused select\'s frontier and transition status', async (t) => {
     await withDir(async (dir) => {
       warnings(t);
       const { cm, strategy, marks } = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 30_000 });
@@ -560,6 +627,7 @@ describe('a compile that can\'t hold the whole messages narrows pins', () => {
       strategy.failNarrowedAfterPlanning = false;
       assert.ok(!strategy.isNarrowed(marks[0]!));
       assert.strictEqual(strategy.getHotContextSettings().currentFrontierTokens, strategy.refusals[0]!.actual);
+      assert.strictEqual(strategy.getHotContextSettings().blocked, undefined, 'the refused select\'s transition status');
       await cm.close();
     });
   });
