@@ -354,9 +354,9 @@ function nextFailureStreak(
  * An L1 run's subject: the chunk's rung, by the chunk's sources (see
  * chunkRunSubject) and the rung's curve label, the stripped retry after a
  * carrier rejection being its own. Not the request's bytes: a pending
- * chunk's request carries the whole unmerged frontier as recall pairs, so
- * every other L1 that lands changes it, and those landings are the evidence
- * a run needs.
+ * chunk's request carries the unmerged frontier summaries that start before
+ * it as recall pairs, so an L1 that lands for history before it changes it,
+ * and those landings are the evidence a run needs.
  */
 function chunkRunKey(runSubject: string, curveLabel: string, stripped: boolean): string {
   return sha256Json({ runSubject, curveLabel, stripped });
