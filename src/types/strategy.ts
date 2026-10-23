@@ -2084,6 +2084,23 @@ export function getSummaryParentId(s: SummaryEntry): string | undefined {
  * how far the span folds instead, and where pins overlap at a message, one
  * bound holds it (see `level`), so a raw pin there might not keep it raw.
  *
+ * A message stored in parts (a long message that ingress splits under
+ * `adaptiveResolution`) counts as one where a pin is rendered: under adaptive
+ * resolution, an end inside one covers it from its first part to its last in
+ * the selects, the agent's view. The summarizer's prompt reads a pin by its
+ * ids, as compression does, so a raw pin keeps out of compression only the
+ * parts its ids name (a part chunked before the pin was made stays in its
+ * chunk, as before), and the message's other parts are chunked and
+ * summarized like any history. A summary whose chunk runs past the message's
+ * edge goes out beside the raw message, so some of the message is sent twice.
+ * A pin with a fixed level reads whole too: under kv-unified, as for any
+ * pinned level, compiles fail until each part of the message has the summary
+ * that level needs.
+ * When a compile can't hold the whole messages within its budget but can
+ * hold the rest with the pin narrowed to its ids, it narrows it for as long
+ * as the strategy instance runs, and warns. Nothing records the narrowing, so
+ * a store opened again reads the pin whole.
+ *
  * - `kind: 'pin'` — generic protected range (any first/last span).
  * - `kind: 'document'` — typically a single message containing a body of
  *   information the agent wants to keep; semantically identical to a
@@ -2120,7 +2137,7 @@ export interface ProtectedRange {
    * conflict, and every compile fails until one does. Under
    * any other selector, and without adaptive resolution, the range is raw (a
    * safe superset). The canonical L1 compression prompt shows raw what the
-   * configured selector keeps raw, where its budgets allow (see
+   * configured selector keeps raw, reading pins by their ids, where its budgets allow (see
    * `compressionRecallBudgetTokens`); it doesn't hold a span at its pinned
    * level. Where pins overlap at a message, a bound takes a classic pin's
    * place there, `level` takes `maxLevel`'s, and the lowest of each kind
