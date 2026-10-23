@@ -1639,9 +1639,12 @@ export class ContextManager {
   /**
    * Pin a range of messages. A pin's bound is its `level`, or without one
    * its `maxLevel`. A raw pin, with no bound or a bound of 0, keeps the
-   * messages it names out of compression and renders them raw at their
-   * original chronological position, a message stored in parts whole, as
-   * `ProtectedRange` describes. A bound above 0 is read only under
+   * messages out of compression and renders them raw at their original
+   * chronological position, a message stored in parts whole, as
+   * `ProtectedRange` describes. A compile whose budget can't hold them beside
+   * the rest refuses with `OverBudgetError`; where the adaptive plan's middle
+   * is over the budget, its message and `diagnostics.rawPins` name each pin
+   * keeping raw tokens in that middle. A bound above 0 is read only under
    * `foldingStrategy: 'kv-stable'` and `'kv-unified'` with
    * `adaptiveResolution`: there the range is still compressed, since only a
    * summary can supply its level, and is held at `level`, or no deeper than
@@ -1668,7 +1671,7 @@ export class ContextManager {
    * it renders where one does, or raw (`ProtectedRange.level`). Honored
    * by `foldingStrategy: 'kv-stable'` and `'kv-unified'` with adaptive
    * resolution; under any other selector the range is raw, in the live view
-   * and, read by its ids, in the canonical L1 compression prompt where its budgets allow (see
+   * and in the canonical L1 compression prompt where its budgets allow (see
    * `compressionRecallBudgetTokens`). Returns the new pin id.
    */
   pinAtLevel(firstMessageId: MessageId, lastMessageId: MessageId, level: number, opts?: { name?: string }): string {
@@ -1683,13 +1686,12 @@ export class ContextManager {
    * or `maxLevel` the message is kept raw, while
    * `markDocument(id, { maxLevel })` lets it fold no deeper than that level
    * where the selector reads level bounds. Under adaptive resolution, a mark
-   * on any part of a message stored in parts renders the whole message, less
-   * a part locked with `lockChunk` that it doesn't name, as `pinRange` does:
-   * where the whole message doesn't fit, a mark that renders it raw is
-   * narrowed to the part it names. Under `kv-stable`, a mark with `level`
-   * (not `maxLevel`) holds whole each summary it reaches, so a locked part
-   * that shares a summary with a part the mark covers renders at the level
-   * the mark holds that summary at.
+   * on any part of a message stored in parts covers the whole message, less
+   * a part locked with `lockChunk` outside the span the mark's id names, as
+   * `pinRange` does.
+   * Under `kv-stable`, a mark with `level` (not `maxLevel`) holds whole each
+   * summary it reaches, so a locked part that shares a summary with a part
+   * the mark covers renders at the level the mark holds that summary at.
    * Returns the new pin id.
    */
   markDocument(messageId: MessageId, opts?: PinLevelOptions): string {

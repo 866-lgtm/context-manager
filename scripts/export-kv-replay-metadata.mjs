@@ -19,11 +19,8 @@ try {
   strategy.loadCalibration(view);
   const messages = view.getAll();
   const estimates = strategy.postStripEstimates(view);
-  // The selects' reading, as at a restart: under adaptive resolution a pin
-  // covers the whole of a message stored in parts. A narrowing a live compile
-  // made isn't stored, so this reads that pin whole too.
-  const pins = strategy.pinnedPositions(messages, strategy.selectsPinReading());
-  const bounds = strategy.pinLevelBounds(messages, strategy.selectsPinReading());
+  const pins = strategy.pinnedPositions(messages);
+  const bounds = strategy.pinLevelBounds(messages);
   const metadata = messages.map((message, index) => ({
     id: message.id, index, timestamp: message.timestamp.getTime(),
     postStripTokens: estimates[index], toolResult: strategy.hasToolResult(message),

@@ -53,7 +53,7 @@ import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
-import { Picker, OverBudgetError, UncoveredDropError, type OverBudgetClearedBy, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
+import { Picker, OverBudgetError, UncoveredDropError, type OverBudgetClearedBy, type OverBudgetDiagnostics, type OverBudgetRawPin, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { reportOverlap } from '../adaptive/kv-control.js';
@@ -2154,32 +2154,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected pins: ProtectedRange[] = [];
   /** Monotonically increasing counter for pin ids. Persisted as part of the pins snapshot. */
   protected pinIdCounter = 0;
-  /**
-   * Pins a compile narrowed (`selectNarrowingPins`), by `narrowKey`: their
-   * whole reading (`pinSpan`) covers only their own ids until the strategy
-   * loads the store again (`initialize`: an open, a branch switch, a fork or
-   * `setStrategy`, which clear it with the branch's other mirrors), a reload
-   * of the store's state mid-life (`takeUpStoreState`) excluded. Nothing
-   * records the narrowing itself, so a store loaded again reads every pin
-   * whole; what a narrowed compile sent is recorded as any compile's is. A pin
-   * unpinned and marked again is a new pin, and whole.
-   */
-  protected readonly narrowedPins = new Set<string>();
-
-  /** A pin's key in `narrowedPins`: its id, ends and creation time, which no API changes. */
-  protected narrowKey(pin: ProtectedRange): string {
-    return JSON.stringify([pin.id, pin.firstMessageId, pin.lastMessageId, pin.created]);
-  }
-
-  /**
-   * The reading the summarizer's prompt takes for pins (`pinSpan`), and so
-   * everything that describes that prompt: its pinned-raw warning and the
-   * count of queued work that predicts it (`requestCarriesToolBlocks`). By
-   * their ids: the prompt already has a marked message's other parts as
-   * summaries, and carrying them raw multiplied later compression requests'
-   * input.
-   */
-  protected static readonly PROMPT_PIN_READING = 'ids' as const;
 
   /**
    * Per-message resolution state for the adaptive-resolution picker.
@@ -2567,9 +2541,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * lock while it stands: under the greedy solvers and kv-stable, the pinned
    * message renders raw, and its locked level stays stored and returns when
    * the pin is removed. kv-unified treats a pin and a lock as constraints and
-   * reports a conflict when they are incompatible. A pin whose ids name
-   * another part of a message stored in parts doesn't cover a locked part
-   * (`pinPositions`): there the lock holds, under every solver.
+   * reports a conflict when they are incompatible. A pin on another part
+   * of a message stored in parts doesn't cover a locked part outside the span
+   * its ids name (`pinPositions`): there the lock holds, under every solver.
    * No-op when adaptiveResolution is false. Set-only programmatic API per
    * the design (no agent-facing tool in V1). Persisted to chronicle.
    */
@@ -2864,7 +2838,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.warnedQuarantineSkips.clear();
     this.pins = [];
     this.pinIdCounter = 0;
-    this.narrowedPins.clear();
     this.resolutions.clear();
     this.locked.clear();
     this._adaptivePicker = null;
@@ -3541,12 +3514,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Pin a range of messages. A pin's bound is its `level`, or without one
    * its `maxLevel` (`normalizePinLevels`). A raw pin, with no bound or a
-   * bound of 0, keeps the messages it names out of compression and renders
-   * them raw at their original position, a message stored in parts whole
-   * (`pinSpan`): where the whole messages don't fit the budget but the rest
-   * does with the pin narrowed to its ids, a compile narrows it until the
-   * strategy loads the store again (`selectNarrowingPins`). A bound above 0
-   * is read only under `foldingStrategy: 'kv-stable'` and `'kv-unified'` with
+   * bound of 0, keeps the messages out of compression and renders them raw
+   * at their original position. A compile whose budget can't hold them
+   * beside the rest refuses with `OverBudgetError`; where the adaptive plan's
+   * middle is over the budget, it names each pin keeping raw tokens in that
+   * middle (`rawPinsDiagnostics`). Under adaptive resolution, a message
+   * stored in parts counts as one: a pin whose first or last id names one of its parts
+   * covers it from its first part to its last, less a part locked with
+   * `lockChunk` outside the span its ids name, for every reader of pins
+   * (`pinPositions`). A bound above 0 is read only under
+   * `foldingStrategy: 'kv-stable'` and `'kv-unified'` with
    * `adaptiveResolution` (`readsPinBounds`): there the range is still
    * compressed, since only a summary can supply its level, and is held at
    * `level`, or no deeper than `maxLevel`, as `ProtectedRange` describes.
@@ -3578,13 +3555,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * `level` or `maxLevel` the message is kept raw, while `{ maxLevel }` lets
    * it fold no deeper than that level where the selector reads level bounds.
    * Under adaptive resolution, a mark on any part of a message stored in
-   * parts renders the whole message, less a part locked with `lockChunk`
-   * that it doesn't name (`pinPositions`), as `pinRange` does: where the
-   * whole message doesn't fit, a mark that renders it raw is narrowed to the
-   * part it names (`selectNarrowingPins`). Under `kv-stable`, a mark with
-   * `level` (not `maxLevel`) holds whole each summary it reaches, so a locked
-   * part that shares a summary with a part the mark covers renders at the
-   * level the mark holds that summary at.
+   * parts covers the whole message, as `pinRange` does (`pinPositions`).
+   * Under `kv-stable`, a mark with `level` (not `maxLevel`) holds whole each
+   * summary it reaches, so a locked part that shares a summary with a part
+   * the mark covers renders at the level the mark holds that summary at.
    */
   markDocument(messageId: string, opts?: PinLevelOptions): string {
     this.requireLoadedBranch('markDocument');
@@ -3609,8 +3583,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summary at `level` doesn't list it renders where one does, or raw
    * (`ProtectedRange.level`). Honored by `foldingStrategy: 'kv-stable'`
    * and `'kv-unified'` with adaptive resolution; under any other selector the
-   * range is raw (`resolvedPinBounds`), in the live view and, read by its
-   * ids, in the canonical L1 compression prompt where its budgets allow (see
+   * range is raw (`resolvedPinBounds`), in the live view and in the canonical
+   * L1 compression prompt where its budgets allow (see
    * `compressionRecallBudgetTokens`).
    * Equivalent to `pinRange(first, last, { level })`.
    */
@@ -3802,84 +3776,50 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * The store positions a pin covers, first and last inclusive, in one of its
-   * two readings (`ProtectedRange`):
-   * - `'ids'`: the messages from its first id to its last, a part of a
-   *   message stored in parts covering only itself. The summarizer's prompt
-   *   reads this (`PROMPT_PIN_READING`). Compression keeps out only parts raw
-   *   this way (`compressionPinnedPositions`).
-   * - `'whole'`: from the first part of the message its first id is in to the
-   *   last part of the message its last id is in. The selects read this under
-   *   adaptive resolution (`selectsPinReading`), so the whole message goes out
-   *   raw where the budget holds it. A pin narrowed in this instance
-   *   (`narrowedPins`) reads by its ids here too. A part locked with
-   *   `lockChunk` outside the pin's ids isn't covered (`pinPositions`).
-   * Undefined when either id is no longer in the store.
-   */
-  protected pinSpan(
-    pin: ProtectedRange,
-    positionOf: ReadonlyMap<MessageId, number>,
-    messages: readonly StoredMessage[],
-    reading: 'ids' | 'whole',
-  ): { lo: number; hi: number } | undefined {
-    if (reading !== 'ids' && reading !== 'whole') throw new TypeError(`pinSpan: a reading is 'ids' or 'whole', not ${String(reading)}`);
-    const first = positionOf.get(pin.firstMessageId);
-    const last = positionOf.get(pin.lastMessageId);
-    if (first === undefined || last === undefined) return undefined;
-    const lo = Math.min(first, last);
-    const hi = Math.max(first, last);
-    if (reading === 'ids' || this.narrowedPins.has(this.narrowKey(pin))) return { lo, hi };
-    return { lo: bodyBoundsIn(messages, lo).from, hi: bodyBoundsIn(messages, hi).to };
-  }
-
-  /**
-   * The store positions a pin covers in `reading`: its span (`pinSpan`),
-   * less the messages locked with `lockChunk` that only the whole reading
-   * adds. A lock is said of that part, while the whole reading is what a mark
-   * on another part implies, so the lock holds there. A pin over its own
-   * locked messages keeps the rule `lockChunk` describes. Undefined when
-   * either id is no longer in the store.
+   * The store positions a pin covers, in order. Without adaptive resolution,
+   * the messages from its first id to its last. Under adaptive resolution,
+   * the only ingress that stores a message in parts, such a message counts as
+   * one: the span runs from the first part of the message its first id is in
+   * to the last part of the message its last id is in (`bodyBoundsIn`), less
+   * a part locked with `lockChunk` outside the span its ids name. A lock is
+   * said of that part, while covering the rest of its message is what a pin
+   * on another part implies, so the lock holds there; a pin over its own
+   * locked messages keeps the rule `lockChunk` describes. Every reader of
+   * pins takes this: the selects, compression, the summarizer's prompt and
+   * the replay exporter. Undefined when either id is no longer in the store.
    */
   protected pinPositions(
     pin: ProtectedRange,
     positionOf: ReadonlyMap<MessageId, number>,
     messages: readonly StoredMessage[],
-    reading: 'ids' | 'whole',
   ): number[] | undefined {
-    const span = this.pinSpan(pin, positionOf, messages, reading);
-    if (!span) return undefined;
-    const ids = reading === 'ids' ? span : this.pinSpan(pin, positionOf, messages, 'ids')!;
+    const first = positionOf.get(pin.firstMessageId);
+    const last = positionOf.get(pin.lastMessageId);
+    if (first === undefined || last === undefined) return undefined;
+    const lo = Math.min(first, last);
+    const hi = Math.max(first, last);
+    const whole = this.config.adaptiveResolution === true;
+    const from = whole ? bodyBoundsIn(messages, lo).from : lo;
+    const to = whole ? bodyBoundsIn(messages, hi).to : hi;
     const out: number[] = [];
-    for (let i = span.lo; i <= span.hi; i++) {
-      if ((i < ids.lo || i > ids.hi) && this.locked.has(messages[i].id)) continue;
+    for (let i = from; i <= to; i++) {
+      if ((i < lo || i > hi) && this.locked.has(messages[i].id)) continue;
       out.push(i);
     }
     return out;
   }
 
   /**
-   * The reading the selects take (`pinSpan`), the agent's view, with what
-   * must agree with them (the narrowing's candidates, and what compression
-   * keeps out): `'whole'` under adaptive resolution, the only ingress that
-   * stores a message in parts, and `'ids'` otherwise, so a store written with
-   * it and opened without it reads its pins as before. The summarizer's prompt
-   * reads pins by their ids either way.
+   * Build a set of message-store positions covered by any pin
+   * (`pinPositions`). O(N pins · K range). Returns positions for which the
+   * message exists; orphan pins (deleted messages) are silently skipped.
    */
-  protected selectsPinReading(): 'ids' | 'whole' {
-    return this.config.adaptiveResolution ? 'whole' : 'ids';
-  }
-
-  /**
-   * Build a set of message-store positions covered by any pin, in `reading`
-   * (`pinSpan`). O(N pins · K range). Returns positions for which the message
-   * exists; orphan pins (deleted messages) are silently skipped.
-   */
-  protected pinnedPositions(messages: StoredMessage[], reading: 'ids' | 'whole'): Set<number> {
+  protected pinnedPositions(messages: StoredMessage[]): Set<number> {
     if (this.pins.length === 0) return new Set();
     const positionOf = this.positionIndex(messages);
     const out = new Set<number>();
     for (const pin of this.pins) {
-      for (const i of this.pinPositions(pin, positionOf, messages, reading) ?? []) out.add(i);
+      for (const i of this.pinPositions(pin, positionOf, messages) ?? []) out.add(i);
     }
     return out;
   }
@@ -3894,15 +3834,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * kv-stable's reading applies: a bound there takes the place of a classic
    * pin, a fixed level takes the place of a cap, and within each kind the
    * lowest wins (`pinLevelBounds`). A level or cap of 0 is raw
-   * (`isRawPinBound`). Pins are read in `reading` (`pinSpan`): the summarizer's
-   * prompt by their ids, the selects as whole messages, and compression keeps
-   * out what both keep raw.
+   * (`isRawPinBound`).
    */
-  protected resolvedPinBounds(messages: StoredMessage[], reading: 'ids' | 'whole'): Map<number, ResolvedPinBound> {
+  protected resolvedPinBounds(messages: StoredMessage[]): Map<number, ResolvedPinBound> {
     const out = new Map<number, ResolvedPinBound>();
-    const pinned = this.pinnedPositions(messages, reading);
+    const pinned = this.pinnedPositions(messages);
     if (pinned.size === 0) return out;
-    const bounds = this.readsPinBounds() ? this.pinLevelBounds(messages, reading) : undefined;
+    const bounds = this.readsPinBounds() ? this.pinLevelBounds(messages) : undefined;
     for (const position of pinned) {
       const bound = bounds?.get(position);
       if (bound?.level !== undefined) out.set(position, { level: bound.level });
@@ -3926,10 +3864,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return 'level' in bound ? bound.level === 0 : bound.maxLevel === 0;
   }
 
-  /** Positions of the messages that pins keep raw, in `reading` (`resolvedPinBounds`). */
-  protected forceRawPinPositions(messages: StoredMessage[], reading: 'ids' | 'whole'): Set<number> {
+  /** Positions of the messages that pins keep raw (`resolvedPinBounds`). */
+  protected forceRawPinPositions(messages: StoredMessage[]): Set<number> {
     const out = new Set<number>();
-    for (const [position, bound] of this.resolvedPinBounds(messages, reading)) {
+    for (const [position, bound] of this.resolvedPinBounds(messages)) {
       if (AutobiographicalStrategy.isRawPinBound(bound)) out.add(position);
     }
     return out;
@@ -3939,18 +3877,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * The V2 dynamic-pin fold-depth bounds (`ProtectedRange.level` /
    * `maxLevel`) by message position. Only pins that carry a bound appear; a
    * classic raw pin (no bound) is absent here and handled by `pinnedPositions`.
-   * Where bounded pins overlap, the lowest fixed level and the lowest cap are
-   * kept; `resolvedPinBounds` decides between them and a classic pin. Pins
-   * are read in `reading` (`pinSpan`).
+   * A pin covers what `pinPositions` says. Where bounded pins overlap, the
+   * lowest fixed level and the lowest cap are kept; `resolvedPinBounds`
+   * decides between them and a classic pin.
    */
-  protected pinLevelBounds(messages: StoredMessage[], reading: 'ids' | 'whole'): Map<number, { level?: number; maxLevel?: number }> {
+  protected pinLevelBounds(messages: StoredMessage[]): Map<number, { level?: number; maxLevel?: number }> {
     const out = new Map<number, { level?: number; maxLevel?: number }>();
     if (this.pins.length === 0) return out;
     const positionOf = this.positionIndex(messages);
 
     for (const pin of this.pins) {
       if (pin.level === undefined && pin.maxLevel === undefined) continue;
-      for (const i of this.pinPositions(pin, positionOf, messages, reading) ?? []) {
+      for (const i of this.pinPositions(pin, positionOf, messages) ?? []) {
         const prev = out.get(i) ?? {};
         // A fixed level is the strongest constraint; when two pins fix the same
         // position, the shallower (lower) level wins (finest requirement).
@@ -8042,169 +7980,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private selectPath(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
-    const cacheKeys = this._prevCacheKeys;
-    try {
-      return this.selectOnce(store, budget, opts);
-    } catch (err) {
-      if (!(err instanceof OverBudgetError)) throw err;
-      return this.selectNarrowingPins(store, budget, opts, err, cacheKeys);
-    }
-  }
-
-  /**
-   * Answers a select refused over budget (`refusal`) where the whole messages
-   * pins cover may be what doesn't fit: a mark on a long message's first part
-   * keeps the whole message raw (`pinSpan`), which can be more than the
-   * budget holds beside the rest. Pins are narrowed to their own ids one at a
-   * time, the one that frees the most first (`freedByNarrowing`), and the
-   * select runs again after each. Compression reads pins by their ids, so the
-   * parts a narrowing frees are chunked and summarized like any history, and
-   * the narrowed select can send their summaries.
-   * - A refusal whose middle holds nothing, as when the head and recent
-   *   windows alone are over the budget, stands as it was: nothing is
-   *   narrowed and no select runs again.
-   * - Where the selects read pins by their ids, as without adaptive
-   *   resolution, no pin covers more than its ids, so the refusal stands
-   *   without that look.
-   * - When a select goes ahead, the pins narrowed so far stay narrowed until
-   *   the strategy loads the store again (`narrowedPins`), and a warning
-   *   names each. Nothing records them, so a store loaded again reads every
-   *   pin whole: with a larger budget it sends the whole message, and one
-   *   that still doesn't fit narrows again at its first refused compile.
-   * - A provisional calibration multiplier above 1 that puts the whole
-   *   reading over is dropped first (`selectOnce`), as for any refusal, so a
-   *   guess the first sample replaces doesn't narrow a pin.
-   * - When no pin is left to narrow, the pins go back to whole messages and
-   *   the first refusal is thrown, with its preview and the frontier it
-   *   planned (`getHotContextSettings`).
-   * - A dry compile narrows for its own select only: it puts the pins back
-   *   and warns nothing.
-   */
-  private selectNarrowingPins(
-    store: MessageStoreView,
-    budget: TokenBudget,
-    opts: SelectOptions | undefined,
-    refusal: OverBudgetError,
-    cacheKeys: string[] | undefined,
-  ): ContextEntry[] {
-    if (this.selectsPinReading() === 'ids' || !(refusal.diagnostics.middleTokens > 0)) throw refusal;
-    // What the refused select recorded for observers, which a narrowed
-    // attempt overwrites and a refusal that stands puts back.
-    const preview = this._lastPreview;
-    const frontier = this.lastFrontierTokens;
-    const blocked = this.transitionBlocked;
-    const narrowed: ProtectedRange[] = [];
-    const putBack = (): void => {
-      for (const pin of narrowed) this.narrowedPins.delete(this.narrowKey(pin));
-      this._lastPreview = preview;
-      this.lastFrontierTokens = frontier;
-      this.transitionBlocked = blocked;
-    };
-    let entries: ContextEntry[] | undefined;
-    try {
-      // The order is taken once, before the first narrowing. Narrowing a raw
-      // pin changes no other pin's reading, and what it stops covering
-      // mostly stays out of compression as it was (a position there is raw
-      // by some pin's ids, and so by that pin's whole reading too). Where a
-      // pin with a level overlaps that position, the level can take the
-      // other pin's place once this one is narrowed (`resolvedPinBounds`), so
-      // later candidates' counts can be off there; the loop doesn't take
-      // them again.
-      for (const { pin } of this.freedByNarrowing(store)) {
-        this.narrowedPins.add(this.narrowKey(pin));
-        narrowed.push(pin);
-        // A refused select can have placed its cache markers; each attempt is
-        // measured against the request before the compile, as select puts back.
-        this._prevCacheKeys = cacheKeys;
-        try {
-          entries = this.selectOnce(store, budget, opts);
-          break;
-        } catch (err) {
-          if (!(err instanceof OverBudgetError)) throw err;
-        }
-      }
-    } catch (err) {
-      putBack();
-      throw err;
-    }
-    if (!entries) {
-      putBack();
-      throw refusal;
-    }
-    if (opts?.dryRun === true) for (const pin of narrowed) this.narrowedPins.delete(this.narrowKey(pin));
-    else this.warnNarrowedPins(narrowed, refusal);
-    return entries;
-  }
-
-  /**
-   * What narrowing each raw pin would free, the most first: the raw tokens of
-   * the messages its reading as the selects take it (`selectsPinReading`)
-   * covers beyond its own ids that compression can summarize
-   * (`getCompressibleMessages`: outside the head and recent windows) and that
-   * have an L1 the select can fold them to (their chunk's summary, else
-   * `l1ByMessageIndex`, as selectAdaptive finds it), priced as the selects
-   * price them (`postStripEstimates`), less those the selects hold at a
-   * level. A part locked with `lockChunk` isn't among them: the whole reading
-   * leaves it out (`pinPositions`). Only those can go out as summaries once
-   * it's narrowed. Where the selects read bounds, a pin with a level or cap
-   * above 0 frees nothing, since its parts are held at that level: its parts
-   * already fold, and where it overlaps a raw pin, narrowing it could turn
-   * parts raw. Elsewhere every pin renders raw and can be narrowed. A pin
-   * that frees nothing, a narrowed one included, isn't listed.
-   */
-  private freedByNarrowing(store: MessageStoreView): Array<{ pin: ProtectedRange; tokens: number }> {
-    if (this.pins.length === 0) return [];
-    const messages = store.getAll();
-    const positionOf = this.positionIndex(messages);
-    const compressible = new Set(this.getCompressibleMessages(store).map((m) => m.id));
-    const summarized = new Set<MessageId>(this.l1ByMessageIndex().keys());
-    for (const chunk of this.chunks) if (chunk.summaryId !== undefined) for (const m of chunk.messages) summarized.add(m.id);
-    const reading = this.selectsPinReading();
-    // A pin keeps raw only where the selects resolve it raw: where they read
-    // bounds, a position a pin holds at a level (this one's own, if it has a
-    // level or cap) stays held, so a pin with a level or cap frees nothing
-    // there.
-    const bounds = this.resolvedPinBounds(messages, reading);
-    const prices = this.postStripEstimates(store);
-    const out: Array<{ pin: ProtectedRange; tokens: number }> = [];
-    for (const pin of this.pins) {
-      const whole = this.pinPositions(pin, positionOf, messages, reading);
-      const ids = this.pinSpan(pin, positionOf, messages, 'ids');
-      if (!whole || !ids) continue;
-      let tokens = 0;
-      for (const i of whole) {
-        const id = messages[i].id;
-        const bound = bounds.get(i);
-        const raw = bound !== undefined && AutobiographicalStrategy.isRawPinBound(bound);
-        if ((i < ids.lo || i > ids.hi) && raw && compressible.has(id) && summarized.has(id)) tokens += prices[i] ?? 0;
-      }
-      if (tokens > 0) out.push({ pin, tokens });
-    }
-    return out.sort((a, b) => b.tokens - a.tokens);
-  }
-
-  /** Warn, naming each pin `selectNarrowingPins` narrowed, of what it now covers and how to have it whole again. */
-  private warnNarrowedPins(narrowed: readonly ProtectedRange[], refusal: OverBudgetError): void {
-    for (const pin of narrowed) {
-      const what = pin.kind === 'document' ? 'document mark' : 'pin';
-      const label = pin.name !== undefined ? `"${pin.name}" (${pin.id})` : pin.id;
-      const one = pin.firstMessageId === pin.lastMessageId;
-      const covers = one
-        ? `only message ${pin.firstMessageId}, one part of a message stored in parts, not the whole message`
-        : `only messages ${pin.firstMessageId} to ${pin.lastMessageId}, not the whole of the messages stored in parts at its ends`;
-      this.diag.warn(
-        `autobio: ${what} ${label} now covers ${covers}. ${narrowed.length > 1 ? `With the ${narrowed.length} pins narrowed here covering their whole messages` : `With it covering ${one ? 'the whole message' : 'them whole'}`}, ` +
-          `the compile came to ~${refusal.actual} tokens against a hard budget of ${refusal.budget}` +
-          `${refusal.diagnostics.configuredBudget === undefined ? '' : ` (maxTokens ${refusal.diagnostics.configuredBudget})`}. Until this ` +
-          `context is loaded again, the parts it no longer covers fold like any history. Loaded again, as at a restart, the ${what} ` +
-          `covers ${one ? 'the whole message' : 'them'} again where the budget holds ${one ? 'it' : 'them'}: to have ` +
-          `${one ? 'it' : 'them'} whole, raise the budget, then restart or unpin ${pin.id} and ` +
-          `${pin.kind === 'document' ? 'mark the message' : 'pin the range'} again.`,
-      );
-    }
-  }
-
-  private selectOnce(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
     // Image stripping runs inside each select path (before stats commit / cache
     // markers), so the returned entries are already bounded — see
     // applyImageStripping.
@@ -8215,8 +7990,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // A provisional multiplier above 1 that puts the compile over budget
         // is dropped to 1 and the select runs again: with the refusal
         // standing, no inference would run, so no sample could ever correct
-        // it (#179, the startup wedge). Any other refusal stands here, for
-        // selectNarrowingPins to answer.
+        // it (#179, the startup wedge). Any other refusal stands.
         if (!(err instanceof OverBudgetError) || !this.dropProvisionalCalibration(err, opts?.dryRun === true)) throw err;
         // The retry answers for the select: a preview the discarded attempt
         // recorded mustn't stand in for a retry that refuses before recording
@@ -9434,9 +9208,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // optimization that scales catastrophically: a 4000-message import
     // converged to ~500 L1s that never aged out, blowing the 200k
     // window around chunk 118.
-    // Pins in the canonical L1 prompt, read by their ids (PROMPT_PIN_READING,
-    // forceRawPinPositions): a marked message's other parts reach the prompt
-    // as their summaries, though the selects send them raw. A
+    // Pins in the canonical L1 prompt. The live view shows a message that a
+    // pin keeps raw (forceRawPinPositions) raw, so this prompt does too. A
     // frontier summary that can't be shown as a recall pair (it covers such a
     // message, or its content is empty) is DESCENDED, not dropped: its
     // children take its place, so only the branch holding the pin opens,
@@ -9579,7 +9352,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // order, after a head-window reset or an unpin) isn't recalled at all
     // (layoutHistory), and its messages stay covered.
     const forceRawMessageIds = new Set<MessageId>();
-    for (const i of this.forceRawPinPositions(allMessages, AutobiographicalStrategy.PROMPT_PIN_READING)) {
+    for (const i of this.forceRawPinPositions(allMessages)) {
       if (i < chunkStartIdx) forceRawMessageIds.add(allMessages[i].id);
     }
     const recallBudget = sourceOnly ? 0 : (this.config.compressionRecallBudgetTokens ?? 100_000);
@@ -10094,16 +9867,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The pins that keep one of those messages raw: a pin whose own bound
       // reads as raw here, over a message the pins keep raw.
       const pinnedRawSet = new Set(pinned.pinnedRaw);
-      const forceRawPositions = this.forceRawPinPositions(allMessages, AutobiographicalStrategy.PROMPT_PIN_READING);
+      const forceRawPositions = this.forceRawPinPositions(allMessages);
       const readsBounds = this.readsPinBounds();
       const positionOf = this.positionIndex(allMessages);
       const pins = this.pins.filter((pin) => {
         const own: ResolvedPinBound = pin.level !== undefined ? { level: pin.level }
           : pin.maxLevel !== undefined ? { maxLevel: pin.maxLevel } : 'raw';
         if (readsBounds && !AutobiographicalStrategy.isRawPinBound(own)) return false;
-        const span = this.pinSpan(pin, positionOf, allMessages, AutobiographicalStrategy.PROMPT_PIN_READING);
-        if (!span) return false;
-        for (let i = span.lo; i <= span.hi; i++) {
+        for (const i of this.pinPositions(pin, positionOf, allMessages) ?? []) {
           if (pinnedRawSet.has(i) && forceRawPositions.has(i)) return true;
         }
         return false;
@@ -10115,7 +9886,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         `autobio: L1 compression of ${chunk.messages.length} message(s) from ${chunkFirstId} recalls the summaries ` +
           `its pins override: the pinned history it would show raw (~${pinned.pinnedRawTokens} tokens in ` +
           `${pinned.pinnedRaw.length} message(s); pins: ${pins.join(', ') || 'none found'}) ${limit}. ` +
-          `Narrow the pins or raise that budget to show them raw here.`,
+          `Unpin them, or narrow a range pin to fewer messages (a pin on any part of a message stored in parts covers the ` +
+          `rest of that message too), or raise that budget to show them raw here.`,
       );
       logCompressionCall({
         event: 'compression:pinned-raw-over-budget',
@@ -12991,11 +12763,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     within?: ReadonlySet<MessageId>,
   ): boolean {
     // Work frees room only where its summary folds a message the selection
-    // can fold: both selectors keep the head and recent windows raw, and a
-    // message a pin keeps raw. That's the chunker's own reading of what's
-    // compressible (getCompressibleMessages), which counts the parts a pin
-    // covers only as the selects read it: their summaries are what a
-    // narrowing sends (selectNarrowingPins).
+    // can fold now: both selectors keep the head and recent windows raw, and
+    // a message a pin keeps raw. That's the chunker's own reading of what's
+    // compressible (getCompressibleMessages).
     const foldable = new Set(
       this.getCompressibleMessages(store).map((m) => m.id).filter((id) => within === undefined || within.has(id)),
     );
@@ -13143,7 +12913,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const all = store.getAll();
     const sourceOnly = this.config.compressionSourceOnly === true;
     const position = new Map(all.map((message, i) => [message.id, i]));
-    const pins = sourceOnly ? [] : [...this.forceRawPinPositions(all, AutobiographicalStrategy.PROMPT_PIN_READING)].sort((a, b) => a - b);
+    const pins = sourceOnly ? [] : [...this.forceRawPinPositions(all)].sort((a, b) => a - b);
     // Built at the first head read, so a count that reads none (source-only,
     // or each chunk holding a tool block itself) scans no holds.
     let heads: ((pos: number) => { start: number; end: number }) | undefined;
@@ -13227,6 +12997,54 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
   }
 
+  /**
+   * The pins that keep messages raw in the adaptive plan's middle, for its
+   * refusal to name (`OverBudgetDiagnostics.rawPins`): the positions the plan
+   * folds history in (before the head, and from the head's end to the tail's
+   * start, which is the recent window's start or the head's end where the
+   * recent window reaches back into the head) that pins keep raw
+   * (`forceRawPinPositions`), each priced by `price`, the plan's own raw
+   * price. A position locked raw with `lockChunk` stays raw without its pin,
+   * so it isn't counted. Where bounds are read, a pin whose own bound isn't
+   * raw keeps nothing raw, so it isn't named even where it overlaps a raw
+   * pin; where they aren't, every pin renders raw. Undefined when no pin
+   * keeps any.
+   */
+  private rawPinsDiagnostics(store: MessageStoreView, price: (position: number) => number): OverBudgetDiagnostics['rawPins'] {
+    if (this.pins.length === 0) return undefined;
+    const messages = store.getAll();
+    const raw = this.forceRawPinPositions(messages);
+    const headStart = this.getHeadWindowStartIndex(store);
+    const headEnd = this.getHeadWindowEnd(store);
+    const tailStart = Math.max(this.getRecentWindowStart(store), headEnd);
+    const lockedRaw = (id: MessageId): boolean => this.locked.has(id) && (this.resolutions.get(id) ?? 0) === 0;
+    const kept = (i: number): boolean => raw.has(i) && (i < headStart || (i >= headEnd && i < tailStart))
+      && !lockedRaw(messages[i]!.id);
+    let tokens = 0;
+    for (const i of raw) if (kept(i)) tokens += price(i);
+    if (tokens === 0) return undefined;
+    const positionOf = this.positionIndex(messages);
+    const readsBounds = this.readsPinBounds();
+    const pins: OverBudgetRawPin[] = [];
+    for (const pin of this.pins) {
+      const bound: ResolvedPinBound = pin.level !== undefined ? { level: pin.level }
+        : pin.maxLevel !== undefined ? { maxLevel: pin.maxLevel } : 'raw';
+      if (readsBounds && !AutobiographicalStrategy.isRawPinBound(bound)) continue;
+      const at = this.pinPositions(pin, positionOf, messages);
+      if (!at) continue;
+      let own = 0;
+      for (const i of at) if (kept(i)) own += price(i);
+      if (own === 0) continue;
+      const named = Math.abs(positionOf.get(pin.lastMessageId)! - positionOf.get(pin.firstMessageId)!) + 1;
+      pins.push({
+        pinId: pin.id, kind: pin.kind, ...(pin.name === undefined ? {} : { name: pin.name }),
+        firstMessageId: pin.firstMessageId, lastMessageId: pin.lastMessageId,
+        ...(at.length > named ? { parts: at.length } : {}), tokens: own,
+      });
+    }
+    return { tokens, pins };
+  }
+
   // ============================================================================
   // Adaptive resolution (picker-driven) path
   // ============================================================================
@@ -13267,6 +13085,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // apart from the exceptions applyImageStripping's asEstimated names.
     const pse = this.postStripEstimates(store);
     if (_diag) { this.diag.error(`[cm-cache] selectAdaptive: pse ${Date.now() - _t}ms`); _t = Date.now(); }
+    // A middle message's raw price, as the plan prices it and its refusal
+    // prices the pins that keep it raw (rawPinsDiagnostics). The shard path
+    // in step 5 sends a run of a body's raw shards as one entry, their text
+    // joined and uncut, so a shard takes no extra.
+    const middlePrice = (i: number): number => {
+      const msg = messages[i]!;
+      return msg.bodyGroupId ? pse[i]! : pse[i]! + this.cappedForSend(store, msg, msgCap).extra;
+    };
 
     // ----- 1. Build head/tail sets and reserve the tail before emitting -----
     const headStart = this.getHeadWindowStartIndex(store);
@@ -13386,15 +13212,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // Each pinned position's fold bound, resolved once (resolvedPinBounds),
-    // so the picker doesn't fold what the user marked keep-raw, read as the
-    // selects read pins (selectsPinReading). A chunk carries at most one
+    // so the picker doesn't fold what the user marked keep-raw and every
+    // selector reads a pin as compression does. A chunk carries at most one
     // of `pinned` (raw: a classic pin, or a level or cap of 0), `pinLevel` or
     // `pinMaxLevel`, so every reader of `pinned` agrees on what stays raw.
     // The last two appear only under the strategies that honor them
     // (kv-stable, kv-unified), which must be able to move the chunk to or
     // within its bound; elsewhere a bounded pin resolves to `pinned`. Built
     // once and reused.
-    const pinBounds = this.resolvedPinBounds(messages, this.selectsPinReading());
+    const pinBounds = this.resolvedPinBounds(messages);
 
     // O(1) summary lookup for findAncestorAt — avoids O(summaries) find()
     // calls during emission.
@@ -13429,15 +13255,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = segStart; i < segEnd && i < messages.length; i++) {
       const msg = messages[i];
       const ch = chunkAtPosition ? chunkAtPosition[i] : chunksByMessageId.get(msg.id);
-      // This is the chunk's raw price. The shard path in step 5 sends a run
-      // of a body's raw shards as one entry, their text joined and uncut, so
-      // a shard takes no extra here. It prices that entry as the shards'
-      // text it joins, each by estimateTokens, the store's price, so a shard
-      // of text alone is counted there as here; a shard's other blocks are
-      // priced here, and the shard path leaves them out. A shard the plan
-      // folds is priced as its summary. The head and recent windows cut a
-      // shard as they emit it.
-      const tokens = msg.bodyGroupId ? pse[i] : pse[i] + this.cappedForSend(store, msg, msgCap).extra;
+      // This is the chunk's raw price (middlePrice). The shard path in step 5
+      // prices its joined entry as the shards' text it joins, each by
+      // estimateTokens, the store's price, so a shard of text alone is
+      // counted there as here; a shard's other blocks are priced here, and
+      // the shard path leaves them out. A shard the plan folds is priced as
+      // its summary. The head and recent windows cut a shard as they emit it.
+      const tokens = middlePrice(i);
       const bound = pinBounds.size > 0 ? pinBounds.get(i) : undefined;
       const l1Id = ch?.summaryId ?? l1ByMessage.get(msg.id);
       pickerChunks.push({
@@ -13810,6 +13634,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // real compile will do. If the retry at 1 is still over, it reports.
     const dryFallback = dryRun && this._calibrationProvisional !== null && this._calibration > 1;
     if (!planFits && (!dryRun || dryFallback)) {
+      // The plan's middle is what's over, priced as the plan priced it, so
+      // the pins keeping raw tokens there are named. The refusals after the
+      // plan count other things (an emitted prefix, a shard's text alone)
+      // and don't name pins.
+      const rawPins = this.rawPinsDiagnostics(store, middlePrice);
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: result.finalTokens,
@@ -13822,6 +13651,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           middleTokens: Math.max(0, result.finalTokens - headTokens - tailTokens),
           middleChunkCount: pickerChunks.length - headMessageIds.size - tailMessageIds.size,
           deepestLevel,
+          ...(rawPins === undefined ? {} : { rawPins }),
         },
       });
     }
@@ -16103,7 +15933,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const maxTokens = budget.maxTokens - budget.reserveForResponse;
     const messages = store.getAll();
     const msgCap = this.config.maxMessageTokens;
-
     // Emission grace (coverage invariant, 76e95a0): selection below still
     // TARGETS maxTokens, but emission never silently drops content to fit —
     // it may overshoot up to the grace window, and beyond that the select
@@ -16344,7 +16173,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const positionOf = this.positionIndex(messages);
     // Without adaptive resolution no selector reads a pin's level bound, so
     // every pinned position resolves to raw (resolvedPinBounds).
-    const pinnedPositionsSet = this.forceRawPinPositions(messages, this.selectsPinReading());
+    const pinnedPositionsSet = this.forceRawPinPositions(messages);
     // Pinned messages between head and recent (head/recent pinned ones
     // already emit raw via Phase 0 / Phase 4).
     const pinnedInMiddle: { msg: StoredMessage; position: number }[] = [];
@@ -17126,33 +16955,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // ============================================================================
 
   /**
-   * The positions compression leaves out for pins: raw both by the pins' ids
-   * and as the selects read them (`forceRawPinPositions`, `'ids'` and
-   * `selectsPinReading`). A part a pin's ids name that another pin's whole
-   * reading holds at a level isn't one, since the selects need its summary,
-   * and a part a pin covers only as the selects read it isn't either: its
-   * summary is what a narrowing sends. No chunk made while a position is in
-   * this set takes it (a chunk recorded before keeps its messages), so what
-   * relies on that reads it.
-   */
-  protected compressionPinnedPositions(messages: StoredMessage[]): Set<number> {
-    // Where the selects read pins by their ids too, the two sets are one.
-    if (this.selectsPinReading() === 'ids') return this.forceRawPinPositions(messages, 'ids');
-    const rawAsSelected = this.forceRawPinPositions(messages, this.selectsPinReading());
-    const out = new Set<number>();
-    for (const i of this.forceRawPinPositions(messages, 'ids')) if (rawAsSelected.has(i)) out.add(i);
-    return out;
-  }
-
-  /**
    * Get messages in the compressible zone: outside both head window and
    * recent window AND not kept raw by a pin. Returns messages from
    * [0, headStart) ∪ [headEnd, recentStart) minus any position a pin or
-   * document mark keeps raw both by its ids and as the selects read it
-   * (compressionPinnedPositions): of a message stored in parts, only the
-   * parts a pin's ids name stay out, though the selects send the whole
-   * message raw, and a part another pin's whole reading holds at a level
-   * comes in for its summary. A pin with a positive
+   * document mark keeps raw (forceRawPinPositions). A pin with a positive
    * level or cap is compressible where bounds are read (kv-stable and
    * kv-unified, with adaptive resolution: readsPinBounds): it renders at a
    * level, which only a summary can supply.
@@ -17162,7 +16968,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     const recentStart = this.getRecentWindowStart(store);
-    const pinned = this.compressionPinnedPositions(messages);
+    const pinned = this.forceRawPinPositions(messages);
     const out: StoredMessage[] = [];
     for (let i = 0; i < recentStart; i++) {
       if (i >= headStart && i < headEnd) continue;

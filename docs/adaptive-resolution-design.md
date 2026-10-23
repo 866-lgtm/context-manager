@@ -374,14 +374,13 @@ This case should be rare in practice with unbounded L_n: the picker can almost a
 > **refuses the turn** (`UncoveredDropError`) — pressure never ships silent
 > loss. The philosophy stands: surface the overage, let the host decide.
 >
-> *(Pins on messages stored in parts)* A pin or document mark covers the
-> whole of a message stored in parts in the selects. Where that is what
-> doesn't fit, a refusal is answered first by narrowing a pin that renders
-> the message raw to the parts its ids name (`selectNarrowingPins`), and the
-> select runs again: the
-> narrowing lasts until the store is loaded again, and a host-log warning
-> names the pin. When no narrowing lets the compile through, the refusal is
-> thrown as above.
+> *(Raw pins)* The refusal of a plan whose middle is over the budget names
+> each pin that keeps raw tokens there (`OverBudgetDiagnostics.rawPins`), with
+> the tokens it keeps. Under adaptive resolution a pin on part of a message
+> stored in parts covers the whole message, so a mark on a long message can
+> be what doesn't fit: whoever manages the pins can unpin it, which lets
+> compression fold it, or whoever sets the budget can raise it, where the
+> model's window allows.
 
 ### 3.11 Recent-window slide
 
