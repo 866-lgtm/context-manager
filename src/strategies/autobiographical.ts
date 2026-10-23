@@ -3581,9 +3581,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * parts renders the whole message, less a part locked with `lockChunk`
    * that it doesn't name (`pinPositions`), as `pinRange` does: where the
    * whole message doesn't fit, a mark that renders it raw is narrowed to the
-   * part it names (`selectNarrowingPins`). Under `kv-stable`, a mark with a
-   * level holds whole each summary it reaches, so a locked part that shares a
-   * summary with a part the mark covers takes the mark's level.
+   * part it names (`selectNarrowingPins`). Under `kv-stable`, a mark with
+   * `level` (not `maxLevel`) holds whole each summary it reaches, so a locked
+   * part that shares a summary with a part the mark covers renders at the
+   * level the mark holds that summary at.
    */
   markDocument(messageId: string, opts?: PinLevelOptions): string {
     this.requireLoadedBranch('markDocument');
