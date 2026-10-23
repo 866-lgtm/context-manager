@@ -2094,12 +2094,13 @@ export function getSummaryParentId(s: SummaryEntry): string | undefined {
  * summarized like any history. A summary whose chunk runs past the message's
  * edge goes out beside the raw message, so some of the message is sent twice.
  * A pin with a fixed level reads whole too: under kv-unified, as for any
- * pinned level, compiles fail until each part of the message has the summary
- * that level needs.
+ * pinned level, compiles fail until each part of the message in the middle
+ * (outside the head and recent windows) has the summary that level needs.
  * When a compile can't hold the whole messages within its budget but can
- * hold the rest with the pin narrowed to its ids, it narrows it for as long
- * as the strategy instance runs, and warns. Nothing records the narrowing, so
- * a store opened again reads the pin whole.
+ * hold the rest with the pin narrowed to its ids, it narrows it until the
+ * strategy loads the store again (an open, a branch switch or a fork), and
+ * warns. Nothing records the narrowing, so a store loaded again reads the
+ * pin whole.
  *
  * - `kind: 'pin'` — generic protected range (any first/last span).
  * - `kind: 'document'` — typically a single message containing a body of

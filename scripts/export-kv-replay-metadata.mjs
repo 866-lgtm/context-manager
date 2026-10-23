@@ -19,8 +19,10 @@ try {
   strategy.loadCalibration(view);
   const messages = view.getAll();
   const estimates = strategy.postStripEstimates(view);
-  const pins = strategy.pinnedPositions(messages);
-  const bounds = strategy.pinLevelBounds(messages);
+  // The live selector's reading: under adaptive resolution a pin covers the
+  // whole of a message stored in parts.
+  const pins = strategy.pinnedPositions(messages, strategy.selectsPinReading());
+  const bounds = strategy.pinLevelBounds(messages, strategy.selectsPinReading());
   const metadata = messages.map((message, index) => ({
     id: message.id, index, timestamp: message.timestamp.getTime(),
     postStripTokens: estimates[index], toolResult: strategy.hasToolResult(message),

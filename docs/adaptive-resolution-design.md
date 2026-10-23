@@ -373,6 +373,14 @@ This case should be rare in practice with unbounded L_n: the picker can almost a
 > pressure, but any such eviction that would silently lose content instead
 > **refuses the turn** (`UncoveredDropError`) — pressure never ships silent
 > loss. The philosophy stands: surface the overage, let the host decide.
+>
+> *(Pins on messages stored in parts)* A pin or document mark covers the
+> whole of a message stored in parts in the selects. Where that is what
+> doesn't fit, a refusal is answered first by narrowing the pin to the parts
+> its ids name (`selectNarrowingPins`), and the select runs again: the
+> narrowing lasts until the store is loaded again, and a host-log warning
+> names the pin. When no narrowing lets the compile through, the refusal is
+> thrown as above.
 
 ### 3.11 Recent-window slide
 

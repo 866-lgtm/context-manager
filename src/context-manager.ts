@@ -1684,7 +1684,8 @@ export class ContextManager {
    * `markDocument(id, { maxLevel })` lets it fold no deeper than that level
    * where the selector reads level bounds. Under adaptive resolution, a mark
    * on any part of a message stored in parts renders the whole message, as
-   * `pinRange` does.
+   * `pinRange` does, narrowed to the part it names where the whole message
+   * doesn't fit.
    * Returns the new pin id.
    */
   markDocument(messageId: MessageId, opts?: PinLevelOptions): string {
