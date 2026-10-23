@@ -32,6 +32,8 @@ import type {
   SummaryEntry,
   TimeRangeSummaryEntry,
   HotContextSettingsUpdate,
+  RequestIdentity,
+  ThinkingBinding,
   SelectOptions,
   PreviewResult,
   HotContextSettingsStatus,
@@ -58,6 +60,11 @@ import { randomUUID } from 'node:crypto';
 import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-provenance.js';
 import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
+import {
+  UNVOUCHED, bindThinking, clearBindingRecord, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
+  refuseUnboundBinding, refuseUnreadableIdentity, registerBindingState, withoutThinking, writeBindingRecord,
+  type BindOutcome, type BindingRecord,
+} from './thinking-binding.js';
 import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
 import type { FoldQuery, FoldQueryResult, FoldReceipt, Presentation, ReceiptSource, RoundUsage } from './fold-journal.js';
 import type {
@@ -430,6 +437,7 @@ export class ContextManager {
     // so strategies always have something to scope state IDs by, even when
     // the caller didn't supply a namespace.
     const strategyNamespace = config.namespace ?? 'default';
+    registerBindingState(store, strategyNamespace);
     const messageStore = new MessageStore(store, {
       estimator: config.tokenEstimator,
       namespace: messageNamespace,
@@ -1146,6 +1154,10 @@ export class ContextManager {
    * - "afterUser": inserted after the last user message, or at the end when
    *   the messages hold none
    *
+   * With `opts.thinkingBinding.binds`, it then leaves out the thinking a
+   * model that binds thinking can no longer take, injections placed (see
+   * `SelectOptions.thinkingBinding`).
+   *
    * May block if strategy has pending work.
    */
   async compile(
@@ -1154,6 +1166,9 @@ export class ContextManager {
     opts?: SelectOptions
   ): Promise<CompileResult> {
     this.requireInitialized('compile');
+    // Before anything is selected or committed: a compile refused here leaves
+    // nothing behind.
+    if (opts?.thinkingBinding?.binds === true) refuseUnboundBinding(opts);
     this.expireCompressionHolds();
     // Don't block the agent's turn on speculative compression — let it
     // run in the background. The strategy renders whatever's available
@@ -1234,11 +1249,39 @@ export class ContextManager {
     }
 
     const finish = (result: CompileResult, injected: ContentBlock[][]): CompileResult => {
-      result.rawBodies = rawBodiesOf(attribution);
+      const rawBodies = rawBodiesOf(attribution);
+      const compileId = randomUUID();
+      const binding = opts?.thinkingBinding?.binds === true
+        ? this.bindThinkingIn(result, messageSources, opts, compileId)
+        : null;
+      result.rawBodies = rawBodies;
       if (renderStats) result.renderStats = renderStats;
-      const layout = this.renderedLayoutFor(viewMessages, entries, attribution.rawComplete, injected, selectionCause);
+      // A body sent without its thinking isn't carried whole, and the layout
+      // prices what was sent: thinking only where a stored body kept it.
+      let layoutEntries = entries;
+      let layoutInjected = injected;
+      let rawComplete = attribution.rawComplete;
+      if (binding) {
+        const without = new Set(binding.record.without);
+        if (without.size > 0) {
+          markThinkingLeftOut(messageSources, without);
+          // Keyed by each stored member of a body, as attribution keys it.
+          const complete = new Map(rawComplete);
+          for (const id of without) {
+            for (const member of rawBodies.get(id) ?? []) if (complete.has(member.id)) complete.set(member.id, false);
+          }
+          rawComplete = complete;
+        }
+        layoutEntries = entries.map((entry, e) => {
+          const source = attribution.sources[e];
+          const kept = source?.kind === 'raw' && !source.bodies.some((body) => without.has(body.messageId));
+          return kept || !entry.content.some(isThinkingBlock) ? entry : { ...entry, content: withoutThinking(entry.content) };
+        });
+        layoutInjected = injected.map((content) => (content.some(isThinkingBlock) ? withoutThinking(content) : content));
+      }
+      const layout = this.renderedLayoutFor(viewMessages, layoutEntries, rawComplete, layoutInjected, selectionCause);
       result.provenance = {
-        compileId: randomUUID(),
+        compileId,
         namespace: this.strategyNamespace,
         branch,
         messages: messageSources,
@@ -1248,6 +1291,27 @@ export class ContextManager {
         ...(layout ? { journalMark: this.foldJournal.mark() } : {}),
       };
       if (this.debugLogContext) this.logCompiledContext(result);
+      // Last, once nothing of the compile can still fail: what a committing
+      // compile leaves behind for the next one.
+      if (opts?.dryRun !== true) {
+        if (binding) {
+          // The store write is the compile's last step that can fail. The
+          // strategy's note only adjusts its calibration, so a strategy that
+          // throws there is logged and the compile stands.
+          writeBindingRecord(this.store, this.strategyNamespace, binding.record);
+          if (binding.leftOut.length > 0) {
+            try {
+              this.strategy.noteThinkingLeftOut?.(binding.leftOut);
+            } catch (err) {
+              this.diag.error('[context-manager] the strategy failed to take note of thinking left out:', describeThrown(err));
+            }
+          }
+        } else {
+          // What it sends, no record vouches for: the next binding compile
+          // starts a record, as a branch's first does.
+          clearBindingRecord(this.store, this.strategyNamespace);
+        }
+      }
       return result;
     };
 
@@ -1318,6 +1382,36 @@ export class ContextManager {
     }
 
     return finish({ messages, systemInjections }, injectedContent);
+  }
+
+  /**
+   * Leave out of `result.messages` the thinking the branch's record says a
+   * binding model can no longer take, and report it (see
+   * `SelectOptions.thinkingBinding`). Returns what a committing compile then
+   * leaves behind: the record, and the stored thinking it left out.
+   */
+  private bindThinkingIn(
+    result: CompileResult,
+    sources: readonly CompiledMessageSources[],
+    opts: SelectOptions,
+    compileId: string,
+  ): BindOutcome {
+    const record = this.readBindingRecordFor('this compile goes on as if the branch had no record');
+    const outcome = bindThinking({
+      messages: result.messages,
+      sources,
+      record,
+      dropBlock: opts.thinkingBinding?.dropBlock === true,
+      // Checked at the compile's start (refuseUnboundBinding).
+      identity: opts.identity!,
+      participant: opts.thinkingBinding!.participant!,
+      sequence: this.store.currentSequence(),
+      compileId,
+    });
+    result.messages = outcome.messages;
+    if (outcome.strip) result.thinkingStrip = outcome.strip;
+    result.thinkingRecordedAfter = outcome.record.recordedAfter;
+    return outcome;
   }
 
   /**
@@ -1556,7 +1650,8 @@ export class ContextManager {
   /**
    * What the next compile sends for each of `ids`, messages this manager has
    * just stored, rendered as the newest of the window (see
-   * `ContextStrategy.renderAsNewest`). Give each message by the id
+   * `ContextStrategy.renderAsNewest`), before any thinking the thinking
+   * binding leaves out (`SelectOptions.thinkingBinding`). Give each message by the id
    * `addMessage` returned. For a body stored as shards that's its first
    * shard's, which stands for the whole body where the compile joins its
    * shards; where the compile sends each shard on its own, an id gives back
@@ -1586,6 +1681,102 @@ export class ContextManager {
     return this.strategy.renderAsNewest(this.strategyMessageView(), ids);
   }
 
+  /**
+   * Note what a stream built from this branch's last committing compile sent
+   * after the compiled messages (see `SelectOptions.thinkingBinding`): as it
+   * sends each later round, every row its request carried so far, and once
+   * the stream has ended, those rows and its last reply. Call it on the
+   * branch that compile was on, with `compileId`, that compile's
+   * `provenance.compileId`. Each row, in order, is the id `addMessage`
+   * returned for a stored message, which stands for the whole body, or
+   * `{ unstored: true }`. `identity` is the head the stream was sent with.
+   * The branch's record then holds these rows, so at the next compile they
+   * keep their thinking while nothing up to them differs. Past the record's
+   * end nothing keeps its thinking: a reply keeps its thinking at the next
+   * compile only once a note holds it.
+   *
+   * Note only what the host can vouch it sent, or for the last reply, got
+   * back: a stored row whose copy, as `renderAsNewest` renders it and the
+   * host's request then carries it, differs from what was sent or returned
+   * is `{ unstored: true }`, and so is a row the store doesn't hold that the
+   * next request won't carry where this one did. A request-only row the
+   * host puts back in the same place at every later request needs no row,
+   * since no compile holds it. A note sent with another head than the
+   * record's leaves the record vouching for nothing until the next
+   * committing compile: the stream's earlier thinking was minted under the
+   * old head. A host that notes nothing keeps no reply's thinking past the
+   * compile after it was stored, and is never refused for it.
+   *
+   * Each stored row is digested as `renderAsNewest` renders it, so one it
+   * renders as null, or that the next compile renders otherwise, matches
+   * nothing there, and what follows goes without its thinking; a note that
+   * renders rows this way releases compression holds that have timed out, as
+   * `renderAsNewest` does.
+   * Without `renderAsNewest`, a row is its stored content, and a body stored
+   * as shards matches nothing, and so does an id the store doesn't hold, as
+   * after a removal.
+   *
+   * Returns false and writes nothing when `compileId` isn't the compile that
+   * wrote the branch's record, as for a stream whose note arrives after
+   * another committing compile: its replies were minted under a prefix the
+   * record no longer holds, and go without their thinking. So it does when
+   * the branch has no record, as after a committing compile without
+   * `thinkingBinding.binds`, or one this version can't read, which it logs.
+   * A dry compile writes no record, so it leaves a stream's notes as they
+   * were. Throws, writing nothing, for a row that isn't an id or the marker,
+   * a `compileId` that isn't a string, or a digest that isn't a string.
+   */
+  noteRequestSent(rows: ReadonlyArray<MessageId | { unstored: true }>, identity: RequestIdentity, compileId: string): boolean {
+    this.requireInitialized('noteRequestSent');
+    if (!Array.isArray(rows)) throw new TypeError(`noteRequestSent: \`rows\` must be an array, got ${typeof rows}`);
+    rows.forEach((row: unknown, i) => {
+      if (typeof row === 'string') return;
+      if (typeof row === 'object' && row !== null && (row as { unstored?: unknown }).unstored === true) return;
+      throw new TypeError(`noteRequestSent: row ${i} must be a message id or { unstored: true }, got ${JSON.stringify(row) ?? typeof row}`);
+    });
+    refuseUnreadableIdentity(identity);
+    if (typeof compileId !== 'string') {
+      throw new TypeError(
+        `noteRequestSent: \`compileId\` must be a string, the provenance.compileId of the compile the stream was built from; got ${typeof compileId}`,
+      );
+    }
+    const record = this.readBindingRecordFor('this note writes nothing, and the branch\'s next committing compile replaces it');
+    // A note is for the stream of the compile that wrote the record; after
+    // another committing compile its replies were minted under a prefix the
+    // record no longer holds.
+    if (record === null || record.compileId !== compileId) return false;
+    const view = this.mergedMessageView();
+    // An id the store doesn't hold, as after a removal, is nothing the next
+    // compile sends: it vouches for nothing, as the marker does.
+    const ids = rows.filter((row): row is MessageId => typeof row === 'string' && view.get(row) !== null);
+    const rendered = ids.length > 0 ? this.renderAsNewest(ids) : [];
+    let next = 0;
+    const continued = rows.map((row) => {
+      if (typeof row !== 'string') return UNVOUCHED;
+      const stored = view.get(row);
+      if (stored === null) return UNVOUCHED;
+      // With no renderAsNewest, a row is its stored content, which for a body
+      // stored as shards is only its first shard's.
+      const content = rendered === undefined ? (stored.bodyGroupId === undefined ? stored.content : null) : rendered[next];
+      next++;
+      return content === null || content === undefined ? UNVOUCHED : messageDigest({ participant: stored.participant, content });
+    });
+    writeBindingRecord(this.store, this.strategyNamespace, continueRecord(record, continued, identity));
+    return true;
+  }
+
+  /** The branch's binding record; one this version can't read is logged, with what follows from it, and read as none. */
+  private readBindingRecordFor(consequence: string): BindingRecord | null {
+    const { record, malformed } = readBindingRecord(this.store, this.strategyNamespace);
+    if (malformed) {
+      this.diag.warn(
+        `[context-manager] the thinking-binding record of branch ${this.store.currentBranch().name} isn't ` +
+        `one this version reads; ${consequence}`,
+      );
+    }
+    return record;
+  }
+
   /** Read the active strategy's allowlisted live settings, if supported. */
   getHotContextSettings(): HotContextSettingsStatus | null {
     this.requireInitialized('getHotContextSettings');
@@ -1606,11 +1797,14 @@ export class ContextManager {
    * Non-committing preview of the layout at a hypothetical budget and/or
    * settings. Commits nothing — see `AutobiographicalStrategy.previewContext`.
    * Returns null when the active strategy has no fold plan to preview.
+   * `opts.thinkingBinding` previews a compile with that option: a binding
+   * one prices a summary's carriers as such a compile renders them (see
+   * `SelectOptions.thinkingBinding`); without it, as configured.
    */
   previewContext(
     budget: TokenBudget,
     overrides?: Record<string, unknown>,
-    opts?: { render?: boolean },
+    opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
   ): PreviewResult | null {
     this.requireInitialized('previewContext');
     const s = this.strategy as unknown as {
@@ -1619,7 +1813,7 @@ export class ContextManager {
         log: ReturnType<ContextLog['createView']>,
         budget: TokenBudget,
         overrides?: Record<string, unknown>,
-        opts?: { render?: boolean },
+        opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
       ) => PreviewResult;
     };
     if (typeof s.previewContext !== 'function') return null;
