@@ -1,8 +1,9 @@
 /**
  * The head a compression or merge request gives as context is the head in force when the history it summarizes
  * happened: before the live head's start, the head starting at the latest topic transition at or before the
- * request's first message, or the opening; from the live head's start on, the live head; cut at that message (#317). After resetHeadWindow, a request for history from before the reset gave the
- * new topic's opening ahead of it, where the code places the chronicle's opening and keeps later events out.
+ * request's first message, or the opening; from the live head's start on, the live head; cut at that message
+ * (#317). After resetHeadWindow, a request for history from before the reset gave the new topic's opening ahead of
+ * it, where the code places the chronicle's opening and keeps later events out.
  */
 
 import { describe, it, after } from 'node:test';
@@ -27,6 +28,33 @@ class ProbeStrategy extends AutobiographicalStrategy {
   }
   runMerge(targetLevel: number, sourceIds: string[], ctx: StrategyContext): Promise<boolean> {
     return this.executeMerge(targetLevel as never, sourceIds, ctx);
+  }
+  /** One reader of heads for many positions, as the count of queued work holds one. */
+  heads(ctx: StrategyContext): (pos: number) => { start: number; end: number } {
+    return (this as unknown as { headsAsOf(store: unknown): (pos: number) => { start: number; end: number } })
+      .headsAsOf(ctx.messageStore);
+  }
+  /** The head rule worked out for one position alone, scanning back from it, as headAsOf computed it per call
+   *  before heads were read once per count: the oracle the shared reader is checked against. */
+  headAlone(ctx: StrategyContext, pos: number): { start: number; end: number } {
+    const store = ctx.messageStore;
+    const liveStart = this.getHeadWindowStartIndex(store);
+    const hold = this.holdBoundary(store);
+    if (pos < 0) return { start: liveStart, end: liveStart };
+    if (pos >= liveStart) return { start: liveStart, end: Math.min(this.getHeadWindowEnd(store), hold, pos) };
+    const messages = store.getAll();
+    let start = 0;
+    for (let i = pos; i > 0; i--) {
+      if (this.isTopicTransitionMessage(messages[i]!)) {
+        start = i;
+        break;
+      }
+    }
+    return { start, end: Math.min(this.headWindowEndFrom(store, messages, start), hold, pos) };
+  }
+  /** Timeline scans of holdBoundary so far. */
+  holdScans(): number {
+    return this.holdBoundaryScans;
   }
   /** The head a request gives for history from `pos` on. */
   asOf(ctx: StrategyContext, pos: number): { start: number; end: number } {
@@ -240,7 +268,7 @@ describe('the head a compression or merge request gives is the head as of the hi
     await manager.close();
   });
 
-  it('a restart reads the same heads while the live head starts at the last transition: past heads come from the store alone', async () => {
+  it("a restart reads the same heads while the live head starts at the last transition: where a past head starts comes from the store alone", async () => {
     const path = freshPath();
     const first = await build(2, { path });
     const positions = [first.at.OPEN6!, first.at.ONE5!, first.at.T1!, first.at.TWO4!];
@@ -438,8 +466,9 @@ describe('the head a compression or merge request gives is the head as of the hi
     // Seeded newest first, so the order the request gives comes from the sort by start, not from the seeding.
     for (const x of [c, b, gone, newer, older]) strategy.seed(x);
     // The newer summary's first message is removed: it starts at OPEN5, its first leaf still in the store, after
-    // the older one's OPEN3. (main's 1a, by sourceRange.first, left it out; ordering by sourceRange.first would put
-    // it first, at -1.)
+    // the older one's OPEN3. (Before this change the merge's prior recall set, section 1a of executeMerge, placed a
+    // summary by sourceRange.first, which has no place here: it left this one out. Ordering by sourceRange.first
+    // would put it first, at -1.)
     manager.removeMessage(ids[at.OPEN4!]! as never);
     manager.removeMessage(ids[at.OPEN6!]! as never);
     assert.equal(await strategy.runMerge(2, [b.id, c.id], ctx), true, 'premise: the merge runs');
@@ -631,6 +660,98 @@ describe('the head a compression or merge request gives is the head as of the hi
       assert.deepEqual(later, [], `a request for history from ${order[first]} carries, before its chunk: ${later.join(',')}`);
     }
     assert.ok(compressions >= 5 && merges >= 1, `premise: the flow compresses and merges (${compressions} compressions, ${merges} merges)`);
+    await manager.close();
+  });
+
+  it("one reader of heads gives every position the head the rule gives it alone, asked in any order, with three topics before the live head, a hold in the live head, and the live head's end overridden", async () => {
+    const { manager, strategy, ctx, at } = await build(2);
+    // Two resets more, so three transitions lie before the live head's start.
+    for (const topic of ['THREE', 'FOUR']) {
+      await manager.resetHeadWindow(`${topic} begins.`);
+      for (let i = 0; i < 4; i++) manager.addMessage(i % 2 ? 'assistant' : 'user', text(body(`${topic}${i}`)));
+    }
+    const messages = ctx.messageStore.getAll();
+    const liveStart = strategy.asOf(ctx, messages.length - 1).start;
+    const transitions = messages.flatMap((m, i) =>
+      i > 0 && i < liveStart && m.content.some((c) => c.type === 'text' && c.text.startsWith('[Topic Transition]')) ? [i] : []);
+    assert.equal(transitions.length, 3, 'premise: three transitions before the live head');
+    const positions = Array.from({ length: messages.length + 1 }, (_, i) => i - 1);
+    const orders = {
+      ascending: positions,
+      descending: [...positions].reverse(),
+      'evens, then odds': [...positions.filter((p) => p % 2 === 0), ...positions.filter((p) => p % 2 !== 0)],
+    };
+    const check = (state: string): void => {
+      for (const [name, order] of Object.entries(orders)) {
+        const reader = strategy.heads(ctx);
+        for (const p of order) assert.deepEqual(reader(p), strategy.headAlone(ctx, p), `${state}, ${name}: position ${p}`);
+      }
+    };
+    check('as built');
+    assert.deepEqual(strategy.heads(ctx)(at.ONE5!), { start: at.T1!, end: at.T1! + 3 }, "topic one's head");
+    const live = strategy as unknown as { getHeadWindowEnd(store: unknown): number };
+    live.getHeadWindowEnd = () => liveStart + 1;
+    assert.deepEqual(strategy.heads(ctx)(liveStart + 2), { start: liveStart, end: liveStart + 1 }, "premise: the override shortens the live head");
+    check("with the live head's end overridden");
+    delete (live as { getHeadWindowEnd?: unknown }).getHeadWindowEnd;
+    manager.holdCompression([messages[liveStart + 2]!.id]);
+    assert.deepEqual(strategy.heads(ctx)(liveStart + 3), { start: liveStart, end: liveStart + 2 }, 'premise: the hold cuts the live head');
+    check('with a hold in the live head');
+    await manager.close();
+  });
+
+  it('one count reads the holds once and walks a head once for the chunks that share it, however many it reads', async () => {
+    const { manager, strategy, ctx, at } = await build(2, { openingTool: true });
+    const ids = ctx.messageStore.getAll().map((m) => m.id);
+    manager.holdCompression([ids[at.TWO5!]!]);
+    const walker = strategy as unknown as { headWindowEndFrom(...args: unknown[]): number };
+    const walk = walker.headWindowEndFrom.bind(strategy);
+    let walks = 0;
+    walker.headWindowEndFrom = (...args: unknown[]): number => {
+      walks++;
+      return walk(...args);
+    };
+    const scans = strategy.holdScans();
+    const reader = strategy.toolBlockReader(ctx);
+    const chunks = [chunkOf(ctx, at.OPEN4!, at.OPEN5!), chunkOf(ctx, at.OPEN6!, at.OPEN7!), chunkOf(ctx, at.OPEN8!, at.OPEN9!)];
+    assert.deepEqual(chunks.map((c) => reader(c)), [true, true, true], "premise: the opening's head carries its tool cycle into each chunk's request");
+    assert.equal(strategy.holdScans() - scans, 1, 'one scan of the holds');
+    assert.equal(walks, 1, "one walk of the opening's head");
+    const before = strategy.holdScans();
+    const own = strategy.toolBlockReader(ctx);
+    assert.equal(own(chunkOf(ctx, at.OPEN1!, at.OPEN3!)), true, 'premise: a chunk holding a tool block answers from its own messages');
+    assert.equal(strategy.holdScans(), before, 'so its count reads no head and scans no holds');
+    await manager.close();
+  });
+
+  it("one count's reader keys its memo by the pins before a chunk too: a pin that opens a summary over a tool cycle changes the answer at the same head start", async () => {
+    const { manager, strategy, ctx, at } = await build(0, { openingTool: true });
+    const ids = ctx.messageStore.getAll().map((m) => m.id);
+    // The opening's tool cycle (OPEN1, OPEN2) is covered by an L1, and a pin on OPEN3 opens that L1's messages.
+    strategy.seed(summary('L1-921', [ids[at.OPEN1!]!, ids[at.OPEN2!]!, ids[at.OPEN3!]!]));
+    manager.pinRange(ids[at.OPEN3!]! as never, ids[at.OPEN3!]! as never);
+    const before = chunkOf(ctx, at.OPEN0!, at.OPEN1!);
+    const after = chunkOf(ctx, at.OPEN6!, at.OPEN8!);
+    assert.equal(strategy.asOf(ctx, at.OPEN0!).start, strategy.asOf(ctx, at.OPEN6!).start, 'premise: both chunks have the same head start');
+    const reader = strategy.toolBlockReader(ctx);
+    assert.equal(reader(before), false, 'before the pin, the L1 covers the cycle');
+    assert.equal(reader(after), true, 'after it, the pin opens the L1 and its cycle is carried raw');
+    await manager.close();
+  });
+
+  it('under a recall budget for one pair, a compression request keeps the newer summary when the older one has its first message removed', async () => {
+    const { manager, strategy, ctx, captured, at } = await build(0);
+    const ids = ctx.messageStore.getAll().map((m) => m.id);
+    const older = summary('L1-931', [ids[at.OPEN3!]!, ids[at.OPEN4!]!]);
+    const newer = summary('L1-932', [ids[at.OPEN5!]!, ids[at.OPEN6!]!]);
+    strategy.seed(older);
+    strategy.seed(newer);
+    (strategy as unknown as { config: { compressionRecallBudgetTokens: number } }).config.compressionRecallBudgetTokens = 100;
+    manager.removeMessage(ids[at.OPEN3!]! as never);
+    await strategy.runCompress(chunkOf(ctx, at.OPEN7!, at.OPEN9!), ctx);
+    const req = captured[0]!;
+    assert.equal(countIn(req, `authored ${older.id}`) + countIn(req, `authored ${newer.id}`), 1, 'premise: the budget holds one pair');
+    assert.equal(countIn(req, `authored ${newer.id}`), 1, 'the newer summary, which starts later, is kept');
     await manager.close();
   });
 

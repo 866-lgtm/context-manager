@@ -4016,12 +4016,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Consecutive compression/merge requests share a long, append-mostly
    * prefix — head window + prior recall pairs (~60% of input on synthetic
    * workloads, ~93% on mature stores) — that previously went to the API
-   * with zero `cache_control` and was re-read cold on every call. Markers
+   * with zero `cache_control` and was re-read cold on every call. They share
+   * the head window only while they summarize one topic's history: after a
+   * head-window reset, requests for different topics' history each carry
+   * that topic's head (headAsOf). Markers
    * land at the three boundaries whose survival probability ranks highest
    * (measured optimum; `analysis/2026-08-20-cm37-cache-partition-experiments.md`
    * in the workspace root):
    *
-   *   1. end of head window        — survives everything short of identity edits
+   *   1. end of head window        — survives everything short of identity edits,
+   *                                  among requests for one topic's history
    *   2. last level>=2 recall pair — survives appends AND L1→L2 merges (a
    *      merge replaces the run at this boundary and extends it)
    *   3. last recall pair          — the append frontier
@@ -4085,7 +4089,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (frontierEnd === -1) return false; // no ladder yet — nothing stable to cache
     // A capped ladder front-evicts on every mint, so the pair seams shift and
     // writing them is waste. The head seam does not: tools, system prompt and
-    // head window precede the ladder and are the same request after request,
+    // head window precede the ladder and are the same request after request
+    // for one topic's history (headAsOf gives each topic its own head),
     // unless image shedding (one byte budget, spent newest-first) replaces a
     // head image for one payload and not for the next.
     let placed = false;
@@ -9220,9 +9225,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // starts before the chunk and reaches past it (a sparse sweep
       // artifact, issue #42) is still recalled, since the messages it covers
       // before the chunk have no other form here; so its later part, what it
-      // says of history after the chunk, still reaches this request, the one
-      // way later content does, and only where a summary straddles the
-      // chunk. Where a summary starts is summaryStartInStore's rule, the one
+      // says of history after the chunk, still reaches this request, and only
+      // where a summary straddles the chunk. A summary written before this
+      // rule may also carry what came after its own history, from the head or
+      // recall pairs it was written with; that stays in its text. Where a
+      // summary starts is summaryStartInStore's rule, the one
       // a merge's prior recall set uses: a summary whose first message a host
       // removed starts at its first message still there, and one with none
       // left isn't recalled. A chunk with no message left (chunkStartIdx -1)
@@ -11829,7 +11836,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //
     // No tail-after-merge: same as-of principle as L1 compression. The
     // consolidation is being formed at the moment the last source was
-    // ready, so nothing after that is visible.
+    // ready, so nothing after that is visible, except what a recalled
+    // summary's own text carries: one written before this as-of rule may
+    // say what came after its history.
     const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
 
     // Build lookup maps
@@ -12868,6 +12877,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const sourceOnly = this.config.compressionSourceOnly === true;
     const position = new Map(all.map((message, i) => [message.id, i]));
     const pins = sourceOnly ? [] : [...this.forceRawPinPositions(all)].sort((a, b) => a - b);
+    // Built at the first head read, so a count that reads none (source-only,
+    // or each chunk holding a tool block itself) scans no holds.
+    let heads: ((pos: number) => { start: number; end: number }) | undefined;
     // For each count of pins before a chunk and the start its head's raw
     // reading takes, the index of the first message that request carries raw
     // with a tool block, or all.length for none.
@@ -12877,7 +12889,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (sourceOnly) return false;
       // The chunk's start as tick's request takes it (startInStore).
       const start = this.startInStore(chunk.messages.map((m) => m.id), position);
-      const head = this.headAsOf(store, start);
+      heads ??= this.headsAsOf(store);
+      const head = heads(start);
       const headEnd = head.end;
       const from = Math.min(head.start, headEnd);
       const pinned = pins.filter((i) => i < start);
@@ -12887,8 +12900,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const pinnedIds = new Set(pinned.map((i) => all[i].id));
         const seen = this.recallCoverage(pinnedIds);
         // Before `from`, the request carries only what pins keep raw: an L1 a
-        // pin opens, and a pinned message (which lies before headEnd, since
-        // from is at most headEnd).
+        // pin opens, and a pinned message. (Either lies before headEnd there,
+        // since from is at most headEnd.)
         const carried = (message: StoredMessage, i: number): boolean =>
           !seen.coveredMessageIds.has(message.id)
           && (i >= from || seen.openedMessageIds.has(message.id) || pinnedIds.has(message.id));
@@ -18193,35 +18206,74 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the original instance saw it" and keeps later events out.
    *
    * Three things it is, by choice:
-   * - Before the live head's start it reads the store alone, as a restart
-   *   does. A strategy-level resetHeadWindow to a message that isn't a
-   *   transition isn't in the store: history before that message gets the
-   *   latest transition before it, or the opening, as after a restart. History
-   *   from that message on gets the live head, which a restart moves to the
-   *   last transition in the store. So a restart gives the same heads while
-   *   the live head starts at the last transition, as it does when every
-   *   transition is written by ContextManager.resetHeadWindow, which resets
-   *   the head to it.
+   * - Before the live head's start, where a head starts comes from the store
+   *   alone, as a restart reads it. A strategy-level resetHeadWindow to a
+   *   message that isn't a transition isn't in the store: history before that
+   *   message gets the latest transition before it, or the opening, as after a
+   *   restart. History from that message on gets the live head, which a
+   *   restart moves to the last transition in the store. So a restart gives
+   *   the same heads while the live head starts at the last transition in the
+   *   store.
    * - A past head is priced with today's headWindowTokens and calibration, as
-   *   the live head is, not with those in force when it was the head.
+   *   the live head is, and the ratchet guard (anchorHeadToCoverage) extends
+   *   it by today's chunk ownership, not by those in force when it was the
+   *   head.
    * - Before the live head's start, any Context Manager message whose text
    *   starts with "[Topic Transition]" starts a head, as the restart reads
    *   one, whether or not resetHeadWindow wrote it.
    */
   protected headAsOf(store: MessageStoreView, pos: number): { start: number; end: number } {
+    return this.headsAsOf(store)(pos);
+  }
+
+  /**
+   * headAsOf for many positions in one store state, such as each queued chunk
+   * a count of queued work reads (requestCarriesToolBlocks): the live head's
+   * start, the holds and the live head's end are read once, the transitions
+   * before the live head's start once when a position before it is asked
+   * for, and each past head's end once per start. Tick's requests (through
+   * headAsOf) and the count both read heads here, so a subclass that changes
+   * heads overrides this.
+   */
+  protected headsAsOf(store: MessageStoreView): (pos: number) => { start: number; end: number } {
     const liveStart = this.getHeadWindowStartIndex(store);
     const hold = this.holdBoundary(store);
-    if (pos < 0) return { start: liveStart, end: liveStart };
-    if (pos >= liveStart) return { start: liveStart, end: Math.min(this.getHeadWindowEnd(store), hold, pos) };
-    const messages = store.getAll();
-    let start = 0;
-    for (let i = pos; i > 0; i--) {
-      if (this.isTopicTransitionMessage(messages[i])) {
-        start = i;
-        break;
+    let liveEnd: number | undefined;
+    let messages: StoredMessage[] | undefined;
+    let transitions: number[] | undefined;
+    const pastEnds = new Map<number, number>();
+    return (pos) => {
+      if (pos < 0) return { start: liveStart, end: liveStart };
+      if (pos >= liveStart) {
+        liveEnd ??= this.getHeadWindowEnd(store);
+        return { start: liveStart, end: Math.min(liveEnd, hold, pos) };
       }
-    }
-    return { start, end: Math.min(this.headWindowEndFrom(store, messages, start), hold, pos) };
+      messages ??= store.getAll();
+      if (!transitions) {
+        const found: number[] = [];
+        for (let i = 1; i < liveStart && i < messages.length; i++) {
+          if (this.isTopicTransitionMessage(messages[i])) found.push(i);
+        }
+        transitions = found;
+      }
+      // The latest transition at or before pos, or the opening.
+      let start = 0;
+      for (let lo = 0, hi = transitions.length - 1; lo <= hi;) {
+        const mid = (lo + hi) >> 1;
+        if (transitions[mid]! <= pos) {
+          start = transitions[mid]!;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      let end = pastEnds.get(start);
+      if (end === undefined) {
+        end = this.headWindowEndFrom(store, messages, start);
+        pastEnds.set(start, end);
+      }
+      return { start, end: Math.min(end, hold, pos) };
+    };
   }
 
   /**
