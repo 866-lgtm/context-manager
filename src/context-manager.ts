@@ -1186,6 +1186,8 @@ export class ContextManager {
       opts
     );
     const selectionCause = this.strategy.takeSelectionCause?.();
+    // Read now, before anything else selects: these are this select's own.
+    const renderStats = isRenderStatsCapable(this.strategy) ? this.strategy.getLastSelectStats?.() ?? null : null;
     if (_diag) this.diag.error(`[cm-cache] compile: select ${Date.now() - _t0}ms (${entries.length} entries)`);
 
     const viewMessages = view.getAll();
@@ -1233,6 +1235,7 @@ export class ContextManager {
 
     const finish = (result: CompileResult, injected: ContentBlock[][]): CompileResult => {
       result.rawBodies = rawBodiesOf(attribution);
+      if (renderStats) result.renderStats = renderStats;
       const layout = this.renderedLayoutFor(viewMessages, entries, attribution.rawComplete, injected, selectionCause);
       result.provenance = {
         compileId: randomUUID(),
@@ -1761,7 +1764,9 @@ export class ContextManager {
    * counts, plus per-level summary counts and total tokens. Returns null
    * if the strategy doesn't implement `getRenderStats`, and before a live
    * compile has run since the strategy loaded its branch (opening the store,
-   * `setStrategy()`, a branch switch): a dry run or preview records none.
+   * `setStrategy()`, a branch switch). A dry run or preview leaves it as it
+   * was; a compile's own stats, a dry one's included, are its result's
+   * `renderStats`.
    *
    * Designed for TUIs / dashboards that want to display "how much of the
    * agent's context is folded vs raw" at a glance.
