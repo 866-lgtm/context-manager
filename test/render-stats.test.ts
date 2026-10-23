@@ -149,6 +149,10 @@ describe('getRenderStats — inspect, not reconstruct', () => {
     const dry = await manager.compile(budget, undefined, { dryRun: true });
     assert.strictEqual(manager.getRenderStats(), null, 'a dry run records no stats');
     assert.strictEqual(dry.renderStats?.total.messages, dry.messages.length, 'the dry result carries its own on this path too');
+    // Injections are merged in after the select, so its stats leave them out.
+    const injected = await manager.compile(budget, [{ namespace: 'probe', position: 'afterUser', content: text('an injected note') }], { dryRun: true });
+    assert.ok(injected.messages.length > dry.messages.length, 'the request holds the injection');
+    assert.strictEqual(injected.renderStats?.total.messages, dry.messages.length, 'a compile with injections carries stats that leave it out');
     const compiled = await manager.compile(budget);
     const rs = manager.getRenderStats();
     assert.ok(rs, 'a live compile records its stats');
