@@ -855,6 +855,71 @@ export interface CompressionQuarantineStatus {
   unreadable?: true;
 }
 
+/** Why a load's repair dropped a summary that held text (LoadRepairReport). */
+export type LoadRepairDropReason =
+  /**
+   * At L1, no copy or chunk record holds its sources as a list of ids;
+   * above L1, no one copy holds both its sources and its range.
+   */
+  | 'unreadable'
+  /** It names a summary the repaired state doesn't hold. */
+  | 'names-missing'
+  /** It names a summary at its own level or above. */
+  | 'names-not-below'
+  /** It names a summary it isn't the parent of. */
+  | 'names-non-child';
+
+/** One summary holding text that a load's repair dropped. */
+export interface LoadRepairDroppedSummary {
+  /** Its id as stored, as text. */
+  id: string;
+  /** Its `level` as stored; null where that isn't a number. */
+  level: number | null;
+  /** Its `tokens` as stored; null where that isn't a number. */
+  tokens: number | null;
+  reason: LoadRepairDropReason;
+  /**
+   * The messages it covered, by the range the repair held for it (the copy
+   * it chose for the summary's text, or another copy it rebuilt the summary
+   * from): the range's end ids, each with that message's stored time (ISO).
+   * A time is null where the strategy's message view doesn't give it: the
+   * store doesn't hold the message, the host's view filter leaves it out, or
+   * its time can't be read. The range is null where it isn't two message
+   * ids. An 'unreadable' drop can still have one, where what couldn't be read
+   * was its sources.
+   */
+  sourceRange: { first: string; last: string; firstAt: string | null; lastAt: string | null } | null;
+}
+
+/**
+ * What a load's repair of the summary state dropped, when it dropped a
+ * summary holding text (AutobiographicalStrategy.setLoadRepairHandler). It
+ * holds no summary text: the text dropped is read back from the store's
+ * history with `getStateJsonAt(stateId, sequenceBefore)` while `branch` is
+ * the store's current branch, since Chronicle reads a state at a sequence
+ * on the current branch only.
+ */
+export interface LoadRepairReport {
+  /** The namespace whose summary state was repaired. */
+  namespace: string;
+  /**
+   * The Chronicle branch the repair wrote on, by name. The read back at
+   * `sequenceBefore` gives the old summaries only with this branch current:
+   * on another, it gives that branch's state at that sequence.
+   */
+  branch: string;
+  /** The state the repair rewrote. */
+  stateId: string;
+  /** The branch's sequence just before the repair's write: the state there is the summaries as they were. */
+  sequenceBefore: number;
+  /** Each summary holding text that the repair dropped, in stored order. */
+  dropped: LoadRepairDroppedSummary[];
+  /** The sum of `dropped`'s tokens that are numbers. */
+  droppedTokens: number;
+  /** Empty summaries the same repair dropped, which held no text. */
+  emptyDropped: number;
+}
+
 /** One quarantined span: a chunk's messages, which stay raw while it's quarantined. */
 export interface CompressionQuarantineSpan {
   /** The span's identity: the hash of its chunk's message ids. */
