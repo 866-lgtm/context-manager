@@ -17,6 +17,9 @@ import type {
   AutobiographicalOptions,
   CompressionQuarantineStatus,
   CompressionQuarantineSpan,
+  LoadRepairReport,
+  LoadRepairDroppedSummary,
+  LoadRepairDropReason,
   SummaryLevel,
   SummaryEntry,
   ProtectedRange,
@@ -3144,6 +3147,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const emptyIds: string[] = [];
     const unreadableIds: string[] = [];
     const rebuiltIds: string[] = [];
+    // Each dropped summary that holds text, as it was when dropped, with why:
+    // what the load-repair report names (loadRepairReport).
+    const textDrops = new Map<string, { summary: SummaryEntry; reason: LoadRepairDropReason }>();
     const namesParent = (copy: SummaryEntry, pointer: unknown): boolean =>
       typeof pointer === 'string' && (copiesById.get(pointer) ?? []).some(
         (parent) => parent.level > copy.level && Array.isArray(parent.sourceIds) && parent.sourceIds.includes(copy.id),
@@ -3156,7 +3162,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // An L1's own sources, else its compressed chunk record's, else a
         // copy's. Its range is their ends, which every L1 writer sets.
         const ids = [summary.sourceIds, chunkSources.get(id), ...copies.map((copy) => copy.sourceIds)].find(isIdList);
-        if (!ids) { unreadableIds.push(id); continue; }
+        if (!ids) { unreadableIds.push(id); textDrops.set(id, { summary, reason: 'unreadable' }); continue; }
         const range = summary.sourceRange as { first?: unknown; last?: unknown } | undefined;
         if (ids !== summary.sourceIds || range?.first !== ids[0] || range?.last !== ids[ids.length - 1]) {
           summary = { ...summary, sourceIds: [...ids], sourceRange: { first: ids[0]!, last: ids[ids.length - 1]! } };
@@ -3166,7 +3172,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // Above L1 a range's ends are message ids that the sources don't
         // name, so sources and range come together from one copy.
         const donor = copies.find((copy) => isIdList(copy.sourceIds) && isReadableRange(copy.sourceRange));
-        if (!donor) { unreadableIds.push(id); continue; }
+        if (!donor) { unreadableIds.push(id); textDrops.set(id, { summary, reason: 'unreadable' }); continue; }
         summary = { ...summary, sourceIds: [...donor.sourceIds], sourceRange: { ...donor.sourceRange } };
         rebuiltIds.push(id);
       }
@@ -3195,7 +3201,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (const [id, summary] of byId) {
           if (!(summary.level > 1) || (!notBelow(summary) && summary.sourceIds.every((sourceId) => byId.has(sourceId)))) continue;
           byId.delete(id);
-          (notBelow(summary) ? misplacedIds : ancestorIds).push(id);
+          const misplaced = notBelow(summary);
+          (misplaced ? misplacedIds : ancestorIds).push(id);
+          textDrops.set(id, { summary, reason: misplaced ? 'names-not-below' : 'names-missing' });
           changed = true;
         }
       }
@@ -3263,6 +3271,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (summary.level > 1 && summary.sourceIds.some((sourceId) => parentOf.get(sourceId) !== id)) {
         byId.delete(id);
         notParentIds.push(id);
+        textDrops.set(id, { summary, reason: 'names-non-child' });
       }
     }
     dropMissingAndMisplaced();
@@ -3292,6 +3301,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const keptRebuiltIds = rebuiltIds.filter((id) => byId.has(id));
     if (malformed > 0 || dupes > 0 || droppedIds.length > 0 || keptRebuiltIds.length > 0 ||
         reparentedIds.length > 0 || clearedIds.length > 0) {
+      // Read before the write, which moves the branch's sequence past the
+      // summaries as they were. A repair that dropped only empty summaries,
+      // or none, lost no text and has no report: its line below says it all.
+      const report = textDrops.size > 0
+        ? this.loadRepairReport(this.store, [...copiesById.keys()], textDrops, emptyIds.length)
+        : undefined;
       this.store.setStateJson(this.summariesStateId, this.summaries);
       this.diag.warn(
         `[autobiographical] repaired summary state: removed ${malformed} malformed entr(ies) and deduped ${dupes}; ` +
@@ -3302,6 +3317,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `[${keptRebuiltIds.join(', ')}]; set the parent of [${reparentedIds.join(', ')}]; cleared ` +
           `the parent pointers of [${clearedIds.join(', ')}], which named no kept parent`,
       );
+      if (report) this.deliverLoadRepair(report);
     }
 
     // An invalid L1 may also be referenced by a persisted chunk record. Make
@@ -5122,6 +5138,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** When tick last swept ladder progress (sweepCompressionProgressIfDue). */
   private compressionProgressSweptAt = 0;
   private onQuarantineAlarm?: (status: CompressionQuarantineStatus) => void;
+  /** Where a load-repair report goes (setLoadRepairHandler); unset, reports are held. */
+  private onLoadRepair?: (report: LoadRepairReport) => unknown;
+  /** Load-repair reports not yet handed to a handler, oldest first: in memory only. */
+  private heldLoadRepairs: LoadRepairReport[] = [];
+  /** The newest load-repair report this instance has made (getLatestLoadRepairReport). */
+  private latestLoadRepair: LoadRepairReport | null = null;
 
   /**
    * Host wiring point: the framework maps this to its ops-alert channel
@@ -5142,6 +5164,140 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   setQuarantineAlarmHandler(fn: (status: CompressionQuarantineStatus) => void): void {
     this.onQuarantineAlarm = fn;
+  }
+
+  /**
+   * Host wiring point for telling whoever keeps the agent that a load's
+   * repair of the summary state dropped summaries holding text: memory that
+   * changed, which the repair's diagnostic line alone doesn't reach anyone
+   * with (context-manager#175). A load (loadPersistedState) runs at each
+   * initialization (an open, a branch switch, a fork, setStrategy) and at
+   * each take-up of what another instance on the store wrote. A repair that
+   * drops only empty summaries, or none, loses no text and makes no report.
+   *
+   * A host that sets this after the store's open, as one that wires its
+   * handlers once the manager is open does, has missed that load, so reports
+   * made while none is set are held, in memory only, and setting a handler
+   * hands it each of them at once, oldest first. A report made while one is
+   * set goes to it once its load's synchronous run has ended: a microtask
+   * later, or, for a load a handler runs itself, when that handler returns.
+   * So a handler that calls back into the manager, such as to switch
+   * branches, never meets a load partway. It can meet an operation that ran
+   * the load and is still going, as any caller between that operation's
+   * steps can: an initialization, which keeps the manager's operations
+   * fenced until it has finished, or a compression that took up the store's
+   * state (takeUpStoreState). Each strategy instance holds its own. A throw
+   * from `fn`, or a rejection of what it returns (a promise or any
+   * thenable), is logged, and stops neither the load nor the next report.
+   * The report isn't handed over again, and the getter gives it until a
+   * newer one.
+   */
+  setLoadRepairHandler(fn: (report: LoadRepairReport) => unknown): void {
+    this.onLoadRepair = fn;
+    this.handHeldLoadRepairs();
+  }
+
+  /**
+   * The newest load-repair report this instance has made, whether held or
+   * handed on, for a health surface to show; null until a load it ran makes
+   * one (setLoadRepairHandler). A load that drops summaries holding text
+   * makes none only where the store's branch or sequence can't be read,
+   * which is logged.
+   */
+  getLatestLoadRepairReport(): LoadRepairReport | null {
+    return this.latestLoadRepair;
+  }
+
+  /**
+   * A load-repair report, queued for the handler: one already set takes it
+   * a microtask later, once the load's synchronous run has ended, and one
+   * set later takes it when it's set (setLoadRepairHandler).
+   */
+  private deliverLoadRepair(report: LoadRepairReport): void {
+    this.latestLoadRepair = report;
+    this.heldLoadRepairs.push(report);
+    if (this.onLoadRepair) queueMicrotask(() => this.handHeldLoadRepairs());
+  }
+
+  /**
+   * Each queued report to the handler set when it's taken, oldest first,
+   * those queued meanwhile included.
+   */
+  private handHeldLoadRepairs(): void {
+    while (this.onLoadRepair && this.heldLoadRepairs.length > 0) {
+      this.handLoadRepair(this.onLoadRepair, this.heldLoadRepairs.shift()!);
+    }
+  }
+
+  private handLoadRepair(fn: (report: LoadRepairReport) => unknown, report: LoadRepairReport): void {
+    const failed = (error: unknown): void => this.diag.warn(
+      `[autobiographical] the load-repair handler failed on the report for ${report.stateId} on branch ${report.branch} at sequence ${report.sequenceBefore}:`, error,
+    );
+    try {
+      // Promise.resolve adopts a promise from another realm or a library's
+      // thenable as well as this realm's, and passes anything else through.
+      Promise.resolve(fn(report)).catch(failed);
+    } catch (error) {
+      failed(error);
+    }
+  }
+
+  /**
+   * The report of a load's repair that dropped summaries holding text
+   * (LoadRepairReport), read before the repair writes: `drops` in the order
+   * of `ids`, the summary ids as stored. Undefined where the store's branch
+   * or sequence can't be read, which is logged: the repair goes ahead either
+   * way. A range end whose time can't be read has a null time.
+   */
+  private loadRepairReport(
+    store: JsStore,
+    ids: readonly string[],
+    drops: ReadonlyMap<string, { summary: SummaryEntry; reason: LoadRepairDropReason }>,
+    emptyDropped: number,
+  ): LoadRepairReport | undefined {
+    try {
+      const messages = this.hostContext?.messageStore;
+      // A view that throws, or an invalid Date's toISOString, gives null.
+      const storedAt = (id: string): string | null => {
+        try {
+          return messages?.get(id)?.timestamp.toISOString() ?? null;
+        } catch {
+          return null;
+        }
+      };
+      // Loaded state is untyped: a number field that isn't one is null. (The
+      // store holds JSON, which refuses NaN and the infinities.)
+      const numberOrNull = (value: unknown): number | null => typeof value === 'number' ? value : null;
+      const dropped: LoadRepairDroppedSummary[] = [];
+      for (const id of ids) {
+        const drop = drops.get(id);
+        if (!drop) continue;
+        const { summary, reason } = drop;
+        // The range the repair held for it: its chosen copy's, or another
+        // copy's where the repair rebuilt it from one. A summary whose
+        // sources can't be read can still hold a readable range.
+        const range = isReadableRange(summary.sourceRange) ? summary.sourceRange : null;
+        dropped.push({
+          id: String(id),
+          level: numberOrNull(summary.level),
+          tokens: numberOrNull(summary.tokens),
+          reason,
+          sourceRange: range && { first: range.first, last: range.last, firstAt: storedAt(range.first), lastAt: storedAt(range.last) },
+        });
+      }
+      return {
+        namespace: this.ns,
+        branch: store.currentBranch().name,
+        stateId: this.summariesStateId,
+        sequenceBefore: store.currentSequence(),
+        dropped,
+        droppedTokens: dropped.reduce((sum, d) => sum + (d.tokens ?? 0), 0),
+        emptyDropped,
+      };
+    } catch (error) {
+      this.diag.warn('[autobiographical] a load\'s repair drops summaries holding text, and its report couldn\'t be read:', error);
+      return undefined;
+    }
   }
 
   /**
