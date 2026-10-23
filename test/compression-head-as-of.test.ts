@@ -84,7 +84,7 @@ class ProbeStrategy extends AutobiographicalStrategy {
 
 /** Lets every merge through the topology check, so a merge whose source messages a host removed reaches its
  *  request and executeMerge's own start rule is what these tests pin. The real check may refuse such a merge (a
- *  merge whose first source message was removed returned false in Effie-2289's P5): these tests don't show that
+ *  merge whose first source message was removed returned false in a review's probe): these tests don't show that
  *  production reaches it. */
 class PlacingTopologyStrategy extends ProbeStrategy {
   protected override mergeTopologyProblem(): string | null {
@@ -615,7 +615,7 @@ describe('the head a compression or merge request gives is the head as of the hi
   });
 
   it('with merges on, through two resets, no compression request carries anything from at or after its chunk', async () => {
-    // From a review: Effie-2289's P8, the two-reset flow with merges on, run through ContextManager as a host does.
+    // From a review: the two-reset flow with merges on, run through ContextManager as a host does.
     const MARKER = 'You will soon form a new memory';
     const NAME = /\b(OPEN\d|ONE\d|TWO\d|TOPIC_ONE|TOPIC_TWO)\b/g;
     const namesIn = (t: string): string[] => [...new Set([...t.replace(/\\n/g, ' ').matchAll(NAME)].map((m) => m[1]!))];
