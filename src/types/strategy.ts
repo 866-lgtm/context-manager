@@ -2087,7 +2087,8 @@ export function getSummaryParentId(s: SummaryEntry): string | undefined {
  * A message stored in parts (a long message that ingress splits under
  * `adaptiveResolution`) counts as one where a pin is rendered: under adaptive
  * resolution, an end inside one covers it from its first part to its last in
- * the selects, the agent's view. The summarizer's prompt reads a pin by its
+ * the selects, the agent's view, less a part locked with `lockChunk` that the
+ * pin's ids don't name, where the lock holds. The summarizer's prompt reads a pin by its
  * ids, as compression does, so a raw pin keeps out of compression only the
  * parts its ids name (a part chunked before the pin was made stays in its
  * chunk, as before), and the message's other parts are chunked and

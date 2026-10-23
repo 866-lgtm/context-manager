@@ -112,6 +112,10 @@ class PinStore extends AutobiographicalStrategy {
       record.compressed = false;
     }
   }
+  /** The stored resolution of a message (0 is raw). */
+  resolutionOf(id: string): number {
+    return this.resolutions.get(id) ?? 0;
+  }
   /** The id a pin's range starts at. */
   firstIdOf(pinId: string): string {
     return this.pinById(pinId).firstMessageId;
@@ -511,15 +515,36 @@ describe('a compile that can\'t hold the whole messages narrows pins', () => {
     });
   });
 
-  it('a mark over parts locked at a fold is narrowed: narrowed, they return to their locked level', async (t) => {
+  for (const kind of ['adaptive', 'kv-unified'] as const) {
+    it(`${kind}: a part locked at a fold keeps its lock, so a mark on another part sends the request it sent before`, async (t) => {
+      await withDir(async (dir) => {
+        const out = warnings(t);
+        const { cm, strategy, marks, before } = await upgradedStore(dir, { kind, bodies: [['Bdoc', 6000]], budget: 30_000 });
+        // The earlier version's compile folded the message's later parts; lock them there.
+        const parts = partsOf(cm, strategy.firstIdOf(marks[0]!));
+        for (const id of parts.slice(1)) strategy.lockChunk(id);
+        assert.ok(parts.slice(1).every((id) => strategy.resolutionOf(id) > 0), 'locked at a fold');
+        assert.deepStrictEqual(sent(await cm.compile(budget(30_000))), before);
+        assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(60_000))), 'Bdoc'), rawWords(before, 'Bdoc'));
+        assert.ok(!strategy.isNarrowed(marks[0]!));
+        assert.deepStrictEqual(narrowingWarnings(out), []);
+        await cm.close();
+      });
+    });
+  }
+
+  it('a mark over its own part locked at a fold renders it raw over the lock, as before', async () => {
     await withDir(async (dir) => {
-      warnings(t);
-      const { cm, strategy, marks, before } = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 30_000 });
-      // The earlier version's compile folded the message's later parts; lock them there.
-      const parts = partsOf(cm, strategy.firstIdOf(marks[0]!));
-      for (const id of parts.slice(1)) strategy.lockChunk(id);
-      assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(30_000))), 'Bdoc'), rawWords(before, 'Bdoc'));
-      assert.ok(strategy.isNarrowed(marks[0]!));
+      const { cm, strategy } = await open(dir);
+      await history(cm);
+      const b = cm.addMessage('user', words('Bdoc', 6000));
+      await traffic(cm, 360);
+      await ready(cm);
+      await cm.compile(budget(30_000));
+      assert.ok(strategy.resolutionOf(b) > 0, 'the first part folded');
+      strategy.lockChunk(b);
+      cm.markDocument(b);
+      assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(60_000))), 'Bdoc'), allOf(6000));
       await cm.close();
     });
   });

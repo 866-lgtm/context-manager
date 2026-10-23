@@ -2567,7 +2567,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * lock while it stands: under the greedy solvers and kv-stable, the pinned
    * message renders raw, and its locked level stays stored and returns when
    * the pin is removed. kv-unified treats a pin and a lock as constraints and
-   * reports a conflict when they are incompatible.
+   * reports a conflict when they are incompatible. A pin whose ids name
+   * another part of a message stored in parts doesn't cover a locked part
+   * (`pinPositions`): there the lock holds, under every solver.
    * No-op when adaptiveResolution is false. Set-only programmatic API per
    * the design (no agent-facing tool in V1). Persisted to chronicle.
    */
@@ -3806,7 +3808,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *   last part of the message its last id is in. The selects read this under
    *   adaptive resolution (`selectsPinReading`), so the whole message goes out
    *   raw where the budget holds it. A pin narrowed in this instance
-   *   (`narrowedPins`) reads by its ids here too.
+   *   (`narrowedPins`) reads by its ids here too. A part locked with
+   *   `lockChunk` outside the pin's ids isn't covered (`pinPositions`).
    * Undefined when either id is no longer in the store.
    */
   protected pinSpan(
@@ -3823,6 +3826,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const hi = Math.max(first, last);
     if (reading === 'ids' || this.narrowedPins.has(this.narrowKey(pin))) return { lo, hi };
     return { lo: bodyBoundsIn(messages, lo).from, hi: bodyBoundsIn(messages, hi).to };
+  }
+
+  /**
+   * The store positions a pin covers in `reading`: its span (`pinSpan`),
+   * less the messages locked with `lockChunk` that only the whole reading
+   * adds. A lock is said of that part, while the whole reading is what a mark
+   * on another part implies, so the lock holds there. A pin over its own
+   * locked messages keeps the rule `lockChunk` describes. Undefined when
+   * either id is no longer in the store.
+   */
+  protected pinPositions(
+    pin: ProtectedRange,
+    positionOf: ReadonlyMap<MessageId, number>,
+    messages: readonly StoredMessage[],
+    reading: 'ids' | 'whole',
+  ): number[] | undefined {
+    const span = this.pinSpan(pin, positionOf, messages, reading);
+    if (!span) return undefined;
+    const ids = reading === 'ids' ? span : this.pinSpan(pin, positionOf, messages, 'ids')!;
+    const out: number[] = [];
+    for (let i = span.lo; i <= span.hi; i++) {
+      if ((i < ids.lo || i > ids.hi) && this.locked.has(messages[i].id)) continue;
+      out.push(i);
+    }
+    return out;
   }
 
   /**
@@ -3847,9 +3875,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const positionOf = this.positionIndex(messages);
     const out = new Set<number>();
     for (const pin of this.pins) {
-      const span = this.pinSpan(pin, positionOf, messages, reading);
-      if (!span) continue;
-      for (let i = span.lo; i <= span.hi; i++) out.add(i);
+      for (const i of this.pinPositions(pin, positionOf, messages, reading) ?? []) out.add(i);
     }
     return out;
   }
@@ -3920,9 +3946,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     for (const pin of this.pins) {
       if (pin.level === undefined && pin.maxLevel === undefined) continue;
-      const span = this.pinSpan(pin, positionOf, messages, reading);
-      if (!span) continue;
-      for (let i = span.lo; i <= span.hi; i++) {
+      for (const i of this.pinPositions(pin, positionOf, messages, reading) ?? []) {
         const prev = out.get(i) ?? {};
         // A fixed level is the strongest constraint; when two pins fix the same
         // position, the shallower (lower) level wins (finest requirement).
@@ -8112,11 +8136,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * have an L1 the select can fold them to (their chunk's summary, else
    * `l1ByMessageIndex`, as selectAdaptive finds it), priced as the selects
    * price them (`postStripEstimates`), less those the selects hold at a
-   * level, and those locked raw: a pin renders a locked message raw over its
-   * lock (`lockChunk`), and narrowed, the message returns to its locked
-   * level, which frees something only where that level is a fold. Only those
-   * can go out as summaries once it's narrowed. Where the selects read bounds, a pin with a level or cap above
-   * 0 frees nothing, since its parts are held at that level: its parts
+   * level. A part locked with `lockChunk` isn't among them: the whole reading
+   * leaves it out (`pinPositions`). Only those can go out as summaries once
+   * it's narrowed. Where the selects read bounds, a pin with a level or cap
+   * above 0 frees nothing, since its parts are held at that level: its parts
    * already fold, and where it overlaps a raw pin, narrowing it could turn
    * parts raw. Elsewhere every pin renders raw and can be narrowed. A pin
    * that frees nothing, a narrowed one included, isn't listed.
@@ -8132,20 +8155,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // A pin keeps raw only where the selects resolve it raw: where they read
     // bounds, a position a pin holds at a level (this one's own, if it has a
     // level or cap) stays held, so a pin with a level or cap frees nothing
-    // there. A message locked raw stays raw narrowed too.
+    // there.
     const bounds = this.resolvedPinBounds(messages, reading);
     const prices = this.postStripEstimates(store);
     const out: Array<{ pin: ProtectedRange; tokens: number }> = [];
     for (const pin of this.pins) {
-      const whole = this.pinSpan(pin, positionOf, messages, reading);
+      const whole = this.pinPositions(pin, positionOf, messages, reading);
       const ids = this.pinSpan(pin, positionOf, messages, 'ids');
       if (!whole || !ids) continue;
       let tokens = 0;
-      for (let i = whole.lo; i <= whole.hi; i++) {
+      for (const i of whole) {
         const id = messages[i].id;
         const bound = bounds.get(i);
-        const lockedRaw = this.locked.has(id) && (this.resolutions.get(id) ?? 0) === 0;
-        const raw = bound !== undefined && AutobiographicalStrategy.isRawPinBound(bound) && !lockedRaw;
+        const raw = bound !== undefined && AutobiographicalStrategy.isRawPinBound(bound);
         if ((i < ids.lo || i > ids.hi) && raw && compressible.has(id) && summarized.has(id)) tokens += prices[i] ?? 0;
       }
       if (tokens > 0) out.push({ pin, tokens });
