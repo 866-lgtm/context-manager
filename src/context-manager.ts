@@ -1274,7 +1274,8 @@ export class ContextManager {
         }
         // Each entry keeps the thinking the compile sent of it: an entry the
         // compile splits (a bundled tool cycle) is bound part by part, so one
-        // part can keep what another leaves out.
+        // part can keep what another leaves out. The record's `without` is
+        // per body, so from the next compile such a body goes without whole.
         const sent = thinkingSent(result.messages);
         layoutEntries = entries.map((entry) => {
           const content = thinkingAsSent(entry.content, sent);

@@ -627,7 +627,11 @@ describe('thinking binding: compile', () => {
     const manager = await open();
     manager.addMessage('User', [text('U1')]);
     const c1 = await manager.compile(BIG, undefined, BIND_DROP);
-    const b1 = manager.addMessage('Claude', [thought(1), toolUse('t1'), toolResult('t1', 'zz-bundled'), thought(2), text('B1')]);
+    // The first part's thinking includes a redacted block; the second part's
+    // costs more than the first's, so the price says which part kept its own.
+    const redacted = { type: 'redacted_thinking', data: 'zz-redacted-payload==' } as ContentBlock;
+    const long = { type: 'thinking', thinking: 'zz-long '.repeat(80), signature: 'zz-sig-long-0123456789' } as ContentBlock;
+    const b1 = manager.addMessage('Claude', [thought(1), redacted, toolUse('t1'), toolResult('t1', 'zz-bundled'), long, text('B1')]);
     manager.noteRequestSent([b1], identity(), c1.provenance!.compileId);
     // Placed after the cycle's result, the injection changes what precedes
     // the second part, so its thinking goes and the first part's stays.
@@ -635,9 +639,10 @@ describe('thinking binding: compile', () => {
     const plain = await manager.compile(BIG, [late], { dryRun: true });
     const bound = await manager.compile(BIG, [late], { ...BIND_DROP, dryRun: true });
     const kept = bound.messages.flatMap((m) => m.content.filter(isThinking));
-    assert.deepEqual(kept, [thought(1)], 'setup: the first part keeps its thinking, the second goes without');
+    assert.deepEqual(kept, [thought(1), redacted], 'setup: the first part keeps its thinking, the second goes without');
     const price = (blocks: ContentBlock[]) => (manager as unknown as { messageStore: { estimateBaseTokens(c: ContentBlock[]): number } }).messageStore.estimateBaseTokens(blocks);
-    assert.equal(bound.provenance!.layout!.totalTokens, plain.provenance!.layout!.totalTokens - price([thought(2)]));
+    assert.ok(price([long]) > price([thought(1), redacted]), 'setup: the parts\u2019 thinking prices differ');
+    assert.equal(bound.provenance!.layout!.totalTokens, plain.provenance!.layout!.totalTokens - price([long]));
     await manager.close();
   });
 
@@ -1178,9 +1183,10 @@ describe('thinking binding: a summary\u2019s carriers', () => {
     assert.deepEqual(after, [full, full, full, full, full], 'outside a select, as configured, after a binding one too');
     // And after a binding select that throws, committing or dry.
     const refusing = { maxTokens: 1, reserveForResponse: 0 };
-    await manager.compile(refusing, undefined, BIND).catch(() => undefined);
+    manager.addMessage('User', [text('zz-over ' + 'w '.repeat(400))]);
+    await assert.rejects(manager.compile(refusing, undefined, BIND), 'setup: the binding compile is refused');
     assert.equal(price(strategy), full, 'after a refused binding compile');
-    await manager.compile(refusing, undefined, { ...BIND, dryRun: true }).catch(() => undefined);
+    await assert.rejects(manager.compile(refusing, undefined, { ...BIND, dryRun: true }), 'setup: the binding dry compile is refused');
     assert.equal(price(strategy), full, 'after a refused binding dry compile');
     await manager.close();
     await reference.close();

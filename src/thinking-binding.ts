@@ -46,9 +46,10 @@ export function withoutThinking(content: ContentBlock[]): ContentBlock[] {
 }
 
 /**
- * The content less the thinking blocks `messages` don't carry, raw forms
- * released as `withoutThinking` releases them; the content itself when they
- * carry all of its thinking. A block is matched by its canonical form, cache
+ * The content less the thinking blocks `sent` doesn't hold (the canonical
+ * forms `thinkingSent` takes from the compiled messages), raw forms released
+ * as `withoutThinking` releases them; the content itself when `sent` holds
+ * all of its thinking. A block is matched by its canonical form, cache
  * marker aside: a signature makes each one distinct.
  */
 export function thinkingAsSent(content: ContentBlock[], sent: ReadonlySet<string>): ContentBlock[] {
@@ -75,8 +76,9 @@ export interface BindingRecord {
    *  note came with another head than `identity`: then the record vouches
    *  for nothing until the next committing compile. */
   sent: string[];
-  /** The rows a host noted after those messages, in order: each a stored
-   *  body's digest as the strategy renders it among the newest, or
+  /** What a host noted after those messages, in order: for each stored
+   *  row, a digest of each message the compile makes of it as the strategy
+   *  renders it among the newest (a bundled tool cycle makes several), or
    *  `UNVOUCHED` for a row the next compile can't reproduce. Empty until a
    *  note. */
   continued: string[];
@@ -183,12 +185,12 @@ function isBindingRecord(value: unknown): value is BindingRecord {
  * order, so a block read back from the store (keys sorted) and the same block
  * as built compare equal, as the provider reads them. A cache breakpoint isn't
  * part of it, nor a block's own cache marker (`cache_control`,
- * `cacheControl`): the binding doesn't count them. Anthropic's docs don't
- * say so; in a run on Anthropic's API on 2026-10-23 (Haiku 5.5 with the
- * drop control, on an account that enforces the binding and on one that
- * doesn't), moving only a cache marker, onto or off a block before two
- * replies, dropped neither reply's thinking, where changing one word
- * dropped both. Other binding models weren't run for markers. 66 bits of
+ * `cacheControl`): the binding doesn't count them, as observed in a run on
+ * Anthropic's API on 2026-10-23 (Haiku 5.5 with the drop control, on an
+ * account that enforces the binding and on one that doesn't): moving only a
+ * cache marker, onto or off a block before two replies, dropped neither
+ * reply's thinking, where changing one word dropped both. Other binding
+ * models weren't run for markers. 66 bits of
  * SHA-256 are kept: a digest is only ever compared with the one recorded at
  * the same place.
  */
