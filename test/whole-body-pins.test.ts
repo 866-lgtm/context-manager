@@ -1,20 +1,20 @@
 /**
- * A pin renders whole messages: a pin or document mark whose first or last
- * id names a part of a message stored in parts covers that message from its
- * first part to its last in the selects, while the summarizer's prompt and
- * compression read it by its ids, so the message's other parts are chunked
- * and summarized like any history (`pinSpan`). A compile refused
- * over budget narrows pins back to their own ids, the one that frees the
- * most first, one at a time, until a select goes ahead, and keeps them so
- * while the strategy instance holds them; otherwise it puts them back
- * (`selectNarrowingPins`).
+ * A pin covers whole messages: under adaptive resolution, a pin or document
+ * mark whose first or last id names a part of a message stored in parts
+ * covers that message from its first part to its last, for every reader of
+ * pins, the selects, compression and the summarizer's prompt alike, as a
+ * pinRange over all its parts does where no part is locked (`pinPositions`):
+ * a part locked with `lockChunk` outside the span the pin's ids name keeps
+ * its lock. A compile that can't hold a whole message refuses, as for any
+ * pin the budget can't hold, and the adaptive plan's refusal names the pin.
  *
  * The store: six history messages, then long messages that ingress stores
  * in parts (adaptive resolution with 1,500-token chunks), then 360 messages
  * of traffic. A head window of 500 tokens and a recent window of 8,000 leave
  * the long messages in the middle. With one 6,000-word message marked, its
  * first part alone fits at 22,000 tokens and the whole message needs about
- * 38,000; the tests use 30,000 for "can't be whole" and 42,000 for "fits".
+ * 38,000; the tests use 30,000 for "can't be whole" and 42,000 or 60,000 for
+ * "fits".
  */
 
 import { describe, it } from 'node:test';
@@ -42,33 +42,13 @@ const KV_UNIFIED = {
 
 /** Reaches the strategy's pins and windows. */
 class PinStore extends AutobiographicalStrategy {
-  private pinById(pinId: string) {
-    return this.pins.find((p) => p.id === pinId)!;
-  }
-  /** Narrow a pin to its ids, or put it back, as a compile does: the request an earlier version sent. */
-  setNarrowed(pinId: string, narrowed: boolean): void {
-    if (narrowed) this.narrowedPins.add(this.narrowKey(this.pinById(pinId)));
-    else this.narrowedPins.delete(this.narrowKey(this.pinById(pinId)));
-  }
-  /** Whether a compile narrowed this pin. */
-  isNarrowed(pinId: string): boolean {
-    return this.narrowedPins.has(this.narrowKey(this.pinById(pinId)));
-  }
-  /** Read the store's state again, as this instance does when another instance on the store has written it. */
-  reload(): void {
-    this.loadPersistedState({ keepKvUnifiedPresentation: true });
-  }
-  /** The fold bound each pinned position resolves to, as every selector reads it. */
+  /** The fold bound each pinned position resolves to, as every reader of pins takes it. */
   boundsAt(messages: unknown[]): Map<number, unknown> {
-    return this.resolvedPinBounds(messages as never, 'whole');
+    return this.resolvedPinBounds(messages as never);
   }
-  /** The positions pins cover in a reading, as a caller passes it, from JavaScript too. */
-  pinnedWith(messages: unknown[], reading: unknown): Set<number> {
-    return this.pinnedPositions(messages as never, reading as never);
-  }
-  /** The level bounds pins give in a reading, as the replay exporter reads them. */
-  levelBoundsWith(messages: unknown[], reading: 'ids' | 'whole'): Map<number, { level?: number; maxLevel?: number }> {
-    return this.pinLevelBounds(messages as never, reading);
+  /** The level bounds pins give, as the replay exporter reads them. */
+  levelBounds(messages: unknown[]): Map<number, { level?: number; maxLevel?: number }> {
+    return this.pinLevelBounds(messages as never);
   }
   /** The ids of the messages in compressed chunks. */
   summarizedIds(): Set<string> {
@@ -82,73 +62,21 @@ class PinStore extends AutobiographicalStrategy {
     for (const chunk of this.chunks) for (const m of chunk.messages) out.add(m.id);
     return out;
   }
-  /** Where the head window starts, and where the recent window starts. */
-  windows(store: never): { headStart: number; recentStart: number } {
-    return { headStart: this.getHeadWindowStartIndex(store), recentStart: this.getRecentWindowStart(store) };
-  }
   /** Where the head window ends. */
   headEnd(store: never): number {
     return this.getHeadWindowEnd(store);
-  }
-  /** How many adaptive selects ran, and the refusals they threw. */
-  selects = 0;
-  refusals: OverBudgetError[] = [];
-  /** Fail a select that a narrowed pin let through, after it planned. */
-  failNarrowedAfterPlanning = false;
-  protected selectAdaptive(store: never, budget: never, opts?: never): never {
-    this.selects++;
-    let entries: never;
-    try {
-      entries = super.selectAdaptive(store, budget, opts) as never;
-    } catch (err) {
-      if (err instanceof OverBudgetError) this.refusals.push(err);
-      throw err;
-    }
-    if (this.failNarrowedAfterPlanning && this.pins.some((p) => this.narrowedPins.has(this.narrowKey(p)))) {
-      // As a narrowed select's plan can leave a transition status before a later failure.
-      (this as unknown as { transitionBlocked: string }).transitionBlocked = 'transition-pace-floor';
-      throw new Error('select failed');
-    }
-    return entries;
-  }
-  /**
-   * Leave the L1s covering these messages as the only record of their
-   * coverage, as an adopted summary can: their chunks lose the pointer to it
-   * and read as not compressed.
-   */
-  dropChunkPointers(ids: readonly string[]): void {
-    const of = new Set(ids);
-    for (const record of this.chunkRecords) {
-      if (!record.sourceIds.some((id) => of.has(id))) continue;
-      record.summaryId = undefined;
-      record.compressed = false;
-    }
   }
   /** The stored resolution of a message (0 is raw). */
   resolutionOf(id: string): number {
     return this.resolutions.get(id) ?? 0;
   }
-  /** The id a pin's range starts at. */
-  firstIdOf(pinId: string): string {
-    return this.pinById(pinId).firstMessageId;
-  }
-  /** Persist a provisional calibration multiplier, as a restart no sample has confirmed leaves one. */
-  saveProvisionalCalibration(multiplier: number): void {
-    const epoch = (AutobiographicalStrategy as unknown as { CALIBRATION_PRICING_EPOCH: number }).CALIBRATION_PRICING_EPOCH;
-    this.store!.setStateJson(this.calibrationStateId, { multiplier, at: 1, pricing: epoch, provisional: true });
-  }
-  /** Fail a select with an error that isn't a refusal while a pin is narrowed. */
-  failWhileNarrowed = false;
-  protected resolvedPinBounds(messages: never, reading: 'ids' | 'whole'): never {
-    if (this.failWhileNarrowed && this.pins.some((p) => this.narrowedPins.has(this.narrowKey(p)))) throw new Error('select failed');
-    return super.resolvedPinBounds(messages, reading) as never;
-  }
 }
 
-type Kind = 'adaptive' | 'kv-unified';
+type Kind = 'adaptive' | 'kv-stable' | 'kv-unified';
 const config = (kind: Kind, recentWindowTokens: number): AutobiographicalConfig => ({
   headWindowTokens: 500, recentWindowTokens, imageStripDepthTokens: 0, compressionModel: 'test-model',
   hierarchical: false, adaptiveResolution: true, targetChunkTokens: 1500,
+  ...(kind === 'kv-stable' ? { foldingStrategy: 'kv-stable' } : {}),
   ...(kind === 'kv-unified' ? { foldingStrategy: 'kv-unified', kvUnified: { ...KV_UNIFIED, policy: { ...KV_UNIFIED.policy } } } : {}),
 } as AutobiographicalConfig);
 
@@ -183,7 +111,10 @@ function rawWords(messages: Sent[], label: string): number[] {
     .sort((a, b) => a - b);
 }
 const allOf = (n: number): number[] => Array.from({ length: n }, (_, i) => i);
-const ready = async (cm: ContextManager) => { for (let i = 0; i < 800 && !cm.isReady(); i++) await cm.tick(); };
+const ready = async (cm: ContextManager) => {
+  for (let i = 0; i < 800 && !cm.isReady(); i++) await cm.tick();
+  assert.ok(cm.isReady(), 'compression caught up');
+};
 
 async function history(cm: ContextManager): Promise<void> {
   for (let i = 0; i < 6; i++) cm.addMessage(i % 2 ? 'assistant' : 'user', words(`hist${i}`, 200));
@@ -193,36 +124,13 @@ async function traffic(cm: ContextManager, n: number, label = 'event'): Promise<
   for (let i = 0; i < n; i++) cm.addMessage(i % 2 ? 'assistant' : 'user', words(`${label}${i}`, 200));
 }
 
-/**
- * A store as an earlier version left it: the marks on long messages covered
- * their first part only, so the rest of each was chunked and summarized, as
- * it still is. Returns the request it sent then, and the marks read whole
- * again, as the upgraded store reads them.
- */
-async function upgradedStore(dir: string, opts: { kind?: Kind; bodies: Array<[string, number, string?]>; budget: number }) {
-  const s = await open(dir, opts.kind);
-  await history(s.cm);
-  const marks: string[] = [];
-  for (const [label, n, name] of opts.bodies) {
-    const mark = s.cm.markDocument(s.cm.addMessage('user', words(label, n)), name === undefined ? undefined : { name });
-    s.strategy.setNarrowed(mark, true);
-    marks.push(mark);
-  }
-  await traffic(s.cm, 360);
-  await ready(s.cm);
-  const before = sent(await s.cm.compile(budget(opts.budget)));
-  for (const mark of marks) s.strategy.setNarrowed(mark, false);
-  return { ...s, marks, before };
-}
-
 function warnings(t: { mock: { method: (o: object, m: string, f: (...a: unknown[]) => void) => unknown } }): string[] {
   const out: string[] = [];
   t.mock.method(console, 'warn', (...args: unknown[]) => { out.push(String(args[0])); });
   return out;
 }
-const narrowingWarnings = (out: string[]) => out.filter((w) => w.includes(' now covers only '));
 
-type View = { getAll(): Array<{ id: string; bodyGroupId?: string }> };
+type View = { getAll(): Array<{ id: string; bodyGroupId?: string }>; estimateTokens(message: unknown): number };
 const viewOf = (cm: ContextManager): View => (cm as unknown as { strategyMessageView(): View }).strategyMessageView();
 /** The ids of the parts of the message `id` is in, in store order. */
 const partsOf = (cm: ContextManager, id: string): string[] => {
@@ -244,26 +152,67 @@ async function withDir(body: (dir: string) => Promise<void>): Promise<void> {
   }
 }
 
-describe('pins render whole messages', () => {
+/** A store where a long message arrives, is chunked and summarized, and then is marked, as a store an earlier version marked reads now. */
+async function markedAfterSummaries(dir: string, kind: Kind = 'adaptive') {
+  const s = await open(dir, kind);
+  await history(s.cm);
+  const b = s.cm.addMessage('user', words('Bdoc', 6000));
+  await traffic(s.cm, 360);
+  await ready(s.cm);
+  await s.cm.compile(budget(30_000));
+  const parts = partsOf(s.cm, b);
+  assert.ok(parts.slice(1).every((id) => s.strategy.summarizedIds().has(id)), 'the later parts are summarized');
+  return { ...s, b, parts };
+}
+
+/** The compile's refusal, or a failure when it compiles. */
+async function refusalOf(cm: ContextManager, maxTokens: number): Promise<OverBudgetError> {
+  try {
+    await cm.compile(budget(maxTokens));
+  } catch (err) {
+    if (err instanceof OverBudgetError) return err;
+    throw err;
+  }
+  assert.fail(`the compile at ${maxTokens} went ahead`);
+}
+
+describe('a pin covers whole messages, for every reader', () => {
   for (const kind of ['adaptive', 'kv-unified'] as const) {
-    it(`${kind}: a document mark on a long message's first part sends the whole message raw, while compression summarizes its other parts`, async () => {
-      await withDir(async (dir) => {
-        // A recent window of 20,000 holds the whole message as it arrives, so the mark is there before
-        // compression chunks any part of it.
-        const { cm, strategy } = await open(dir, kind, 20_000);
-        await history(cm);
-        const b = cm.addMessage('user', words('Bdoc', 6000));
-        assert.deepStrictEqual(partsOf(cm, b).filter((id) => strategy.chunkedIds().has(id)), [], 'no part is chunked yet');
-        cm.markDocument(b);
-        await traffic(cm, 360);
-        await ready(cm);
-        assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(60_000))), 'Bdoc'), allOf(6000));
-        const parts = partsOf(cm, b);
-        assert.ok(parts.length > 2, 'the message is stored in parts');
-        const summarized = strategy.summarizedIds();
-        assert.deepStrictEqual(parts.map((id) => summarized.has(id)), parts.map((_, i) => i > 0), 'every part but the marked one is summarized');
-        await cm.close();
-      });
+    it(`${kind}: a document mark on a long message's first part is read as a range pin over all its parts: the same request, chunks and summarizer input`, async () => {
+      const run = async (how: 'mark' | 'range') => {
+        let out: { request: string[]; raw: number[]; chunked: boolean[]; prompts: Array<[boolean, boolean]> } | undefined;
+        await withDir(async (dir) => {
+          // A recent window of 20,000 holds the whole message as it arrives, so the pin is there before
+          // compression chunks any part of it.
+          const { cm, strategy, requests } = await open(dir, kind, 20_000);
+          await history(cm);
+          const b = cm.addMessage('user', words('Bdoc', 6000));
+          const parts = partsOf(cm, b);
+          assert.ok(parts.length > 2, 'the message is stored in parts');
+          assert.deepStrictEqual(parts.filter((id) => strategy.chunkedIds().has(id)), [], 'no part is chunked yet');
+          if (how === 'mark') cm.markDocument(b);
+          else cm.pinRange(parts[0]!, parts.at(-1)!);
+          await traffic(cm, 360);
+          await ready(cm);
+          const request = sent(await cm.compile(budget(60_000)));
+          // The summarizer's requests for chunks long after the message: does each carry its first and last words raw?
+          const later = requests.filter((r) => r.includes('"event300 word0'));
+          assert.ok(later.length > 0, 'the chunk was summarized');
+          out = {
+            request: request.map(textOf), raw: rawWords(request, 'Bdoc'),
+            chunked: parts.map((id) => strategy.chunkedIds().has(id)),
+            prompts: later.map((r) => [r.includes('Bdoc word0 word1'), r.includes('word5999')]),
+          };
+          await cm.close();
+        });
+        return out!;
+      };
+      const mark = await run('mark');
+      const range = await run('range');
+      assert.deepStrictEqual(mark.raw, allOf(6000), 'the whole message goes out raw');
+      assert.deepStrictEqual(mark.chunked, mark.chunked.map(() => false), 'compression leaves every part out');
+      assert.ok(mark.prompts.every(([first, last]) => first && last), 'the summarizer\'s prompt carries the whole message raw');
+      assert.deepStrictEqual(mark, range);
     });
   }
 
@@ -278,6 +227,41 @@ describe('pins render whole messages', () => {
       await traffic(cm, 360);
       await ready(cm);
       assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(42_000))), 'Bdoc'), allOf(6000));
+      await cm.close();
+    });
+  });
+
+  it('a mark on a long message whose other parts were summarized before it, as an earlier version left one, sends the whole message where it fits', async () => {
+    await withDir(async (dir) => {
+      const { cm, b } = await markedAfterSummaries(dir);
+      assert.ok(rawWords(sent(await cm.compile(budget(30_000))), 'Bdoc').length < 6000, 'before the mark, the later parts fold');
+      cm.markDocument(b);
+      assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(42_000))), 'Bdoc'), allOf(6000));
+      await cm.close();
+    });
+  });
+
+  it('a range pin given its ends in reverse order covers the same whole message', async () => {
+    await withDir(async (dir) => {
+      const { cm, strategy } = await open(dir, 'kv-unified');
+      await history(cm);
+      const parts = partsOf(cm, cm.addMessage('user', words('Bdoc', 6000)));
+      cm.pinRange(parts[3]!, parts[1]!);
+      const all = viewOf(cm).getAll();
+      const bounds = strategy.boundsAt(all);
+      const of = new Set(parts);
+      assert.deepStrictEqual(all.flatMap((m, i) => (bounds.has(i) ? [m.id] : [])), all.filter((m) => of.has(m.id)).map((m) => m.id));
+      await cm.close();
+    });
+  });
+
+  it('a range pin over a part locked at a fold between its ids renders it raw over the lock, as before', async () => {
+    await withDir(async (dir) => {
+      const { cm, strategy, parts } = await markedAfterSummaries(dir);
+      strategy.lockChunk(parts[3]!);
+      assert.ok(strategy.resolutionOf(parts[3]!) > 0, 'locked at a fold');
+      cm.pinRange(parts[1]!, parts[5]!);
+      assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(60_000))), 'Bdoc'), allOf(6000));
       await cm.close();
     });
   });
@@ -335,77 +319,35 @@ describe('pins render whole messages', () => {
     });
   });
 
-  it('a compression request after the mark carries the marked part raw and the other parts as summaries, as main gives it', async () => {
-    await withDir(async (dir) => {
-      const { cm, requests } = await open(dir);
-      await history(cm);
-      cm.markDocument(cm.addMessage('user', words('Bdoc', 6000)));
-      await traffic(cm, 360);
-      await ready(cm);
-      // A request whose chunk holds traffic message 300, long after the marked message.
-      const later = requests.filter((r) => r.includes('"event300 word0'));
-      assert.ok(later.length > 0, 'the chunk was summarized');
-      for (const r of later) {
-        assert.ok(r.includes('Bdoc word0 word1'), 'the marked part is in the prompt raw');
-        assert.ok(!r.includes('word5999'), 'the message\'s last part is not');
-      }
-      await cm.close();
-    });
-  });
-
-  it('the summarizer\'s over-budget warning doesn\'t count a mark\'s later parts, which its prompt sends as summaries', async (t) => {
+  it('the summarizer\'s over-budget warning counts a mark\'s whole message and names the mark', async (t) => {
     await withDir(async (dir) => {
       const out = warnings(t);
-      // A head window of 3,000 holds the message's first part (about 2,070 tokens), where the mark's own
-      // id is. Read whole, its later parts would be raw history ahead of the traffic's chunks, more than
-      // the summarizer's recall budget of 2,000.
+      // A head window of 3,000 holds the message's first part (about 2,070 tokens), where the mark's own id is.
+      // Its later parts are raw history ahead of the traffic's chunks, more than the summarizer's recall budget of 2,000.
       const { cm, strategy, calls } = await open(dir, 'adaptive', 8000, { headWindowTokens: 3000, compressionRecallBudgetTokens: 2000 });
-      cm.markDocument(cm.addMessage('user', words('Bdoc', 6000)));
+      cm.markDocument(cm.addMessage('user', words('Bdoc', 6000)), { name: 'P' });
       await traffic(cm, 120);
       await ready(cm);
       assert.strictEqual(strategy.headEnd(viewOf(cm) as never), 1, 'the head holds the first part alone');
       assert.ok(calls() > 0, 'the summarizer was called');
-      assert.deepStrictEqual(out.filter((w) => w.includes('recalls the summaries its pins override')), []);
+      const over = out.filter((w) => w.includes('recalls the summaries its pins override'));
+      assert.ok(over.length > 0, 'the warning was given');
+      for (const w of over) {
+        assert.ok(w.includes('pins: P)'), w);
+        assert.ok(w.includes('Unpin them, or narrow a range pin to fewer messages (a pin on any part of a message stored in parts covers the rest of that message too, less a part locked with lockChunk outside the pin\'s ids)'), w);
+      }
       await cm.close();
     });
   });
-
-  for (const kind of ['adaptive', 'kv-unified'] as const) {
-    it(`${kind}: the summarizer's over-budget warning names the pins that keep its raw history raw, read by their ids as its prompt reads them`, async (t) => {
-      await withDir(async (dir) => {
-        const out = warnings(t);
-        // The summarizer shows a pinned message raw where a summary would cover it. Under kv-unified, Q's whole
-        // reading holds P's part at a level, so it's summarized; a recent window of 20,000 holds the message as it
-        // arrives, so both pins are there before any part is chunked. Elsewhere, a recent window of 8,000 lets the
-        // message's early parts be chunked as they arrive, before the pins.
-        const { cm } = await open(dir, kind, kind === 'kv-unified' ? 20_000 : 8000, { compressionRecallBudgetTokens: 1000 });
-        await history(cm);
-        const b = cm.addMessage('user', words('Bdoc', 6000));
-        const parts = partsOf(cm, b);
-        // P keeps the first part raw, about 2,070 tokens, over the recall budget of 1,000. Q names the sixth part:
-        // raw where no bounds are read, and at level 1 under kv-unified, where read whole it would hold the first
-        // part at that level in P's place.
-        cm.markDocument(b, { name: 'P' });
-        cm.pinRange(parts[5]!, parts[5]!, kind === 'kv-unified' ? { name: 'Q', level: 1 } : { name: 'Q' });
-        await traffic(cm, 360);
-        await ready(cm);
-        const over = out.filter((w) => w.includes('recalls the summaries its pins override'));
-        assert.ok(over.length > 0, 'the warning was given');
-        // Only P's part is the prompt's pinned raw history: Q's whole reading would reach it, its ids don't.
-        for (const w of over) assert.ok(w.includes('pins: P)'), w);
-        await cm.close();
-      });
-    });
-  }
 
   it('a store opened without adaptive resolution reads a mark by its ids, as before', async () => {
     await withDir(async (dir) => {
       const first = await open(dir);
       await history(first.cm);
       const b = first.cm.addMessage('user', words('Bdoc', 6000));
-      first.cm.markDocument(b);
       await traffic(first.cm, 360);
       await ready(first.cm);
+      first.cm.markDocument(b);
       const summarized = first.strategy.summarizedIds();
       assert.ok(partsOf(first.cm, b).slice(1).every((id) => summarized.has(id)), 'the later parts are summarized');
       await first.cm.close();
@@ -416,156 +358,28 @@ describe('pins render whole messages', () => {
   });
 });
 
-describe('a compile that can\'t hold the whole messages narrows pins', () => {
+describe('a lock holds against a pin\'s whole reading', () => {
   for (const kind of ['adaptive', 'kv-unified'] as const) {
-    it(`${kind}: an upgraded store whose mark can't be whole narrows it in memory and sends the request it sent before`, async (t) => {
+    it(`${kind}: parts locked at a fold after the part a mark names keep their lock`, async () => {
       await withDir(async (dir) => {
-        const out = warnings(t);
-        const { cm, strategy, marks, before } = await upgradedStore(dir, { kind, bodies: [['Bdoc', 6000]], budget: 30_000 });
-        assert.deepStrictEqual(rawWords(before, 'Bdoc'), allOf(763), 'before, the mark kept its first part raw');
-        assert.deepStrictEqual(sent(await cm.compile(budget(30_000))), before);
-        assert.ok(strategy.isNarrowed(marks[0]!));
-        const said = narrowingWarnings(out);
-        assert.strictEqual(said.length, 1);
-        assert.match(said[0]!, new RegExp(`^autobio: document mark ${marks[0]} now covers only message `));
-        assert.match(said[0]!, /With it covering the whole message, the compile came to ~\d+ tokens against a hard budget of 30600 \(maxTokens 30000\)\./);
-        assert.match(said[0]!, /Until this context is loaded again, the parts it no longer covers fold like any history\./);
-        assert.match(said[0]!, new RegExp(`raise the budget, then restart or unpin ${marks[0]} and mark the message again\\.`));
-        // Narrowed, it fits: the next compile sends the same and warns no more.
-        assert.deepStrictEqual(sent(await cm.compile(budget(30_000))), before);
-        assert.strictEqual(narrowingWarnings(out).length, 1);
+        const { cm, strategy, b, parts } = await markedAfterSummaries(dir, kind);
+        const later = parts.slice(1);
+        for (const id of later) strategy.lockChunk(id);
+        assert.ok(later.every((id) => strategy.resolutionOf(id) > 0), 'locked at a fold');
+        cm.markDocument(b);
+        assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(60_000))), 'Bdoc'), wordsOfPart(cm, b), 'only the part the mark names');
         await cm.close();
       });
     });
-  }
 
-  it('an upgraded store whose mark fits sends the whole message and narrows nothing', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      const { cm, strategy, marks } = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 42_000 });
-      assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(42_000))), 'Bdoc'), allOf(6000));
-      assert.ok(!strategy.isNarrowed(marks[0]!));
-      assert.deepStrictEqual(narrowingWarnings(out), []);
-      await cm.close();
-    });
-  });
-
-  it('a store opened again reads the mark whole: with room it sends the whole message, without it narrows again', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      const first = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 30_000 });
-      await first.cm.compile(budget(30_000));
-      assert.ok(first.strategy.isNarrowed(first.marks[0]!));
-      await first.cm.close();
-      const roomy = await open(dir);
-      assert.deepStrictEqual(rawWords(sent(await roomy.cm.compile(budget(42_000))), 'Bdoc'), allOf(6000));
-      assert.ok(!roomy.strategy.isNarrowed(first.marks[0]!));
-      await roomy.cm.close();
-      const tight = await open(dir);
-      assert.notDeepStrictEqual(rawWords(sent(await tight.cm.compile(budget(30_000))), 'Bdoc'), allOf(6000));
-      assert.ok(tight.strategy.isNarrowed(first.marks[0]!));
-      assert.strictEqual(narrowingWarnings(out).length, 2, 'each instance that narrows warns once');
-      await tight.cm.close();
-    });
-  });
-
-  it('a narrowing holds when this instance reads the store\'s state again', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      const { cm, strategy, marks, before } = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 30_000 });
-      await cm.compile(budget(30_000));
-      strategy.reload();
-      assert.ok(strategy.isNarrowed(marks[0]!));
-      assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(42_000))), 'Bdoc'), rawWords(before, 'Bdoc'));
-      assert.strictEqual(narrowingWarnings(out).length, 1);
-      await cm.close();
-    });
-  });
-
-  it('a narrowing ends when the strategy loads the store again: a fork narrows again, and the same strategy reopened with room sends the whole message', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      const { cm, strategy, marks } = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 30_000 });
-      await cm.compile(budget(30_000));
-      assert.ok(strategy.isNarrowed(marks[0]!));
-      await cm.fork();
-      assert.ok(!strategy.isNarrowed(marks[0]!), 'the fork loaded the store again');
-      await cm.compile(budget(30_000));
-      assert.ok(strategy.isNarrowed(marks[0]!), 'and narrowed again');
-      assert.strictEqual(narrowingWarnings(out).length, 2);
-      await cm.close();
-      const again = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane: summarizer().membrane });
-      assert.deepStrictEqual(rawWords(sent(await again.compile(budget(42_000))), 'Bdoc'), allOf(6000));
-      assert.ok(!strategy.isNarrowed(marks[0]!));
-      await again.close();
-    });
-  });
-
-  it('a later narrowing that fails, or that a dry compile makes, leaves an earlier one as it was', async (t) => {
-    await withDir(async (dir) => {
-      warnings(t);
-      const { cm, strategy, marks } = await upgradedStore(dir, { bodies: [['Bdoc', 6000], ['Cdoc', 1500]], budget: 30_000 });
-      strategy.setNarrowed(marks[0]!, true);
-      // With the first narrowed, the second fits at 25,000 only narrowed, and at 15,000 not even so.
-      let selects = strategy.selects;
-      await assert.rejects(cm.compile(budget(15_000)), OverBudgetError);
-      assert.strictEqual(strategy.selects - selects, 2, 'the refused select and one narrowing the second mark');
-      assert.ok(strategy.isNarrowed(marks[0]!), 'the first stays narrowed');
-      assert.ok(!strategy.isNarrowed(marks[1]!));
-      selects = strategy.selects;
-      assert.strictEqual(cm.previewContext(budget(25_000))!.fits, true);
-      assert.strictEqual(strategy.selects - selects, 2, 'the dry select narrowed the second mark');
-      assert.ok(strategy.isNarrowed(marks[0]!), 'the first stays narrowed');
-      assert.ok(!strategy.isNarrowed(marks[1]!));
-      await cm.close();
-    });
-  });
-
-  it('a mark whose parts\' L1s only the summaries record, with no chunk pointing to them, is narrowed as the select folds them', async (t) => {
-    await withDir(async (dir) => {
-      warnings(t);
-      const { cm, strategy, marks, before } = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 30_000 });
-      strategy.dropChunkPointers(partsOf(cm, strategy.firstIdOf(marks[0]!)));
-      assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(30_000))), 'Bdoc'), rawWords(before, 'Bdoc'));
-      assert.ok(strategy.isNarrowed(marks[0]!));
-      await cm.close();
-    });
-  });
-
-  for (const kind of ['adaptive', 'kv-unified'] as const) {
-    it(`${kind}: a part locked at a fold keeps its lock, so a mark on another part sends the request it sent before`, async (t) => {
-      await withDir(async (dir) => {
-        const out = warnings(t);
-        const { cm, strategy, marks, before } = await upgradedStore(dir, { kind, bodies: [['Bdoc', 6000]], budget: 30_000 });
-        // The earlier version's compile folded the message's later parts; lock them there.
-        const parts = partsOf(cm, strategy.firstIdOf(marks[0]!));
-        for (const id of parts.slice(1)) strategy.lockChunk(id);
-        assert.ok(parts.slice(1).every((id) => strategy.resolutionOf(id) > 0), 'locked at a fold');
-        assert.deepStrictEqual(sent(await cm.compile(budget(30_000))), before);
-        assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(60_000))), 'Bdoc'), rawWords(before, 'Bdoc'));
-        assert.ok(!strategy.isNarrowed(marks[0]!));
-        assert.deepStrictEqual(narrowingWarnings(out), []);
-        await cm.close();
-      });
-    });
-  }
-
-  for (const kind of ['adaptive', 'kv-unified'] as const) {
     it(`${kind}: parts locked at a fold before the part a mark names keep their lock`, async () => {
       await withDir(async (dir) => {
-        const { cm, strategy } = await open(dir, kind);
-        await history(cm);
-        const b = cm.addMessage('user', words('Bdoc', 6000));
-        await traffic(cm, 360);
-        await ready(cm);
-        await cm.compile(budget(30_000));
-        const parts = partsOf(cm, b);
+        const { cm, strategy, parts } = await markedAfterSummaries(dir, kind);
         const earlier = parts.slice(0, -1);
         for (const id of earlier) strategy.lockChunk(id);
         assert.ok(earlier.every((id) => strategy.resolutionOf(id) > 0), 'locked at a fold');
         cm.markDocument(parts.at(-1)!);
-        const last = wordsOfPart(cm, parts.at(-1)!);
-        assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(60_000))), 'Bdoc'), last, 'only the part the mark names');
+        assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(60_000))), 'Bdoc'), wordsOfPart(cm, parts.at(-1)!), 'only the part the mark names');
         await cm.close();
       });
     });
@@ -581,33 +395,16 @@ describe('a compile that can\'t hold the whole messages narrows pins', () => {
       cm.pinAtLevel(b, b, 1);
       const messages = viewOf(cm).getAll();
       const at = (id: string) => messages.findIndex((m) => m.id === id);
-      const bounds = strategy.levelBoundsWith(messages, 'whole');
+      const bounds = strategy.levelBounds(messages);
       assert.deepStrictEqual(parts.filter((id) => bounds.has(at(id))), parts.filter((_, i) => i !== 3));
       assert.deepStrictEqual(bounds.get(at(parts[0]!)), { level: 1 });
       await cm.close();
     });
   });
 
-  it('a reading other than ids or whole is refused, as from a JavaScript caller that leaves it out', async () => {
-    await withDir(async (dir) => {
-      const { cm, strategy } = await open(dir);
-      cm.markDocument(cm.addMessage('user', words('Bdoc', 6000)));
-      const messages = viewOf(cm).getAll();
-      assert.throws(() => strategy.pinnedWith(messages, undefined), /a reading is 'ids' or 'whole', not undefined/);
-      assert.throws(() => strategy.pinnedWith(messages, 'all'), TypeError);
-      assert.ok(strategy.pinnedWith(messages, 'whole').size > 1);
-      await cm.close();
-    });
-  });
-
   it('a mark over its own part locked at a fold renders it raw over the lock, as before', async () => {
     await withDir(async (dir) => {
-      const { cm, strategy } = await open(dir);
-      await history(cm);
-      const b = cm.addMessage('user', words('Bdoc', 6000));
-      await traffic(cm, 360);
-      await ready(cm);
-      await cm.compile(budget(30_000));
+      const { cm, strategy, b } = await markedAfterSummaries(dir);
       assert.ok(strategy.resolutionOf(b) > 0, 'the first part folded');
       strategy.lockChunk(b);
       cm.markDocument(b);
@@ -615,428 +412,326 @@ describe('a compile that can\'t hold the whole messages narrows pins', () => {
       await cm.close();
     });
   });
+});
 
-  it('an error from a narrowed select leaves the refused select\'s frontier and transition status', async (t) => {
+describe('a compile that can\'t hold a whole message refuses, naming the pins that keep raw tokens in the middle', () => {
+  for (const kind of ['adaptive', 'kv-stable', 'kv-unified'] as const) {
+    it(`${kind}: names the mark, its whole message and its tokens; unpinned, the compile goes ahead`, async () => {
+      await withDir(async (dir) => {
+        const { cm, b, parts } = await markedAfterSummaries(dir, kind);
+        const mark = cm.markDocument(b, { name: 'the spec' });
+        const refusal = await refusalOf(cm, 30_000);
+        const raw = refusal.diagnostics.rawPins!;
+        assert.deepStrictEqual(raw.pins.map(({ tokens, ...pin }) => pin), [{
+          pinId: mark, kind: 'document', name: 'the spec', firstMessageId: b, lastMessageId: b, parts: parts.length,
+        }]);
+        assert.ok(raw.tokens > 10_000 && raw.pins[0]!.tokens === raw.tokens, `the whole message's tokens: ${raw.tokens}`);
+        assert.ok(raw.tokens <= refusal.diagnostics.middleTokens, `no more than the middle holds: ${raw.tokens} of ${refusal.diagnostics.middleTokens}`);
+        assert.match(refusal.message, /exceed hard budget/, 'the phrase agent-framework matches stays');
+        assert.ok(refusal.message.endsWith(
+          `). A pin keeps ~${raw.tokens} tokens raw in the middle: document mark "the spec" (${mark}), message ${b}, ` +
+          `covering ${parts.length} stored parts of its message. Whoever manages pins can unpin it, freeing up to those tokens; ` +
+          `whoever sets the hard budget can raise it if the model's window allows.`), refusal.message);
+        assert.ok(cm.unpin(mark));
+        await cm.compile(budget(30_000));
+        await cm.close();
+      });
+    });
+  }
+
+  it('counts the parts a mark covers, less a part locked with lockChunk that it doesn\'t name', async () => {
     await withDir(async (dir) => {
-      warnings(t);
-      const { cm, strategy, marks } = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 30_000 });
-      strategy.refusals = [];
-      // The narrowed select plans, setting its own frontier, and then fails.
-      strategy.failNarrowedAfterPlanning = true;
-      await assert.rejects(cm.compile(budget(30_000)), /select failed/);
-      strategy.failNarrowedAfterPlanning = false;
-      assert.ok(!strategy.isNarrowed(marks[0]!));
-      assert.strictEqual(strategy.getHotContextSettings().currentFrontierTokens, strategy.refusals[0]!.actual);
-      assert.strictEqual(strategy.getHotContextSettings().blocked, undefined, 'the refused select\'s transition status');
+      const { cm, strategy, b, parts } = await markedAfterSummaries(dir);
+      strategy.lockChunk(parts[3]!);
+      const mark = cm.markDocument(b);
+      const refusal = await refusalOf(cm, 30_000);
+      assert.deepStrictEqual(refusal.diagnostics.rawPins!.pins.map((p) => [p.pinId, p.parts]), [[mark, parts.length - 1]]);
+      assert.match(refusal.message, new RegExp(`covering ${parts.length - 1} stored parts of its message`));
       await cm.close();
     });
   });
 
-  it('the warning names a named mark and its part, and gives the whole reading\'s refusal', async (t) => {
+  it('adaptive: prices a pinned message the cap cuts as the select sends it, cut', async () => {
     await withDir(async (dir) => {
-      const out = warnings(t);
-      const { cm, strategy, marks } = await upgradedStore(dir, { bodies: [['Bdoc', 6000, 'spec']], budget: 30_000 });
-      strategy.refusals = [];
-      await cm.compile(budget(30_000));
-      const refusal = strategy.refusals[0]!;
-      const said = narrowingWarnings(out);
-      assert.strictEqual(said.length, 1);
-      assert.ok(said[0]!.startsWith(`autobio: document mark "spec" (${marks[0]}) now covers only message ${strategy.firstIdOf(marks[0]!)}, one part of a message stored in parts, not the whole message. `), said[0]);
-      assert.ok(said[0]!.includes(`the compile came to ~${refusal.actual} tokens against a hard budget of ${refusal.budget} (maxTokens 30000).`), said[0]);
-      await cm.close();
-    });
-  });
-
-  it('a provisional calibration multiplier the whole reading is over is dropped before any narrowing, as for any refusal', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      const first = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 42_000 });
-      first.strategy.saveProvisionalCalibration(1.3);
-      await first.cm.close();
-      // At 1.3 the whole message is over 42,000 and the narrowed one isn't; at 1 the whole one fits.
-      const { cm, strategy } = await open(dir);
-      assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(42_000))), 'Bdoc'), allOf(6000));
-      assert.ok(!strategy.isNarrowed(first.marks[0]!));
-      assert.deepStrictEqual(narrowingWarnings(out), []);
-      const calibration = cm.getRenderStats()!.calibration!;
-      assert.deepStrictEqual([calibration.multiplier, calibration.reset?.discardedMultiplier], [1, 1.3]);
-      await cm.close();
-    });
-  });
-
-  it('a mark whose other parts aren\'t summarized yet frees nothing, so another mark\'s narrowing doesn\'t take it along', async (t) => {
-    await withDir(async (dir) => {
-      warnings(t);
-      const { cm, strategy } = await open(dir);
+      // A message of about 1,000 tokens, under the size at which ingress stores a message in parts, cut at 300.
+      const { cm } = await open(dir, 'adaptive', 8000, { maxMessageTokens: 300 });
       await history(cm);
-      // C's parts are summarized; B's, which arrive after, aren't, with no tick since.
-      const c = cm.markDocument(cm.addMessage('user', words('Cdoc', 3000)));
-      await traffic(cm, 120);
+      const m = cm.addMessage('user', words('Mlong', 280));
+      await traffic(cm, 360);
       await ready(cm);
-      const b = cm.markDocument(cm.addMessage('user', words('Bdoc', 6000)));
-      await traffic(cm, 60, 'later');
-      for (let max = 80_000; !strategy.isNarrowed(c) && max > 10_000; max -= 1_000) {
+      const pin = cm.pinRange(m, m);
+      let raw: NonNullable<OverBudgetError['diagnostics']['rawPins']> | undefined;
+      for (const maxTokens of [12_000, 9_000, 7_000, 5_000, 4_000, 3_000, 2_000, 1_500, 1_000, 700]) {
         try {
-          await cm.compile(budget(max));
+          await cm.compile(budget(maxTokens));
         } catch (err) {
           if (!(err instanceof OverBudgetError)) throw err;
+          raw = err.diagnostics.rawPins;
+          if (raw) break;
         }
       }
-      assert.ok(strategy.isNarrowed(c), 'C was narrowed');
-      assert.ok(!strategy.isNarrowed(b), 'B was not');
+      assert.ok(raw, 'a refusal named the pin');
+      assert.deepStrictEqual(raw.pins.map((p) => p.pinId), [pin]);
+      assert.ok(raw.pins[0]!.tokens > 0 && raw.pins[0]!.tokens < 450, `priced cut: ${raw.pins[0]!.tokens}`);
       await cm.close();
     });
   });
 
-  it('unpinning a narrowed mark and marking the message again covers it whole', async (t) => {
+  it('prices a marked message\'s parts uncut, as the plan sends a run of them joined', async () => {
     await withDir(async (dir) => {
-      warnings(t);
-      const { cm, marks } = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 30_000 });
-      await cm.compile(budget(30_000));
-      const b = cm.listPins()[0]!.firstMessageId;
-      assert.ok(cm.unpin(marks[0]!));
-      cm.markDocument(b);
-      assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(42_000))), 'Bdoc'), allOf(6000));
-      await cm.close();
-    });
-  });
-
-  it('a new mark on a long message narrows as it stops fitting, with no compile refused', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      const { cm, strategy } = await open(dir);
-      const turn = async (content: ContentBlock[], role: 'user' | 'assistant') => {
-        cm.addMessage(role, content);
-        const request = sent(await cm.compile(budget(30_000)));
-        await ready(cm);
-        return request;
-      };
-      for (let i = 0; i < 6; i++) await turn(words(`hist${i}`, 200), i % 2 ? 'assistant' : 'user');
-      const mark = cm.markDocument(cm.addMessage('user', words('Bdoc', 6000)));
-      let last: Sent[] = [];
-      for (let i = 0; i < 120; i++) last = await turn(words(`event${i}`, 200), i % 2 ? 'assistant' : 'user');
-      assert.ok(strategy.isNarrowed(mark));
-      assert.strictEqual(narrowingWarnings(out).length, 1);
-      assert.match(narrowingWarnings(out)[0]!, new RegExp(`document mark ${mark} now covers only message `));
-      assert.deepStrictEqual(rawWords(last, 'Bdoc'), allOf(763));
-      await cm.close();
-    });
-  });
-
-  it('narrows the mark whose whole message adds the most first, and no more than the compile needs', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      // Both whole need about 40,800; B narrowed alone, about 25,200; C narrowed alone, about 38,700.
-      // C is marked first, so taking the first mark that frees anything would narrow C.
-      const { cm, strategy, marks } = await upgradedStore(dir, { bodies: [['Cdoc', 1500], ['Bdoc', 6000]], budget: 30_000 });
-      const request = sent(await cm.compile(budget(30_000)));
-      assert.deepStrictEqual(marks.map((m) => strategy.isNarrowed(m)), [false, true]);
-      assert.deepStrictEqual(rawWords(request, 'Cdoc'), allOf(1500));
-      assert.strictEqual(narrowingWarnings(out).length, 1);
-      assert.match(narrowingWarnings(out)[0]!, new RegExp(`document mark ${marks[1]} `));
-      await cm.close();
-    });
-  });
-
-  it('narrows a second mark, after the first, when the first alone doesn\'t let the compile through', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      // Both narrowed need about 23,000; B narrowed alone, about 25,200.
-      const { cm, strategy, marks, before } = await upgradedStore(dir, { bodies: [['Bdoc', 6000], ['Cdoc', 1500]], budget: 24_000 });
-      assert.deepStrictEqual(sent(await cm.compile(budget(24_000))), before);
-      assert.deepStrictEqual(marks.map((m) => strategy.isNarrowed(m)), [true, true]);
-      const said = narrowingWarnings(out);
-      assert.strictEqual(said.length, 2);
-      assert.match(said[0]!, new RegExp(`document mark ${marks[0]} `));
-      assert.match(said[1]!, new RegExp(`document mark ${marks[1]} `));
-      // The refusal's total had both whole, and each warning says so.
-      for (const w of said) assert.ok(w.includes('With the 2 pins narrowed here covering their whole messages, the compile came to ~'), w);
-      await cm.close();
-    });
-  });
-
-  it('two marks on one message: narrowing one frees nothing while the other covers the message, so both are narrowed', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      const { cm, strategy } = await open(dir);
-      await history(cm);
-      const parts = partsOf(cm, cm.addMessage('user', words('Bdoc', 6000)));
-      const first = cm.markDocument(parts[0]!);
-      const second = cm.markDocument(parts[2]!);
-      strategy.setNarrowed(first, true);
-      strategy.setNarrowed(second, true);
-      await traffic(cm, 360);
-      await ready(cm);
-      const before = sent(await cm.compile(budget(30_000)));
-      strategy.setNarrowed(first, false);
-      strategy.setNarrowed(second, false);
-      assert.deepStrictEqual(sent(await cm.compile(budget(30_000))), before);
-      assert.deepStrictEqual([strategy.isNarrowed(first), strategy.isNarrowed(second)], [true, true]);
-      assert.strictEqual(narrowingWarnings(out).length, 2);
-      await cm.close();
-    });
-  });
-
-  it('doesn\'t narrow a mark whose message lies in the recent window, which is sent raw either way', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      // A recent window of 20,000. B, marked before the upgrade, is in the middle; C, 6,000 words marked
-      // now, is in the recent window. Both whole need about 39,100; B narrowed, about 33,900, with C whole
-      // or not. C's whole message adds more than B's, so without the window check C would go first.
-      const { cm, strategy } = await open(dir, 'adaptive', 20_000);
-      await history(cm);
-      const b = cm.markDocument(cm.addMessage('user', words('Bdoc', 2500)));
-      strategy.setNarrowed(b, true);
-      await traffic(cm, 360);
-      const c = cm.markDocument(cm.addMessage('user', words('Cdoc', 6000)));
-      await ready(cm);
-      strategy.setNarrowed(b, false);
-      const request = sent(await cm.compile(budget(36_000)));
-      assert.deepStrictEqual([strategy.isNarrowed(b), strategy.isNarrowed(c)], [true, false]);
-      assert.deepStrictEqual(rawWords(request, 'Cdoc'), allOf(6000));
-      assert.strictEqual(narrowingWarnings(out).length, 1);
-      await cm.close();
-    });
-  });
-
-  it('a mark whose message is in the head window frees nothing, so a refusal runs no select again', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      // A head window of 25,000 holds the history and the whole 6,000-word message.
-      const { cm, strategy } = await open(dir, 'adaptive', 8000, { headWindowTokens: 25_000 });
+      // Parts of about 2,000 tokens, each over a cap of 300 that the plan doesn't apply to them.
+      const { cm } = await open(dir, 'adaptive', 8000, { maxMessageTokens: 300 });
       await history(cm);
       const b = cm.addMessage('user', words('Bdoc', 6000));
+      await traffic(cm, 360);
+      await ready(cm);
       const mark = cm.markDocument(b);
+      let raw: NonNullable<OverBudgetError['diagnostics']['rawPins']> | undefined;
+      for (const maxTokens of [30_000, 25_000, 20_000, 15_000]) {
+        try {
+          await cm.compile(budget(maxTokens));
+        } catch (err) {
+          if (!(err instanceof OverBudgetError)) throw err;
+          raw = err.diagnostics.rawPins;
+          if (raw) break;
+        }
+      }
+      assert.ok(raw, 'a refusal named the mark');
+      assert.deepStrictEqual(raw.pins.map((p) => p.pinId), [mark]);
+      assert.ok(raw.tokens > 10_000, `priced uncut: ${raw.tokens}`);
+      await cm.close();
+    });
+  });
+
+  it('names every pin keeping raw tokens in the middle, counting a message two pins cover once, and none in the recent window', async () => {
+    await withDir(async (dir) => {
+      const { cm, b, parts } = await markedAfterSummaries(dir);
+      const all = viewOf(cm).getAll();
+      const at = all.findIndex((m) => m.id === parts.at(-1));
+      const mark = cm.markDocument(b);
+      // A range over B's third and fourth parts, which read whole covers all of B, as the mark does.
+      const inside = cm.pinRange(parts[2]!, parts[3]!);
+      // A range over two traffic messages in the middle, and a pin on the newest message, in the recent window.
+      const traffic2 = cm.pinRange(all[at + 10]!.id, all[at + 11]!.id, { name: 'two events' });
+      cm.pinRange(all.at(-1)!.id, all.at(-1)!.id);
+      const refusal = await refusalOf(cm, 30_000);
+      const raw = refusal.diagnostics.rawPins!;
+      assert.deepStrictEqual(raw.pins.map((p) => [p.pinId, p.parts]), [[mark, parts.length], [inside, parts.length], [traffic2, undefined]]);
+      const [m, i, t] = raw.pins;
+      assert.strictEqual(m!.tokens, i!.tokens, 'both cover the whole message');
+      assert.strictEqual(raw.tokens, m!.tokens + t!.tokens, 'the message both cover counts once');
+      assert.ok(refusal.message.endsWith('Whoever manages pins can unpin them, freeing up to those tokens; whoever sets the hard budget can raise it if the model\'s window allows.'), refusal.message);
+      await cm.close();
+    });
+  });
+
+  it('a pin in the head window isn\'t named, since the head is sent raw either way', async () => {
+    await withDir(async (dir) => {
+      // A head window of 3,000 holds the first history messages.
+      const { cm, strategy } = await open(dir, 'adaptive', 8000, { headWindowTokens: 3000 });
+      await history(cm);
+      const b = cm.addMessage('user', words('Bdoc', 6000));
       await traffic(cm, 360);
       await ready(cm);
       const all = viewOf(cm).getAll();
-      const last = all.findIndex((m) => m.id === partsOf(cm, b).at(-1));
-      assert.ok(strategy.headEnd(viewOf(cm) as never) > last, 'the head holds the whole message');
-      // Lower the budget until a compile is refused for its middle, where narrowing would free nothing.
-      let refused: OverBudgetError | undefined;
-      let ran = 0;
-      for (let max = 44_000; !refused && max > 20_000; max -= 1_000) {
-        const selects = strategy.selects;
+      assert.ok(strategy.headEnd(viewOf(cm) as never) > 0, 'the head window holds the first message');
+      cm.pinRange(all[0]!.id, all[0]!.id);
+      const mark = cm.markDocument(b);
+      const raw = (await refusalOf(cm, 30_000)).diagnostics.rawPins!;
+      assert.deepStrictEqual(raw.pins.map((p) => p.pinId), [mark]);
+      await cm.close();
+    });
+  });
+
+  it('after a head reset, names a pin in the history before the new head, which the select folds as middle', async () => {
+    await withDir(async (dir) => {
+      const { cm, strategy } = await markedAfterSummaries(dir);
+      const all = viewOf(cm).getAll();
+      // The head now starts at the newest message, so the recent window reaches back before it: the history before
+      // the head, recent messages included, is the select's middle.
+      strategy.resetHeadWindow(all.at(-1)!.id);
+      const pin = cm.pinRange(all.at(-3)!.id, all.at(-3)!.id);
+      const raw = (await refusalOf(cm, 3_000)).diagnostics.rawPins;
+      assert.deepStrictEqual(raw?.pins.map((p) => p.pinId), [pin]);
+      await cm.close();
+    });
+  });
+
+  it('with the head window disabled, a head reset leaves the recent messages before the head in the tail, so a pin there isn\'t named', async () => {
+    await withDir(async (dir) => {
+      const { cm, strategy } = await open(dir, 'adaptive', 8000, { headWindowTokens: 0 });
+      await history(cm);
+      const b = cm.addMessage('user', words('Bdoc', 6000));
+      await traffic(cm, 360);
+      await ready(cm);
+      const mark = cm.markDocument(b);
+      const all = viewOf(cm).getAll();
+      strategy.resetHeadWindow(all.at(-1)!.id);
+      cm.pinRange(all.at(-3)!.id, all.at(-3)!.id);
+      const refusal = await refusalOf(cm, 30_000);
+      assert.match(refusal.message, /^Adaptive picker exhausted/);
+      assert.deepStrictEqual(refusal.diagnostics.rawPins?.pins.map((p) => p.pinId), [mark]);
+      await cm.close();
+    });
+  });
+
+  it('kv-stable: names a raw pin but not a pin with a level or a cap that overlaps it, which keeps nothing raw', async () => {
+    await withDir(async (dir) => {
+      const { cm, b } = await markedAfterSummaries(dir, 'kv-stable');
+      const mark = cm.markDocument(b, { level: 0 });
+      cm.pinAtLevel(b, b, 2);
+      cm.pinRange(b, b, { maxLevel: 2 });
+      const raw = (await refusalOf(cm, 30_000)).diagnostics.rawPins!;
+      assert.deepStrictEqual(raw.pins.map((p) => p.pinId), [mark]);
+      await cm.close();
+    });
+  });
+
+  it('kv-unified: doesn\'t count toward a raw range the message a level pin holds inside it', async () => {
+    await withDir(async (dir) => {
+      const { cm } = await open(dir, 'kv-unified');
+      await history(cm);
+      const b = cm.addMessage('user', words('Bdoc', 3000));
+      const c = cm.addMessage('user', words('Cdoc', 3000));
+      await traffic(cm, 360);
+      await ready(cm);
+      // The range keeps B and C raw; a level, which takes a classic pin's place, holds C at level 1.
+      const range = cm.pinRange(b, c);
+      cm.pinAtLevel(c, c, 1);
+      let raw: NonNullable<OverBudgetError['diagnostics']['rawPins']> | undefined;
+      const seen: string[] = [];
+      for (const maxTokens of [30_000, 25_000, 20_000, 15_000, 12_000]) {
         try {
-          await cm.compile(budget(max));
+          await cm.compile(budget(maxTokens));
+          seen.push(`${maxTokens}: compiled`);
         } catch (err) {
-          assert.ok(err instanceof OverBudgetError);
-          refused = err;
-          ran = strategy.selects - selects;
+          if (!(err instanceof OverBudgetError)) throw err;
+          seen.push(`${maxTokens}: ${err.message.slice(0, 120)}`);
+          raw = err.diagnostics.rawPins;
+          if (raw) break;
         }
       }
-      assert.ok(refused && refused.diagnostics.middleTokens > 0, 'refused for its middle');
-      assert.strictEqual(ran, 1, 'nothing to narrow, so no select again');
-      assert.ok(!strategy.isNarrowed(mark));
-      assert.deepStrictEqual(narrowingWarnings(out), []);
+      assert.ok(raw, `a refusal named the range: ${seen.join(' | ')}`);
+      assert.deepStrictEqual(raw.pins.map((p) => p.pinId), [range]);
+      assert.strictEqual(raw.pins[0]!.tokens, raw.tokens, 'the range keeps raw only what the total counts');
+      // B and C are the same size, so B alone is about half of both.
+      const ids = new Set([...partsOf(cm, b), ...partsOf(cm, c)]);
+      const both = viewOf(cm).getAll().filter((m) => ids.has(m.id)).reduce((n, m) => n + viewOf(cm).estimateTokens(m), 0);
+      assert.ok(raw.tokens < both * 0.6, `${raw.tokens} of ${both}: C, held at a level, isn't counted`);
       await cm.close();
     });
   });
 
-  it('after a head-window reset, a mark in the history before the head frees its message once it leaves the recent window', async (t) => {
+  it('under a solver that reads no bounds, names a mark with a level, which renders raw there', async () => {
     await withDir(async (dir) => {
-      warnings(t);
-      // A recent window of 20,000. The marked message is history before the head, which the selects fold.
-      const { cm, strategy } = await open(dir, 'adaptive', 20_000);
-      await history(cm);
-      const b = cm.addMessage('user', words('Bdoc', 2500));
-      const mark = cm.markDocument(b);
-      await cm.resetHeadWindow('A new topic.');
-      const narrows = async (): Promise<boolean> => {
-        for (let max = 60_000; !strategy.isNarrowed(mark) && max > 8_000; max -= 1_000) {
-          try {
-            await cm.compile(budget(max));
-          } catch (err) {
-            if (!(err instanceof OverBudgetError)) throw err;
-          }
-        }
-        return strategy.isNarrowed(mark);
-      };
-      const positions = () => {
-        const at = viewOf(cm).getAll().findIndex((m) => m.id === b);
-        return { at, ...strategy.windows(viewOf(cm) as never) };
-      };
-      // Within the recent window its parts can't be summarized, so narrowing it would free nothing.
-      cm.addMessage('user', words('after', 20));
-      await ready(cm);
-      const inRecent = positions();
-      assert.ok(inRecent.at > inRecent.recentStart && inRecent.at < inRecent.headStart, JSON.stringify(inRecent));
-      assert.strictEqual(await narrows(), false);
-      // Out of it, they're summarized, and narrowing it frees them.
-      await traffic(cm, 120);
-      await ready(cm);
-      const outOfRecent = positions();
-      assert.ok(outOfRecent.at < outOfRecent.recentStart && outOfRecent.at < outOfRecent.headStart, JSON.stringify(outOfRecent));
-      assert.strictEqual(await narrows(), true);
+      const { cm, b } = await markedAfterSummaries(dir);
+      const mark = cm.markDocument(b, { level: 2 });
+      const raw = (await refusalOf(cm, 30_000)).diagnostics.rawPins!;
+      assert.deepStrictEqual(raw.pins.map((p) => p.pinId), [mark]);
       await cm.close();
     });
   });
 
-  it('narrows a range pin to its own ids, warning in a range\'s words, and sends the request it sent before', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      const { cm, strategy } = await open(dir);
-      await history(cm);
-      const bParts = partsOf(cm, cm.addMessage('user', words('Bdoc', 6000)));
-      const cParts = partsOf(cm, cm.addMessage('user', words('Cdoc', 1500)));
-      // From B's last part to C's first: whole, both messages; by its ids, B's last part and C's first.
-      const range = cm.pinRange(bParts.at(-1)!, cParts[0]!);
-      strategy.setNarrowed(range, true);
-      await traffic(cm, 360);
-      await ready(cm);
-      const before = sent(await cm.compile(budget(30_000)));
-      strategy.setNarrowed(range, false);
-      assert.deepStrictEqual(sent(await cm.compile(budget(30_000))), before);
-      assert.ok(strategy.isNarrowed(range));
-      const said = narrowingWarnings(out);
-      assert.strictEqual(said.length, 1);
-      assert.match(said[0]!, new RegExp(`^autobio: pin ${range} now covers only messages ${bParts.at(-1)} to ${cParts[0]}, `));
-      assert.match(said[0]!, new RegExp(`unpin ${range} and pin the range again\\.`));
-      await cm.close();
-    });
-  });
-
-  it('a refusal narrowing doesn\'t answer puts the mark back and stands as it was, preview included', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      const { cm, strategy, marks } = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 30_000 });
-      // At 15,000 the narrowed request is over too.
-      const preview = cm.previewContext(budget(15_000))!;
-      assert.ok(!strategy.isNarrowed(marks[0]!), 'the dry compile kept nothing');
-      const selects = strategy.selects;
-      let thrown: OverBudgetError | undefined;
-      await assert.rejects(cm.compile(budget(15_000)), (err: unknown) => {
-        assert.ok(err instanceof OverBudgetError);
-        thrown = err;
-        return true;
+  it('counts a part locked raw inside a pin\'s span, as every raw position in the middle', async () => {
+    const named = async (lock: boolean) => {
+      let tokens = 0;
+      await withDir(async (dir) => {
+        const { cm, strategy } = await open(dir);
+        await history(cm);
+        const b = cm.addMessage('user', words('Bdoc', 6000));
+        await traffic(cm, 360);
+        await ready(cm);
+        const parts = partsOf(cm, b);
+        // No compile has folded it yet, so the lock holds it raw.
+        if (lock) strategy.lockChunk(parts[4]!);
+        assert.strictEqual(strategy.resolutionOf(parts[4]!), 0);
+        // A range over every part, so the locked one is inside the span its ids name and the pin covers it.
+        cm.pinRange(parts[0]!, parts.at(-1)!);
+        tokens = (await refusalOf(cm, 30_000)).diagnostics.rawPins!.tokens;
+        await cm.close();
       });
-      assert.strictEqual(strategy.selects - selects, 2, 'the refused select and one narrowed');
-      assert.ok(!strategy.isNarrowed(marks[0]!));
-      assert.deepStrictEqual(narrowingWarnings(out), []);
-      // A preview reports the plan the refusal describes, not a narrowed retry's, and so does the frontier.
-      assert.strictEqual(preview.fits, false);
-      assert.strictEqual(preview.finalTokens, thrown!.actual);
-      assert.strictEqual(strategy.getHotContextSettings().currentFrontierTokens, thrown!.actual);
-      // The refusal thrown is the whole reading's: the narrowed reading's is smaller.
-      strategy.setNarrowed(marks[0]!, true);
-      await assert.rejects(cm.compile(budget(15_000)), (err: unknown) => {
-        assert.ok(err instanceof OverBudgetError);
-        assert.ok(thrown!.actual > err.actual, `whole ${thrown!.actual}, narrowed ${err.actual}`);
-        return true;
-      });
-      strategy.setNarrowed(marks[0]!, false);
-      // Put back whole: the next compile with room sends it whole.
-      assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(42_000))), 'Bdoc'), allOf(6000));
+      return tokens;
+    };
+    assert.strictEqual(await named(true), await named(false));
+  });
+
+  it('a mark held at a level keeps nothing raw, so a refusal in the middle names no pin, as before', async () => {
+    await withDir(async (dir) => {
+      const { cm, b } = await markedAfterSummaries(dir, 'kv-stable');
+      cm.markDocument(b, { level: 1 });
+      const refusal = await refusalOf(cm, 10_000);
+      assert.match(refusal.message, /^Adaptive picker exhausted/, 'the plan\'s refusal, the one that names pins');
+      assert.strictEqual(refusal.diagnostics.rawPins, undefined);
+      assert.ok(refusal.message.endsWith(')'), refusal.message);
       await cm.close();
     });
   });
 
-  it('a refusal while nothing the mark covers is summarized narrows nothing, and the whole message goes out once compression catches up', async (t) => {
+  it('a refusal of the head and recent windows alone names no pin, since unpinning wouldn\'t clear it', async () => {
     await withDir(async (dir) => {
-      const out = warnings(t);
-      const { cm, strategy } = await open(dir);
-      await history(cm);
-      const mark = cm.markDocument(cm.addMessage('user', words('Bdoc', 6000)));
-      // No tick while 360 messages arrive: nothing after the message is summarized.
-      await traffic(cm, 360);
-      const selects = strategy.selects;
-      await assert.rejects(cm.compile(budget(42_000)), OverBudgetError);
-      assert.strictEqual(strategy.selects - selects, 1, 'no narrowed select ran');
-      assert.ok(!strategy.isNarrowed(mark));
-      assert.deepStrictEqual(narrowingWarnings(out), []);
-      await ready(cm);
-      assert.deepStrictEqual(rawWords(sent(await cm.compile(budget(42_000))), 'Bdoc'), allOf(6000));
+      const { cm, b } = await markedAfterSummaries(dir);
+      cm.markDocument(b);
+      const refusal = await refusalOf(cm, 5_000);
+      assert.match(refusal.message, /^Head\/tail reservation exceeded budget/);
+      assert.strictEqual(refusal.diagnostics.rawPins, undefined);
       await cm.close();
     });
   });
 
-  it('under a solver that reads no bounds, a mark with a level cap renders raw and is narrowed like any', async (t) => {
+  it('a hierarchical refusal names no pin, as before: only the adaptive plan\'s refusal does', async () => {
     await withDir(async (dir) => {
-      const out = warnings(t);
-      const { cm, strategy } = await open(dir);
-      await history(cm);
-      const mark = cm.markDocument(cm.addMessage('user', words('Bdoc', 6000)), { maxLevel: 1 });
-      strategy.setNarrowed(mark, true);
-      await traffic(cm, 360);
-      await ready(cm);
-      const before = sent(await cm.compile(budget(30_000)));
-      strategy.setNarrowed(mark, false);
-      assert.deepStrictEqual(sent(await cm.compile(budget(30_000))), before);
-      assert.ok(strategy.isNarrowed(mark));
-      assert.strictEqual(narrowingWarnings(out).length, 1);
-      await cm.close();
+      const strategy = new AutobiographicalStrategy({
+        compressionModel: 'test-model', adaptiveResolution: false, targetChunkTokens: 40, headWindowTokens: 0,
+        recentWindowTokens: 0, overBudgetGraceRatio: 0.25, autoTickOnNewMessage: false, speculativeProduction: false,
+      } as AutobiographicalConfig);
+      const cm = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane: summarizer().membrane });
+      const ids: string[] = [];
+      for (let i = 0; i < 12; i++) ids.push(cm.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]));
+      cm.pinRange(ids[2]!, ids[3]!);
+      const refusal = await refusalOf(cm, 100);
+      assert.match(refusal.message, /^Hierarchical emission overran the budget/);
+      assert.strictEqual(refusal.diagnostics.rawPins, undefined);
+      assert.ok(refusal.message.endsWith(')'), refusal.message);
+      cm.close();
     });
   });
+});
 
-  it('kv-unified: a mark with a level cap isn\'t narrowed, so a refusal runs no select again', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      const { cm, strategy } = await open(dir, 'kv-unified');
-      await history(cm);
-      const mark = cm.markDocument(cm.addMessage('user', words('Bdoc', 6000)), { maxLevel: 1 });
-      await traffic(cm, 360);
-      await ready(cm);
-      const selects = strategy.selects;
-      await assert.rejects(cm.compile(budget(12_000)), (err: unknown) => {
-        assert.ok(err instanceof OverBudgetError);
-        assert.ok(err.diagnostics.middleTokens > 0, 'refused for its middle');
-        return true;
-      });
-      assert.strictEqual(strategy.selects - selects, 1);
-      assert.ok(!strategy.isNarrowed(mark));
-      assert.deepStrictEqual(narrowingWarnings(out), []);
-      await cm.close();
+describe('the refusal\'s words for the pins it names', () => {
+  const diagnostics = { headTokens: 0, tailTokens: 10, middleTokens: 90, middleChunkCount: 3, deepestLevel: 1 };
+  it('names one pin, a range read whole, and a pin with no name', () => {
+    const error = new OverBudgetError({
+      budget: 50, actual: 100,
+      diagnostics: { ...diagnostics, rawPins: { tokens: 70, pins: [{ pinId: 'pin-1', kind: 'pin', firstMessageId: 'a', lastMessageId: 'c', parts: 5, tokens: 70 }] } },
     });
+    assert.ok(error.message.endsWith(
+      '). A pin keeps ~70 tokens raw in the middle: pin pin-1, messages a to c, covering 5 stored messages. ' +
+      'Whoever manages pins can unpin it, freeing up to those tokens; whoever sets the hard budget can raise it if the model\'s window allows.'), error.message);
   });
-
-  it('a refusal the head and recent windows alone cause narrows nothing and runs no select again', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      const { cm, strategy } = await open(dir);
-      await history(cm);
-      const mark = cm.markDocument(cm.addMessage('user', words('Bdoc', 6000)));
-      await traffic(cm, 360);
-      await ready(cm);
-      // A recent window of 8,000 doesn't fit 6,000.
-      const selects = strategy.selects;
-      await assert.rejects(cm.compile(budget(6_000)), (err: unknown) => {
-        assert.ok(err instanceof OverBudgetError);
-        assert.strictEqual(err.diagnostics.middleTokens, 0);
-        return true;
-      });
-      assert.strictEqual(strategy.selects - selects, 1);
-      assert.ok(!strategy.isNarrowed(mark));
-      assert.deepStrictEqual(narrowingWarnings(out), []);
-      await cm.close();
+  it('names several pins, and says nothing of pins without any', () => {
+    const error = new OverBudgetError({
+      budget: 50, actual: 100,
+      diagnostics: {
+        ...diagnostics,
+        rawPins: { tokens: 80, pins: [
+          { pinId: 'pin-0', kind: 'document', name: 'notes', firstMessageId: 'm', lastMessageId: 'm', tokens: 50 },
+          { pinId: 'pin-2', kind: 'pin', firstMessageId: 'x', lastMessageId: 'x', tokens: 30 },
+        ] },
+      },
     });
+    assert.ok(error.message.endsWith(
+      '). Pins keep ~80 tokens raw in the middle: document mark "notes" (pin-0), message m, ~50 tokens; pin pin-2, message x, ~30 tokens. ' +
+      'Whoever manages pins can unpin them, freeing up to those tokens; whoever sets the hard budget can raise it if the model\'s window allows.'), error.message);
+    assert.ok(new OverBudgetError({ budget: 50, actual: 100, diagnostics }).message.endsWith(')'));
   });
-
-  it('a dry compile narrows for itself only: it sends what the live compile will, and keeps and warns nothing', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      const { cm, strategy, marks, before } = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 30_000 });
-      const dry = sent(await cm.compile(budget(30_000), undefined, { dryRun: true }));
-      assert.deepStrictEqual(dry, before);
-      assert.ok(!strategy.isNarrowed(marks[0]!));
-      assert.deepStrictEqual(narrowingWarnings(out), []);
-      assert.deepStrictEqual(sent(await cm.compile(budget(30_000))), dry);
-      assert.ok(strategy.isNarrowed(marks[0]!));
-      assert.strictEqual(narrowingWarnings(out).length, 1);
-      await cm.close();
-    });
-  });
-
-  it('a select that fails while narrowing puts the marks back and fails the compile with its error', async (t) => {
-    await withDir(async (dir) => {
-      const out = warnings(t);
-      const { cm, strategy, marks, before } = await upgradedStore(dir, { bodies: [['Bdoc', 6000]], budget: 30_000 });
-      strategy.failWhileNarrowed = true;
-      await assert.rejects(cm.compile(budget(30_000)), /select failed/);
-      strategy.failWhileNarrowed = false;
-      assert.ok(!strategy.isNarrowed(marks[0]!));
-      assert.deepStrictEqual(narrowingWarnings(out), []);
-      assert.deepStrictEqual(sent(await cm.compile(budget(30_000))), before);
-      await cm.close();
-    });
+  it('ends with a remedy short enough to stay whole in the last quarter of a 600-character cut', () => {
+    for (const n of [1, 2]) {
+      const pins = Array.from({ length: n }, (_, i) => ({ pinId: `pin-${i}`, kind: 'pin' as const, name: 'x'.repeat(400), firstMessageId: 'm', lastMessageId: 'm', tokens: 10 }));
+      const message = new OverBudgetError({ budget: 50, actual: 100, diagnostics: { ...diagnostics, rawPins: { tokens: 10 * n, pins } } }).message;
+      // agent-framework quotes a compile error cut at 600 characters, keeping the head and the last 140.
+      const remedy = message.lastIndexOf(' Whoever manages pins');
+      assert.ok(message.length > 600 && remedy >= 0, message);
+      assert.ok(message.length - remedy <= 140, message);
+    }
   });
 });
