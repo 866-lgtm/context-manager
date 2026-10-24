@@ -1300,11 +1300,14 @@ export class ContextManager {
       if (opts?.dryRun !== true) {
         if (binding) {
           // Nothing here fails the compile: a record it can't write leaves
-          // the one before, which this compile's stream can't note onto, so
-          // what it sends past that record goes without its thinking. The
-          // strategy's note only adjusts its calibration, so a strategy that
-          // throws there is logged and the compile stands too.
-          this.writeBindingRecordFor(binding.record, 'the next compile compares against the record before it');
+          // the one before, if any, which this compile's stream can't note
+          // onto, so what it sends past that record goes without its
+          // thinking. The strategy's note only adjusts its calibration, so a
+          // strategy that throws there is logged and the compile stands too.
+          this.writeBindingRecordFor(
+            binding.record,
+            'this compile\'s stream can\'t note onto the record before it, if any, so its replies go without their thinking until a compile with binds writes the record',
+          );
           if (binding.leftOut.length > 0) {
             try {
               this.strategy.noteThinkingLeftOut?.(binding.leftOut);
@@ -1316,8 +1319,9 @@ export class ContextManager {
         // A compile without binds neither reads nor writes the record. One an
         // earlier binding compile left is compared at the next binding compile
         // like any other: a message keeps its thinking only while everything
-        // up to it matches what that compile sent, a prefix the provider took
-        // with that thinking, and nothing past the record's end keeps it.
+        // up to it matches what that compile sent and its stream noted, a
+        // prefix the provider took with that thinking, and nothing past the
+        // record's end keeps it.
       }
       return result;
     };
@@ -1403,7 +1407,7 @@ export class ContextManager {
     opts: SelectOptions,
     compileId: string,
   ): BindOutcome {
-    const record = this.readBindingRecordFor('this compile goes on as if the branch had no record');
+    const record = this.readBindingRecordFor('this compile goes on as if the branch had no record, and if it commits, its record takes that one\'s place');
     const outcome = bindThinking({
       messages: result.messages,
       sources,
@@ -1689,7 +1693,8 @@ export class ContextManager {
   }
 
   /**
-   * Note what a stream built from this branch's last committing compile sent
+   * Note what a stream built from this branch's last committing compile with
+   * `binds` sent
    * after the compiled messages (see `SelectOptions.thinkingBinding`): as it
    * sends each later round, every row its request carried so far, and once
    * the stream has ended, those rows and its last reply. Call it on the
@@ -1709,8 +1714,8 @@ export class ContextManager {
    * next request won't carry where this one did. A request-only row the
    * host puts back in the same place at every later request needs no row,
    * since no compile holds it. A note sent with another head than the
-   * record's leaves the record vouching for nothing until the next
-   * committing compile: the stream's earlier thinking was minted under the
+   * record's leaves the record vouching for nothing until a compile writes
+   * it again: the stream's earlier thinking was minted under the
    * old head. A host that notes nothing keeps no reply's thinking past the
    * compile after it was stored, and is never refused for it.
    *
@@ -1727,10 +1732,13 @@ export class ContextManager {
    *
    * Returns false and writes nothing when `compileId` isn't the compile that
    * wrote the branch's record, as for a stream whose note arrives after
-   * another committing compile: its replies were minted under a prefix the
-   * record no longer holds, and go without their thinking. So it does when
-   * the branch has no record, or one this version can't read or the store
-   * can't give, and when the store can't write it; it logs each of those.
+   * another committing compile with `binds`: its replies were minted under a
+   * prefix the record no longer holds, and go without their thinking. A
+   * compile without `binds` leaves the record, so a note after one still
+   * writes. It returns false too when the branch has no record, and, logging
+   * it, when the record is one this version can't read, or the store can't
+   * read or write it; a note it can't write is lost, and the record stands
+   * as the last one written.
    * A dry compile writes no record, so it leaves a stream's notes as they
    * were. Throws, writing nothing, for a row that isn't an id or the marker,
    * a `compileId` that isn't a string, or a digest that isn't a string.
@@ -1749,10 +1757,10 @@ export class ContextManager {
         `noteRequestSent: \`compileId\` must be a string, the provenance.compileId of the compile the stream was built from; got ${typeof compileId}`,
       );
     }
-    const record = this.readBindingRecordFor('this note writes nothing, and the branch\'s next committing compile replaces it');
+    const record = this.readBindingRecordFor('this note writes nothing, and the branch\'s next committing compile with binds replaces the record');
     // A note is for the stream of the compile that wrote the record; after
-    // another committing compile its replies were minted under a prefix the
-    // record no longer holds.
+    // another committing compile with binds its replies were minted under a
+    // prefix the record no longer holds.
     if (record === null || record.compileId !== compileId) return false;
     const view = this.mergedMessageView();
     // An id the store doesn't hold, as after a removal, is nothing the next
@@ -1780,21 +1788,28 @@ export class ContextManager {
       // its parts.
       for (const part of splitMixedToolMessages([{ participant: stored.participant, content }])) continued.push(messageDigest(part));
     }
-    return this.writeBindingRecordFor(continueRecord(record, continued, identity), 'this note is lost, so what it named goes without its thinking');
+    return this.writeBindingRecordFor(
+      continueRecord(record, continued, identity),
+      'this note is lost: the record stands as the last one written, so the rows this note adds go without their thinking unless a later note of the stream writes',
+    );
   }
 
-  /** The branch's binding record; one this version can't read is logged, with what follows from it, and read as none. */
+  /**
+   * The branch's binding record. One this version doesn't read, or that the
+   * store can't give, is logged, with what follows from it, and read as
+   * none; a committing compile with `binds` then writes its own in its place.
+   */
   private readBindingRecordFor(consequence: string): BindingRecord | null {
     let read: ReturnType<typeof readBindingRecord>;
     try {
       read = readBindingRecord(this.store, this.strategyNamespace);
     } catch (err) {
-      this.diag.warn(`[context-manager] the thinking-binding record of branch ${this.branchNameForLog()} couldn't be read (${describeThrown(err)}); ${consequence}`);
+      this.diag.warn(`[context-manager] the thinking-binding record of branch ${this.store.currentBranch().name} couldn't be read (${describeThrown(err)}); ${consequence}`);
       return null;
     }
     if (read.malformed) {
       this.diag.warn(
-        `[context-manager] the thinking-binding record of branch ${this.branchNameForLog()} isn't ` +
+        `[context-manager] the thinking-binding record of branch ${this.store.currentBranch().name} isn't ` +
         `one this version reads; ${consequence}`,
       );
     }
@@ -1807,17 +1822,8 @@ export class ContextManager {
       writeBindingRecord(this.store, this.strategyNamespace, record);
       return true;
     } catch (err) {
-      this.diag.warn(`[context-manager] the thinking-binding record of branch ${this.branchNameForLog()} couldn't be written (${describeThrown(err)}); ${consequence}`);
+      this.diag.warn(`[context-manager] the thinking-binding record of branch ${this.store.currentBranch().name} couldn't be written (${describeThrown(err)}); ${consequence}`);
       return false;
-    }
-  }
-
-  /** The current branch's name for a log line, or '?' when the store can't say. */
-  private branchNameForLog(): string {
-    try {
-      return this.store.currentBranch().name;
-    } catch {
-      return '?';
     }
   }
 

@@ -214,10 +214,12 @@ export interface CompileResult {
 export interface ThinkingStrip {
   /**
    * The stored bodies (`RawBodySource.messageId`) of the participant's
-   * replies whose thinking this compile leaves out and the branch's last
-   * committing compile didn't, whether or not its request went out: that
-   * compile sent them with their thinking, they were stored since, or it
-   * didn't send them as stored replies at all.
+   * replies whose thinking this compile leaves out and the compile that
+   * wrote the branch's record didn't, whether or not its request went out:
+   * that compile sent them with their thinking, they were stored since, or
+   * it didn't send them as stored replies at all. A record is written by a
+   * committing compile with `binds`, so a compile without it is passed
+   * over.
    * So a reply can be reported again: one whose thinking went, that a later
    * compile didn't send, and that renders again. A host that tells each
    * loss once keeps its own set of what it has told.

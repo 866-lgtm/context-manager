@@ -71,10 +71,10 @@ function thinkingKey(block: ContentBlock): string {
 
 /** What a branch last sent, as its record keeps it. */
 export interface BindingRecord {
-  /** Each message the last committing compile sent, in order: a digest of
-   *  its participant and content (`messageDigest`). `[UNVOUCHED]` once a
-   *  note came with another head than `identity`: then the record vouches
-   *  for nothing until the next committing compile. */
+  /** Each message the compile that wrote the record sent, in order: a
+   *  digest of its participant and content (`messageDigest`). `[UNVOUCHED]`
+   *  once a note came with another head than `identity`: then the record
+   *  vouches for nothing until a compile writes it again. */
   sent: string[];
   /** What a host noted after those messages, in order: for each stored
    *  row, a digest of each message the compile makes of it as the strategy
@@ -82,10 +82,9 @@ export interface BindingRecord {
    *  `UNVOUCHED` for a row the next compile can't reproduce. Empty until a
    *  note. */
   continued: string[];
-  /** The stored bodies the last committing compile sent without their
-   *  thinking. */
+  /** The stored bodies that compile sent without their thinking. */
   without: MessageId[];
-  /** The head digests the last committing compile sent. */
+  /** The head digests that compile sent. */
   identity: RequestIdentity;
   /** The branch's sequence (`JsStore.currentSequence`) when the record
    *  began: a message at or below it was stored before. */
@@ -151,7 +150,7 @@ export function readBindingRecord(store: JsStore, namespace: string): { record: 
   return isBindingRecord(value) ? { record: value, malformed: false } : { record: null, malformed: true };
 }
 
-export function writeBindingRecord(store: JsStore, namespace: string, record: BindingRecord | null): void {
+export function writeBindingRecord(store: JsStore, namespace: string, record: BindingRecord): void {
   store.setStateJson(bindingStateId(namespace), record);
 }
 
@@ -330,12 +329,12 @@ function copyIdentity(identity: RequestIdentity): RequestIdentity {
 }
 
 /**
- * The record once a host has noted the rows it sent after the last
- * committing compile's messages (`continued`, each a digest or `UNVOUCHED`),
+ * The record once a host has noted the rows it sent after the messages of
+ * the compile that wrote it (`continued`, each a digest or `UNVOUCHED`),
  * with the head `identity`. A note with another head than the record's
  * carried thinking minted under the old one: the record keeps its head and
- * vouches for nothing until the next committing compile, so the next
- * compile under the new head reports the head change.
+ * vouches for nothing until a compile writes it again, so the next compile
+ * under the new head reports the head change.
  */
 export function continueRecord(record: BindingRecord, continued: string[], identity: RequestIdentity): BindingRecord {
   const sameHead = IDENTITY_KEYS.every((key) => identity[key] === record.identity[key]);

@@ -415,13 +415,17 @@ export interface SelectOptions {
    * compared at the next binding compile like any other, so a message keeps
    * its thinking only while everything up to it matches what that compile
    * sent, a prefix the provider took with that thinking, and nothing past
-   * the record's end keeps it. A record that can't be read or written is
-   * logged and never fails a compile; one that can't be read is read as
-   * none.
+   * the record's end keeps it, unless a host noted it after that compile.
+   * A record the store can't read or write is logged, and never fails a
+   * compile or a note. One it can't read is read as none, so a committing
+   * compile starts a record in its place, as for a record this version
+   * doesn't read. When it can't write a compile's record, the record before
+   * it, if any, stands, and that compile's stream can't note onto it.
    *
    * The manager keeps a record per branch of what the branch last sent: the
-   * last committing compile's messages as sent (cache breakpoints aside,
-   * injections included), then the rows a host noted after them
+   * messages its last committing compile with `binds` sent (cache
+   * breakpoints aside, injections included), then the rows a host noted
+   * after them
    * (`ContextManager.noteRequestSent`): what its stream's requests went on
    * to carry and, once the stream ended, its last reply. With them it keeps
    * the stored bodies the compile sent without their thinking, the
@@ -444,9 +448,9 @@ export interface SelectOptions {
    * a branch with no record, its own or (on a branch made since) the one it
    * inherits as of its branch point, leaves out every reply's thinking
    * without `dropBlock`; with `dropBlock` it leaves the stored replies'
-   * thinking as it is. Either way it starts the record. Each committing compile writes
-   * the record; a dry compile reports what it would leave out and writes no
-   * record. The record survives a restart.
+   * thinking as it is. Either way it starts the record. Each committing
+   * compile with `binds` writes the record; a dry compile reports what it
+   * would leave out and writes no record. The record survives a restart.
    *
    * So once a branch has a record, a reply keeps its thinking at the compile
    * after it's stored only if the host has noted it: each later round of a
@@ -454,10 +458,11 @@ export interface SelectOptions {
    * stored. A host that passes `thinkingBinding` and notes nothing loses
    * each reply's thinking at the compile after it's stored, and is never
    * refused for it. A note names the compile its stream was built from, so
-   * a committing compile while a stream is open makes that stream's later
-   * notes vouch for nothing, and its replies go without their thinking:
-   * while one of a branch's requests is streaming, compile for its branch
-   * only with `dryRun`, which writes no record. A preview prices a
+   * a committing compile with `binds` while a stream is open makes that
+   * stream's later notes vouch for nothing, and its replies go without
+   * their thinking: while one of a branch's requests is streaming, compile
+   * for its branch with `binds` only with `dryRun`, which writes no
+   * record. A preview prices a
    * summary's carriers by the option it's given (`previewContext`'s
    * `thinkingBinding`), as a compile does.
    *

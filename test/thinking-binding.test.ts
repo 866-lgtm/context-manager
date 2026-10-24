@@ -448,9 +448,9 @@ describe('thinking binding: compile', () => {
     await manager.close();
   });
 
-  it('a note is for the stream of the compile that wrote the record: after another committing compile it writes nothing, and a dry compile changes nothing', async () => {
+  it('a note is for the stream of the compile that wrote the record: after another committing compile with binds it writes nothing, and a dry compile or one without binds changes nothing', async () => {
     // previewContext calls the strategy alone and never reaches the record.
-    for (const between of ['a committing compile', 'a dry compile', 'nothing'] as const) {
+    for (const between of ['a committing compile', 'a committing compile without binds', 'a dry compile', 'nothing'] as const) {
       cleanup();
       const manager = await open();
       manager.addMessage('User', [text('U1')]);
@@ -458,6 +458,7 @@ describe('thinking binding: compile', () => {
       // Stored while C1's stream is open, so C1's reply was minted without it.
       manager.addMessage('User', [text('zz-X')]);
       if (between === 'a committing compile') await manager.compile(BIG, undefined, BIND);
+      if (between === 'a committing compile without binds') await manager.compile(BIG);
       if (between === 'a dry compile') await manager.compile(BIG, undefined, bind({ dryRun: true }));
       const a1 = manager.addMessage('Claude', [thought(1), text('A1')]);
       const accepted = manager.noteRequestSent([a1], identity(), c1.provenance!.compileId);
@@ -475,6 +476,8 @@ describe('thinking binding: compile', () => {
     manager.addMessage('User', [text('U1')]);
     const c1 = await manager.compile(BIG, undefined, BIND);
     await manager.compile(BIG, undefined, bind({ dryRun: true }));
+    // A compile without binds leaves the record, so C1's stream still notes.
+    await manager.compile(BIG);
     const a1 = manager.addMessage('Claude', [thought(1), text('A1')]);
     assert.equal(manager.noteRequestSent([a1], identity(), c1.provenance!.compileId), true);
     assert.equal(manager.noteRequestSent([a1], identity(), 'zz-another-compile'), false, 'another compile\u2019s id writes nothing');
@@ -1035,6 +1038,37 @@ describe('thinking binding: compile', () => {
     }
   });
 
+  it('a compile whose record the store can\u2019t write leaves the record before it, which that compile\u2019s stream can\u2019t note onto', async () => {
+    cleanup();
+    const manager = await open();
+    seed(manager);
+    await manager.compile(BIG, undefined, BIND_DROP);
+    const recorded = JSON.stringify(recordOf(manager));
+    manager.addMessage('User', [text('U3')]);
+    const store = manager.getStore() as unknown as { setStateJson(id: string, value: unknown): void };
+    const set = store.setStateJson.bind(store);
+    store.setStateJson = (id: string, value: unknown) => { if (id === 'default/thinking-binding') throw new Error('zz-store-unwritable'); set(id, value); };
+    const warn = console.warn;
+    const warned: string[] = [];
+    console.warn = (message: string) => { warned.push(message); };
+    let c2: CompileResult;
+    try {
+      c2 = await manager.compile(BIG, undefined, BIND_DROP);
+    } finally {
+      console.warn = warn;
+      store.setStateJson = set;
+    }
+    assert.equal(warned.length, 1, 'the failed write is logged');
+    assert.equal(JSON.stringify(recordOf(manager)), recorded, 'the record before it stands');
+    const a3 = manager.addMessage('Claude', [thought(3), text('A3')]);
+    assert.equal(manager.noteRequestSent([a3], identity(), c2.provenance!.compileId), false, 'the failed compile\u2019s stream can\u2019t note onto it');
+    // Compared against the first compile's record: U3 and A3 are past its end.
+    const next = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.deepEqual(thinkingByText(next), { U1: false, A1: true, U2: false, A2: true, U3: false, A3: false });
+    assert.deepEqual(next.thinkingStrip, { newly: [a3], cause: 'messages' });
+    await manager.close();
+  });
+
   it('a compile that fails after selecting writes no record and tells the strategy nothing', async () => {
     cleanup();
     const told: ContentBlock[][] = [];
@@ -1107,7 +1141,7 @@ describe('thinking binding: compile', () => {
     cleanup();
   });
 
-  it('thinkingRecordedAfter is the branch\u2019s sequence, at or above every message stored before, one the view filter hides included', async () => {
+  it('thinkingRecordedAfter is the branch\u2019s sequence where its record began, at or above every message stored before, one the view filter hides included', async () => {
     cleanup();
     const manager = await ContextManager.open({
       path: STORE,
