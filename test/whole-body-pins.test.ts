@@ -334,7 +334,7 @@ describe('a pin covers whole messages, for every reader', () => {
       assert.ok(over.length > 0, 'the warning was given');
       for (const w of over) {
         assert.ok(w.includes('pins: P)'), w);
-        assert.ok(w.includes('Unpin them, or narrow a range pin to fewer messages (a pin on any part of a message stored in parts covers the rest of that message too)'), w);
+        assert.ok(w.includes('Unpin them, or narrow a range pin to fewer messages (a pin on any part of a message stored in parts covers the rest of that message too, less a part locked with lockChunk outside the pin\'s ids)'), w);
       }
       await cm.close();
     });
@@ -430,8 +430,8 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
         assert.match(refusal.message, /exceed hard budget/, 'the phrase agent-framework matches stays');
         assert.ok(refusal.message.endsWith(
           `). A pin keeps ~${raw.tokens} tokens raw in the middle: document mark "the spec" (${mark}), message ${b}, ` +
-          `covering ${parts.length} stored parts of its message, ~${raw.tokens} tokens. Whoever manages the pins can unpin it, which ` +
-          `lets compression fold what it covers and frees up to its tokens less its summary; or whoever sets the hard budget can raise it, if the model's window allows.`), refusal.message);
+          `covering ${parts.length} stored parts of its message. Whoever manages pins can unpin it, freeing up to those tokens; ` +
+          `whoever sets the hard budget can raise it if the model's window allows.`), refusal.message);
         assert.ok(cm.unpin(mark));
         await cm.compile(budget(30_000));
         await cm.close();
@@ -520,8 +520,7 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
       const [m, i, t] = raw.pins;
       assert.strictEqual(m!.tokens, i!.tokens, 'both cover the whole message');
       assert.strictEqual(raw.tokens, m!.tokens + t!.tokens, 'the message both cover counts once');
-      assert.ok(refusal.message.endsWith('Whoever manages the pins can unpin them, which lets compression fold what they cover and frees up to those ' +
-        'tokens less their summaries; or whoever sets the hard budget can raise it, if the model\'s window allows.'), refusal.message);
+      assert.ok(refusal.message.endsWith('Whoever manages pins can unpin them, freeing up to those tokens; whoever sets the hard budget can raise it if the model\'s window allows.'), refusal.message);
       await cm.close();
     });
   });
@@ -611,7 +610,7 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
     });
   });
 
-  it('doesn\'t count a part locked raw inside a pin\'s span, which stays raw without its pin', async () => {
+  it('counts a part locked raw inside a pin\'s span, as every raw position in the middle', async () => {
     const named = async (lock: boolean) => {
       let tokens = 0;
       await withDir(async (dir) => {
@@ -631,9 +630,7 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
       });
       return tokens;
     };
-    const whole = await named(false);
-    const lessLocked = await named(true);
-    assert.ok(lessLocked < whole && lessLocked > whole * 0.7, `${lessLocked} of ${whole}`);
+    assert.strictEqual(await named(true), await named(false));
   });
 
   it('a mark held at a level keeps nothing raw, so a refusal in the middle names no pin, as before', async () => {
@@ -686,8 +683,8 @@ describe('the refusal\'s words for the pins it names', () => {
       diagnostics: { ...diagnostics, rawPins: { tokens: 70, pins: [{ pinId: 'pin-1', kind: 'pin', firstMessageId: 'a', lastMessageId: 'c', parts: 5, tokens: 70 }] } },
     });
     assert.ok(error.message.endsWith(
-      '). A pin keeps ~70 tokens raw in the middle: pin pin-1, messages a to c, covering 5 stored messages, ~70 tokens. ' +
-      'Whoever manages the pins can unpin it, which lets compression fold what it covers and frees up to its tokens less its summary; or whoever sets the hard budget can raise it, if the model\'s window allows.'), error.message);
+      '). A pin keeps ~70 tokens raw in the middle: pin pin-1, messages a to c, covering 5 stored messages. ' +
+      'Whoever manages pins can unpin it, freeing up to those tokens; whoever sets the hard budget can raise it if the model\'s window allows.'), error.message);
   });
   it('names several pins, and says nothing of pins without any', () => {
     const error = new OverBudgetError({
@@ -702,7 +699,17 @@ describe('the refusal\'s words for the pins it names', () => {
     });
     assert.ok(error.message.endsWith(
       '). Pins keep ~80 tokens raw in the middle: document mark "notes" (pin-0), message m, ~50 tokens; pin pin-2, message x, ~30 tokens. ' +
-      'Whoever manages the pins can unpin them, which lets compression fold what they cover and frees up to those tokens less their summaries; or whoever sets the hard budget can raise it, if the model\'s window allows.'), error.message);
+      'Whoever manages pins can unpin them, freeing up to those tokens; whoever sets the hard budget can raise it if the model\'s window allows.'), error.message);
     assert.ok(new OverBudgetError({ budget: 50, actual: 100, diagnostics }).message.endsWith(')'));
+  });
+  it('ends with a remedy short enough to stay whole in the last quarter of a 600-character cut', () => {
+    for (const n of [1, 2]) {
+      const pins = Array.from({ length: n }, (_, i) => ({ pinId: `pin-${i}`, kind: 'pin' as const, name: 'x'.repeat(400), firstMessageId: 'm', lastMessageId: 'm', tokens: 10 }));
+      const message = new OverBudgetError({ budget: 50, actual: 100, diagnostics: { ...diagnostics, rawPins: { tokens: 10 * n, pins } } }).message;
+      // agent-framework quotes a compile error cut at 600 characters, keeping the head and the last 140.
+      const remedy = message.lastIndexOf(' Whoever manages pins');
+      assert.ok(message.length > 600 && remedy >= 0, message);
+      assert.ok(message.length - remedy <= 140, message);
+    }
   });
 });

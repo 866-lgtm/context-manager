@@ -9887,7 +9887,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `its pins override: the pinned history it would show raw (~${pinned.pinnedRawTokens} tokens in ` +
           `${pinned.pinnedRaw.length} message(s); pins: ${pins.join(', ') || 'none found'}) ${limit}. ` +
           `Unpin them, or narrow a range pin to fewer messages (a pin on any part of a message stored in parts covers the ` +
-          `rest of that message too), or raise that budget to show them raw here.`,
+          `rest of that message too, less a part locked with lockChunk outside the pin's ids), or raise that budget to ` +
+          `show them raw here.`,
       );
       logCompressionCall({
         event: 'compression:pinned-raw-over-budget',
@@ -13004,11 +13005,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * start, which is the recent window's start or the head's end where the
    * recent window reaches back into the head) that pins keep raw
    * (`forceRawPinPositions`), each priced by `price`, the plan's own raw
-   * price. A position locked raw with `lockChunk` stays raw without its pin,
-   * so it isn't counted. Where bounds are read, a pin whose own bound isn't
-   * raw keeps nothing raw, so it isn't named even where it overlaps a raw
-   * pin; where they aren't, every pin renders raw. Undefined when no pin
-   * keeps any.
+   * price. Every such position counts, a part locked with `lockChunk` among
+   * them, so the tokens are what unpinning frees at most: a pin that keeps no
+   * part raw alone is still named. Where bounds are read, a pin whose own
+   * bound isn't raw keeps nothing raw, so it isn't named even where it
+   * overlaps a raw pin; where they aren't, every pin renders raw. Undefined
+   * when no pin keeps any.
    */
   private rawPinsDiagnostics(store: MessageStoreView, price: (position: number) => number): OverBudgetDiagnostics['rawPins'] {
     if (this.pins.length === 0) return undefined;
@@ -13017,9 +13019,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     const tailStart = Math.max(this.getRecentWindowStart(store), headEnd);
-    const lockedRaw = (id: MessageId): boolean => this.locked.has(id) && (this.resolutions.get(id) ?? 0) === 0;
-    const kept = (i: number): boolean => raw.has(i) && (i < headStart || (i >= headEnd && i < tailStart))
-      && !lockedRaw(messages[i]!.id);
+    const kept = (i: number): boolean => raw.has(i) && (i < headStart || (i >= headEnd && i < tailStart));
+
     let tokens = 0;
     for (const i of raw) if (kept(i)) tokens += price(i);
     if (tokens === 0) return undefined;

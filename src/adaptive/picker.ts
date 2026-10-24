@@ -52,11 +52,14 @@ export interface OverBudgetDiagnostics {
   /** Configured window minus the response reserve, before over-budget grace. */
   inputBudget?: number;
   /**
-   * The pins that keep messages raw in the middle, which compression would
-   * otherwise fold: outside the head and recent windows. `tokens` is the raw
-   * tokens they keep there together, estimated as the select prices them,
-   * and each pin gives its own; a message two pins cover counts once in
-   * `tokens` and toward each pin. Left out when no pin keeps any.
+   * The pins that keep messages raw in the adaptive plan's middle, which
+   * compression would otherwise fold: outside the head and recent windows.
+   * `tokens` is the raw tokens they keep there together, estimated as the
+   * plan prices them, and each pin gives its own; a message two pins cover
+   * counts once in `tokens` and toward each pin. Set only by the refusal of a
+   * plan whose middle is over the budget ("Adaptive picker exhausted but …");
+   * every other refusal leaves it out, as does that one when no pin keeps
+   * any.
    */
   rawPins?: { tokens: number; pins: readonly OverBudgetRawPin[] };
 }
@@ -180,17 +183,18 @@ function rawPinsText(raw: OverBudgetDiagnostics['rawPins']): string {
     const parts = pin.parts === undefined ? ''
       : pin.firstMessageId === pin.lastMessageId ? `, covering ${pin.parts} stored parts of its message`
         : `, covering ${pin.parts} stored messages`;
-    return `${what} ${label}, ${span}${parts}, ~${pin.tokens} tokens`;
+    // A lone pin's own tokens are the total, already given.
+    return `${what} ${label}, ${span}${parts}${pins.length === 1 ? '' : `, ~${pin.tokens} tokens`}`;
   });
   // Several pins can cover one message, so unpinning one of them frees none
   // of it: the remedy speaks of them together, whose tokens count it once.
   // It says who can act rather than telling its reader to, since a host can
-  // pass the text on to an agent that can do neither.
-  const remedy = pins.length === 1
-    ? 'Whoever manages the pins can unpin it, which lets compression fold what it covers and frees up to its tokens less its summary'
-    : 'Whoever manages the pins can unpin them, which lets compression fold what they cover and frees up to those tokens less their summaries';
-  return `. ${pins.length === 1 ? 'A pin keeps' : 'Pins keep'} ~${total} tokens raw in the middle: ${each.join('; ')}. ` +
-    `${remedy}; or whoever sets the hard budget can raise it, if the model's window allows.`;
+  // pass the text on to an agent that can do neither. It comes last and is
+  // kept under 140 characters, so a host that quotes a long message by its
+  // head and last quarter, cut at 600 characters, still quotes it whole.
+  const remedy = `Whoever manages pins can unpin ${pins.length === 1 ? 'it' : 'them'}, freeing up to those tokens; ` +
+    `whoever sets the hard budget can raise it if the model's window allows.`;
+  return `. ${pins.length === 1 ? 'A pin keeps' : 'Pins keep'} ~${total} tokens raw in the middle: ${each.join('; ')}. ${remedy}`;
 }
 
 /**
