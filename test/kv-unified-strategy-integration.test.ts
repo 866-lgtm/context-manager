@@ -1,9 +1,12 @@
-import { afterEach, test } from 'node:test';
+import { afterEach, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, rmSync } from 'node:fs';
-import { ContextManager, AutobiographicalStrategy, OverBudgetError } from '../src/index.js';
-import type { ContextEntry } from '../src/types/index.js';
+import { createHash } from 'node:crypto';
+import { ContextManager, AutobiographicalStrategy, KnowledgeStrategy, OverBudgetError, PassthroughStrategy } from '../src/index.js';
+import type { ContextEntry, StoredMessage } from '../src/types/index.js';
 import type { KvUnifiedReceiptChain } from '../src/adaptive/kv-unified-receipts.js';
+import { ParetoKvUnifiedPolicySolver, type ParetoSolveOptions } from '../src/adaptive/kv-unified-pareto.js';
+import { SparseLabelCeilingError } from '../src/adaptive/kv-unified.js';
 
 const STORE = './test-kv-unified-integration-store';
 
@@ -11,13 +14,7 @@ afterEach(() => {
   if (existsSync(STORE)) rmSync(STORE, { recursive: true, force: true });
 });
 
-function strategy(overrides: Record<string, unknown> = {}): AutobiographicalStrategy {
-  return new AutobiographicalStrategy({
-    adaptiveResolution: true,
-    foldingStrategy: 'kv-unified',
-    headWindowTokens: 0,
-    recentWindowTokens: 100,
-    kvUnified: {
+const KV_UNIFIED = {
       policy: {
         alpha: 0.7,
         budgetLowRatio: 0.5,
@@ -42,7 +39,16 @@ function strategy(overrides: Record<string, unknown> = {}): AutobiographicalStra
       adoptEpsilon: 0,
       treeifyNonContiguousSummaries: false,
       preserveGapBearingSummaries: false,
-    },
+};
+
+function strategy(overrides: Record<string, unknown> = {}): AutobiographicalStrategy {
+  return new AutobiographicalStrategy({
+    adaptiveResolution: true,
+    foldingStrategy: 'kv-unified',
+    headWindowTokens: 0,
+    recentWindowTokens: 100,
+    // A copy per strategy: a test below deletes a key from its own block.
+    kvUnified: { ...KV_UNIFIED, policy: { ...KV_UNIFIED.policy } },
     ...overrides,
   });
 }
@@ -50,6 +56,65 @@ function strategy(overrides: Record<string, unknown> = {}): AutobiographicalStra
 function receipts(strategy: AutobiographicalStrategy): KvUnifiedReceiptChain {
   return (strategy as unknown as { kvUnifiedReceipts: KvUnifiedReceiptChain }).kvUnifiedReceipts;
 }
+
+// #239: a superseded submission's line names the namespace it was logged for, after its fields, so
+// one process's strategies' lines can be told apart.
+test('a submission superseded before it settled is logged with its namespace', async (t) => {
+  const logged: string[] = [];
+  const original = console.error.bind(console);
+  t.mock.method(console, 'error', (...args: unknown[]) => {
+    const line = args.map(String).join(' ');
+    if (line.startsWith('[kv-unified]')) logged.push(line);
+    else original(...args);
+  });
+  const first = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: first, namespace: 'agents/wren' });
+  manager.addMessage('user', [{ type: 'text', text: 'hello continuity' }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  first.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  first.beginKvUnifiedSubmission({ submissionId: 's2', requestHash: 'wire2', layoutHash: 'layout1' });
+  assert.deepEqual(logged, [
+    '[kv-unified] submission s1 was never settled (no usage event before the next provider call); ' +
+      'superseded by s2 ns=agents/wren',
+  ]);
+  manager.close();
+});
+
+// #252: a live solve past the label ceiling compiles on the minimum-token cut.
+// The first such solve in the strategy's life is said where its operator
+// reads, naming the ceiling, the labels and the engine, and the plan line
+// marks each compile whose own solve took it.
+test('a live solve past the label ceiling compiles anyway, warns once and marks every plan line', async (t) => {
+  const warned: string[] = [];
+  const planLines: string[] = [];
+  const original = console.error.bind(console);
+  t.mock.method(console, 'warn', (...args: unknown[]) => { warned.push(args.map(String).join(' ')); });
+  t.mock.method(console, 'error', (...args: unknown[]) => {
+    const line = args.map(String).join(' ');
+    if (line.startsWith('[plan-vs-actual]')) planLines.push(line);
+    else original(...args);
+  });
+  t.mock.method(ParetoKvUnifiedPolicySolver.prototype, 'solve', (options: ParetoSolveOptions) => {
+    throw new SparseLabelCeilingError(options.labelCeiling!, options.labelCeiling! + 1);
+  });
+  const live = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: live, namespace: 'agents/wren' });
+  manager.addMessage('user', [{ type: 'text', text: 'hello continuity' }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  manager.addMessage('assistant', [{ type: 'text', text: 'and once more' }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  assert.equal(manager.getRenderStats()?.planVsActual?.ceiling, 'live');
+  manager.close();
+  assert.deepEqual(warned.filter((line) => line.includes('labelCeiling')), [
+    '[kv-unified] labelCeiling 10000 exceeded at 10001 labels (engine: packed, after subtree); ' +
+      'that solve took the minimum-token cut, as each one that exceeds it will. A high enough labelCeiling ' +
+      'lets this forest\'s search fit, and larger bucket sizes may (said once; [plan-vs-actual] shows ' +
+      'ceiling=live for each compile whose own solve did) ns=agents/wren',
+  ]);
+  assert.equal(planLines.length, 2, planLines.join('\n'));
+  for (const line of planLines) assert.ok(line.includes(' ceiling=live'), line);
+});
 
 test('kv-unified presentation commits only after acceptance and survives restart', async () => {
   const first = strategy();
@@ -105,6 +170,104 @@ test('kv-unified failed submission clears single flight without committing', asy
   manager.close();
 });
 
+/** The pending compile a begun submission carries, as its acceptance will read it. */
+function pendingOf(strategy: AutobiographicalStrategy) {
+  const fields = strategy as unknown as {
+    kvUnifiedPendingLayout: unknown;
+    kvUnifiedPendingMarkerUnitIndices: number[];
+    kvUnifiedPendingRender: unknown;
+  };
+  return {
+    layout: fields.kvUnifiedPendingLayout,
+    markers: fields.kvUnifiedPendingMarkerUnitIndices.length,
+    render: fields.kvUnifiedPendingRender,
+  };
+}
+
+/** A wire receipt with one marker per boundary the compile marked, so the acceptance builds a reference. */
+function wireReceiptFor(requestHash: string, markers: number) {
+  return {
+    requestHash,
+    markers: Array.from({ length: markers }, (_, ordinal) => ({
+      ordinal,
+      prefixHash: `prefix-${ordinal}`,
+      estimatedOffset: ordinal + 1,
+    })),
+  };
+}
+
+/** A store with s1 begun on one compile, then s2 begun on a later compile that has a message more, so
+ *  each has its own draft. s2 supersedes s1, and the line that logs it is the one console.error left
+ *  unprinted. */
+async function twoSubmissions(t: TestContext) {
+  const original = console.error.bind(console);
+  t.mock.method(console, 'error', (...args: unknown[]) => {
+    if (!args.map(String).join(' ').includes('was never settled')) original(...args);
+  });
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  const compile = () => manager.compile(
+    { maxTokens: 10_000, reserveForResponse: 0 },
+    undefined,
+    { kvUnifiedImmutablePrefixHash: 'immutable-v1' },
+  );
+  manager.addMessage('user', [{ type: 'text', text: 'hello continuity' }]);
+  await compile();
+  selected.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+  const first = pendingOf(selected);
+  manager.addMessage('assistant', [{ type: 'text', text: 'hello again' }]);
+  await compile();
+  selected.beginKvUnifiedSubmission({ submissionId: 's2', requestHash: 'wire2', layoutHash: 'layout2' });
+  const second = pendingOf(selected);
+  assert.ok(second.markers > 0, "premise: s2's compile marks a boundary");
+  assert.ok(second.render, "premise: s2's compile took a render record");
+  assert.notEqual(second.layout, first.layout, "premise: s2's draft isn't s1's");
+  return { selected, manager, first, second };
+}
+
+/** s2's acceptance keeps the reference its own compile describes: its layout, a marker per boundary
+ *  and its render record. */
+function acceptKeepsS2(selected: AutobiographicalStrategy, second: ReturnType<typeof pendingOf>): void {
+  assert.equal(receipts(selected).inFlightSubmissionId, 's2', 's2 is still in flight');
+  selected.reportKvUnifiedAccepted({ submissionId: 's2', acceptedAt: 2, wireReceipt: wireReceiptFor('wire2', second.markers) });
+  const cache = receipts(selected).cache;
+  assert.equal(receipts(selected).head?.submissionId, 's2');
+  assert.ok(cache, "s2's acceptance keeps a cache reference");
+  assert.equal(cache.immutablePrefixHash, 'immutable-v1');
+  assert.equal(cache.layout, second.layout, "it holds s2's own layout");
+  assert.equal(cache.markers.length, second.markers);
+  assert.equal(cache.render, second.render, "and s2's render record");
+}
+
+// The receipt chain takes a late accept or fail for a submission a later one superseded as a
+// duplicate, "never a state change" (KvUnifiedReceiptChain.begin), so it must leave the
+// in-flight submission's pending compile for that submission's own acceptance.
+for (const late of ['accept', 'fail'] as const) {
+  test(`a late ${late} for a superseded submission leaves the in-flight one its cache reference`, async (t) => {
+    const { selected, manager, first, second } = await twoSubmissions(t);
+    if (late === 'accept') {
+      selected.reportKvUnifiedAccepted({ submissionId: 's1', acceptedAt: 1, wireReceipt: wireReceiptFor('wire1', first.markers) });
+    } else {
+      selected.reportKvUnifiedFailed('s1');
+    }
+    acceptKeepsS2(selected, second);
+    manager.close();
+  });
+}
+
+// The chain refuses a callback for a submission it never began; the strategy hands it on rather than
+// dropping it, and the refusal leaves the in-flight submission's pending compile alone.
+test('a callback for a submission never begun is refused, and leaves the in-flight one its cache reference', async (t) => {
+  const { selected, manager, second } = await twoSubmissions(t);
+  assert.throws(
+    () => selected.reportKvUnifiedAccepted({ submissionId: 's0', acceptedAt: 1, wireReceipt: wireReceiptFor('wire0', second.markers) }),
+    /does not match the in-flight submission/,
+  );
+  assert.throws(() => selected.reportKvUnifiedFailed('s0'), /does not match the in-flight submission/);
+  acceptKeepsS2(selected, second);
+  manager.close();
+});
+
 test('a dry compile leaves the last real compile\u2019s kv-unified draft markers alone', async () => {
   const selected = strategy();
   const manager = await ContextManager.open({ path: STORE, strategy: selected });
@@ -143,7 +306,10 @@ test('a dry compile refuses a kv-unified plan that selects a level with no summa
           if (!first) return result;
           const finalResolutions = new Map(result.finalResolutions);
           finalResolutions.set(first.id, 1);
-          return { ...result, finalResolutions };
+          // The positional view (levelAt, levelsBySequence) describes the
+          // original levels; a stub that replaces the map drops it so the
+          // strategy reads the map.
+          return { ...result, finalResolutions, levelAt: undefined, levelsBySequence: undefined };
         },
       });
     }
@@ -183,6 +349,31 @@ test('kv-unified places token-weighted 33/66/100 history markers plus tail', () 
       (entry as { cacheMarker?: boolean }).cacheMarker ? [index] : []),
     [1, 2, 8, 11],
   );
+});
+
+test('kv-unified measures where its entries first differ from the previous compile’s, as other strategies do, and marks them as before', () => {
+  const selected = strategy() as unknown as {
+    placeCacheMarkers: (
+      entries: ContextEntry[],
+      head: ReadonlySet<string>,
+      tail: ReadonlySet<string>,
+    ) => number | null;
+  };
+  const entries = (edited?: number) => Array.from({ length: 12 }, (_, index) => ({
+    index,
+    sourceMessageId: `m${index}`,
+    sourceRelation: 'copy' as const,
+    participant: 'user',
+    content: [{ type: 'text' as const, text: (index === edited ? 'y' : 'x').repeat(index === 2 ? 400 : 40) }],
+  })) as ContextEntry[];
+  const place = (es: ContextEntry[]) => selected.placeCacheMarkers(es, new Set(['m0']), new Set(['m9', 'm10', 'm11']));
+  const marks = (es: ContextEntry[]) => es.flatMap((entry, index) => (entry.cacheMarker ? [index] : []));
+  const first = entries();
+  assert.equal(place(first), null, 'no earlier compile');
+  const second = entries(6); // the same length, other bytes
+  assert.equal(place(second), 6);
+  assert.deepEqual(marks(second), marks(first));
+  assert.deepEqual(marks(first), [1, 2, 8, 11]);
 });
 
 test('kv-unified reconciles folded, composite, and tail markers to atomic layout units', () => {
@@ -560,4 +751,346 @@ test('kv-unified latent demand keeps no ranking between compiles', async () => {
     assert.ok(value === null || typeof value !== 'object', `latentDemand.${key} holds state across compiles`);
   }
   manager.close();
+});
+
+test('a usage report inside the calibration dead band keeps the kv-unified forest derived across compiles', async () => {
+  // Summaries matter here: an applied multiplier reprices every recall pair,
+  // and a changed recall cost is what makes the forest decline to derive.
+  const membrane = {
+    complete: async () => ({
+      stopReason: 'end_turn',
+      content: [{ type: 'text', text: 'summary ' + 'word '.repeat(20) }],
+      usage: { inputTokens: 100, outputTokens: 30 },
+    }),
+  };
+  const selected = strategy({ targetChunkTokens: 60, compressionModel: 'mock' });
+  const internals = selected as unknown as {
+    summaries: unknown[];
+    _lastCompileEstimate: number;
+    _calibration: number;
+    _lastKvUnified: { lastTimings: { forestDerived: boolean } | null } | null;
+  };
+  const derived = () => internals._lastKvUnified?.lastTimings?.forestDerived;
+  const manager = await ContextManager.open({ path: STORE, strategy: selected, membrane: membrane as never });
+  let turn = 0;
+  const add = () => {
+    manager.addMessage(turn % 2 ? 'assistant' : 'user', [{ type: 'text', text: `turn ${turn} ` + 'word '.repeat(30) }]);
+    turn++;
+  };
+  for (let i = 0; i < 12; i++) add();
+  const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+  await manager.compile(budget);
+  for (let i = 0; i < 6 && internals.summaries.length === 0; i++) await manager.tick();
+  assert.ok(internals.summaries.length > 0, 'the fixture needs at least one summary');
+  // Let production settle, then take two appends: the second derives.
+  for (let i = 0; i < 6; i++) await manager.tick();
+  await manager.compile(budget);
+  add();
+  await manager.compile(budget);
+  assert.equal(derived(), true, 'control: an append derives the forest from the previous compile');
+
+  // A host reports the real input total once per compile. A 0.5% miss is the
+  // normal case; it must not reprice the store and force a full build.
+  selected.reportRealInputTokens(internals._lastCompileEstimate * 1.005);
+  assert.equal(internals._calibration, 1);
+  add();
+  await manager.compile(budget);
+  assert.equal(derived(), true, 'a sample inside the dead band keeps cross-compile reuse');
+
+  // A sustained 10% miss leaves the band, is applied, and reprices every
+  // recall pair: that compile builds in full, as every compile did before.
+  let applied = false;
+  for (let i = 0; i < 6 && !applied; i++) {
+    selected.reportRealInputTokens(internals._lastCompileEstimate * 1.1);
+    applied = internals._calibration !== 1;
+    add();
+    await manager.compile(budget);
+  }
+  assert.equal(applied, true);
+  assert.equal(derived(), false, 'an applied multiplier change is a full build');
+  manager.close();
+});
+
+test('one live kv-unified compile stamps its own elapsed time on plan-vs-actual, with the solve inside it', async () => {
+  const manager = await ContextManager.open({ path: STORE, strategy: strategy() });
+  const added = ['time me', 'timing you', 'and again'];
+  for (const [i, text] of added.entries()) manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  const pva = manager.getRenderStats()!.planVsActual!;
+  assert.equal(pva.messages, added.length, 'messages= is the number of stored messages the compile read');
+  assert.ok(Number.isInteger(pva.compileMs) && pva.compileMs! >= 0, `compileMs=${pva.compileMs}`);
+  assert.ok(Number.isInteger(pva.solveMs) && pva.solveMs! >= 0, `solveMs=${pva.solveMs}`);
+  assert.ok(pva.solveMs! <= pva.compileMs!, `solveMs=${pva.solveMs} exceeds compileMs=${pva.compileMs}`);
+  manager.close();
+});
+
+test('the production shadow pick leaves plan-vs-actual on the live kv-unified solve', async () => {
+  const selected = strategy({ productionBudgetTokens: 50 });
+  const internals = selected as unknown as {
+    buildPicker: (...args: unknown[]) => unknown;
+    _lastKvUnified: unknown;
+  };
+  const built: unknown[] = [];
+  const buildPicker = internals.buildPicker.bind(selected);
+  internals.buildPicker = (...args) => {
+    const picker = buildPicker(...args);
+    built.push(internals._lastKvUnified);
+    return picker;
+  };
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  manager.addMessage('user', [{ type: 'text', text: 'live and shadow' }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  assert.equal(built.length, 2, 'control: the live pick and the shadow pick each built a kv-unified solver');
+  assert.notEqual(built[0], built[1]);
+  assert.equal(internals._lastKvUnified, built[0], 'the live solver, not the shadow one, backs the stats');
+  manager.close();
+});
+
+test('ages are banded at 4 steps per doubling unless the recipe policy says otherwise', async () => {
+  const stepsOf = async (kvUnified: Record<string, unknown>) => {
+    const selected = strategy({ kvUnified });
+    const manager = await ContextManager.open({ path: STORE, strategy: selected });
+    manager.addMessage('user', [{ type: 'text', text: 'hello' }]);
+    await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+    const solver = (selected as unknown as { _lastKvUnified: { options: { policy: { ageBandSteps?: number } } } })._lastKvUnified;
+    const steps = solver.options.policy.ageBandSteps;
+    manager.close();
+    rmSync(STORE, { recursive: true, force: true });
+    return steps;
+  };
+  assert.equal(await stepsOf({ ...KV_UNIFIED }), 4);
+  assert.equal(await stepsOf({ ...KV_UNIFIED, policy: { ...(KV_UNIFIED as { policy: object }).policy, ageBandSteps: 0 } }), 0);
+  // A caller forwarding an optional setting leaves the key present and undefined.
+  assert.equal(await stepsOf({ ...KV_UNIFIED, policy: { ...(KV_UNIFIED as { policy: object }).policy, ageBandSteps: undefined } }), 4);
+});
+
+test('the hysteresis certificate is on unless the recipe says false', async () => {
+  // A kvUnified block without the key certifies the carried layout on an
+  // append; the same block with `hysteresisCertificate: false` runs the full
+  // solver, which leaves no certificate on the result.
+  const certified = async (kvUnified: Record<string, unknown>) => {
+    const selected = strategy({ kvUnified });
+    const internals = selected as unknown as {
+      _lastKvUnified: { lastResult: { certificate?: unknown } | null; lastTimings: { certificateMs: number } | null } | null;
+    };
+    const manager = await ContextManager.open({ path: STORE, strategy: selected });
+    const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+    const prefix = { kvUnifiedImmutablePrefixHash: 'immutable-v1' };
+    for (let i = 0; i < 12; i++) manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text: `turn ${i} ` + 'word '.repeat(30) }]);
+    await manager.compile(budget, undefined, prefix);
+    assert.equal(internals._lastKvUnified?.lastResult?.certificate, undefined, 'a blank-slate solve is never certified');
+    // The carried layout is the last ACCEPTED presentation, so accept this one.
+    selected.beginKvUnifiedSubmission({ submissionId: 's1', requestHash: 'wire1', layoutHash: 'layout1' });
+    const markerCount = (selected as unknown as { kvUnifiedPendingMarkerUnitIndices: number[] }).kvUnifiedPendingMarkerUnitIndices.length;
+    selected.reportKvUnifiedAccepted({
+      submissionId: 's1',
+      acceptedAt: 1,
+      wireReceipt: {
+        requestHash: 'wire1',
+        markers: Array.from({ length: markerCount }, (_, ordinal) => ({ ordinal, prefixHash: `prefix-${ordinal}`, estimatedOffset: ordinal + 1 })),
+      },
+    });
+    manager.addMessage('user', [{ type: 'text', text: 'turn 12 ' + 'word '.repeat(30) }]);
+    await manager.compile(budget, undefined, prefix);
+    const result = {
+      certificate: internals._lastKvUnified?.lastResult?.certificate !== undefined,
+      certificateMs: internals._lastKvUnified?.lastTimings?.certificateMs ?? 0,
+    };
+    manager.close();
+    rmSync(STORE, { recursive: true, force: true });
+    return result;
+  };
+  // Epsilon 0 can never be proven: the bound subtracts a roundoff allowance.
+  const byDefault = await certified({ ...KV_UNIFIED, adoptEpsilon: 50 });
+  assert.equal(byDefault.certificate, true, 'no key: the append is certified');
+  assert.ok(byDefault.certificateMs > 0, 'no key: the certificate ran');
+  const off = await certified({ ...KV_UNIFIED, adoptEpsilon: 50, hysteresisCertificate: false });
+  assert.equal(off.certificate, false, 'false: the full solver decides');
+  assert.equal(off.certificateMs, 0, 'false: the certificate never ran');
+});
+
+test('the plan-vs-actual line keeps its old prefix, and marks dry runs', async () => {
+  const manager = await ContextManager.open({ path: STORE, strategy: strategy() });
+  manager.addMessage('user', [{ type: 'text', text: 'live then dry' }]);
+  const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+  const lines: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => {
+    if (typeof args[0] === 'string' && args[0].startsWith('[plan-vs-actual]')) lines.push(args[0]);
+    else error(...args);
+  };
+  try {
+    await manager.compile(budget);
+    assert.equal(manager.getRenderStats()!.planVsActual!.dryRun, undefined, 'a live compile is not marked');
+    await manager.compile(budget, undefined, { dryRun: true });
+  } finally {
+    console.error = error;
+  }
+  const shape = /^\[plan-vs-actual\] planned=\d+ actual=\d+ delta=[+-]\d+ \([+-]\d+\.\d%\) budgetMet=\w+ exhausted=\w+ moves=\d+ solver=kv-unified messages=1 compileMs=\d+ solveMs=\d+/;
+  assert.equal(lines.length, 2, lines.join('\n'));
+  assert.match(lines[0], shape);
+  assert.doesNotMatch(lines[0], /dryRun/);
+  assert.match(lines[1], shape);
+  // Its namespace follows its fields (#239).
+  assert.match(lines[1], / dryRun=true ns=default$/);
+  manager.close();
+});
+
+test('messages= counts the strategy view under a strategy with its own chunker', async () => {
+  // KnowledgeStrategy replaces the base chunker; the count must not depend on it.
+  const manager = await ContextManager.open({
+    path: STORE,
+    strategy: new KnowledgeStrategy({ adaptiveResolution: true, headWindowTokens: 0, recentWindowTokens: 100 }),
+  });
+  for (const text of ['one', 'two', 'three']) manager.addMessage('user', [{ type: 'text', text }]);
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  assert.equal(manager.getRenderStats()!.planVsActual!.messages, 3);
+  manager.close();
+});
+
+/** The [plan-vs-actual] lines logged while `fn` runs, read through a stand-in
+ *  console: the line goes to console.error, or to console.warn with an overrun
+ *  note when the emitter overruns the plan. Lines opening with a tag in
+ *  `quiet` are dropped; everything else goes to the real console. */
+async function planVsActualLines(fn: () => Promise<void>, quiet: string[] = []): Promise<string[]> {
+  const lines: string[] = [];
+  const { error, warn } = console;
+  const capture = (pass: (...args: unknown[]) => void) => (...args: unknown[]) => {
+    const first = args[0];
+    if (typeof first === 'string' && first.startsWith('[plan-vs-actual]')) lines.push(first);
+    else if (!(typeof first === 'string' && quiet.some((tag) => first.startsWith(tag)))) pass(...args);
+  };
+  console.error = capture(error);
+  console.warn = capture(warn);
+  try {
+    await fn();
+  } finally {
+    console.error = error;
+    console.warn = warn;
+  }
+  return lines;
+}
+
+/** The fields every [plan-vs-actual] line opens with, through `moves=`. */
+const PVA_OPENING =
+  String.raw`^\[plan-vs-actual\] planned=\d+ actual=\d+ delta=[+-]\d+ \([+-]\d+\.\d%\) budgetMet=(true|false) exhausted=(true|false)` +
+  String.raw` moves=\d+`;
+/**
+ * The note that ends the line's message when the emitter overruns the plan, then the namespace
+ * the line names, which follows its fields and the note (#239).
+ */
+const PVA_OVERRUN = String.raw`( \u2014 emitter overran the plan; .*)? ns=default$`;
+
+test('a kv-stable compile after a preview that solved with kv-unified logs no solveMs', async () => {
+  // buildPicker's kv-stable branch leaves _lastKvUnified as the preview's pick
+  // set it, so only the plan's solver keeps those timings off the live line.
+  const lines = await planVsActualLines(async () => {
+    const manager = await ContextManager.open({ path: STORE, strategy: strategy({ foldingStrategy: 'kv-stable' }) });
+    for (const [i, text] of ['one', 'two', 'three'].entries()) manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text }]);
+    const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+    assert.ok(manager.previewContext(budget, { foldingStrategy: 'kv-unified' }), 'premise: the preview ran');
+    await manager.compile(budget);
+    manager.close();
+  }, ['[picker-config-drift]']);
+  assert.equal(lines.length, 2, `one line for each compile: ${JSON.stringify(lines)}`);
+  assert.match(lines[0]!, new RegExp(PVA_OPENING + String.raw` solver=kv-unified messages=3 compileMs=\d+ solveMs=\d+ dryRun=true` + PVA_OVERRUN),
+    'premise: the preview solved with kv-unified');
+  assert.match(lines[1]!, new RegExp(PVA_OPENING + String.raw` solver=kv-stable messages=3 compileMs=\d+` + PVA_OVERRUN), 'the live kv-stable compile');
+});
+
+test('compileMs spans the select from its start, chunk rebuild included, and no more than the compile call', async () => {
+  const selected = strategy();
+  // A chunk rebuild that takes at least 30 ms: select() runs it before it plans.
+  const internals = selected as unknown as { rebuildChunks: (store: unknown) => void };
+  const rebuild = internals.rebuildChunks.bind(selected);
+  internals.rebuildChunks = (store) => {
+    const until = performance.now() + 30;
+    while (performance.now() < until) { /* the rebuild's own time */ }
+    rebuild(store);
+  };
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  manager.addMessage('user', [{ type: 'text', text: 'slow to chunk' }]);
+  const started = performance.now();
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  const elapsed = performance.now() - started;
+  const { compileMs } = manager.getRenderStats()!.planVsActual!;
+  assert.ok(compileMs! >= 30, `compileMs=${compileMs} leaves out the chunk rebuild`);
+  assert.ok(compileMs! <= Math.ceil(elapsed), `compileMs=${compileMs} is longer than the compile call, ${elapsed.toFixed(1)} ms`);
+  manager.close();
+});
+
+test('a preview marks its plan-vs-actual line and its own stats dryRun, and a dry pass leaves the live stats as the live compile left them', async () => {
+  let preview: ReturnType<ContextManager['previewContext']> = null;
+  const lines = await planVsActualLines(async () => {
+    const manager = await ContextManager.open({ path: STORE, strategy: strategy() });
+    for (const [i, text] of ['one', 'two', 'three'].entries()) manager.addMessage(i % 2 ? 'assistant' : 'user', [{ type: 'text', text }]);
+    const budget = { maxTokens: 10_000, reserveForResponse: 0 };
+    await manager.compile(budget);
+    await manager.compile(budget, undefined, { dryRun: true });
+    preview = manager.previewContext(budget, undefined, { render: true });
+    assert.equal(manager.getRenderStats()!.planVsActual!.dryRun, undefined, 'getRenderStats still describes the live compile');
+    manager.close();
+  });
+  assert.equal(preview!.stats?.planVsActual?.dryRun, true, "the preview's own stats are marked");
+  assert.equal(lines.length, 3, `one line for each compile: ${JSON.stringify(lines)}`);
+  assert.match(lines[2]!, new RegExp(PVA_OPENING + String.raw` solver=kv-unified messages=3 compileMs=\d+ solveMs=\d+ dryRun=true` + PVA_OVERRUN),
+    "the preview's line");
+});
+
+test('messages= counts the strategy view: auxiliary slots merged in, after the view filter', async () => {
+  const shown = (message: StoredMessage) => !message.content.some((block) => block.type === 'text' && block.text.includes('hidden'));
+  const main = await ContextManager.open({ path: STORE, strategy: new PassthroughStrategy() });
+  const reader = await ContextManager.open({
+    store: main.getStore(),
+    namespace: 'plan-vs-actual/reader',
+    isolate: true,
+    strategy: strategy(),
+    auxiliaryMessageViews: [{}],
+    viewFilter: shown,
+  });
+  for (const text of ['main one', 'main two', 'main hidden']) main.addMessage('user', [{ type: 'text', text }]);
+  for (const text of ['reader one', 'reader hidden']) reader.addMessage('user', [{ type: 'text', text }]);
+  await reader.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  // Five stored across the two slots, two of them hidden. Unfiltered the view
+  // would hold five, and without the merge two, or one once filtered.
+  assert.equal(reader.getRenderStats()!.planVsActual!.messages, 3);
+  reader.close();
+  main.close();
+});
+
+test('a quarantined merge is blocked for latent demand by its source-set key', async () => {
+  const selected = strategy();
+  const manager = await ContextManager.open({ path: STORE, strategy: selected });
+  manager.addMessage('user', [{ type: 'text', text: 'hello' }]);
+  const sourceIds = ['L1-a', 'L1-b'];
+  const key = createHash('sha256').update(JSON.stringify(sourceIds), 'utf8').digest('hex');
+  (selected as unknown as { mergeQuarantine: Map<string, unknown> }).mergeQuarantine.set(key, {
+    key, level: 2, sourceIds, attempts: 3, lastOutcome: 'refusal', quarantinedAt: 1,
+  });
+  await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+  const solver = (selected as unknown as {
+    _lastKvUnified: { options: { latentDemand?: { blocked?: (sourceIds: readonly string[]) => boolean } } };
+  })._lastKvUnified;
+  const blocked = solver.options.latentDemand?.blocked;
+  assert.ok(blocked, 'the recipe-built solver carries the predicate');
+  assert.equal(blocked(sourceIds), true, 'the quarantined source set, in order');
+  assert.equal(blocked([...sourceIds].reverse()), false, 'another order is another merge');
+  assert.equal(blocked(['L1-a', 'L1-c']), false);
+  manager.close();
+});
+
+test('latent demand is joint unless the recipe says individual', async () => {
+  const modeOf = async (kvUnified: Record<string, unknown>) => {
+    const selected = strategy({ kvUnified });
+    const manager = await ContextManager.open({ path: STORE, strategy: selected });
+    manager.addMessage('user', [{ type: 'text', text: 'hello' }]);
+    await manager.compile({ maxTokens: 10_000, reserveForResponse: 0 });
+    const solver = (selected as unknown as { _lastKvUnified: { options: { latentDemand?: { mode?: string } } } })._lastKvUnified;
+    const mode = solver.options.latentDemand?.mode;
+    manager.close();
+    rmSync(STORE, { recursive: true, force: true });
+    return mode;
+  };
+  assert.equal(await modeOf({ ...KV_UNIFIED }), 'joint');
+  assert.equal(await modeOf({ ...KV_UNIFIED, latentDemandMode: 'individual' }), 'individual');
 });

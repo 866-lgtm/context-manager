@@ -33,6 +33,14 @@ export type {
   BranchInfo,
   ContextInjection,
   CompileResult,
+  BranchRef,
+  RawBodySource,
+  CompiledMessageSources,
+  CompileProvenance,
+  JournalMark,
+  RenderedLayout,
+  LayoutUnit,
+  ThinkingStrip,
 } from './context.js';
 
 // Strategy types
@@ -51,6 +59,10 @@ export type {
   AutobiographicalConfig,
   AutobiographicalOptions,
   CompressionQuarantineStatus,
+  CompressionQuarantineSpan,
+  LoadRepairReport,
+  LoadRepairDroppedSummary,
+  LoadRepairDropReason,
   RecallEnvelopeMode,
   CarrierPolicy,
   SummaryLevel,
@@ -68,7 +80,11 @@ export type {
   TimeRangeSummaryEntry,
   SummaryOverviewStrategy,
   RenderStats,
+  CalibrationReset,
   RenderStatsCapableStrategy,
+  RenderedSummaryInfo,
+  ThinkingBinding,
+  RequestIdentity,
 } from './strategy.js';
 
 export {

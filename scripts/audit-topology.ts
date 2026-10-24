@@ -2,15 +2,18 @@
  * Audit a store's summary topology: every summary whose leaves are not
  * contiguous among chunk-owned messages in store order (crossed ownership —
  * issue #122 cross-era merges, restore/branch interleavings, hand surgery).
- * Read-only; the same audit `initialize` runs (topologyPolicy).
+ * It runs the same audit as `initialize` (topologyPolicy).
  *
  * Usage:
  *   node dist/scripts/audit-topology.js <store-path> [--namespace <ns>] [--json]
  *
  * Exit code 0 = clean, 2 = violations found, 1 = could not open.
- * Opens the store audit-only (no frontier chunking, no merge enqueue, no
- * queue rewrite). Run it on a stopped resident's store or a copy: opening a
- * chronicle store takes its lock and may rewrite its state index.
+ * Opens the store audit-only: no frontier chunking, no merge enqueue, and no
+ * dropping of queued merges the grouping grammar refuses. The open still
+ * writes. Opening a chronicle store takes its lock and may rewrite its state
+ * index, and loading persists the strategy's repair of what readers can't
+ * use (see `auditOnly`). So run it on a stopped resident's store, and on a
+ * copy to keep the store as it was.
  */
 
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
@@ -54,6 +57,8 @@ async function main(): Promise<void> {
     } else {
       console.log(`${storePath}${namespace ? ` (${namespace})` : ''}: ${manager.getMessageCount()} messages, ${seen}, ` +
         `${violations.length} topology violation(s), compression debt ${debt.state}`);
+      // What the report couldn't read, what that means and what to do, a line each.
+      if (debt.error !== undefined) for (const line of debt.error.split('\n')) console.log(`  ${line}`);
       for (const v of violations) {
         console.log(`  L${v.level} ${v.id}: ${v.leafCount} leaves ${v.span.first}..${v.span.last}, ` +
           `${v.holes} hole(s) e.g. ${v.holeSample.join(',')}` +

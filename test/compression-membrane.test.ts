@@ -222,7 +222,7 @@ describe('Dedicated compression membrane', () => {
     const compression = capturing('compression', (request, n) => {
       if (carriesReasoning(request)) {
         rejected++;
-        throw Object.assign(new Error('invalid_request_error: thinking blocks cannot be modified'), { httpStatus: 400 });
+        throw Object.assign(new Error('invalid_request_error: thinking blocks cannot be modified'), { type: 'invalid_request', retryable: false, httpStatus: 400 });
       }
       return {
         stopReason: 'end_turn',
@@ -254,6 +254,71 @@ describe('Dedicated compression membrane', () => {
     assert.strictEqual(summary, 'zz transition summary');
     assert.strictEqual(primary.calls.length, 0);
     assert.strictEqual(compression.calls.length, 1);
+    await manager.close();
+    cleanup();
+  });
+});
+
+describe('Memory-write system prompts and spliced refusals', () => {
+  before(() => cleanup());
+  after(() => cleanup());
+
+  it('compressionSystemPrompt rides every memory-write when the host declares no prompt', async () => {
+    const primary = capturing('primary');
+    await runWorkload({ primary: primary.membrane, strategyOptions: { compressionSystemPrompt: ZZ_LIGHT } });
+    assert.ok(primary.calls.length >= 3);
+    assert.ok(primary.calls.every((r) => r.system === ZZ_LIGHT), 'every L1 and merge carries the operator prompt');
+  });
+
+  it('no compressionRefusalSystemPrompt: a refusal is not retried (one call per rung)', async () => {
+    const primary = capturing('primary', (request, n) =>
+      isMerge(request) ? ok(request, n) : { stopReason: 'refusal', content: [t('no')], usage: { input_tokens: 10, output_tokens: 1 } });
+    await runWorkload({ primary: primary.membrane, turns: 8, strategyOptions: { compressionSystemPrompt: ZZ_LIGHT } });
+    assert.ok(primary.calls.length >= 1);
+    assert.ok(primary.calls.every((r) => r.system === ZZ_LIGHT), 'nothing escalated');
+  });
+
+  it('a refusal spliced onto a truncated answer is a refusal: it escalates, and is never minted', async () => {
+    // An output filter that cuts the completion mid-token, appends a canned
+    // refusal and reports a length stop: the answer must not be read as an
+    // incomplete memory, nor kept as one.
+    const SPLICED = 'Earlier that day the deploy went out and the logs show th' +
+      "I'm sorry, but I cannot assist with that request.";
+    const compression = capturing('compression', (request, n) => {
+      if (request.system === ZZ_HEAVY) return ok(request, n);
+      return { stopReason: 'max_tokens', content: [t(SPLICED)], usage: { input_tokens: 0, output_tokens: 0 } };
+    });
+    const strategy = await runWorkload({
+      primary: capturing('primary').membrane,
+      attach: compression.membrane,
+      strategyOptions: { compressionSystemPrompt: ZZ_LIGHT, compressionRefusalSystemPrompt: ZZ_HEAVY },
+    });
+    const heavy = compression.calls.filter((r) => r.system === ZZ_HEAVY);
+    const light = compression.calls.filter((r) => r.system === ZZ_LIGHT);
+    assert.ok(light.length >= 2 && heavy.length === light.length, 'every spliced answer was escalated once');
+    assert.strictEqual(strategy.getCompressionQuarantineStatus().count, 0, 'the escalations answered');
+  });
+
+  it('a spliced refusal with no escalation configured is quarantined as a refusal, not minted', async () => {
+    cleanup();
+    const SPLICED = 'The conversation covered three topics and th' + "I'm sorry, but I can't help with that.";
+    const compression = capturing('compression', () => ({
+      stopReason: 'max_tokens', content: [t(SPLICED)], usage: { input_tokens: 0, output_tokens: 0 },
+    }));
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: ZZ_COMPRESSION_MODEL, targetChunkTokens: 80, headWindowTokens: 0, recentWindowTokens: 0,
+      hierarchical: true, quarantineAlarmIntervalMs: 0,
+    } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
+    const manager = await ContextManager.open({ path: ZZ_STORE_PATH, strategy, compressionMembrane: compression.membrane });
+    for (let i = 0; i < 12; i++) {
+      manager.addMessage(i % 2 === 0 ? 'user' : 'agent', [t(`turn ${i} of steady traffic `.repeat(4))]);
+      await drain(manager);
+    }
+    assert.ok(compression.calls.length > 0);
+    const minted = (strategy as unknown as { summaries: Array<{ content: string }> }).summaries;
+    assert.ok(!minted.some((s) => s.content.includes("I'm sorry")), 'no spliced refusal became a memory');
+    const status = strategy.getCompressionQuarantineStatus();
+    assert.ok(status.count >= 1, 'the chunk is quarantined');
     await manager.close();
     cleanup();
   });

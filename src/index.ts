@@ -12,12 +12,14 @@ export { concatBodyGroups } from './adaptive/render.js';
 export { continuesBody, bodyStart, bodyEnd, bodyBounds, bodyBoundsIn, type BodyShard } from './body-runs.js';
 export { ContextLog } from './context-log.js';
 export { BlobManager, blockAsStored } from './blob-manager.js';
+export { MalformedContentError, malformedContentPlaces } from './well-formed-content.js';
 export {
   persistMintRequestPreimage,
   getMintRequestPreimageBytes,
   getMintRequestByHash,
   MintPreimageMaterializationError,
 } from './mint-preimage.js';
+export type { Diagnostics } from './diagnostics.js';
 
 // Strategies
 export { PassthroughStrategy } from './strategies/passthrough.js';
@@ -37,9 +39,11 @@ export type { ConfigLayer, ConfigResolutionSemantics, EffectiveConfigReport } fr
 // classifyInferenceError); exporting them from the root gives consumers a
 // real `instanceof` instead of stringly-typed `err.name` matching.
 export { OverBudgetError, UncoveredDropError } from './adaptive/picker.js';
+export type { OverBudgetClearedBy } from './adaptive/picker.js';
+export { CompressionWithdrawn } from './compression-withdrawn.js';
 export { StoreTopologyError, type TopologyViolation } from './strategies/autobiographical.js';
 export { planTopologyRepair, type RepairPlan, type RepairInputs, type RepairOptions } from './repair/topology.js';
-export type { OverBudgetDiagnostics } from './adaptive/picker.js';
+export type { OverBudgetDiagnostics, OverBudgetRawPin } from './adaptive/picker.js';
 
 // Types
 export type {
@@ -69,6 +73,14 @@ export type {
   BranchInfo,
   ContextInjection,
   CompileResult,
+  BranchRef,
+  RawBodySource,
+  CompiledMessageSources,
+  CompileProvenance,
+  JournalMark,
+  RenderedLayout,
+  LayoutUnit,
+  ThinkingStrip,
   // Strategy types
   MessageStoreView,
   ContextLogView,
@@ -81,6 +93,9 @@ export type {
   HotConfigurableStrategy,
   AutobiographicalConfig,
   AutobiographicalOptions,
+  LoadRepairReport,
+  LoadRepairDroppedSummary,
+  LoadRepairDropReason,
   RecallEnvelopeMode,
   CarrierPolicy,
   SummaryLevel,
@@ -94,7 +109,32 @@ export type {
   AddMessageOptions,
   CompressionHoldOptions,
   CompressionHoldInfo,
+  RenderedSummaryInfo,
+  ThinkingBinding,
+  RequestIdentity,
 } from './types/index.js';
+
+// Accepted rounds and fold receipts
+export {
+  FOLD_QUERY_DEFAULT_LIMIT,
+  FOLD_QUERY_MAX_LIMIT,
+  ACCEPTED_LAYOUT_RECORD,
+  STORE_IDENTITY_RECORD,
+  storeIdentity,
+} from './fold-journal.js';
+export type {
+  FoldReceipt,
+  FoldReceiptSource,
+  FoldChange,
+  FoldForm,
+  FoldLayoutRun,
+  FoldSpanBound,
+  FoldQuery,
+  FoldQueryResult,
+  RoundUsage,
+  ReceiptSource,
+  Presentation,
+} from './fold-journal.js';
 
 export {
   DEFAULT_AUTOBIOGRAPHICAL_CONFIG,

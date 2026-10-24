@@ -4,7 +4,10 @@
  * Always raise the chronologically-oldest raisable chunk's group, regardless
  * of level distribution. This is the "memory fades chronologically" policy
  * — the simplest possible monotonic policy and the one originally proposed
- * in rev 1 of the design doc.
+ * in rev 1 of the design doc. Like flat-profile, it never lowers a chunk
+ * within a solve, a pinned chunk is seeded raw, and a chunk carried at a level
+ * where it has no summary starts at the next level down where it has one
+ * (greedy-fold.ts).
  *
  * Kept for comparison against FlatProfileStrategy and as a fallback during
  * early rollout.
@@ -30,11 +33,12 @@ function oldestFirstStep(state: GreedyState, budget: FoldingBudget): GreedyOp | 
   const middle = state.foldableMiddle();
   if (middle.length === 0) return null;
 
-  // Find the oldest raisable chunk.
+  // Raise the oldest chunk through its next summary up. With none above it,
+  // ask for one at the next level.
   const oldest = middle[0];
-  const targetLevel = oldest.currentResolution + 1;
-  const parent = oldest.ancestorAt(targetLevel);
+  const parent = state.nextAncestor(oldest);
   if (!parent) {
+    const targetLevel = oldest.currentResolution + 1;
     const lkAncestor = oldest.currentResolution === 0 ? null : oldest.ancestorAt(oldest.currentResolution);
     const range = lkAncestor
       ? {
