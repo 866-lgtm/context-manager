@@ -6,11 +6,18 @@
  * Usage:
  *   drain-autobiographical <copied-store> <namespace> --apply \
  *     --model=claude-fable-5 --participant=fable [--max-steps=200]
+ *
+ * [local patch] --provider=openai-compatible sends the calls to an
+ * OpenAI-compatible endpoint instead of Anthropic: COMPRESSION_OPENAI_BASE_URL
+ * (required) and COMPRESSION_OPENAI_API_KEY (or OPENAI_API_KEY), the same
+ * variables a host's dedicated compression membrane reads. --model names the
+ * model on that endpoint.
  */
 
 import {
   AnthropicAdapter,
   Membrane,
+  OpenAICompatibleAdapter,
   NativeFormatter,
   type ToolDefinition,
 } from '@animalabs/membrane';
@@ -45,22 +52,41 @@ if (!Number.isSafeInteger(maxSteps) || maxSteps <= 0) {
   process.exit(2);
 }
 
-const authToken = process.env.ANTHROPIC_AUTH_TOKEN;
-const apiKey = process.env.ANTHROPIC_API_KEY;
-if (!authToken && !apiKey) {
-  console.error('ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY is required');
+const provider = option('provider') ?? 'anthropic';
+if (provider !== 'anthropic' && provider !== 'openai-compatible') {
+  console.error(`invalid --provider=${provider} (anthropic | openai-compatible)`);
   process.exit(2);
 }
 
-const adapter = new AnthropicAdapter({
-  ...(authToken
-    ? {
-        authToken,
-        defaultHeaders: { 'anthropic-beta': 'oauth-2025-04-20' },
-      }
-    : { apiKey: apiKey! }),
-  baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
-});
+function anthropicAdapter(): AnthropicAdapter {
+  const authToken = process.env.ANTHROPIC_AUTH_TOKEN;
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!authToken && !apiKey) {
+    console.error('ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY is required');
+    process.exit(2);
+  }
+  return new AnthropicAdapter({
+    ...(authToken
+      ? {
+          authToken,
+          defaultHeaders: { 'anthropic-beta': 'oauth-2025-04-20' },
+        }
+      : { apiKey: apiKey! }),
+    baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
+  });
+}
+
+function openAICompatibleAdapter(): OpenAICompatibleAdapter {
+  const baseURL = process.env.COMPRESSION_OPENAI_BASE_URL;
+  const apiKey = process.env.COMPRESSION_OPENAI_API_KEY ?? process.env.OPENAI_API_KEY;
+  if (!baseURL || !apiKey) {
+    console.error('COMPRESSION_OPENAI_BASE_URL and COMPRESSION_OPENAI_API_KEY (or OPENAI_API_KEY) are required');
+    process.exit(2);
+  }
+  return new OpenAICompatibleAdapter({ baseURL, apiKey });
+}
+
+const adapter = provider === 'openai-compatible' ? openAICompatibleAdapter() : anthropicAdapter();
 const membrane = new Membrane(adapter, {
   formatter: new NativeFormatter(),
   assistantParticipant: participant,
@@ -91,6 +117,10 @@ const passthroughKeys = [
   'witnessedIdentityReminder',
   'witnessedBeforeSequence',
   'witnessedInstruction',
+  // [local patch] memory-write prompts and tool surface, as the resident runs them
+  'compressionSystemPrompt',
+  'compressionRefusalSystemPrompt',
+  'compressionDeclareTools',
 ] as const;
 const recipeOptions: Record<string, unknown> = {};
 for (const key of passthroughKeys) {
