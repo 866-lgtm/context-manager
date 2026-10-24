@@ -759,23 +759,35 @@ describe('thinking binding: compile', () => {
     await manager.close();
   });
 
-  it('a committing compile without binds clears the record, and a dry one leaves it', async () => {
+  it('a compile without binds neither reads nor writes the record; one an earlier binding compile left is compared like any other', async () => {
     cleanup();
     const manager = await open();
     const { a1, a2 } = seed(manager);
     await manager.compile(BIG, undefined, BIND_DROP);
+    const recorded = JSON.stringify(recordOf(manager));
+    // A store that can't give or take the record state doesn't touch a
+    // compile without the option, committing or dry.
+    const store = manager.getStore() as unknown as { getStateJson(id: string): unknown; setStateJson(id: string, value: unknown): void };
+    const get = store.getStateJson.bind(store);
+    const set = store.setStateJson.bind(store);
+    let touched = 0;
+    store.getStateJson = (id: string) => { if (id === 'default/thinking-binding') { touched++; throw new Error('zz-store-unreadable'); } return get(id); };
+    store.setStateJson = (id: string, value: unknown) => { if (id === 'default/thinking-binding') { touched++; throw new Error('zz-store-unwritable'); } set(id, value); };
+    await manager.compile(BIG);
     await manager.compile(BIG, undefined, { dryRun: true });
-    assert.notEqual(recordOf(manager), null, 'a dry compile without binds leaves the record');
+    manager.addMessage('User', [text('U3')]);
+    const a3 = manager.addMessage('Claude', [thought(3), text('A3')]);
     await manager.compile(BIG);
-    assert.equal(recordOf(manager), null, 'a committing one clears it');
-    // Back on a binding model, the replies stored meanwhile were minted under
-    // requests no record saw.
-    const back = await manager.compile(BIG, undefined, BIND);
-    assert.deepEqual(back.thinkingStrip, { newly: [a1, a2], cause: 'first' });
-    // A record it can't read is cleared too.
-    manager.getStore().setStateJson('default/thinking-binding', { sent: 'zz-not-a-list' });
-    await manager.compile(BIG);
-    assert.equal(recordOf(manager), null, 'a malformed record is cleared');
+    store.getStateJson = get;
+    store.setStateJson = set;
+    assert.equal(touched, 0, 'no read or write of the record');
+    assert.equal(JSON.stringify(recordOf(manager)), recorded, 'the record is as the binding compile left it');
+    // Back on a binding model, the record is compared as it stands: the
+    // prefix that matches keeps its thinking, and what came after goes without.
+    const back = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.deepEqual(thinkingByText(back), { U1: false, A1: true, U2: false, A2: true, U3: false, A3: false });
+    assert.deepEqual(back.thinkingStrip, { newly: [a3], cause: 'messages' });
+    void a1; void a2;
     await manager.close();
   });
 
@@ -974,24 +986,53 @@ describe('thinking binding: compile', () => {
     await manager.close();
   });
 
-  it('a record write that fails tells the strategy nothing', async () => {
-    cleanup();
-    const told: ContentBlock[][] = [];
-    class Listening extends PassthroughStrategy {
-      noteThinkingLeftOut(blocks: readonly ContentBlock[]): void { told.push([...blocks]); }
+  it('a record the store can\u2019t read or write is logged, and never fails a compile or a note', async () => {
+    for (const fails of ['write', 'read'] as const) {
+      cleanup();
+      const told: ContentBlock[][] = [];
+      class Listening extends PassthroughStrategy {
+        noteThinkingLeftOut(blocks: readonly ContentBlock[]): void { told.push([...blocks]); }
+      }
+      const manager = await open(STORE, new Listening());
+      const { a1, a2 } = seed(manager);
+      const store = manager.getStore() as unknown as { getStateJson(id: string): unknown; setStateJson(id: string, value: unknown): void };
+      const get = store.getStateJson.bind(store);
+      const set = store.setStateJson.bind(store);
+      const failing = () => {
+        if (fails === 'read') store.getStateJson = (id: string) => { if (id === 'default/thinking-binding') throw new Error('zz-store-unreadable'); return get(id); };
+        else store.setStateJson = (id: string, value: unknown) => { if (id === 'default/thinking-binding') throw new Error('zz-store-unwritable'); set(id, value); };
+      };
+      const warned: string[] = [];
+      const warn = console.warn;
+      console.warn = (message: string) => { warned.push(message); };
+      try {
+        failing();
+        // Read as no record, the compile strips as a branch's first does.
+        const result = await manager.compile(BIG, undefined, BIND);
+        assert.deepEqual(result.thinkingStrip, { newly: [a1, a2], cause: 'first' }, fails);
+        assert.equal(told.length, 1, `${fails}: the strategy is told what was left out of what was sent`);
+        assert.equal(warned.length, 1, fails);
+        assert.match(warned[0]!, fails === 'read' ? /thinking-binding record of branch main couldn't be read \(.*zz-store-unreadable/ : /thinking-binding record of branch main couldn't be written \(.*zz-store-unwritable/, fails);
+        store.getStateJson = get;
+        store.setStateJson = set;
+        // A note can't read or write it either: it writes nothing and says so.
+        const compiled = await manager.compile(BIG, undefined, BIND);
+        const a3 = manager.addMessage('Claude', [thought(3), text('A3')]);
+        const before = JSON.stringify(recordOf(manager));
+        failing();
+        warned.length = 0;
+        assert.equal(manager.noteRequestSent([a3], identity(), compiled.provenance!.compileId), false, fails);
+        assert.equal(warned.length, 1, `${fails}: the note is logged`);
+        store.getStateJson = get;
+        store.setStateJson = set;
+        assert.equal(JSON.stringify(recordOf(manager)), before, `${fails}: the record is as it was`);
+      } finally {
+        console.warn = warn;
+        store.getStateJson = get;
+        store.setStateJson = set;
+      }
+      await manager.close();
     }
-    const manager = await open(STORE, new Listening());
-    seed(manager);
-    const store = manager.getStore() as unknown as { setStateJson(id: string, value: unknown): void };
-    const set = store.setStateJson.bind(store);
-    store.setStateJson = (id: string, value: unknown) => {
-      if (id === 'default/thinking-binding') throw new Error('zz-write-failed');
-      set(id, value);
-    };
-    await assert.rejects(manager.compile(BIG, undefined, BIND), /zz-write-failed/);
-    assert.deepEqual(told, []);
-    store.setStateJson = set;
-    await manager.close();
   });
 
   it('a compile that fails after selecting writes no record and tells the strategy nothing', async () => {

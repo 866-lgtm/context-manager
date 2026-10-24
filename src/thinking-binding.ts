@@ -155,13 +155,6 @@ export function writeBindingRecord(store: JsStore, namespace: string, record: Bi
   store.setStateJson(bindingStateId(namespace), record);
 }
 
-/** Clear the branch's record, whatever it holds, malformed included. A
- *  branch with none is left unwritten. */
-export function clearBindingRecord(store: JsStore, namespace: string): void {
-  const value = store.getStateJson(bindingStateId(namespace)) as unknown;
-  if (value !== null && value !== undefined) store.setStateJson(bindingStateId(namespace), null);
-}
-
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === 'string');
 }

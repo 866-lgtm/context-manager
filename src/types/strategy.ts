@@ -330,8 +330,8 @@ export interface ContextStrategy {
  * See `SelectOptions.thinkingBinding`.
  */
 export interface ThinkingBinding {
-  /** The model binds thinking. Absent or false: the compile goes on without
-   *  the option, and clears the branch's record if it commits. */
+  /** The model binds thinking. Absent or false: the compile is as it would be
+   *  without the option, and neither reads nor writes the branch's record. */
   binds?: boolean;
   /** The request carries the provider's drop control, so a stale block is
    *  set aside rather than refused. Absent means false. */
@@ -410,9 +410,14 @@ export interface SelectOptions {
    * it was minted, and reports it in `CompileResult.thinkingStrip`. With
    * `binds`, `participant` and `identity` are required, and a compile
    * without them is refused before anything is selected. Without `binds`,
-   * the compile is as it would be without the option, except that a
-   * committing one clears the branch's record: what it sends, no record
-   * vouches for.
+   * the compile is as it would be without the option: it neither reads nor
+   * writes the branch's record. A record an earlier binding compile left is
+   * compared at the next binding compile like any other, so a message keeps
+   * its thinking only while everything up to it matches what that compile
+   * sent, a prefix the provider took with that thinking, and nothing past
+   * the record's end keeps it. A record that can't be read or written is
+   * logged and never fails a compile; one that can't be read is read as
+   * none.
    *
    * The manager keeps a record per branch of what the branch last sent: the
    * last committing compile's messages as sent (cache breakpoints aside,

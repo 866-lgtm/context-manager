@@ -61,7 +61,7 @@ import { attributeEntries, buildRenderedLayout, rawBodiesOf } from './compile-pr
 import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } from './fold-journal.js';
 import { describeThrown, logThrown } from './describe-thrown.js';
 import {
-  UNVOUCHED, bindThinking, clearBindingRecord, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
+  UNVOUCHED, bindThinking, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
   refuseUnboundBinding, refuseUnreadableIdentity, registerBindingState, thinkingAsSent, thinkingSent, withoutThinking, writeBindingRecord,
   type BindOutcome, type BindingRecord,
 } from './thinking-binding.js';
@@ -1299,10 +1299,12 @@ export class ContextManager {
       // compile leaves behind for the next one.
       if (opts?.dryRun !== true) {
         if (binding) {
-          // The store write is the compile's last step that can fail. The
+          // Nothing here fails the compile: a record it can't write leaves
+          // the one before, which this compile's stream can't note onto, so
+          // what it sends past that record goes without its thinking. The
           // strategy's note only adjusts its calibration, so a strategy that
-          // throws there is logged and the compile stands.
-          writeBindingRecord(this.store, this.strategyNamespace, binding.record);
+          // throws there is logged and the compile stands too.
+          this.writeBindingRecordFor(binding.record, 'the next compile compares against the record before it');
           if (binding.leftOut.length > 0) {
             try {
               this.strategy.noteThinkingLeftOut?.(binding.leftOut);
@@ -1310,11 +1312,12 @@ export class ContextManager {
               this.diag.error('[context-manager] the strategy failed to take note of thinking left out:', describeThrown(err));
             }
           }
-        } else {
-          // What it sends, no record vouches for: the next binding compile
-          // starts a record, as a branch's first does.
-          clearBindingRecord(this.store, this.strategyNamespace);
         }
+        // A compile without binds neither reads nor writes the record. One an
+        // earlier binding compile left is compared at the next binding compile
+        // like any other: a message keeps its thinking only while everything
+        // up to it matches what that compile sent, a prefix the provider took
+        // with that thinking, and nothing past the record's end keeps it.
       }
       return result;
     };
@@ -1726,8 +1729,8 @@ export class ContextManager {
    * wrote the branch's record, as for a stream whose note arrives after
    * another committing compile: its replies were minted under a prefix the
    * record no longer holds, and go without their thinking. So it does when
-   * the branch has no record, as after a committing compile without
-   * `thinkingBinding.binds`, or one this version can't read, which it logs.
+   * the branch has no record, or one this version can't read or the store
+   * can't give, and when the store can't write it; it logs each of those.
    * A dry compile writes no record, so it leaves a stream's notes as they
    * were. Throws, writing nothing, for a row that isn't an id or the marker,
    * a `compileId` that isn't a string, or a digest that isn't a string.
@@ -1777,20 +1780,45 @@ export class ContextManager {
       // its parts.
       for (const part of splitMixedToolMessages([{ participant: stored.participant, content }])) continued.push(messageDigest(part));
     }
-    writeBindingRecord(this.store, this.strategyNamespace, continueRecord(record, continued, identity));
-    return true;
+    return this.writeBindingRecordFor(continueRecord(record, continued, identity), 'this note is lost, so what it named goes without its thinking');
   }
 
   /** The branch's binding record; one this version can't read is logged, with what follows from it, and read as none. */
   private readBindingRecordFor(consequence: string): BindingRecord | null {
-    const { record, malformed } = readBindingRecord(this.store, this.strategyNamespace);
-    if (malformed) {
+    let read: ReturnType<typeof readBindingRecord>;
+    try {
+      read = readBindingRecord(this.store, this.strategyNamespace);
+    } catch (err) {
+      this.diag.warn(`[context-manager] the thinking-binding record of branch ${this.branchNameForLog()} couldn't be read (${describeThrown(err)}); ${consequence}`);
+      return null;
+    }
+    if (read.malformed) {
       this.diag.warn(
-        `[context-manager] the thinking-binding record of branch ${this.store.currentBranch().name} isn't ` +
+        `[context-manager] the thinking-binding record of branch ${this.branchNameForLog()} isn't ` +
         `one this version reads; ${consequence}`,
       );
     }
-    return record;
+    return read.record;
+  }
+
+  /** Write the branch's binding record; a write that throws is logged, with what follows from it, and false. */
+  private writeBindingRecordFor(record: BindingRecord, consequence: string): boolean {
+    try {
+      writeBindingRecord(this.store, this.strategyNamespace, record);
+      return true;
+    } catch (err) {
+      this.diag.warn(`[context-manager] the thinking-binding record of branch ${this.branchNameForLog()} couldn't be written (${describeThrown(err)}); ${consequence}`);
+      return false;
+    }
+  }
+
+  /** The current branch's name for a log line, or '?' when the store can't say. */
+  private branchNameForLog(): string {
+    try {
+      return this.store.currentBranch().name;
+    } catch {
+      return '?';
+    }
   }
 
   /** Read the active strategy's allowlisted live settings, if supported. */
