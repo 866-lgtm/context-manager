@@ -604,6 +604,43 @@ describe('thinking binding: compile', () => {
     }
   });
 
+  it('a noted row is digested as the compile sends it: a result under another participant as the user\u2019s, a bundled tool cycle as each part', async () => {
+    cleanup();
+    const manager = await open();
+    manager.addMessage('User', [text('U1')]);
+    const c1 = await manager.compile(BIG, undefined, BIND_DROP);
+    const a1 = manager.addMessage('Claude', [thought(1), toolUse('t1')]);
+    const r1 = manager.addMessage('Tool', [toolResult('t1', 'zz-result')]);
+    const b1 = manager.addMessage('Claude', [thought(2), toolUse('t2'), toolResult('t2', 'zz-bundled'), thought(3), text('B1')]);
+    assert.equal(manager.noteRequestSent([a1, r1, b1], identity(), c1.provenance!.compileId), true);
+    manager.addMessage('User', [text('U2')]);
+    const next = await manager.compile(BIG, undefined, BIND_DROP);
+    assert.ok(next.messages.some((m) => m.participant === 'user' && m.content.some((b) => b.type === 'tool_result')), 'setup: the compile sends results as the user\u2019s');
+    assert.equal(next.messages.length, 7, 'setup: the bundled cycle goes as three messages');
+    assert.equal(next.thinkingStrip, undefined);
+    assert.equal(next.messages.reduce((n, m) => n + m.content.filter(isThinking).length, 0), 3, 'every noted reply keeps its thinking');
+    await manager.close();
+  });
+
+  it('the layout prices a split body\u2019s thinking as each part sent it', async () => {
+    cleanup();
+    const manager = await open();
+    manager.addMessage('User', [text('U1')]);
+    const c1 = await manager.compile(BIG, undefined, BIND_DROP);
+    const b1 = manager.addMessage('Claude', [thought(1), toolUse('t1'), toolResult('t1', 'zz-bundled'), thought(2), text('B1')]);
+    manager.noteRequestSent([b1], identity(), c1.provenance!.compileId);
+    // Placed after the cycle's result, the injection changes what precedes
+    // the second part, so its thinking goes and the first part's stays.
+    const late: ContextInjection = { namespace: 'zz-late', position: 'afterUser', content: [text('zz-late')] };
+    const plain = await manager.compile(BIG, [late], { dryRun: true });
+    const bound = await manager.compile(BIG, [late], { ...BIND_DROP, dryRun: true });
+    const kept = bound.messages.flatMap((m) => m.content.filter(isThinking));
+    assert.deepEqual(kept, [thought(1)], 'setup: the first part keeps its thinking, the second goes without');
+    const price = (blocks: ContentBlock[]) => (manager as unknown as { messageStore: { estimateBaseTokens(c: ContentBlock[]): number } }).messageStore.estimateBaseTokens(blocks);
+    assert.equal(bound.provenance!.layout!.totalTokens, plain.provenance!.layout!.totalTokens - price([thought(2)]));
+    await manager.close();
+  });
+
   it('a strategy that throws taking note of the thinking left out is logged, and the compile stands', async () => {
     cleanup();
     class Throwing extends PassthroughStrategy {

@@ -62,7 +62,7 @@ import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } 
 import { describeThrown, logThrown } from './describe-thrown.js';
 import {
   UNVOUCHED, bindThinking, clearBindingRecord, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
-  refuseUnboundBinding, refuseUnreadableIdentity, registerBindingState, withoutThinking, writeBindingRecord,
+  refuseUnboundBinding, refuseUnreadableIdentity, registerBindingState, thinkingAsSent, thinkingSent, withoutThinking, writeBindingRecord,
   type BindOutcome, type BindingRecord,
 } from './thinking-binding.js';
 import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
@@ -1272,10 +1272,13 @@ export class ContextManager {
           }
           rawComplete = complete;
         }
-        layoutEntries = entries.map((entry, e) => {
-          const source = attribution.sources[e];
-          const kept = source?.kind === 'raw' && !source.bodies.some((body) => without.has(body.messageId));
-          return kept || !entry.content.some(isThinkingBlock) ? entry : { ...entry, content: withoutThinking(entry.content) };
+        // Each entry keeps the thinking the compile sent of it: an entry the
+        // compile splits (a bundled tool cycle) is bound part by part, so one
+        // part can keep what another leaves out.
+        const sent = thinkingSent(result.messages);
+        layoutEntries = entries.map((entry) => {
+          const content = thinkingAsSent(entry.content, sent);
+          return content === entry.content ? entry : { ...entry, content };
         });
         layoutInjected = injected.map((content) => (content.some(isThinkingBlock) ? withoutThinking(content) : content));
       }
@@ -1707,11 +1710,13 @@ export class ContextManager {
    * old head. A host that notes nothing keeps no reply's thinking past the
    * compile after it was stored, and is never refused for it.
    *
-   * Each stored row is digested as `renderAsNewest` renders it, so one it
-   * renders as null, or that the next compile renders otherwise, matches
-   * nothing there, and what follows goes without its thinking; a note that
-   * renders rows this way releases compression holds that have timed out, as
-   * `renderAsNewest` does.
+   * Each stored row is digested as `renderAsNewest` renders it and as the
+   * compile turns that into messages: a tool result under another
+   * participant goes as the user's, and a bundled tool cycle as each of its
+   * parts (`splitMixedToolMessages`). So one it renders as null, or that the
+   * next compile renders otherwise, matches nothing there, and what follows
+   * goes without its thinking; a note that renders rows this way releases
+   * compression holds that have timed out, as `renderAsNewest` does.
    * Without `renderAsNewest`, a row is its stored content, and a body stored
    * as shards matches nothing, and so does an id the store doesn't hold, as
    * after a removal.
@@ -1751,16 +1756,26 @@ export class ContextManager {
     const ids = rows.filter((row): row is MessageId => typeof row === 'string' && view.get(row) !== null);
     const rendered = ids.length > 0 ? this.renderAsNewest(ids) : [];
     let next = 0;
-    const continued = rows.map((row) => {
-      if (typeof row !== 'string') return UNVOUCHED;
-      const stored = view.get(row);
-      if (stored === null) return UNVOUCHED;
+    const continued: string[] = [];
+    for (const row of rows) {
+      const stored = typeof row === 'string' ? view.get(row) : null;
+      if (stored === null) {
+        continued.push(UNVOUCHED);
+        continue;
+      }
       // With no renderAsNewest, a row is its stored content, which for a body
       // stored as shards is only its first shard's.
       const content = rendered === undefined ? (stored.bodyGroupId === undefined ? stored.content : null) : rendered[next];
       next++;
-      return content === null || content === undefined ? UNVOUCHED : messageDigest({ participant: stored.participant, content });
-    });
+      if (content === null || content === undefined) {
+        continued.push(UNVOUCHED);
+        continue;
+      }
+      // As the compile turns it into messages: a tool result under another
+      // participant goes as the user's, and a bundled tool cycle as each of
+      // its parts.
+      for (const part of splitMixedToolMessages([{ participant: stored.participant, content }])) continued.push(messageDigest(part));
+    }
     writeBindingRecord(this.store, this.strategyNamespace, continueRecord(record, continued, identity));
     return true;
   }

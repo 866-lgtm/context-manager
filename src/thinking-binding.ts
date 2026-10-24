@@ -45,6 +45,29 @@ export function withoutThinking(content: ContentBlock[]): ContentBlock[] {
   return releaseEditedRawForms(content, content.filter((block) => !isThinkingBlock(block)));
 }
 
+/**
+ * The content less the thinking blocks `messages` don't carry, raw forms
+ * released as `withoutThinking` releases them; the content itself when they
+ * carry all of its thinking. A block is matched by its canonical form, cache
+ * marker aside: a signature makes each one distinct.
+ */
+export function thinkingAsSent(content: ContentBlock[], sent: ReadonlySet<string>): ContentBlock[] {
+  const left = (block: ContentBlock) => isThinkingBlock(block) && !sent.has(thinkingKey(block));
+  if (!content.some(left)) return content;
+  return releaseEditedRawForms(content, content.filter((block) => !left(block)));
+}
+
+/** Each thinking block `messages` carry, by its canonical form, for `thinkingAsSent`. */
+export function thinkingSent(messages: ReadonlyArray<{ content: ContentBlock[] }>): Set<string> {
+  const sent = new Set<string>();
+  for (const message of messages) for (const block of message.content) if (isThinkingBlock(block)) sent.add(thinkingKey(block));
+  return sent;
+}
+
+function thinkingKey(block: ContentBlock): string {
+  return canonicalJson(withoutCacheMarker(block));
+}
+
 /** What a branch last sent, as its record keeps it. */
 export interface BindingRecord {
   /** Each message the last committing compile sent, in order: a digest of
