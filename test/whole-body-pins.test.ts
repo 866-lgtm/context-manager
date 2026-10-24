@@ -130,7 +130,7 @@ function warnings(t: { mock: { method: (o: object, m: string, f: (...a: unknown[
   return out;
 }
 
-type View = { getAll(): Array<{ id: string; bodyGroupId?: string }> };
+type View = { getAll(): Array<{ id: string; bodyGroupId?: string }>; estimateTokens(message: unknown): number };
 const viewOf = (cm: ContextManager): View => (cm as unknown as { strategyMessageView(): View }).strategyMessageView();
 /** The ids of the parts of the message `id` is in, in store order. */
 const partsOf = (cm: ContextManager, id: string): string[] => {
@@ -557,6 +557,24 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
     });
   });
 
+  it('with the head window disabled, a head reset leaves the recent messages before the head in the tail, so a pin there isn\'t named', async () => {
+    await withDir(async (dir) => {
+      const { cm, strategy } = await open(dir, 'adaptive', 8000, { headWindowTokens: 0 });
+      await history(cm);
+      const b = cm.addMessage('user', words('Bdoc', 6000));
+      await traffic(cm, 360);
+      await ready(cm);
+      const mark = cm.markDocument(b);
+      const all = viewOf(cm).getAll();
+      strategy.resetHeadWindow(all.at(-1)!.id);
+      cm.pinRange(all.at(-3)!.id, all.at(-3)!.id);
+      const refusal = await refusalOf(cm, 30_000);
+      assert.match(refusal.message, /^Adaptive picker exhausted/);
+      assert.deepStrictEqual(refusal.diagnostics.rawPins?.pins.map((p) => p.pinId), [mark]);
+      await cm.close();
+    });
+  });
+
   it('kv-stable: names a raw pin but not a pin with a level or a cap that overlaps it, which keeps nothing raw', async () => {
     await withDir(async (dir) => {
       const { cm, b } = await markedAfterSummaries(dir, 'kv-stable');
@@ -587,8 +605,8 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
           await cm.compile(budget(maxTokens));
           seen.push(`${maxTokens}: compiled`);
         } catch (err) {
-          seen.push(`${maxTokens}: ${(err as Error).message.slice(0, 120)}`);
-          if (!(err instanceof OverBudgetError)) continue;
+          if (!(err instanceof OverBudgetError)) throw err;
+          seen.push(`${maxTokens}: ${err.message.slice(0, 120)}`);
           raw = err.diagnostics.rawPins;
           if (raw) break;
         }
@@ -596,6 +614,10 @@ describe('a compile that can\'t hold a whole message refuses, naming the pins th
       assert.ok(raw, `a refusal named the range: ${seen.join(' | ')}`);
       assert.deepStrictEqual(raw.pins.map((p) => p.pinId), [range]);
       assert.strictEqual(raw.pins[0]!.tokens, raw.tokens, 'the range keeps raw only what the total counts');
+      // B and C are the same size, so B alone is about half of both.
+      const ids = new Set([...partsOf(cm, b), ...partsOf(cm, c)]);
+      const both = viewOf(cm).getAll().filter((m) => ids.has(m.id)).reduce((n, m) => n + viewOf(cm).estimateTokens(m), 0);
+      assert.ok(raw.tokens < both * 0.6, `${raw.tokens} of ${both}: C, held at a level, isn't counted`);
       await cm.close();
     });
   });

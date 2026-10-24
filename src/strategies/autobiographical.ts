@@ -13001,9 +13001,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * The pins that keep messages raw in the adaptive plan's middle, for its
    * refusal to name (`OverBudgetDiagnostics.rawPins`): the positions the plan
-   * folds history in (before the head, and from the head's end to the tail's
-   * start, which is the recent window's start or the head's end where the
-   * recent window reaches back into the head) that pins keep raw
+   * folds history in (before the tail's start, which is the recent window's
+   * start or the head's end where the recent window reaches back into the
+   * head, and outside the head window; with the head window disabled after a
+   * reset, the plan's tail holds the recent messages before the head) that
+   * pins keep raw
    * (`forceRawPinPositions`), each priced by `price`, the plan's own raw
    * price. Every such position counts, a part locked with `lockChunk` among
    * them, so the tokens are what unpinning frees at most: a pin that keeps no
@@ -13019,7 +13021,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     const tailStart = Math.max(this.getRecentWindowStart(store), headEnd);
-    const kept = (i: number): boolean => raw.has(i) && (i < headStart || (i >= headEnd && i < tailStart));
+    const kept = (i: number): boolean => raw.has(i) && i < tailStart && !(i >= headStart && i < headEnd);
 
     let tokens = 0;
     for (const i of raw) if (kept(i)) tokens += price(i);
